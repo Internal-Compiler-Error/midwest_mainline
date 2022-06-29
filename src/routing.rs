@@ -11,7 +11,7 @@ pub struct Bucket {
     /// inclusive
     lower_bound: NodeId,
     /// exclusive
-    upper_bound: BigNodeIdUint,
+    upper_bound: NodeId,
 
     // TODO: technically a bucket is at most 8 nodes, use a fixed size vector
     nodes: Vec<Node>,
