@@ -1,25 +1,41 @@
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use juicy_bencode::BencodeItemView;
 use serde::ser::{SerializeMap};
 use serde_with::{serde_as, Bytes};
-use serde::Serialize;
+use serde::{Deserialize, Serialize, Serializer};
 use crate::message::query::{FindNodeArgs, GetPeersArgs, PingArgs, QueryType};
 use crate::message::response::{FindNodeResponse, GetPeersResponse, GetPeersResponseType, PingResponse, ResponseType};
 
-pub struct PeerContact(Ipv4Addr);
-
-pub type CompactNodeContact = [u8; 20];
+pub type PeerContact = [u8; 6];
+pub type NodeId = [u8; 20];
 pub type InfoHash = [u8; 20];
 pub type TransactionId = [u8; 2];
 pub type Token = [u8; 20];
 
-pub struct NodeContact {
-    pub node_contact: CompactNodeContact,
+
+#[derive(Debug)]
+pub struct CompactNodeContact {
+    pub node_id: NodeId,
     pub peer_contact: PeerContact,
 }
+
+
+impl Serialize for CompactNodeContact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where S: Serializer
+    {
+        let mut byte_representation: [u8; 26] = [0; 26];
+
+        byte_representation[0..20].copy_from_slice(&self.node_id);
+        byte_representation[20..26].copy_from_slice(&self.peer_contact);
+
+        serializer.serialize_bytes(&byte_representation)
+    }
+}
+
 
 enum MessageType<'a> {
     Query(QueryType),
@@ -48,7 +64,7 @@ impl Display for ParseError {
 impl Error for ParseError {}
 
 impl Message<'static> {
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: CompactNodeContact) -> Message<'static> {
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Message<'static> {
         Message {
             transaction_id,
             message: MessageType::Query(
@@ -61,7 +77,7 @@ impl Message<'static> {
         }
     }
 
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: CompactNodeContact, target_id: InfoHash) -> Message<'static> {
+    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Message<'static> {
         Message {
             transaction_id,
             message: MessageType::Query(
@@ -75,7 +91,7 @@ impl Message<'static> {
         }
     }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: CompactNodeContact, info_hash: InfoHash) -> Message<'static> {
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Message<'static> {
         Message {
             transaction_id,
             message: MessageType::Query(
@@ -90,14 +106,14 @@ impl Message<'static> {
     }
 
     #[allow(unused_variables)]
-    pub fn new_announce_peer_query(transaction_id: TransactionId, querying_id: CompactNodeContact, info_hash: InfoHash, port: u16) -> Message<'static> {
+    pub fn new_announce_peer_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash, port: u16) -> Message<'static> {
         // this is impossible under NAT
         unimplemented!()
     }
 }
 
 impl<'a> Message<'a> {
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: &'a CompactNodeContact) -> Message<'a> {
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: &'a NodeId) -> Message<'a> {
         Message {
             transaction_id,
             message: MessageType::Response(
@@ -111,7 +127,7 @@ impl<'a> Message<'a> {
     }
 
     /// construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: &'a CompactNodeContact, nodes: Vec<&'a CompactNodeContact>) -> Message<'a> {
+    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: &'a NodeId, nodes: Vec<&'a CompactNodeContact>) -> Message<'a> {
         Message {
             transaction_id,
             message: MessageType::Response(
@@ -127,7 +143,7 @@ impl<'a> Message<'a> {
 
     /// construct a response to a get_peers query when the peer is directly found
     pub fn new_get_peers_success_response(transaction_id: TransactionId,
-                                          responding_id: &'a CompactNodeContact,
+                                          responding_id: &'a NodeId,
                                           response_token: &'a Token,
                                           node: &'a CompactNodeContact) -> Message<'a> {
         Message {
@@ -147,7 +163,7 @@ impl<'a> Message<'a> {
     /// construct a response to a get_peers query when the peer is not directly found and the closest
     /// nodes are returned
     pub fn new_get_peers_deferred_response(transaction_id: TransactionId,
-                                           responding_id: &'a CompactNodeContact,
+                                           responding_id: &'a NodeId,
                                            response_token: &'a Token,
                                            closest_nodes: Vec<&'a CompactNodeContact>) -> Message<'a> {
         Message {
@@ -296,7 +312,7 @@ impl<'a> Message<'a> {
         let ping_response = response_body.get(b"id".as_slice()).ok_or(ParseError {
             message: "ping response is missing".to_string(),
         })?;
-        let our_id: &CompactNodeContact = match *ping_response {
+        let our_id: &NodeId = match *ping_response {
             BencodeItemView::ByteString(queried_id) => {
                 queried_id.try_into()?
             }
@@ -355,17 +371,15 @@ impl<'a> Serialize for Message<'a> {
                         message_fields.serialize_entry("q", "get_peers")?;
                         message_fields.serialize_entry("a", &args)?;
                     }
-                    QueryType::AnnouncePeer => {
-                        unimplemented!()
+                    QueryType::AnnouncePeer(args) => {
+                        message_fields.serialize_entry("q", "announce_peer")?;
+                        message_fields.serialize_entry("a", &args)?;
                     }
                 };
             }
             MessageType::Response(_) => { message_fields.serialize_entry("y", "r")?; }
             MessageType::Error => { message_fields.serialize_entry("y", "e")?; }
         }
-
-        //
-
 
         message_fields.end()
     }
@@ -380,34 +394,49 @@ pub mod query {
         FindNode(FindNodeArgs),
         GetPeers(GetPeersArgs),
         // TODO: this is basically impossible under NAT
-        AnnouncePeer,
+        AnnouncePeer(AnnouncePeerArgs),
     }
 
     #[serde_as]
     #[derive(Debug, Serialize)]
     pub struct PingArgs {
         #[serde_as(as = "Bytes")]
-        pub id: CompactNodeContact,
+        pub id: NodeId,
     }
 
     #[serde_as]
     #[derive(Debug, Serialize)]
     pub struct FindNodeArgs {
         #[serde_as(as = "Bytes")]
-        pub id: CompactNodeContact,
+        pub id: NodeId,
 
         #[serde_as(as = "Bytes")]
-        pub target: CompactNodeContact,
+        pub target: NodeId,
     }
 
     #[serde_as]
     #[derive(Debug, Serialize)]
     pub struct GetPeersArgs {
         #[serde_as(as = "Bytes")]
-        pub id: CompactNodeContact,
+        pub id: NodeId,
 
         #[serde_as(as = "Bytes")]
         pub info_hash: InfoHash,
+    }
+
+    #[serde_as]
+    #[derive(Debug, Serialize)]
+    pub struct AnnouncePeerArgs {
+        #[serde_as(as = "Bytes")]
+        pub id: NodeId,
+        pub implied_port: u8,
+
+        #[serde_as(as = "Bytes")]
+        pub info_hash: InfoHash,
+        pub port: u16,
+
+        #[serde_as(as = "Bytes")]
+        pub token: Token,
     }
 }
 
@@ -425,17 +454,17 @@ pub mod response {
 
 
     pub struct PingResponse<'a> {
-        pub id: &'a CompactNodeContact,
+        pub id: &'a NodeId,
     }
 
     pub struct FindNodeResponse<'a> {
-        pub id: &'a CompactNodeContact,
+        pub id: &'a NodeId,
         pub nodes: Vec<&'a CompactNodeContact>,
     }
 
 
     pub struct GetPeersResponse<'a> {
-        pub id: &'a CompactNodeContact,
+        pub id: &'a NodeId,
         pub token: &'a Token,
         pub response: GetPeersResponseType<'a>,
     }
@@ -446,7 +475,7 @@ pub mod response {
     }
 
     pub struct AnnouncePeerResponse<'a> {
-        pub id: &'a CompactNodeContact,
+        pub id: &'a NodeId,
     }
 }
 
