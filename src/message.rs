@@ -1,6 +1,5 @@
-use std::fmt::{Display, Formatter};
 use serde_with::{serde_as, Bytes};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use crate::message::query::{AnnouncePeerArgs, FindNodeArgs, GetPeersArgs, PingArgs, QueryBody};
 use crate::message::response::{AnnouncePeerResponse, FindNodeResponse, GetPeersResponse, GetPeersResponseType, PingResponse, ResponseBody};
 
@@ -9,32 +8,28 @@ pub type InfoHash = [u8; 20];
 pub type TransactionId = [u8; 2];
 pub type Token = [u8; 20];
 
-
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactNodeContact<'a> {
+pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
-    #[serde(borrow)]
-    bytes: &'a [u8; 26],
+    bytes: [u8; 26],
 }
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactPeerContact<'a> {
+pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
-    #[serde(borrow)]
-    bytes: &'a [u8; 6],
+    bytes: [u8; 6],
 }
 
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum MessageBody<'a> {
+enum MessageBody {
     #[serde(rename = "a")]
     Query(QueryBody),
 
     #[serde(rename = "r")]
-    #[serde(borrow)]
-    Response(ResponseBody<'a>),
+    Response(ResponseBody),
 
     #[serde(rename = "e")]
     Error,
@@ -83,7 +78,7 @@ impl QueryMethod {
 /// All KRPC messages are of this type
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message<'a> {
+pub struct Message {
     #[serde(rename = "t")]
     #[serde_as(as = "Bytes")]
     transaction_id: TransactionId,
@@ -97,13 +92,12 @@ pub struct Message<'a> {
     // see the comment in the enum for why it's not using Optional<T>
     query_method: QueryMethod,
 
-    #[serde(borrow)]
     #[serde(flatten)]
-    body: MessageBody<'a>,
+    body: MessageBody,
 }
 
-impl Message<'static> {
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Message<'static> {
+impl Message {
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Query,
@@ -118,7 +112,7 @@ impl Message<'static> {
         }
     }
 
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Message<'static> {
+    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Query,
@@ -134,7 +128,7 @@ impl Message<'static> {
         }
     }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Message<'static> {
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Query,
@@ -151,7 +145,7 @@ impl Message<'static> {
     }
 
     pub fn new_announce_peer_query(transaction_id: TransactionId,
-                                   info_hash: InfoHash, querying_id: NodeId, port: u16, implied_port: bool, token: Token) -> Message<'static> {
+                                   info_hash: InfoHash, querying_id: NodeId, port: u16, implied_port: bool, token: Token) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Query,
@@ -169,10 +163,8 @@ impl Message<'static> {
             ),
         }
     }
-}
 
-impl<'a> Message<'a> {
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: &'a NodeId) -> Message<'a> {
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Response,
@@ -188,7 +180,7 @@ impl<'a> Message<'a> {
     }
 
     /// construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: &'a NodeId, nodes: &'a [u8]) -> Message<'a> {
+    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Response,
@@ -206,9 +198,9 @@ impl<'a> Message<'a> {
 
     /// construct a response to a get_peers query when the peer is directly found
     pub fn new_get_peers_success_response(transaction_id: TransactionId,
-                                          responding_id: &'a NodeId,
-                                          response_token: &'a Token,
-                                          node: Vec<CompactPeerContact<'a>>) -> Message<'a> {
+                                          responding_id: NodeId,
+                                          response_token: Token,
+                                          node: Vec<CompactPeerContact>) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Response,
@@ -228,9 +220,9 @@ impl<'a> Message<'a> {
     /// construct a response to a get_peers query when the peer is not directly found and the closest
     /// nodes are returned
     pub fn new_get_peers_deferred_response(transaction_id: TransactionId,
-                                           responding_id: &'a NodeId,
-                                           response_token: &'a Token,
-                                           closest_nodes: &'a [u8]) -> Message<'a> {
+                                           responding_id: NodeId,
+                                           response_token: Token,
+                                           closest_nodes: Box<[u8]>) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Response,
@@ -247,7 +239,7 @@ impl<'a> Message<'a> {
         }
     }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: &'a NodeId) -> Message<'a> {
+    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Message {
         Message {
             transaction_id,
             message_type: MessageType::Response,
@@ -324,69 +316,61 @@ pub mod response {
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(untagged)]
-    pub enum ResponseBody<'a> {
-        #[serde(borrow)]
-        Ping(PingResponse<'a>),
-        #[serde(borrow)]
-        FindNode(FindNodeResponse<'a>),
-        #[serde(borrow)]
-        GetPeers(GetPeersResponse<'a>),
+    pub enum ResponseBody {
+        Ping(PingResponse),
+
+        FindNode(FindNodeResponse),
+
+        GetPeers(GetPeersResponse),
         // can we receive this under NAT?
-        #[serde(borrow)]
-        AnnouncePeer(AnnouncePeerResponse<'a>),
+
+        AnnouncePeer(AnnouncePeerResponse),
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct PingResponse<'a> {
+    pub struct PingResponse {
         #[serde_as(as = "Bytes")]
-        #[serde(borrow)]
-        pub id: &'a NodeId,
+        pub id: NodeId,
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FindNodeResponse<'a> {
+    pub struct FindNodeResponse {
         #[serde_as(as = "Bytes")]
-        #[serde(borrow)]
-        pub id: &'a NodeId,
+        pub id: NodeId,
 
-        #[serde(borrow)]
         #[serde_as(as = "Bytes")]
-        pub nodes: &'a [u8],
+        pub nodes: Box<[u8]>,
     }
 
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GetPeersResponse<'a> {
+    pub struct GetPeersResponse {
         #[serde_as(as = "Bytes")]
-        pub id: &'a NodeId,
+        pub id: NodeId,
 
         #[serde_as(as = "Bytes")]
-        pub token: &'a Token,
+        pub token: Token,
 
-        #[serde(borrow)]
-        pub response: GetPeersResponseType<'a>,
+        pub response: GetPeersResponseType,
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum GetPeersResponseType<'a> {
-        #[serde(borrow)]
+    pub enum GetPeersResponseType {
         #[serde(rename = "values")]
-        Success(Vec<CompactPeerContact<'a>>),
-        #[serde(borrow)]
+        Success(Vec<CompactPeerContact>),
         #[serde(rename = "node")]
-        Deferred(&'a [u8]),
+        Deferred(Box<[u8]>),
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct AnnouncePeerResponse<'a> {
+    pub struct AnnouncePeerResponse {
         #[serde_as(as = "Bytes")]
-        #[serde(borrow)]
-        pub id: &'a NodeId,
+        pub id: NodeId,
     }
 }
 
@@ -413,7 +397,7 @@ mod test {
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Message = from_bytes(message).unwrap();
 
-            let expected = Message::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456");
+            let expected = Message::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
             assert_eq!(decoded, expected);
         }
 
