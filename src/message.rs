@@ -2,29 +2,16 @@ use serde_with::{serde_as, Bytes};
 use serde::{Deserialize, Serialize};
 use crate::message::query::{AnnouncePeerArgs, FindNodeArgs, GetPeersArgs, PingArgs, QueryBody};
 use crate::message::response::{AnnouncePeerResponse, FindNodeResponse, GetPeersResponse, GetPeersResponseType, PingResponse, ResponseBody};
+use crate::domain_knowledge::{CompactPeerContact, NodeId};
 
-pub type NodeId = [u8; 20];
+
 pub type InfoHash = [u8; 20];
 pub type TransactionId = [u8; 2];
 pub type Token = [u8; 20];
 
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactNodeContact {
-    #[serde_as(as = "Bytes")]
-    bytes: [u8; 26],
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompactPeerContact {
-    #[serde_as(as = "Bytes")]
-    bytes: [u8; 6],
-}
-
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum MessageBody {
+pub(crate) enum MessageBody {
     #[serde(rename = "a")]
     Query(QueryBody),
 
@@ -36,7 +23,7 @@ enum MessageBody {
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum MessageType {
+pub(crate) enum MessageType {
     #[serde(rename = "q")]
     Query,
     #[serde(rename = "r")]
@@ -46,7 +33,7 @@ enum MessageType {
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum QueryMethod {
+pub(crate) enum QueryMethod {
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "find_node")]
@@ -81,19 +68,19 @@ impl QueryMethod {
 pub struct Message {
     #[serde(rename = "t")]
     #[serde_as(as = "Bytes")]
-    transaction_id: TransactionId,
+    pub(crate) transaction_id: TransactionId,
 
     #[serde(rename = "y")]
-    message_type: MessageType,
+    pub(crate) message_type: MessageType,
 
     #[serde(rename = "q")]
     #[serde(skip_serializing_if = "QueryMethod::is_none")]
     #[serde(default = "QueryMethod::not_a_query")]
     // see the comment in the enum for why it's not using Optional<T>
-    query_method: QueryMethod,
+    pub(crate) query_method: QueryMethod,
 
     #[serde(flatten)]
-    body: MessageBody,
+    pub(crate) body: MessageBody,
 }
 
 impl Message {
@@ -253,6 +240,10 @@ impl Message {
             ),
         }
     }
+
+    pub fn id_as_u16(&self) -> u16 {
+        u16::from_be_bytes(self.transaction_id)
+    }
 }
 
 pub mod query {
@@ -312,6 +303,7 @@ pub mod query {
 }
 
 pub mod response {
+    use crate::domain_knowledge::CompactNodeContact;
     use super::*;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +349,7 @@ pub mod response {
         pub response: GetPeersResponseType,
     }
 
+
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum GetPeersResponseType {
@@ -397,19 +390,23 @@ mod test {
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Message = from_bytes(message).unwrap();
 
+
             let expected = Message::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
             assert_eq!(decoded, expected);
         }
 
         #[test]
         fn find_node_response_deserialize() {
-            let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes9:def456...e1:t2:aa1:y1:re";
+            let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Message = from_bytes(message).unwrap();
 
-            // let expected = Message::new_find_node_response(
-            //     b"aa".clone(),
-            //     b"0123456789abcdefghij".clone(),
-            // );
+            let expected = Message::new_find_node_response(
+                b"aa".clone(),
+                b"0123456789abcdefghij".clone(),
+                Box::new(b"mnopqrstuvwxyz123456".clone())
+            );
+
+            assert_eq!(expected, decoded)
         }
     }
 
