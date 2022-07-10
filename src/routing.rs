@@ -4,12 +4,13 @@ use std::time::Instant;
 use num_bigint::BigUint;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
 
-
+#[derive(Debug)]
 pub struct RoutingTable {
     id: BigUint,
-    buckets: Vec<Bucket>,
+    pub(crate) buckets: Vec<Bucket>,
 }
 
+#[derive(Debug)]
 pub struct Bucket {
     /// inclusive
     lower_bound: BigUint,
@@ -46,6 +47,10 @@ impl RoutingTable {
             id,
             buckets: vec![default_bucket],
         }
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
     pub fn our_id(&self) -> &BigUint {

@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::task::Poll::Ready;
+use std::time::Duration;
 use async_recursion::async_recursion;
 use futures::future::join_all;
 use num_bigint::BigUint;
@@ -19,6 +20,7 @@ use tokio::sync::RwLock;
 use tokio::net::UdpSocket;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
 use crate::message::{Message, MessageBody, MessageType, QueryMethod};
 use crate::message::query::QueryBody;
@@ -194,7 +196,102 @@ impl DhtServiceInner {
         let response = rx.await.unwrap();
         Ok(response)
     }
+
+
+    async fn find_node(&self, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
+        // if we already know the node, then no need for any network requests
+        if let Some(node) = self.routing_table.read().await.find(target) {
+            return Ok(node.contact.clone());
+        }
+
+
+        // find the closest nodes that we know
+        let closest;
+        {
+            let table = self.routing_table.read().await;
+            closest = table
+                .find_closest(target)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+        }
+
+
+        for node in &closest {
+            // construct the message to query our friends
+            let transaction_id = self.transaction_id_pool.get_id().await;
+            let query = Message::new_find_node_query(
+                transaction_id.to_be_bytes(),
+                self.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
+                target.clone(),
+            );
+
+            // ask them
+            let response = self.send_message(&query, &(&node.contact).into()).await?;
+
+            if let MessageBody::Response(res) = response.body {
+                if let ResponseBody::FindNode(nodes) = res {
+                    let mut nodes: Vec<_> = nodes
+                        .nodes
+                        .windows(26)
+                        .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                        .collect();
+
+                    nodes.dedup();
+
+
+                    for node in nodes {
+                        self.routing_table.write().await.add_new_node(node.clone());
+                        if node.node_id() == target {
+                            return Ok(node);
+                        } else {
+                            self.recursive_find(target, &node).await?;
+                        }
+                    }
+                }
+            }
+        }
+
+
+        unreachable!()
+    }
+
+    #[async_recursion]
+    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact) -> Result<CompactNodeContact, DhtServiceFailure> {
+        let transaction_id = self.transaction_id_pool.get_id().await;
+        let query = Message::new_find_node_query(
+            transaction_id.to_be_bytes(),
+            self.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
+            target.clone(),
+        );
+
+        let response = self.send_message(&query, &asking.into()).await?;
+
+        if let MessageBody::Response(res) = response.body {
+            if let ResponseBody::FindNode(nodes) = res {
+                let mut nodes: Vec<_> = nodes
+                    .nodes
+                    .windows(26)
+                    .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                    .collect();
+
+                nodes.dedup();
+
+
+                for node in nodes {
+                    self.routing_table.write().await.add_new_node(node.clone());
+                    if node.node_id() == target {
+                        return Ok(node);
+                    } else {
+                        return self.recursive_find(target, &node).await;
+                    }
+                }
+            }
+        }
+        unreachable!();
+    }
 }
+
 
 impl Drop for DhtServiceInner {
     fn drop(&mut self) {
@@ -253,7 +350,7 @@ impl DhtService {
                     let response = dht.inner.send_message(&query, &ip).await.unwrap();
 
                     println!("first message back!");
-                    dbg!(&response);
+
                     match response.body {
                         MessageBody::Response(res) => {
                             match res {
@@ -262,11 +359,26 @@ impl DhtService {
                                         CompactNodeContact::new(x.try_into().unwrap())
                                     }).collect();
 
-                                    dbg!(&nodes);
 
+                                    let mut handles = Vec::new();
                                     for node in nodes {
                                         println!("trying to contact {:?}", &node);
-                                        dht.recursive_find(&our_id, &node).await.expect(".·´¯`(>▂<)´¯`·. Please don't tell me I can't even bootstrap myself");
+
+                                        let dht = dht.inner.clone();
+                                        let handle = tokio::spawn(async move {
+                                            if let Ok(node) = timeout(
+                                                Duration::from_secs(15),
+                                                dht.recursive_find(&our_id, &node)).await {
+                                                return Some(node.unwrap());
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        handles.push(handle);
+                                    }
+
+                                    for handle in handles {
+                                        handle.await;
                                     }
                                 }
                                 other => {
@@ -284,115 +396,6 @@ impl DhtService {
         }
 
         Ok(dht)
-    }
-
-    async fn find_node(&self, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
-        // if we already know the node, then no need for any network requests
-        if let Some(node) = self.inner.routing_table.read().await.find(target) {
-            return Ok(node.contact.clone());
-        }
-
-
-        // find the closest nodes that we know
-        let closest;
-        {
-            let table = self.inner.routing_table.read().await;
-            closest = table
-                .find_closest(target)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-        }
-
-
-        for node in &closest {
-            // construct the message to query our friends
-            let transaction_id = self.inner.transaction_id_pool.get_id().await;
-            let query = Message::new_find_node_query(
-                transaction_id.to_be_bytes(),
-                self.inner.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
-                target.clone(),
-            );
-
-            // ask them
-            let response = self.inner.send_message(&query, &(&node.contact).into()).await?;
-
-            if let MessageBody::Response(res) = response.body {
-                if let ResponseBody::FindNode(nodes) = res {
-                    // bingo, only one node returned, that means it's the node we want
-                    if nodes.nodes.len() == 26 {
-                        let contact = CompactNodeContact::new(
-                            (*nodes.nodes).try_into().unwrap()
-                        );
-                        self.inner.routing_table.write().await.add_new_node(contact.clone());
-                        return Ok(contact);
-                    } else {
-                        // they returned a list of nodes, let's go find ask them if they know
-                        let nodes: Vec<_> = (&*nodes.nodes)
-                            .windows(26)
-                            .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                            .collect();
-
-                        {
-                            let mut table = self.inner.routing_table.write().await;
-                            nodes
-                                .iter()
-                                .for_each(|x| table.add_new_node(x.clone()));
-                        }
-
-                        for node in nodes {
-                            return self.recursive_find(target, &node).await;
-                        }
-                    }
-                }
-            }
-        }
-
-
-        unreachable!()
-    }
-
-    #[async_recursion]
-    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact) -> Result<CompactNodeContact, DhtServiceFailure> {
-        let transaction_id = self.inner.transaction_id_pool.get_id().await;
-        let query = Message::new_find_node_query(
-            transaction_id.to_be_bytes(),
-            self.inner.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
-            target.clone(),
-        );
-
-        let response = self.inner.send_message(&query, &asking.into()).await?;
-
-        if let MessageBody::Response(res) = response.body {
-            if let ResponseBody::FindNode(nodes) = res {
-                // bingo, only one node returned, that means it's the node we want
-                if nodes.nodes.len() == 26 {
-                    let contact = CompactNodeContact::new(
-                        (*nodes.nodes).try_into().unwrap()
-                    );
-                    self.inner.routing_table.write().await.add_new_node(contact.clone());
-                    return Ok(contact);
-                } else {
-                    // they returned a list of nodes, let's go find ask them if they know
-                    let nodes: Vec<_> = (&*nodes.nodes)
-                        .windows(26)
-                        .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                        .collect();
-
-                    {
-                        let mut table = self.inner.routing_table.write().await;
-                        nodes
-                            .iter()
-                            .for_each(|x| table.add_new_node(x.clone()));
-                    }
-
-                    for node in nodes {
-                        return self.recursive_find(target, &node).await;
-                    }
-                }
-            }
-        }
-        unreachable!()
     }
 }
 
@@ -501,6 +504,8 @@ mod tests {
             .unwrap();
 
         println!("Now I'm bootstrapped!");
+        let table = dht.inner.routing_table.read().await;
+        println!("we've found {:?} nodes and recorded in our routing table", table.node_count());
         time::sleep(time::Duration::from_secs(60)).await;
     }
 

@@ -309,14 +309,13 @@ pub mod response {
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(untagged)]
     pub enum ResponseBody {
-        Ping(PingResponse),
-
         FindNode(FindNodeResponse),
 
         GetPeers(GetPeersResponse),
         // can we receive this under NAT?
 
         AnnouncePeer(AnnouncePeerResponse),
+        Ping(PingResponse),
     }
 
     #[serde_as]
@@ -382,7 +381,8 @@ mod test {
 
     mod deserializing {
         use super::*;
-        use bendy::serde::from_bytes;
+        use bendy::serde::{from_bytes, to_bytes};
+
 
 
         #[test]
@@ -400,12 +400,12 @@ mod test {
             let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Message = from_bytes(message).unwrap();
 
+
             let expected = Message::new_find_node_response(
                 b"aa".clone(),
                 b"0123456789abcdefghij".clone(),
                 Box::new(b"mnopqrstuvwxyz123456".clone())
             );
-
             assert_eq!(expected, decoded)
         }
     }
@@ -422,6 +422,8 @@ mod test {
             // taken directly from the spec
             assert_eq!(bytes, b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe");
         }
+
+
 
         #[test]
         fn serialize_find_node_query() {
