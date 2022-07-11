@@ -21,16 +21,21 @@ use tokio::net::UdpSocket;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::instrument;
+use crate::dht_service::transaction_id_pool::TransactionIdPool;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
 use crate::message::{Message, MessageBody, MessageType, QueryMethod};
 use crate::message::query::QueryBody;
 use crate::message::response::ResponseBody;
 use crate::routing::{RoutingTable};
 
+mod transaction_id_pool;
+
 struct DhtService {
     inner: Arc<DhtServiceInner>,
 }
 
+#[derive(Debug)]
 struct DhtServiceInner {
     socket: Arc<UdpSocket>,
     id: BigUint,
@@ -48,6 +53,7 @@ struct DhtServiceFailure {
 
 // todo: find a better name, the struct keep placing the message into the right slot, knowing
 // which place to use by matching the id
+#[derive(Debug)]
 struct RequestRegistry {
     slots: Mutex<HashMap<u16, oneshot::Sender<Message>>>,
     packet_queue: Mutex<mpsc::Receiver<Message>>,
@@ -90,31 +96,6 @@ impl From<std::io::Error> for DhtServiceFailure {
     fn from(error: std::io::Error) -> Self {
         DhtServiceFailure {
             message: error.to_string(),
-        }
-    }
-}
-
-/// Ensures we never use the same ID for two different requests
-struct TransactionIdPool {
-    used_pool: Mutex<HashSet<u16>>,
-}
-
-impl TransactionIdPool {
-    pub fn new() -> Self {
-        TransactionIdPool {
-            used_pool:
-            Mutex::new(HashSet::new())
-        }
-    }
-
-    pub async fn get_id(&self) -> u16 {
-        let mut rand = SmallRng::from_entropy();
-        loop {
-            let id = rand.gen::<u16>();
-            if !self.used_pool.lock().await.contains(&id) {
-                self.used_pool.lock().await.insert(id);
-                return id;
-            }
         }
     }
 }
@@ -257,6 +238,7 @@ impl DhtServiceInner {
     }
 
     #[async_recursion]
+    #[instrument]
     async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact) -> Result<CompactNodeContact, DhtServiceFailure> {
         let transaction_id = self.transaction_id_pool.get_id().await;
         let query = Message::new_find_node_query(

@@ -732,6 +732,7 @@ dependencies = [
  "task-group",
  "tokio",
  "tower",
+ "tracing",
 ]
 
 [[package]]
