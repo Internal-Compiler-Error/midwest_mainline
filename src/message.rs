@@ -22,6 +22,17 @@ pub(crate) enum MessageBody {
     Error,
 }
 
+impl ResponseBody {
+    pub fn queried_id(&self) -> NodeId {
+        match self {
+            ResponseBody::FindNode(res) => { res.id }
+            ResponseBody::GetPeers(res) => { res.id }
+            ResponseBody::AnnouncePeer(res) => { res.id }
+            ResponseBody::Ping(res) => { res.id }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
     #[serde(rename = "q")]
@@ -384,7 +395,6 @@ mod test {
         use bendy::serde::{from_bytes, to_bytes};
 
 
-
         #[test]
         fn ping_response_deserializing() {
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
@@ -404,7 +414,7 @@ mod test {
             let expected = Message::new_find_node_response(
                 b"aa".clone(),
                 b"0123456789abcdefghij".clone(),
-                Box::new(b"mnopqrstuvwxyz123456".clone())
+                Box::new(b"mnopqrstuvwxyz123456".clone()),
             );
             assert_eq!(expected, decoded)
         }
@@ -422,7 +432,6 @@ mod test {
             // taken directly from the spec
             assert_eq!(bytes, b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe");
         }
-
 
 
         #[test]

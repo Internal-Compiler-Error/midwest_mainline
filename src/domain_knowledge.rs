@@ -27,6 +27,13 @@ impl CompactNodeContact {
         CompactNodeContact { bytes }
     }
 
+    pub fn from_node_id_and_addr(node_id: &NodeId, addr: &SocketAddrV4) -> Self {
+        let mut bytes = [0u8; 26];
+        bytes[..20].copy_from_slice(node_id);
+        bytes[20..24].copy_from_slice(&addr.ip().octets());
+        bytes[24..26].copy_from_slice(&addr.port().to_be_bytes());
+        CompactNodeContact { bytes }
+    }
     pub fn node_id(&self) -> &NodeId {
         self.bytes[0..20].try_into().unwrap()
     }

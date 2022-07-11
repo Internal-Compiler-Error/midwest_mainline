@@ -19,7 +19,7 @@ impl TransactionIdPool {
         }
     }
 
-    pub fn get_id(&self) -> u16 {
+    pub fn next(&self) -> u16 {
         self
             .next_id
             .fetch_add(1, Ordering::SeqCst)

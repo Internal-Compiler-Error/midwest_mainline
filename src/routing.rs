@@ -35,7 +35,7 @@ pub struct Node {
 }
 
 impl RoutingTable {
-    pub fn new(id: BigUint) -> Self {
+    pub fn new(id: &NodeId) -> Self {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
@@ -44,7 +44,7 @@ impl RoutingTable {
         };
 
         RoutingTable {
-            id,
+            id: BigUint::from_bytes_be(id),
             buckets: vec![default_bucket],
         }
     }
