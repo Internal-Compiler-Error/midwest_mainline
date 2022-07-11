@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::mem::forget;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::ops::Sub;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,7 +26,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
-use tracing::{error, event, info, instrument, Level};
+use tracing::{error, event, info, instrument, Level, trace};
 use tracing::log::warn;
 use crate::dht_service::transaction_id_pool::TransactionIdPool;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
@@ -33,6 +34,7 @@ use crate::message::{Message, MessageBody, MessageType, QueryMethod};
 use crate::message::query::QueryBody;
 use crate::message::response::ResponseBody;
 use crate::routing::{RoutingTable};
+use crate::utils::ParSpawnAndAwait;
 
 mod transaction_id_pool;
 
@@ -274,20 +276,27 @@ impl DhtServiceInnerV4 {
                         if node.node_id() == target {
                             return Ok(node);
                         } else {
-                            self.recursive_find(target, &node).await?;
+                            self.recursive_find(target, &node, 64).await?;
                         }
                     }
                 }
             }
         }
 
-
-        unreachable!()
+        Err(DhtServiceFailure {
+            message: "could not find node, we literally have no one to contact".to_string(),
+        })
     }
 
     #[async_recursion]
     #[instrument]
-    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact) -> Result<CompactNodeContact, DhtServiceFailure> {
+    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact, recursion_limit: u16) -> Result<(), DhtServiceFailure> {
+        if recursion_limit == 0 {
+            return Err(DhtServiceFailure {
+                message: "recursion limit reached, node still not found".to_string(),
+            });
+        }
+
         let transaction_id = self.transaction_id_pool.next();
         let query = Message::new_find_node_query(
             transaction_id.to_be_bytes(),
@@ -307,13 +316,17 @@ impl DhtServiceInnerV4 {
 
                 nodes.dedup();
 
+                if nodes.is_empty() {
+                    warn!("out of spec DHT node, responding with zero nodes");
+                    return Ok(());
+                }
 
                 for node in nodes {
                     self.routing_table.write().await.add_new_node(node.clone());
                     if node.node_id() == target {
-                        return Ok(node);
+                        return Ok(());
                     } else {
-                        return self.recursive_find(target, &node).await;
+                        return self.recursive_find(target, &node, recursion_limit.sub(1)).await;
                     }
                 }
             }
@@ -326,6 +339,8 @@ impl DhtServiceInnerV4 {
         error!("got {response:?}");
         unreachable!()
     }
+
+
 }
 
 
@@ -404,18 +419,18 @@ impl DhtServiceV4 {
                         let mut find_node_tasks = Vec::new();
                         for node in nodes {
                             let node_ip: SocketAddrV4 = (&node).into();
-                            info!("trying to contact {:?}", node_ip);
+                            trace!("trying to contact {:?}", node_ip);
 
                             let dht = dht.clone();
 
                             let recursive_find_with_timeout = tokio::spawn(async move {
                                 if let Ok(node) = timeout(
                                     Duration::from_secs(15),
-                                    dht.recursive_find(&our_id, &node)).await {
-                                    info!("found node {:?}", node);
+                                    dht.recursive_find(&our_id, &node, 64)).await {
+                                    trace!("found node {:?}", node);
                                     return Some(node.unwrap());
                                 } else {
-                                    info!("failed to contact {:?}, timed out", node_ip);
+                                    trace!("failed to contact {:?}, timed out", node_ip);
                                     None
                                 }
                             });
@@ -435,6 +450,8 @@ impl DhtServiceV4 {
             }
         }
     }
+
+
 }
 
 
@@ -506,7 +523,7 @@ impl Service<Message> for DhtServiceV4 {
                         }
                     }
                 }
-                MessageBody::Error => { unimplemented!() }
+                MessageBody::Error(_) => { unimplemented!() }
             };
         });
 
@@ -541,7 +558,7 @@ mod tests {
         set_global_default(fmt_sub);
 
         let dht = DhtServiceV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51776").unwrap(),
+            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
             vec![
                 // dht.tansmissionbt.com
                 "87.98.162.88:6881".parse().unwrap(),
@@ -557,20 +574,6 @@ mod tests {
         info!("Now I'm bootstrapped!");
         let table = dht.inner.routing_table.read().await;
         info!("we've found {:?} nodes and recorded in our routing table", table.node_count());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn why() -> color_eyre::Result<()> {
-        color_eyre::install()?;
-
-        let socket = UdpSocket::bind("0.0.0.0:51776").await?;
-        let addr = SocketAddrV4::new(
-            Ipv4Addr::new(34, 206, 39, 153),
-            6881,
-        );
-        socket.send_to(b"hello", addr).await?;
 
         Ok(())
     }

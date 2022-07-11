@@ -19,7 +19,7 @@ pub(crate) enum MessageBody {
     Response(ResponseBody),
 
     #[serde(rename = "e")]
-    Error,
+    Error(Box<[u8]>),
 }
 
 impl ResponseBody {
