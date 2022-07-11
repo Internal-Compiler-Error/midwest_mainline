@@ -21,7 +21,7 @@ use tokio::net::UdpSocket;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::instrument;
+use tracing::{event, info, instrument, Level};
 use crate::dht_service::transaction_id_pool::TransactionIdPool;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
 use crate::message::{Message, MessageBody, MessageType, QueryMethod};
@@ -31,12 +31,12 @@ use crate::routing::{RoutingTable};
 
 mod transaction_id_pool;
 
-struct DhtService {
-    inner: Arc<DhtServiceInner>,
+struct DhtServiceV4 {
+    inner: Arc<DhtServiceInnerV4>,
 }
 
 #[derive(Debug)]
-struct DhtServiceInner {
+struct DhtServiceInnerV4 {
     socket: Arc<UdpSocket>,
     id: BigUint,
     request_registry: Arc<RequestRegistry>,
@@ -51,8 +51,6 @@ struct DhtServiceFailure {
     message: String,
 }
 
-// todo: find a better name, the struct keep placing the message into the right slot, knowing
-// which place to use by matching the id
 #[derive(Debug)]
 struct RequestRegistry {
     slots: Mutex<HashMap<u16, oneshot::Sender<Message>>>,
@@ -100,7 +98,7 @@ impl From<std::io::Error> for DhtServiceFailure {
     }
 }
 
-impl DhtServiceInner {
+impl DhtServiceInnerV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     async fn new(
@@ -140,14 +138,14 @@ impl DhtServiceInner {
             .name("socket reader")
             .spawn(async move { socket_reader.await; });
 
-        let message_placer = RequestRegistry::new(rx);
-        let message_placer = Arc::new(message_placer);
+        let message_registry = RequestRegistry::new(rx);
+        let message_registry = Arc::new(message_registry);
 
         // place the messages into the right slot
 
-        let message_placer1 = message_placer.clone();
+        let message_registry1 = message_registry.clone();
         let message_placing = async move {
-            message_placer1.lifetime_loop().await;
+            message_registry1.lifetime_loop().await;
             ()
         };
 
@@ -155,9 +153,9 @@ impl DhtServiceInner {
             .name("message registry")
             .spawn(message_placing);
 
-        Ok(DhtServiceInner {
+        Ok(DhtServiceInnerV4 {
             socket,
-            request_registry: message_placer,
+            request_registry: message_registry,
             id,
             routing_table: RwLock::new(routing_table),
             socket_address: address,
@@ -200,7 +198,7 @@ impl DhtServiceInner {
 
         for node in &closest {
             // construct the message to query our friends
-            let transaction_id = self.transaction_id_pool.get_id().await;
+            let transaction_id = self.transaction_id_pool.get_id();
             let query = Message::new_find_node_query(
                 transaction_id.to_be_bytes(),
                 self.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
@@ -240,7 +238,7 @@ impl DhtServiceInner {
     #[async_recursion]
     #[instrument]
     async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact) -> Result<CompactNodeContact, DhtServiceFailure> {
-        let transaction_id = self.transaction_id_pool.get_id().await;
+        let transaction_id = self.transaction_id_pool.get_id();
         let query = Message::new_find_node_query(
             transaction_id.to_be_bytes(),
             self.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
@@ -275,7 +273,7 @@ impl DhtServiceInner {
 }
 
 
-impl Drop for DhtServiceInner {
+impl Drop for DhtServiceInnerV4 {
     fn drop(&mut self) {
         // stop all tasks required to keep ourself alive
         self
@@ -285,87 +283,59 @@ impl Drop for DhtServiceInner {
     }
 }
 
-impl DhtService {
-    pub async fn bootstrap(id: BigUint, address: SocketAddrV4, initializer: Vec<String>) -> Result<Self, DhtServiceFailure> {
-        let inner = DhtServiceInner::new(id, address).await?;
+impl DhtServiceV4 {
+    pub async fn bootstrap(id: BigUint, address: SocketAddrV4, known_nodes: Vec<SocketAddrV4>) -> Result<Self, DhtServiceFailure> {
+        let inner = DhtServiceInnerV4::new(id, address).await?;
         let dht = Self {
             inner: Arc::new(inner)
         };
 
-        // look up the actual ips
-        let ips = initializer
-            .into_iter()
-            .map(|s| {
-                tokio::spawn(async {
-                    let ip = net::lookup_host(s).await;
-                    let ips: Vec<_> = ip.unwrap().collect();
-                    println!("{ips:?}");
-                    for ip in ips {
-                        match ip {
-                            SocketAddr::V4(addr) => { return ip; }
-                            SocketAddr::V6(_) => {}
-                        }
-                    }
-
-                    unimplemented!("Ipv6 is straight up not implemented yet");
-                })
-            })
-            .collect::<Vec<_>>();
-        let ips = join_all(ips).await;
-        let ips: Vec<_> = ips.into_iter().map(|x| x.unwrap()).collect();
-
 
         // add the initial nodes
-        for ip in ips {
+        for contact in &known_nodes {
             let mut our_id = [0u8; 20];
             our_id = dht.inner.id.to_bytes_be().as_slice().try_into().unwrap();
 
-            let transaction_id = dht.inner.transaction_id_pool.get_id().await;
+            let transaction_id = dht.inner.transaction_id_pool.get_id();
             let query = Message::new_find_node_query(
                 transaction_id.to_be_bytes(),
                 dht.inner.id.to_bytes_be().as_slice().clone().try_into().unwrap(),
                 our_id.clone(),
             );
 
-            match ip {
-                SocketAddr::V4(ip) => {
-                    let response = dht.inner.send_message(&query, &ip).await.unwrap();
 
-                    println!("first message back!");
+            let response = dht.inner.send_message(&query, contact).await.unwrap();
 
-                    match response.body {
-                        MessageBody::Response(res) => {
-                            match res {
-                                ResponseBody::FindNode(res) => {
-                                    let nodes: Vec<_> = res.nodes.windows(26).map(|x| {
-                                        CompactNodeContact::new(x.try_into().unwrap())
-                                    }).collect();
+            info!("bootstrapping with {contact}, got back {response:?}");
+
+            match response.body {
+                MessageBody::Response(res) => {
+                    match res {
+                        ResponseBody::FindNode(res) => {
+                            let nodes: Vec<_> = res.nodes.windows(26).map(|x| {
+                                CompactNodeContact::new(x.try_into().unwrap())
+                            }).collect();
 
 
-                                    let mut handles = Vec::new();
-                                    for node in nodes {
-                                        println!("trying to contact {:?}", &node);
+                            let mut handles = Vec::new();
+                            for node in nodes {
+                                info!("trying to contact {:?}", &node);
 
-                                        let dht = dht.inner.clone();
-                                        let handle = tokio::spawn(async move {
-                                            if let Ok(node) = timeout(
-                                                Duration::from_secs(15),
-                                                dht.recursive_find(&our_id, &node)).await {
-                                                return Some(node.unwrap());
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        handles.push(handle);
+                                let dht = dht.inner.clone();
+                                let handle = tokio::spawn(async move {
+                                    if let Ok(node) = timeout(
+                                        Duration::from_secs(15),
+                                        dht.recursive_find(&our_id, &node)).await {
+                                        return Some(node.unwrap());
+                                    } else {
+                                        None
                                     }
+                                });
+                                handles.push(handle);
+                            }
 
-                                    for handle in handles {
-                                        handle.await;
-                                    }
-                                }
-                                other => {
-                                    eprintln!("expected an response, got {:?}", other);
-                                }
+                            for handle in handles {
+                                handle.await;
                             }
                         }
                         other => {
@@ -373,7 +343,9 @@ impl DhtService {
                         }
                     }
                 }
-                _ => { unimplemented!() }
+                other => {
+                    eprintln!("expected an response, got {:?}", other);
+                }
             }
         }
 
@@ -382,7 +354,7 @@ impl DhtService {
 }
 
 
-impl Service<Message> for DhtService {
+impl Service<Message> for DhtServiceV4 {
     type Response = Option<Vec<Message>>;
     type Error = DhtServiceFailure;
     type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>>>>;
@@ -468,27 +440,40 @@ mod tests {
     use tokio::{net, time};
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
-    use crate::dht_service::DhtService;
+    use tracing::info;
+    use tracing::subscriber::set_global_default;
+    use tracing_subscriber::fmt::format::Format;
+    use crate::dht_service::DhtServiceV4;
 
     #[tokio::test]
     async fn bootstrap() {
-        console_subscriber::init();
+        // console_subscriber::init();
+        let fmt_sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .compact()
+            .finish();
+        set_global_default(fmt_sub);
 
         let mut rand = rand::thread_rng();
         let mut id = [0u8; 20];
         rand.fill_bytes(&mut id);
         let id = BigUint::from_bytes_be(&id);
 
-        let dht = DhtService::bootstrap(id,
-                                        SocketAddrV4::from_str("0.0.0.0:51776").unwrap(),
-                                        vec!["87.98.162.88:6881".to_string()])
-            .await
-            .unwrap();
+        let dht = DhtServiceV4::bootstrap(id,
+                                          SocketAddrV4::from_str("0.0.0.0:51776").unwrap(),
+                                          vec![
+                                              "87.98.162.88:6881".parse().unwrap(),
+                                              "82.221.103.244:6881".parse().unwrap(),
+                                              "67.215.246.10:6881".parse().unwrap(),
+                                          ]);
 
-        println!("Now I'm bootstrapped!");
-        let table = dht.inner.routing_table.read().await;
-        println!("we've found {:?} nodes and recorded in our routing table", table.node_count());
-        time::sleep(time::Duration::from_secs(60)).await;
+        if let Ok(Ok(dht)) = timeout(time::Duration::from_secs(60), dht).await {
+            info!("Now I'm bootstrapped!");
+            let table = dht.inner.routing_table.read().await;
+            info!("we've found {:?} nodes and recorded in our routing table", table.node_count());
+        } else {
+            info!("Either we timed out or internal dht failure");
+        }
     }
 
     #[tokio::test]
