@@ -726,6 +726,7 @@ name = "midwest_mainline"
 version = "0.1.0"
 dependencies = [
  "async-recursion",
+ "async-trait",
  "bendy",
  "color-eyre",
  "console-subscriber",
