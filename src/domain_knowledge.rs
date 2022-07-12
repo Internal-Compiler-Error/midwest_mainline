@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 pub type NodeId = [u8; 20];
 
+
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
     bytes: [u8; 26],
@@ -18,6 +19,12 @@ impl Into<SocketAddrV4> for &CompactNodeContact {
         let port = u16::from_be_bytes([self.bytes[24], self.bytes[25]]);
 
         SocketAddrV4::new(ip, port)
+    }
+}
+
+impl Into<SocketAddrV4> for CompactNodeContact {
+    fn into(self) -> SocketAddrV4 {
+        (&self).into()
     }
 }
 
