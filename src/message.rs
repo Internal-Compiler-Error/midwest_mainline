@@ -1,7 +1,8 @@
+use num_bigint::BigUint;
 use serde_with::{serde_as, Bytes};
 use serde::{Deserialize, Serialize};
-use crate::message::query::{AnnouncePeerArgs, FindNodeArgs, GetPeersArgs, PingArgs, QueryBody};
-use crate::message::response::{AnnouncePeerResponse, FindNodeResponse, GetPeersResponse, GetPeersResponseType, PingResponse, ResponseBody};
+use crate::message::query::{AnnouncePeerArgs, FindNodeArgs, GetPeersArgs, PingArgs};
+use crate::message::response::{FindNodeResponseBody, GetPeersSuccessResponseBody, PingAnnouncePeerResponseBody};
 use crate::domain_knowledge::{CompactPeerContact, NodeId};
 
 
@@ -9,30 +10,169 @@ pub type InfoHash = [u8; 20];
 pub type TransactionId = [u8; 2];
 pub type Token = [u8; 20];
 
-
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum MessageBody {
+#[serde(untagged)]
+pub enum Krpc {
+    PingQuery(PingQuery),
+    FindNodeQuery(FindNodeQuery),
+    AnnouncePeerQuery(AnnouncePeerQuery),
+    GetPeersQuery(GetPeersQuery),
+    FindNodeResponse(FindNodeResponse),
+    GetPeersSuccessResponse(GetPeersSuccessResponse),
+    GetPeersDeferredResponse(GetPeersDeferredResponse),
+    PingAnnouncePeerResponse(PingAnnouncePeerResponse),
+    Error(ErrorMessage),
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingQuery {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "q")]
+    pub(crate) query_method: QueryMethod,
+
     #[serde(rename = "a")]
-    Query(QueryBody),
+    pub(crate) body: PingArgs,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindNodeQuery {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "q")]
+    pub(crate) query_method: QueryMethod,
+
+    #[serde(rename = "a")]
+    pub(crate) body: FindNodeArgs,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindNodeResponse {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "r")]
-    Response(ResponseBody),
+    pub(crate) body: FindNodeResponseBody,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetPeersQuery {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "q")]
+    pub(crate) query_method: QueryMethod,
+
+    #[serde(rename = "a")]
+    pub(crate) body: GetPeersArgs,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetPeersSuccessResponse {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "r")]
+    pub(crate) body: response::GetPeersSuccessResponseBody,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetPeersDeferredResponse {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "r")]
+    pub(crate) body: response::GetPeersDeferredResponseBody,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncePeerQuery {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "q")]
+    pub(crate) query_method: QueryMethod,
+
+    #[serde(rename = "a")]
+    pub(crate) body: AnnouncePeerArgs,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingAnnouncePeerResponse {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
+
+    #[serde(rename = "r")]
+    pub(crate) body: response::PingAnnouncePeerResponseBody,
+}
+
+#[serde_as]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorMessage {
+    #[serde_as(as = "Bytes")]
+    #[serde(rename = "t")]
+    pub(crate) transaction_id: TransactionId,
+
+    #[serde(rename = "y")]
+    #[serde_as(as = "Bytes")]
+    pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "e")]
-    Error(Box<[u8]>),
+    pub(crate) error: Vec<Box<[u8]>>,
 }
 
-impl ResponseBody {
-    pub fn queried_id(&self) -> NodeId {
-        match self {
-            ResponseBody::FindNode(res) => { res.id }
-            ResponseBody::GetPeers(res) => { res.id }
-            ResponseBody::AnnouncePeer(res) => { res.id }
-            ResponseBody::Ping(res) => { res.id }
-        }
-    }
-}
 
+#[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
     #[serde(rename = "q")]
@@ -73,146 +213,155 @@ impl QueryMethod {
     }
 }
 
-/// All KRPC messages are of this type
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    #[serde(rename = "t")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) transaction_id: TransactionId,
 
-    #[serde(rename = "y")]
-    pub(crate) message_type: MessageType,
+impl Krpc {
+    pub fn is_response(&self) -> bool {
+        match self {
+            Krpc::PingAnnouncePeerResponse(_) => true,
+            Krpc::FindNodeResponse(_) => true,
+            Krpc::GetPeersSuccessResponse(_) => true,
+            Krpc::GetPeersDeferredResponse(_) => true,
+            _ => false,
+        }
+    }
 
-    #[serde(rename = "q")]
-    #[serde(skip_serializing_if = "QueryMethod::is_none")]
-    #[serde(default = "QueryMethod::not_a_query")]
-    // see the comment in the enum for why it's not using Optional<T>
-    pub(crate) query_method: QueryMethod,
+    pub fn transaction_id(&self) -> TransactionId {
+        match self {
+            Krpc::PingAnnouncePeerResponse(msg) => msg.transaction_id,
+            Krpc::FindNodeResponse(msg) => msg.transaction_id,
+            Krpc::GetPeersSuccessResponse(msg) => msg.transaction_id,
+            Krpc::GetPeersDeferredResponse(msg) => msg.transaction_id,
+            Krpc::FindNodeQuery(msg) => msg.transaction_id,
+            Krpc::GetPeersQuery(msg) => msg.transaction_id,
+            Krpc::AnnouncePeerQuery(msg) => msg.transaction_id,
+            Krpc::PingQuery(msg) => msg.transaction_id,
+            Krpc::Error(msg) => msg.transaction_id,
+        }
+    }
 
-    #[serde(flatten)]
-    pub(crate) body: MessageBody,
-}
+    pub fn is_error(&self) -> bool {
+        match self {
+            Krpc::Error(_) => true,
+            _ => false,
+        }
+    }
 
-impl Message {
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Message {
-        Message {
+    pub fn is_query(&self) -> bool {
+        match self {
+            Krpc::PingQuery(_) => true,
+            Krpc::FindNodeQuery(_) => true,
+            Krpc::GetPeersQuery(_) => true,
+            Krpc::AnnouncePeerQuery(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
+        let ping_query = PingQuery {
             transaction_id,
-            message_type: MessageType::Query,
+            message_type: Box::new(b"q".clone()),
             query_method: QueryMethod::Ping,
-            body: MessageBody::Query(
-                QueryBody::Ping(
-                    PingArgs {
-                        id: querying_id,
-                    }
-                )
-            ),
-        }
+            body: PingArgs {
+                id: querying_id
+            },
+        };
+
+        Krpc::PingQuery(ping_query)
     }
 
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Message {
-        Message {
+
+    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
+        let find_node_query = FindNodeQuery {
             transaction_id,
-            message_type: MessageType::Query,
+            message_type: Box::new(b"q".clone()),
             query_method: QueryMethod::FindNode,
-            body: MessageBody::Query(
-                QueryBody::FindNode(
-                    FindNodeArgs {
-                        id: querying_id,
-                        target: target_id,
-                    }
-                )
-            ),
-        }
+            body: FindNodeArgs {
+                id: querying_id,
+                target: target_id,
+            },
+        };
+
+        Krpc::FindNodeQuery(find_node_query)
     }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Message {
-        Message {
+
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
+        let get_peers_query = GetPeersQuery {
             transaction_id,
-            message_type: MessageType::Query,
+            message_type: Box::new(b"q".clone()),
             query_method: QueryMethod::GetPeers,
-            body: MessageBody::Query(
-                QueryBody::GetPeers(
-                    GetPeersArgs {
-                        id: querying_id,
-                        info_hash,
-                    }
-                )
-            ),
-        }
+            body: GetPeersArgs {
+                id: querying_id,
+                info_hash,
+            },
+        };
+
+        Krpc::GetPeersQuery(get_peers_query)
     }
 
     pub fn new_announce_peer_query(transaction_id: TransactionId,
-                                   info_hash: InfoHash, querying_id: NodeId, port: u16, implied_port: bool, token: Token) -> Message {
-        Message {
+                                   info_hash: InfoHash,
+                                   querying_id: NodeId,
+                                   port: u16,
+                                   implied_port: bool,
+                                   token: Token) -> Krpc {
+        let announce_peer_query = AnnouncePeerQuery {
             transaction_id,
-            message_type: MessageType::Query,
+            message_type: Box::new(b"q".clone()),
             query_method: QueryMethod::AnnouncePeer,
-            body: MessageBody::Query(
-                QueryBody::AnnouncePeer(
-                    AnnouncePeerArgs {
-                        id: querying_id,
-                        info_hash,
-                        port,
-                        implied_port: if implied_port { 1 } else { 0 },
-                        token,
-                    }
-                )
-            ),
-        }
+            body: AnnouncePeerArgs {
+                id: querying_id,
+                implied_port: if implied_port { 1 } else { 0 },
+                info_hash,
+                port,
+                token,
+            },
+        };
+
+        Krpc::AnnouncePeerQuery(announce_peer_query)
     }
 
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Message {
-        Message {
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
+        let ping_response = PingAnnouncePeerResponse {
             transaction_id,
-            message_type: MessageType::Response,
-            query_method: QueryMethod::None,
-            body: MessageBody::Response(
-                ResponseBody::Ping(
-                    PingResponse {
-                        id: responding_id,
-                    }
-                )
-            ),
-        }
+            message_type: Box::new(b"r".clone()),
+            body: PingAnnouncePeerResponseBody {
+                id: responding_id,
+            },
+        };
+        Krpc::PingAnnouncePeerResponse(ping_response)
     }
 
     /// construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Message {
-        Message {
+    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Krpc {
+        let find_node_response = FindNodeResponse {
             transaction_id,
-            message_type: MessageType::Response,
-            query_method: QueryMethod::None,
-            body: MessageBody::Response(
-                ResponseBody::FindNode(
-                    FindNodeResponse {
-                        id: responding_id,
-                        nodes,
-                    }
-                )
-            ),
-        }
+            message_type: Box::new(b"r".clone()),
+            body: FindNodeResponseBody {
+                id: responding_id,
+                nodes,
+            },
+        };
+
+        Krpc::FindNodeResponse(find_node_response)
     }
 
     /// construct a response to a get_peers query when the peer is directly found
     pub fn new_get_peers_success_response(transaction_id: TransactionId,
                                           responding_id: NodeId,
                                           response_token: Token,
-                                          node: Vec<CompactPeerContact>) -> Message {
-        Message {
+                                          node: Vec<CompactPeerContact>) -> Krpc {
+        let get_peers_success_response = GetPeersSuccessResponse {
             transaction_id,
-            message_type: MessageType::Response,
-            query_method: QueryMethod::None,
-            body: MessageBody::Response(
-                ResponseBody::GetPeers(
-                    GetPeersResponse {
-                        id: responding_id,
-                        token: response_token,
-                        response: GetPeersResponseType::Success(node),
-                    }
-                )
-            ),
-        }
+            message_type: Box::new(b"r".clone()),
+            body: GetPeersSuccessResponseBody {
+                id: responding_id,
+                token: response_token,
+                values: node,
+            },
+        };
+
+        Krpc::GetPeersSuccessResponse(get_peers_success_response)
     }
 
     /// construct a response to a get_peers query when the peer is not directly found and the closest
@@ -220,40 +369,61 @@ impl Message {
     pub fn new_get_peers_deferred_response(transaction_id: TransactionId,
                                            responding_id: NodeId,
                                            response_token: Token,
-                                           closest_nodes: Box<[u8]>) -> Message {
-        Message {
+                                           closest_nodes: Box<[u8]>) -> Krpc {
+        let get_peers_deferred_response = GetPeersDeferredResponse {
             transaction_id,
-            message_type: MessageType::Response,
-            query_method: QueryMethod::None,
-            body: MessageBody::Response(
-                ResponseBody::GetPeers(
-                    GetPeersResponse {
-                        id: responding_id,
-                        token: response_token,
-                        response: GetPeersResponseType::Deferred(closest_nodes),
-                    }
-                )
-            ),
-        }
+            message_type: Box::new(b"r".clone()),
+            body: response::GetPeersDeferredResponseBody {
+                id: responding_id,
+                token: response_token,
+                nodes: closest_nodes,
+            },
+        };
+
+        Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
     }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Message {
-        Message {
+    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
+        let announce_peer_response = PingAnnouncePeerResponse {
             transaction_id,
-            message_type: MessageType::Response,
-            query_method: QueryMethod::None,
-            body: MessageBody::Response(
-                ResponseBody::AnnouncePeer(
-                    AnnouncePeerResponse {
-                        id: responding_id,
-                    }
-                )
-            ),
-        }
+            message_type: Box::new(b"r".clone()),
+            body: response::PingAnnouncePeerResponseBody {
+                id: responding_id,
+            },
+        };
+        Krpc::PingAnnouncePeerResponse(announce_peer_response)
     }
 
     pub fn id_as_u16(&self) -> u16 {
-        u16::from_be_bytes(self.transaction_id)
+        match self {
+            Krpc::Error(error) => {
+                u16::from_be_bytes(error.transaction_id)
+            }
+            Krpc::PingAnnouncePeerResponse(ping) => {
+                u16::from_be_bytes(ping.transaction_id)
+            }
+            Krpc::GetPeersDeferredResponse(peers) => {
+                u16::from_be_bytes(peers.transaction_id)
+            }
+            Krpc::GetPeersSuccessResponse(peers) => {
+                u16::from_be_bytes(peers.transaction_id)
+            }
+            Krpc::FindNodeResponse(node) => {
+                u16::from_be_bytes(node.transaction_id)
+            }
+            Krpc::PingQuery(ping) => {
+                u16::from_be_bytes(ping.transaction_id)
+            }
+            Krpc::FindNodeQuery(node) => {
+                u16::from_be_bytes(node.transaction_id)
+            }
+            Krpc::GetPeersQuery(peers) => {
+                u16::from_be_bytes(peers.transaction_id)
+            }
+            Krpc::AnnouncePeerQuery(peers) => {
+                u16::from_be_bytes(peers.transaction_id)
+            }
+        }
     }
 }
 
@@ -261,14 +431,6 @@ pub mod query {
     use super::*;
     use serde::Serialize;
 
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(untagged)]
-    pub enum QueryBody {
-        Ping(PingArgs),
-        FindNode(FindNodeArgs),
-        GetPeers(GetPeersArgs),
-        AnnouncePeer(AnnouncePeerArgs),
-    }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,28 +479,18 @@ pub mod response {
     use crate::domain_knowledge::CompactNodeContact;
     use super::*;
 
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(untagged)]
-    pub enum ResponseBody {
-        FindNode(FindNodeResponse),
-
-        GetPeers(GetPeersResponse),
-        // can we receive this under NAT?
-
-        AnnouncePeer(AnnouncePeerResponse),
-        Ping(PingResponse),
-    }
-
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct PingResponse {
+    // ping and announce peer response look exactly the same, no can't distinguish them by just
+    // looking at the fields
+    pub struct PingAnnouncePeerResponseBody {
         #[serde_as(as = "Bytes")]
         pub id: NodeId,
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FindNodeResponse {
+    pub struct FindNodeResponseBody {
         #[serde_as(as = "Bytes")]
         pub id: NodeId,
 
@@ -349,40 +501,26 @@ pub mod response {
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GetPeersResponse {
+    pub struct GetPeersSuccessResponseBody {
         #[serde_as(as = "Bytes")]
         pub id: NodeId,
 
         #[serde_as(as = "Bytes")]
         pub token: Token,
 
-        pub response: GetPeersResponseType,
-    }
-
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum GetPeersResponseType {
-        #[serde(rename = "values")]
-        Success(Vec<CompactPeerContact>),
-        #[serde(rename = "node")]
-        Deferred(Box<[u8]>),
+        pub values: Vec<CompactPeerContact>,
     }
 
     #[serde_as]
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct AnnouncePeerResponse {
+    pub struct GetPeersDeferredResponseBody {
         #[serde_as(as = "Bytes")]
         pub id: NodeId,
-    }
-}
 
-pub mod error {
-    pub enum Error {
-        Generic,
-        ServerError,
-        ProtocolError,
-        MethodUnknown,
+        #[serde_as(as = "Bytes")]
+        pub token: Token,
+
+        pub nodes: Box<[u8]>,
     }
 }
 
@@ -394,24 +532,23 @@ mod test {
         use super::*;
         use bendy::serde::{from_bytes, to_bytes};
 
-
         #[test]
         fn ping_response_deserializing() {
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
-            let decoded: Message = from_bytes(message).unwrap();
+            let decoded: Krpc = from_bytes(message).unwrap();
 
 
-            let expected = Message::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
+            let expected = Krpc::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
             assert_eq!(decoded, expected);
         }
 
         #[test]
         fn find_node_response_deserialize() {
             let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
-            let decoded: Message = from_bytes(message).unwrap();
+            let decoded: Krpc = from_bytes(message).unwrap();
 
 
-            let expected = Message::new_find_node_response(
+            let expected = Krpc::new_find_node_response(
                 b"aa".clone(),
                 b"0123456789abcdefghij".clone(),
                 Box::new(b"mnopqrstuvwxyz123456".clone()),
@@ -426,7 +563,7 @@ mod test {
 
         #[test]
         fn serialize_ping_query() {
-            let message = Message::new_ping_query(b"aa".clone(), b"abcdefghij0123456789".clone());
+            let message = Krpc::new_ping_query(b"aa".clone(), b"abcdefghij0123456789".clone());
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec
@@ -436,7 +573,7 @@ mod test {
 
         #[test]
         fn serialize_find_node_query() {
-            let message = Message::new_find_node_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
+            let message = Krpc::new_find_node_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec
@@ -445,7 +582,7 @@ mod test {
 
         #[test]
         fn serialize_get_peers_query() {
-            let message = Message::new_get_peers_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
+            let message = Krpc::new_get_peers_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec

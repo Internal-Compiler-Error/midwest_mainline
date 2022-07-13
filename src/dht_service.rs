@@ -30,9 +30,7 @@ use tracing::{error, event, info, instrument, Level, trace};
 use tracing::log::warn;
 use crate::dht_service::transaction_id_pool::TransactionIdPool;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
-use crate::message::{Message, MessageBody, MessageType, QueryMethod};
-use crate::message::query::QueryBody;
-use crate::message::response::ResponseBody;
+use crate::message::{Krpc};
 use crate::routing::{RoutingTable};
 use crate::utils::ParSpawnAndAwait;
 
@@ -68,14 +66,14 @@ impl Error for DhtServiceFailure {}
 
 #[derive(Debug)]
 struct RequestRegistry {
-    slots: Mutex<HashMap<u16, oneshot::Sender<Message>>>,
-    query_queue: Mutex<mpsc::Sender<Message>>,
-    packet_queue: Mutex<mpsc::Receiver<Message>>,
+    slots: Mutex<HashMap<u16, oneshot::Sender<Krpc>>>,
+    query_queue: Mutex<mpsc::Sender<Krpc>>,
+    packet_queue: Mutex<mpsc::Receiver<Krpc>>,
 }
 
 impl RequestRegistry {
-    pub fn new(incoming_queue: mpsc::Receiver<Message>,
-               query_channel: mpsc::Sender<Message>) -> Self {
+    pub fn new(incoming_queue: mpsc::Receiver<Krpc>,
+               query_channel: mpsc::Sender<Krpc>) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
             query_queue: Mutex::new(query_channel),
@@ -87,7 +85,7 @@ impl RequestRegistry {
         let mut queue = self.packet_queue.lock().await;
         loop {
             if let Some(msg) = queue.recv().await {
-                let id = u16::from_be_bytes(msg.transaction_id.clone());
+                let id = u16::from_be_bytes(msg.transaction_id().clone());
 
                 // see if we have a slot for this transaction id, if we do, that means one of the
                 // messages that we expect, otherwise the message is a query we need to handle
@@ -107,7 +105,7 @@ impl RequestRegistry {
     }
 
     /// Tell the placer we should expect some messages
-    pub async fn register(&self, transaction_id: u16, sending_half: oneshot::Sender<Message>) {
+    pub async fn register(&self, transaction_id: u16, sending_half: oneshot::Sender<Krpc>) {
         let mut guard = self.slots.lock().await;
         assert!(guard.insert(transaction_id, sending_half).is_none())
     }
@@ -193,7 +191,7 @@ impl DhtServiceInnerV4 {
     /// Send a message out and await for a response.
     ///
     /// It does not alter the routing table, callers must decide what to do with the response.
-    async fn send_message(&self, message: &Message, recipient: &SocketAddrV4) -> Result<Message, DhtServiceFailure> {
+    async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
         let (tx, rx) = oneshot::channel();
 
         if let Ok(bytes) = bendy::serde::to_bytes(message) {
@@ -251,7 +249,7 @@ impl DhtServiceInnerV4 {
         for node in &closest {
             // construct the message to query our friends
             let transaction_id = self.transaction_id_pool.next();
-            let query = Message::new_find_node_query(
+            let query = Krpc::new_find_node_query(
                 transaction_id.to_be_bytes(),
                 self.id,
                 target.clone(),
@@ -260,26 +258,35 @@ impl DhtServiceInnerV4 {
             // ask them
             let response = self.send_message(&query, &(&node.contact).into()).await?;
 
-            if let MessageBody::Response(res) = response.body {
-                if let ResponseBody::FindNode(nodes) = res {
-                    let mut nodes: Vec<_> = nodes
-                        .nodes
-                        .windows(26)
-                        .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                        .collect();
+            if let Krpc::FindNodeResponse(res) = response {
+                let nodes = res.body.nodes;
+                let mut nodes: Vec<_> = nodes
 
-                    nodes.dedup();
+                    .windows(26)
+                    .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                    .collect();
+
+                nodes.dedup();
 
 
-                    for node in nodes {
-                        self.routing_table.write().await.add_new_node(node.clone());
-                        if node.node_id() == target {
-                            return Ok(node);
-                        } else {
-                            self.recursive_find(target, &node, 64).await?;
-                        }
+                for node in nodes {
+                    self.routing_table.write().await.add_new_node(node.clone());
+                    if node.node_id() == target {
+                        return Ok(node);
+                    } else {
+                        self.recursive_find(target, &node, 64).await?;
                     }
                 }
+            } else if let Krpc::Error(err) = response {
+                info!("error response from DHT node: {:?}", err.error);
+                return Err(DhtServiceFailure {
+                    message: format!("node responded with an error to our find node request {err:?}"),
+                });
+            } else {
+                warn!("non-compliant response from DHT node");
+                return Err(DhtServiceFailure {
+                    message: "non-compliant response from DHT node".to_string(),
+                });
             }
         }
 
@@ -290,7 +297,7 @@ impl DhtServiceInnerV4 {
 
     #[async_recursion]
     #[instrument]
-    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact, recursion_limit: u16) -> Result<(), DhtServiceFailure> {
+    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact, recursion_limit: u16) -> Result<CompactNodeContact, DhtServiceFailure> {
         if recursion_limit == 0 {
             return Err(DhtServiceFailure {
                 message: "recursion limit reached, node still not found".to_string(),
@@ -298,7 +305,7 @@ impl DhtServiceInnerV4 {
         }
 
         let transaction_id = self.transaction_id_pool.next();
-        let query = Message::new_find_node_query(
+        let query = Krpc::new_find_node_query(
             transaction_id.to_be_bytes(),
             self.id,
             target.clone(),
@@ -306,41 +313,44 @@ impl DhtServiceInnerV4 {
 
         let response = self.send_message(&query, &asking.into()).await?;
 
-        if let MessageBody::Response(res) = &response.body {
-            if let ResponseBody::FindNode(nodes) = res {
-                let mut nodes: Vec<_> = nodes
-                    .nodes
-                    .windows(26)
-                    .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                    .collect();
+        if let Krpc::FindNodeResponse(response) = response {
+            let nodes = response.body.nodes;
+            let mut nodes: Vec<_> = nodes
+                .windows(26)
+                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                .collect();
 
-                nodes.dedup();
+            nodes.dedup();
 
-                if nodes.is_empty() {
-                    warn!("out of spec DHT node, responding with zero nodes");
-                    return Ok(());
-                }
-
-                for node in nodes {
-                    self.routing_table.write().await.add_new_node(node.clone());
-                    if node.node_id() == target {
-                        return Ok(());
-                    } else {
-                        return self.recursive_find(target, &node, recursion_limit.sub(1)).await;
-                    }
-                }
+            if nodes.is_empty() {
+                warn!("out of spec DHT node, responding with zero nodes");
+                return Err(DhtServiceFailure {
+                    message: "out of spec DHT node, responding with zero nodes".to_string(),
+                });
             }
-        } else {
-            warn!("unexpected response, got {response:?}");
+
+            for node in nodes {
+                self.routing_table.write().await.add_new_node(node.clone());
+                return if node.node_id() == target {
+                    Ok(node)
+                } else {
+                    self.recursive_find(target, &node, recursion_limit.sub(1)).await
+                };
+            }
+        } else if let Krpc::Error(err) = response {
+            info!("error response from DHT node: {:?}", err.error);
             return Err(DhtServiceFailure {
-                message: "expected a find node response".to_string(),
+                message: format!("node responded with an error to our find node request {err:?}"),
+            });
+        } else {
+            warn!("non-compliant response from DHT node");
+            return Err(DhtServiceFailure {
+                message: "non-compliant response from DHT node".to_string(),
             });
         }
-        error!("got {response:?}");
+
         unreachable!()
     }
-
-
 }
 
 
@@ -380,7 +390,7 @@ impl DhtServiceV4 {
     async fn bootstrap_single(dht: Arc<DhtServiceInnerV4>, contact: SocketAddrV4) {
         let our_id = dht.id.clone();
         let transaction_id = dht.transaction_id_pool.next();
-        let query = Message::new_find_node_query(
+        let query = Krpc::new_find_node_query(
             transaction_id.to_be_bytes(),
             our_id,
             our_id.clone(),
@@ -400,136 +410,128 @@ impl DhtServiceV4 {
             }
         };
 
-
-        match response.body {
-            MessageBody::Response(res) => {
-                match res {
-                    ResponseBody::FindNode(res) => {
-                        let nodes: Vec<_> = res.nodes.windows(26).map(|x| {
-                            CompactNodeContact::new(x.try_into().unwrap())
-                        }).collect();
-
-                        {
-                            // add the bootstrapping node to our routing table
-                            let mut table = dht.routing_table.write().await;
-                            table.add_new_node(CompactNodeContact::from_node_id_and_addr(&res.id, &contact));
-                        }
-
-
-                        let mut find_node_tasks = Vec::new();
-                        for node in nodes {
-                            let node_ip: SocketAddrV4 = (&node).into();
-                            trace!("trying to contact {:?}", node_ip);
-
-                            let dht = dht.clone();
-
-                            let recursive_find_with_timeout = tokio::spawn(async move {
-                                if let Ok(node) = timeout(
-                                    Duration::from_secs(15),
-                                    dht.recursive_find(&our_id, &node, 64)).await {
-                                    trace!("found node {:?}", node);
-                                    return Some(node.unwrap());
-                                } else {
-                                    trace!("failed to contact {:?}, timed out", node_ip);
-                                    None
-                                }
-                            });
-                            find_node_tasks.push(recursive_find_with_timeout);
-                        }
-
-                        join_all(find_node_tasks).await;
-                        info!("finished attempt to bootstrap with {:?}", contact);
-                    }
-                    other => {
-                        eprintln!("expected an response, got {:?}", other);
-                    }
-                }
+        if let Krpc::FindNodeResponse(response) = response {
+            let nodes = response.body.nodes;
+            let mut nodes: Vec<_> = nodes
+                .windows(26)
+                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                .collect();
+            {
+                // add the bootstrapping node to our routing table
+                let mut table = dht.routing_table.write().await;
+                table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
             }
-            other => {
-                eprintln!("expected an response, got {:?}", other);
+
+            nodes.dedup();
+
+            for node in &nodes {
+                dht.routing_table.write().await.add_new_node(node.clone());
             }
+
+
+            let mut find_node_tasks = Vec::new();
+            for node in nodes {
+                let node_ip: SocketAddrV4 = (&node).into();
+                trace!("trying to contact {:?}", node_ip);
+
+                let dht = dht.clone();
+
+                let recursive_find_with_timeout = tokio::spawn(async move {
+                    if let Ok(node) = timeout(
+                        Duration::from_secs(15),
+                        dht.recursive_find(&our_id, &node, 64)).await {
+                        trace!("found node {:?}", node);
+                        return Some(node.unwrap());
+                    } else {
+                        trace!("failed to contact {:?}, timed out", node_ip);
+                        None
+                    }
+                });
+                find_node_tasks.push(recursive_find_with_timeout);
+            }
+
+            join_all(find_node_tasks).await;
+            info!("finished attempt to bootstrap with {:?}", contact);
         }
     }
-
-
 }
 
 
-impl Service<Message> for DhtServiceV4 {
-    type Response = Option<Vec<Message>>;
-    type Error = DhtServiceFailure;
-    type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>>>>;
-
-    // backpressure? what backpressure? backpressure is when the kernel panics!
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Ready(Ok(()))
-    }
-
-
-    fn call(&mut self, req: Message) -> Self::Future {
-        let dht = self.inner.clone();
-
-        let our_id = dht.id.clone();
-        let fut = Box::pin(async move {
-            let mut buffer = [0u8; 1024];
-
-            let transaction_id = &req.transaction_id;
-            let message_type = &req.message_type;
-            //let query_method = req.query_method;
-            let query_args = &req.body;
-
-
-            match query_args {
-                MessageBody::Query(query_body) => {
-                    match query_body {
-                        QueryBody::Ping(args) => {
-                            let message = bendy::serde::to_bytes(&req).map_err(|e| {
-                                DhtServiceFailure {
-                                    message: format!("Failed to serialize message: {}", e),
-                                }
-                            })?;
-
-                            dht.socket.send(message.as_slice()).await?;
-                            let len = dht.socket.recv(&mut buffer).await?;
-
-                            //socket.send(message.as_slice()).await.unwrap();
-
-                            return Ok(None);
-                        }
-                        QueryBody::FindNode(args) => {
-                            unimplemented!();
-                        }
-                        QueryBody::GetPeers(args) => {
-                            unimplemented!();
-                        }
-                        QueryBody::AnnouncePeer(args) => {
-                            unimplemented!();
-                        }
-                    }
-                }
-                MessageBody::Response(response) => {
-                    match response {
-                        ResponseBody::Ping(ping) => {
-                            unimplemented!();
-                        }
-                        ResponseBody::FindNode(_) => {
-                            unimplemented!();
-                        }
-                        ResponseBody::GetPeers(_) => {
-                            unimplemented!();
-                        }
-                        ResponseBody::AnnouncePeer(_) => {
-                            unimplemented!();
-                        }
-                    }
-                }
-                MessageBody::Error(_) => { unimplemented!() }
-            };
-        });
-
-        fut
-    }
-}
+// impl Service<Message> for DhtServiceV4 {
+//     type Response = Option<Vec<Message>>;
+//     type Error = DhtServiceFailure;
+//     type Future = Pin<Box<dyn Future<Output=Result<Self::Response, Self::Error>>>>;
+//
+//     // backpressure? what backpressure? backpressure is when the kernel panics!
+//     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+//         Ready(Ok(()))
+//     }
+//
+//
+//     fn call(&mut self, req: Message) -> Self::Future {
+//         let dht = self.inner.clone();
+//
+//         let our_id = dht.id.clone();
+//         let fut = Box::pin(async move {
+//             let mut buffer = [0u8; 1024];
+//
+//             let transaction_id = &req.transaction_id;
+//             let message_type = &req.message_type;
+//             //let query_method = req.query_method;
+//             let query_args = &req.body;
+//
+//
+//             match query_args {
+//                 MessageBody::Query(query_body) => {
+//                     match query_body {
+//                         QueryBody::Ping(args) => {
+//                             let message = bendy::serde::to_bytes(&req).map_err(|e| {
+//                                 DhtServiceFailure {
+//                                     message: format!("Failed to serialize message: {}", e),
+//                                 }
+//                             })?;
+//
+//                             dht.socket.send(message.as_slice()).await?;
+//                             let len = dht.socket.recv(&mut buffer).await?;
+//
+//                             //socket.send(message.as_slice()).await.unwrap();
+//
+//                             return Ok(None);
+//                         }
+//                         QueryBody::FindNode(args) => {
+//                             unimplemented!();
+//                         }
+//                         QueryBody::GetPeers(args) => {
+//                             unimplemented!();
+//                         }
+//                         QueryBody::AnnouncePeer(args) => {
+//                             unimplemented!();
+//                         }
+//                     }
+//                 }
+//                 MessageBody::Response(response) => {
+//                     match response {
+//                         ResponseBody::Ping(ping) => {
+//                             unimplemented!();
+//                         }
+//                         ResponseBody::FindNode(_) => {
+//                             unimplemented!();
+//                         }
+//                         ResponseBody::GetPeers(_) => {
+//                             unimplemented!();
+//                         }
+//                         ResponseBody::AnnouncePeer(_) => {
+//                             unimplemented!();
+//                         }
+//                     }
+//                 }
+//                 MessageBody::Error(_) => { unimplemented!() }
+//             };
+//         });
+//
+//         fut
+//     }
+// }
 
 
 #[cfg(test)]
