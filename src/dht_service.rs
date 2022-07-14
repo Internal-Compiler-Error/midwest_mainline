@@ -2,11 +2,10 @@ use crate::{
     dht_service::transaction_id_pool::TransactionIdPool,
     domain_knowledge::{CompactNodeContact, NodeId},
     message::{
-        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
-        find_node_response::FindNodeResponse,
+        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, find_node_response::FindNodeResponse,
         get_peers_deferred_response::GetPeersDeferredResponse, get_peers_query::GetPeersQuery,
-        get_peers_success_response::GetPeersSuccessResponse,
-        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, Krpc,
+        get_peers_success_response::GetPeersSuccessResponse, ping_announce_peer_response::PingAnnouncePeerResponse,
+        ping_query::PingQuery, Krpc,
     },
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -23,7 +22,7 @@ use std::{
     future::Future,
     mem::forget,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    ops::{BitXor, Deref, Sub},
+    ops::{BitXor, Deref, DerefMut, Sub},
     pin::Pin,
     sync::Arc,
     task::{
@@ -36,7 +35,7 @@ use tokio::{
     net::{self, UdpSocket},
     runtime::{Handle, Runtime},
     spawn,
-    sync::{mpsc, oneshot, Mutex, RwLock},
+    sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
     task::{self, JoinHandle},
     time::{error::Elapsed, timeout},
 };
@@ -64,6 +63,15 @@ struct DhtServiceInnerV4 {
 #[derive(Debug)]
 struct DhtServiceFailure {
     message: String,
+}
+
+#[derive(Debug)]
+struct BottomedOut;
+
+impl Display for BottomedOut {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bottomed out")
+    }
 }
 
 impl Display for DhtServiceFailure {
@@ -180,11 +188,9 @@ impl DhtServiceInnerV4 {
             Ok::<_, DhtServiceFailure>(())
         };
 
-        let handle1 = task::Builder::new()
-            .name("socket reader")
-            .spawn(async move {
-                socket_reader.await;
-            });
+        let handle1 = task::Builder::new().name("socket reader").spawn(async move {
+            socket_reader.await;
+        });
 
         let message_registry = RequestRegistry::new(incoming_rx, queries_tx);
         let message_registry = Arc::new(message_registry);
@@ -197,9 +203,7 @@ impl DhtServiceInnerV4 {
             ()
         };
 
-        let handle2 = task::Builder::new()
-            .name("message registry")
-            .spawn(message_placing);
+        let handle2 = task::Builder::new().name("message registry").spawn(message_placing);
 
         Ok(DhtServiceInnerV4 {
             socket,
@@ -215,17 +219,11 @@ impl DhtServiceInnerV4 {
     /// Send a message out and await for a response.
     ///
     /// It does not alter the routing table, callers must decide what to do with the response.
-    async fn send_message(
-        &self,
-        message: &Krpc,
-        recipient: &SocketAddrV4,
-    ) -> Result<Krpc, DhtServiceFailure> {
+    async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
         let (tx, rx) = oneshot::channel();
 
         if let Ok(bytes) = bendy::serde::to_bytes(message) {
-            self.request_registry
-                .register(message.id_as_u16(), tx)
-                .await;
+            self.request_registry.register(message.id_as_u16(), tx).await;
             self.socket.send_to(&bytes, recipient).await?;
         }
         let response = rx.await.unwrap();
@@ -297,10 +295,7 @@ impl DhtServiceInnerV4 {
     }
 
     /// starting point of trying to find any nodes on the network
-    async fn find_node(
-        self: Arc<Self>,
-        target: &NodeId,
-    ) -> Result<CompactNodeContact, DhtServiceFailure> {
+    async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.read().await.find(target) {
             return Ok(node.contact.clone());
@@ -310,11 +305,7 @@ impl DhtServiceInnerV4 {
         let closest;
         {
             let table = (&self).routing_table.read().await;
-            closest = table
-                .find_closest(target)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            closest = table.find_closest(target).into_iter().cloned().collect::<Vec<_>>();
         }
 
         let returned_nodes = closest
@@ -343,10 +334,7 @@ impl DhtServiceInnerV4 {
 
         // it's possible that some of the nodes returned are actually the node we're looking for
         // so we check for that and return it if it's the case
-        let mut target_node = returned_nodes
-            .iter()
-            .flatten()
-            .find(|node| node.node_id() == target);
+        let mut target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
 
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
@@ -379,6 +367,67 @@ impl DhtServiceInnerV4 {
 
     #[async_recursion]
     #[instrument]
+    /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
+    /// looking for
+    async fn recurse_find_from_pool(
+        self: Arc<Self>,
+        mut starting_pool: Vec<CompactNodeContact>,
+        finding: NodeId,
+        seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
+        slot: Arc<Mutex<Option<Sender<CompactNodeContact>>>>,
+    ) -> Result<(), BottomedOut> {
+        // filter the pool to only include nodes that we haven't seen yet
+        starting_pool = async {
+            let mut seen = seen.lock().await;
+            starting_pool
+                .into_iter()
+                .filter(|node| !seen.contains(&node))
+                .collect::<Vec<_>>()
+        }
+        .await;
+
+        // it's ok to assume that this will never get hit for the first time, since the starting
+        // pool is always unseen
+        if starting_pool.len() == 0 {
+            return Err(BottomedOut);
+        }
+
+        // ask all the nodes for target!
+        starting_pool.into_iter().map(|node| {
+            let seen = seen.clone();
+            let dht = self.clone();
+            let slot = slot.clone();
+            async move {
+                let response = dht.ask_her_for_nodes((&node).into(), finding).await?;
+
+                // see if we got the node we're looking for
+                if let Some(node) = response.iter().find(|node| node.node_id() == &finding) {
+                    // if we did, then we're done
+                    let mut slot = slot.lock().await;
+
+                    let huh = slot.deref_mut();
+
+                    if let Some(sender) = huh {
+                        let slot = huh.take();
+                        slot.unwrap().send(node.clone());
+                    }
+
+                    return Ok(());
+                } else {
+                    seen.lock().await.insert(node.clone());
+                }
+
+                seen.lock().await;
+
+                Ok::<_, Box<dyn Error>>(())
+            }
+        });
+
+        todo!()
+    }
+
+    #[async_recursion]
+    #[instrument]
     async fn recursive_find(
         &self,
         target: &NodeId,
@@ -392,8 +441,7 @@ impl DhtServiceInnerV4 {
         }
 
         let transaction_id = self.transaction_id_pool.next();
-        let query =
-            Krpc::new_find_node_query(transaction_id.to_be_bytes(), self.our_id, target.clone());
+        let query = Krpc::new_find_node_query(transaction_id.to_be_bytes(), self.our_id, target.clone());
 
         let time_out = Duration::from_secs(15);
         let response = timeout(time_out, self.send_message(&query, &asking.into())).await??;
@@ -419,8 +467,7 @@ impl DhtServiceInnerV4 {
                 return if node.node_id() == target {
                     Ok(node)
                 } else {
-                    self.recursive_find(target, &node, recursion_limit.sub(1))
-                        .await
+                    self.recursive_find(target, &node, recursion_limit.sub(1)).await
                 };
             }
         } else if let Krpc::Error(err) = response {
@@ -454,9 +501,7 @@ impl DhtServiceV4 {
     ) -> Result<Self, DhtServiceFailure> {
         let inner = DhtServiceInnerV4::new_with_random_id(address).await?;
         let inner = Arc::new(inner);
-        let dht = Self {
-            inner: inner.clone(),
-        };
+        let dht = Self { inner: inner.clone() };
 
         // ask all the known nodes for ourselves
         let mut tasks = Vec::new();
@@ -501,10 +546,7 @@ impl DhtServiceV4 {
             {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
-                table.add_new_node(CompactNodeContact::from_node_id_and_addr(
-                    &response.body.id,
-                    &contact,
-                ));
+                table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
             }
 
             nodes.dedup();
@@ -521,12 +563,7 @@ impl DhtServiceV4 {
                 let dht = dht.clone();
 
                 let recursive_find_with_timeout = tokio::spawn(async move {
-                    if let Ok(node) = timeout(
-                        Duration::from_secs(15),
-                        dht.recursive_find(&our_id, &node, 64),
-                    )
-                    .await
-                    {
+                    if let Ok(node) = timeout(Duration::from_secs(15), dht.recursive_find(&our_id, &node, 64)).await {
                         trace!("found node {:?}", node);
                         return Some(node.unwrap());
                     } else {
