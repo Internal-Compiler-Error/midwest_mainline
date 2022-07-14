@@ -5,8 +5,8 @@
 #![allow(unused_results)]
 #![allow(unreachable_code)]
 
-mod routing;
-mod message;
 mod dht_service;
 mod domain_knowledge;
+mod message;
+mod routing;
 mod utils;

@@ -1,7 +1,9 @@
-use crate::message::{QueryMethod, Token, TransactionId};
-use serde_with::{Bytes, serde_as};
+use crate::{
+    domain_knowledge::NodeId,
+    message::{QueryMethod, Token, TransactionId},
+};
 use serde::{Deserialize, Serialize};
-use crate::domain_knowledge::NodeId;
+use serde_with::{serde_as, Bytes};
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

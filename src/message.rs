@@ -1,27 +1,27 @@
-use num_bigint::BigUint;
-use serde_with::{Bytes, serde_as};
-use serde::{Deserialize, Serialize};
+use crate::{
+    domain_knowledge::{CompactPeerContact, NodeId},
+    message::ping_query::PingQuery,
+};
 use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
 use find_node_query::{FindNodeArgs, FindNodeQuery};
 use find_node_response::{FindNodeResponse, FindNodeResponseBody};
 use get_peers_deferred_response::GetPeersDeferredResponse;
 use get_peers_query::{GetPeersArgs, GetPeersQuery};
-use get_peers_success_response::GetPeersSuccessResponse;
+use get_peers_success_response::{GetPeersSuccessResponse, GetPeersSuccessResponseBody};
+use num_bigint::BigUint;
 use ping_announce_peer_response::{PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
 use ping_query::PingArgs;
-use get_peers_success_response::GetPeersSuccessResponseBody;
-use crate::domain_knowledge::{CompactPeerContact, NodeId};
-use crate::message::ping_query::PingQuery;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, Bytes};
 
-pub mod ping_query;
-pub mod find_node_query;
-pub mod get_peers_query;
 pub mod announce_peer_query;
-pub mod ping_announce_peer_response;
+pub mod find_node_query;
 pub mod find_node_response;
-pub mod get_peers_success_response;
 pub mod get_peers_deferred_response;
-
+pub mod get_peers_query;
+pub mod get_peers_success_response;
+pub mod ping_announce_peer_response;
+pub mod ping_query;
 
 pub type InfoHash = [u8; 20];
 pub type TransactionId = [u8; 2];
@@ -56,7 +56,6 @@ pub struct Error {
     pub(crate) error: Vec<Box<[u8]>>,
 }
 
-
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
@@ -83,7 +82,6 @@ pub(crate) enum QueryMethod {
     None,
 }
 
-
 impl QueryMethod {
     // see the comment in the enum for why is idiotic function exists
     fn is_none(&self) -> bool {
@@ -97,7 +95,6 @@ impl QueryMethod {
         QueryMethod::None
     }
 }
-
 
 impl Krpc {
     pub fn is_response(&self) -> bool {
@@ -146,16 +143,17 @@ impl Krpc {
             transaction_id,
             message_type: Box::new(b"q".clone()),
             query_method: QueryMethod::Ping,
-            body: PingArgs {
-                id: querying_id
-            },
+            body: PingArgs { id: querying_id },
         };
 
         Krpc::PingQuery(ping_query)
     }
 
-
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
+    pub fn new_find_node_query(
+        transaction_id: TransactionId,
+        querying_id: NodeId,
+        target_id: NodeId,
+    ) -> Krpc {
         let find_node_query = FindNodeQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
@@ -169,8 +167,11 @@ impl Krpc {
         Krpc::FindNodeQuery(find_node_query)
     }
 
-
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
+    pub fn new_get_peers_query(
+        transaction_id: TransactionId,
+        querying_id: NodeId,
+        info_hash: InfoHash,
+    ) -> Krpc {
         let get_peers_query = GetPeersQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
@@ -184,12 +185,14 @@ impl Krpc {
         Krpc::GetPeersQuery(get_peers_query)
     }
 
-    pub fn new_announce_peer_query(transaction_id: TransactionId,
-                                   info_hash: InfoHash,
-                                   querying_id: NodeId,
-                                   port: u16,
-                                   implied_port: bool,
-                                   token: Token) -> Krpc {
+    pub fn new_announce_peer_query(
+        transaction_id: TransactionId,
+        info_hash: InfoHash,
+        querying_id: NodeId,
+        port: u16,
+        implied_port: bool,
+        token: Token,
+    ) -> Krpc {
         let announce_peer_query = AnnouncePeerQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
@@ -210,15 +213,17 @@ impl Krpc {
         let ping_response = PingAnnouncePeerResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
-            body: PingAnnouncePeerResponseBody {
-                id: responding_id,
-            },
+            body: PingAnnouncePeerResponseBody { id: responding_id },
         };
         Krpc::PingAnnouncePeerResponse(ping_response)
     }
 
     /// construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Krpc {
+    pub fn new_find_node_response(
+        transaction_id: TransactionId,
+        responding_id: NodeId,
+        nodes: Box<[u8]>,
+    ) -> Krpc {
         let find_node_response = FindNodeResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
@@ -232,10 +237,12 @@ impl Krpc {
     }
 
     /// construct a response to a get_peers query when the peer is directly found
-    pub fn new_get_peers_success_response(transaction_id: TransactionId,
-                                          responding_id: NodeId,
-                                          response_token: Token,
-                                          node: Vec<CompactPeerContact>) -> Krpc {
+    pub fn new_get_peers_success_response(
+        transaction_id: TransactionId,
+        responding_id: NodeId,
+        response_token: Token,
+        node: Vec<CompactPeerContact>,
+    ) -> Krpc {
         let get_peers_success_response = GetPeersSuccessResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
@@ -251,10 +258,12 @@ impl Krpc {
 
     /// construct a response to a get_peers query when the peer is not directly found and the closest
     /// nodes are returned
-    pub fn new_get_peers_deferred_response(transaction_id: TransactionId,
-                                           responding_id: NodeId,
-                                           response_token: Token,
-                                           closest_nodes: Box<[u8]>) -> Krpc {
+    pub fn new_get_peers_deferred_response(
+        transaction_id: TransactionId,
+        responding_id: NodeId,
+        response_token: Token,
+        closest_nodes: Box<[u8]>,
+    ) -> Krpc {
         let get_peers_deferred_response = GetPeersDeferredResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
@@ -268,50 +277,32 @@ impl Krpc {
         Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
     }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
+    pub fn new_announce_peer_response(
+        transaction_id: TransactionId,
+        responding_id: NodeId,
+    ) -> Krpc {
         let announce_peer_response = PingAnnouncePeerResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
-            body: PingAnnouncePeerResponseBody {
-                id: responding_id,
-            },
+            body: PingAnnouncePeerResponseBody { id: responding_id },
         };
         Krpc::PingAnnouncePeerResponse(announce_peer_response)
     }
 
     pub fn id_as_u16(&self) -> u16 {
         match self {
-            Krpc::Error(error) => {
-                u16::from_be_bytes(error.transaction_id)
-            }
-            Krpc::PingAnnouncePeerResponse(ping) => {
-                u16::from_be_bytes(ping.transaction_id)
-            }
-            Krpc::GetPeersDeferredResponse(peers) => {
-                u16::from_be_bytes(peers.transaction_id)
-            }
-            Krpc::GetPeersSuccessResponse(peers) => {
-                u16::from_be_bytes(peers.transaction_id)
-            }
-            Krpc::FindNodeResponse(node) => {
-                u16::from_be_bytes(node.transaction_id)
-            }
-            Krpc::PingQuery(ping) => {
-                u16::from_be_bytes(ping.transaction_id)
-            }
-            Krpc::FindNodeQuery(node) => {
-                u16::from_be_bytes(node.transaction_id)
-            }
-            Krpc::GetPeersQuery(peers) => {
-                u16::from_be_bytes(peers.transaction_id)
-            }
-            Krpc::AnnouncePeerQuery(peers) => {
-                u16::from_be_bytes(peers.transaction_id)
-            }
+            Krpc::Error(error) => u16::from_be_bytes(error.transaction_id),
+            Krpc::PingAnnouncePeerResponse(ping) => u16::from_be_bytes(ping.transaction_id),
+            Krpc::GetPeersDeferredResponse(peers) => u16::from_be_bytes(peers.transaction_id),
+            Krpc::GetPeersSuccessResponse(peers) => u16::from_be_bytes(peers.transaction_id),
+            Krpc::FindNodeResponse(node) => u16::from_be_bytes(node.transaction_id),
+            Krpc::PingQuery(ping) => u16::from_be_bytes(ping.transaction_id),
+            Krpc::FindNodeQuery(node) => u16::from_be_bytes(node.transaction_id),
+            Krpc::GetPeersQuery(peers) => u16::from_be_bytes(peers.transaction_id),
+            Krpc::AnnouncePeerQuery(peers) => u16::from_be_bytes(peers.transaction_id),
         }
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -326,16 +317,15 @@ mod test {
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Krpc = from_bytes(message).unwrap();
 
-
             let expected = Krpc::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
             assert_eq!(decoded, expected);
         }
 
         #[test]
         fn find_node_response_deserialize() {
-            let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
+            let message =
+                b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Krpc = from_bytes(message).unwrap();
-
 
             let expected = Krpc::new_find_node_response(
                 b"aa".clone(),
@@ -356,13 +346,19 @@ mod test {
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec
-            assert_eq!(bytes, b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe");
+            assert_eq!(
+                bytes,
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe"
+            );
         }
-
 
         #[test]
         fn serialize_find_node_query() {
-            let message = Krpc::new_find_node_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
+            let message = Krpc::new_find_node_query(
+                b"aa".clone(),
+                b"abcdefghij0123456789".clone(),
+                b"mnopqrstuvwxyz123456".clone(),
+            );
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec
@@ -371,7 +367,11 @@ mod test {
 
         #[test]
         fn serialize_get_peers_query() {
-            let message = Krpc::new_get_peers_query(b"aa".clone(), b"abcdefghij0123456789".clone(), b"mnopqrstuvwxyz123456".clone());
+            let message = Krpc::new_get_peers_query(
+                b"aa".clone(),
+                b"abcdefghij0123456789".clone(),
+                b"mnopqrstuvwxyz123456".clone(),
+            );
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec

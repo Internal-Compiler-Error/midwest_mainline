@@ -1,8 +1,9 @@
-use crate::message::{QueryMethod, Token, TransactionId};
-use crate::message::ping_query::PingArgs;
-use serde_with::{Bytes, serde_as};
+use crate::{
+    domain_knowledge::{CompactPeerContact, NodeId},
+    message::{ping_query::PingArgs, QueryMethod, Token, TransactionId},
+};
 use serde::{Deserialize, Serialize};
-use crate::domain_knowledge::{CompactPeerContact, NodeId};
+use serde_with::{serde_as, Bytes};
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +19,6 @@ pub struct GetPeersSuccessResponse {
     #[serde(rename = "r")]
     pub(crate) body: GetPeersSuccessResponseBody,
 }
-
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

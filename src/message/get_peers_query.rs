@@ -1,8 +1,9 @@
-use crate::message::{InfoHash, QueryMethod, TransactionId};
-use crate::message::ping_query::PingArgs;
-use serde_with::{Bytes, serde_as};
+use crate::{
+    domain_knowledge::NodeId,
+    message::{ping_query::PingArgs, InfoHash, QueryMethod, TransactionId},
+};
 use serde::{Deserialize, Serialize};
-use crate::domain_knowledge::NodeId;
+use serde_with::{serde_as, Bytes};
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

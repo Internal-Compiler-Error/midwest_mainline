@@ -1,10 +1,10 @@
-use std::collections::HashSet;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicU16, Ordering};
-use rand::prelude::SmallRng;
-use rand::{Rng, SeedableRng};
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use rand::{prelude::SmallRng, Rng, SeedableRng};
+use std::{
+    collections::HashSet,
+    ops::Deref,
+    sync::atomic::{AtomicU16, Ordering},
+};
+use tokio::{runtime::Handle, sync::Mutex};
 
 /// Ensures we never use the same ID for two different requests
 #[derive(Debug)]
@@ -20,8 +20,6 @@ impl TransactionIdPool {
     }
 
     pub fn next(&self) -> u16 {
-        self
-            .next_id
-            .fetch_add(1, Ordering::SeqCst)
+        self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 }

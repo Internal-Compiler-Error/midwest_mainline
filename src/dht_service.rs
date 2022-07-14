@@ -1,46 +1,47 @@
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::future::Future;
-use std::mem::forget;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::ops::{BitXor, Deref, Sub};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::task::Poll::Ready;
-use std::time::Duration;
+use crate::{
+    dht_service::transaction_id_pool::TransactionIdPool,
+    domain_knowledge::{CompactNodeContact, NodeId},
+    message::{
+        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
+        find_node_response::FindNodeResponse,
+        get_peers_deferred_response::GetPeersDeferredResponse, get_peers_query::GetPeersQuery,
+        get_peers_success_response::GetPeersSuccessResponse,
+        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, Krpc,
+    },
+    routing::RoutingTable,
+    utils::ParSpawnAndAwait,
+};
 use async_recursion::async_recursion;
 use either::Either;
 use futures::future::join_all;
 use num_bigint::BigUint;
-use rand::{Rng, RngCore, rngs, SeedableRng};
-use rand::rngs::SmallRng;
-use tokio::{net, spawn, task};
+use rand::{rngs, rngs::SmallRng, Rng, RngCore, SeedableRng};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt::{Display, Formatter},
+    future::Future,
+    mem::forget,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    ops::{BitXor, Deref, Sub},
+    pin::Pin,
+    sync::Arc,
+    task::{
+        Context,
+        Poll::{self, Ready},
+    },
+    time::Duration,
+};
+use tokio::{
+    net::{self, UdpSocket},
+    runtime::{Handle, Runtime},
+    spawn,
+    sync::{mpsc, oneshot, Mutex, RwLock},
+    task::{self, JoinHandle},
+    time::{error::Elapsed, timeout},
+};
 use tower::Service;
-use tokio::sync::oneshot;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use tokio::net::UdpSocket;
-use tokio::runtime::{Handle, Runtime};
-use tokio::task::JoinHandle;
-use tokio::time::error::Elapsed;
-use tokio::time::timeout;
-use tracing::{error, event, info, instrument, Level, span, trace};
-use tracing::log::warn;
-use crate::dht_service::transaction_id_pool::TransactionIdPool;
-use crate::domain_knowledge::{CompactNodeContact, NodeId};
-use crate::message::{Krpc, ping_query::PingQuery};
-use crate::message::announce_peer_query::AnnouncePeerQuery;
-use crate::message::find_node_query::FindNodeQuery;
-use crate::message::find_node_response::FindNodeResponse;
-use crate::message::get_peers_deferred_response::GetPeersDeferredResponse;
-use crate::message::get_peers_query::GetPeersQuery;
-use crate::message::get_peers_success_response::GetPeersSuccessResponse;
-use crate::message::ping_announce_peer_response::PingAnnouncePeerResponse;
-use crate::routing::RoutingTable;
-use crate::utils::ParSpawnAndAwait;
+use tracing::{error, event, info, instrument, log::warn, span, trace, Level};
 
 mod transaction_id_pool;
 
@@ -81,8 +82,7 @@ struct RequestRegistry {
 }
 
 impl RequestRegistry {
-    pub fn new(incoming_queue: mpsc::Receiver<Krpc>,
-               query_channel: mpsc::Sender<Krpc>) -> Self {
+    pub fn new(incoming_queue: mpsc::Receiver<Krpc>, query_channel: mpsc::Sender<Krpc>) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
             query_queue: Mutex::new(query_channel),
@@ -150,16 +150,12 @@ impl From<tokio::task::JoinError> for DhtServiceFailure {
 impl DhtServiceInnerV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
-    async fn new_with_random_id(
-        address: SocketAddrV4,
-    ) -> Result<Self, DhtServiceFailure> {
-        let socket = UdpSocket::bind(&address)
-            .await?;
+    async fn new_with_random_id(address: SocketAddrV4) -> Result<Self, DhtServiceFailure> {
+        let socket = UdpSocket::bind(&address).await?;
 
         // randomly pick our ID
         let mut id = [0u8; 20];
-        rand::thread_rng()
-            .fill_bytes(&mut id);
+        rand::thread_rng().fill_bytes(&mut id);
 
         let socket = Arc::new(socket);
         let routing_table = RoutingTable::new(&id);
@@ -169,7 +165,6 @@ impl DhtServiceInnerV4 {
 
         // todo: eventually we to read the queries
         forget(queries_rx);
-
 
         // keep reading from sockets and place them on a queue for another task to place them into
         // the right slot
@@ -187,7 +182,9 @@ impl DhtServiceInnerV4 {
 
         let handle1 = task::Builder::new()
             .name("socket reader")
-            .spawn(async move { socket_reader.await; });
+            .spawn(async move {
+                socket_reader.await;
+            });
 
         let message_registry = RequestRegistry::new(incoming_rx, queries_tx);
         let message_registry = Arc::new(message_registry);
@@ -215,21 +212,25 @@ impl DhtServiceInnerV4 {
         })
     }
 
-
     /// Send a message out and await for a response.
     ///
     /// It does not alter the routing table, callers must decide what to do with the response.
-    async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
+    async fn send_message(
+        &self,
+        message: &Krpc,
+        recipient: &SocketAddrV4,
+    ) -> Result<Krpc, DhtServiceFailure> {
         let (tx, rx) = oneshot::channel();
 
         if let Ok(bytes) = bendy::serde::to_bytes(message) {
-            self.request_registry.register(message.id_as_u16(), tx).await;
+            self.request_registry
+                .register(message.id_as_u16(), tx)
+                .await;
             self.socket.send_to(&bytes, recipient).await?;
         }
         let response = rx.await.unwrap();
         Ok(response)
     }
-
 
     // async fn ping(&self, recipient: &SocketAddrV4) -> Result<(), DhtServiceFailure> {
     //     let transaction_id = self.transaction_id_pool.next();
@@ -257,14 +258,14 @@ impl DhtServiceInnerV4 {
     // you peers means something special here so you can't use it
     // ask_node_for_nodes just sounds stupid so fuck it, it's her then.
     // Why her and not them? Because I want to piss people off
-    async fn ask_her_for_nodes(self: Arc<Self>, interlocutor: SocketAddrV4, target: NodeId) -> Result<Vec<CompactNodeContact>, DhtServiceFailure> {
+    async fn ask_her_for_nodes(
+        self: Arc<Self>,
+        interlocutor: SocketAddrV4,
+        target: NodeId,
+    ) -> Result<Vec<CompactNodeContact>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(
-            transaction_id.to_be_bytes(),
-            self.our_id,
-            target,
-        );
+        let query = Krpc::new_find_node_query(transaction_id.to_be_bytes(), self.our_id, target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(5);
@@ -289,13 +290,17 @@ impl DhtServiceInnerV4 {
 
             Ok(nodes)
         } else {
-            Err(DhtServiceFailure { message: "Did not get an find node response".to_string() })
+            Err(DhtServiceFailure {
+                message: "Did not get an find node response".to_string(),
+            })
         }
     }
 
-
     /// starting point of trying to find any nodes on the network
-    async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
+    async fn find_node(
+        self: Arc<Self>,
+        target: &NodeId,
+    ) -> Result<CompactNodeContact, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.read().await.find(target) {
             return Ok(node.contact.clone());
@@ -311,7 +316,6 @@ impl DhtServiceInnerV4 {
                 .cloned()
                 .collect::<Vec<_>>();
         }
-
 
         let returned_nodes = closest
             .iter()
@@ -332,7 +336,9 @@ impl DhtServiceInnerV4 {
 
         // if they all ended in failure, then we can't find the node
         if returned_nodes.len() == 0 {
-            return Err(DhtServiceFailure { message: "Could not find node, all nodes requests ended in failure".to_string() });
+            return Err(DhtServiceFailure {
+                message: "Could not find node, all nodes requests ended in failure".to_string(),
+            });
         }
 
         // it's possible that some of the nodes returned are actually the node we're looking for
@@ -345,7 +351,6 @@ impl DhtServiceInnerV4 {
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
         }
-
 
         // if we don't have the node, then we find the alpha closest nodes and ask them in turn
         let mut sorted_by_distance: Vec<_> = returned_nodes
@@ -374,7 +379,12 @@ impl DhtServiceInnerV4 {
 
     #[async_recursion]
     #[instrument]
-    async fn recursive_find(&self, target: &NodeId, asking: &CompactNodeContact, recursion_limit: u16) -> Result<CompactNodeContact, DhtServiceFailure> {
+    async fn recursive_find(
+        &self,
+        target: &NodeId,
+        asking: &CompactNodeContact,
+        recursion_limit: u16,
+    ) -> Result<CompactNodeContact, DhtServiceFailure> {
         if recursion_limit == 0 {
             return Err(DhtServiceFailure {
                 message: "recursion limit reached, node still not found".to_string(),
@@ -382,15 +392,11 @@ impl DhtServiceInnerV4 {
         }
 
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(
-            transaction_id.to_be_bytes(),
-            self.our_id,
-            target.clone(),
-        );
+        let query =
+            Krpc::new_find_node_query(transaction_id.to_be_bytes(), self.our_id, target.clone());
 
         let time_out = Duration::from_secs(15);
-        let response =
-            timeout(time_out, self.send_message(&query, &asking.into())).await??;
+        let response = timeout(time_out, self.send_message(&query, &asking.into())).await??;
 
         if let Krpc::FindNodeResponse(response) = response {
             let nodes = response.body.nodes;
@@ -403,7 +409,9 @@ impl DhtServiceInnerV4 {
 
             if nodes.is_empty() {
                 warn!("out of spec DHT node, responding with zero nodes");
-                return Err(DhtServiceFailure { message: "out of spec DHT node, responding with zero nodes".to_string() });
+                return Err(DhtServiceFailure {
+                    message: "out of spec DHT node, responding with zero nodes".to_string(),
+                });
             }
 
             for node in nodes {
@@ -411,7 +419,8 @@ impl DhtServiceInnerV4 {
                 return if node.node_id() == target {
                     Ok(node)
                 } else {
-                    self.recursive_find(target, &node, recursion_limit.sub(1)).await
+                    self.recursive_find(target, &node, recursion_limit.sub(1))
+                        .await
                 };
             }
         } else if let Krpc::Error(err) = response {
@@ -430,26 +439,24 @@ impl DhtServiceInnerV4 {
     }
 }
 
-
 impl Drop for DhtServiceInnerV4 {
     fn drop(&mut self) {
         // stop all tasks required to keep ourself alive
-        self
-            .helper_tasks
-            .iter()
-            .for_each(|h| h.abort());
+        self.helper_tasks.iter().for_each(|h| h.abort());
     }
 }
 
 impl DhtServiceV4 {
     #[instrument]
-    pub async fn bootstrap_with_random_id(address: SocketAddrV4, known_nodes: Vec<SocketAddrV4>) -> Result<Self, DhtServiceFailure> {
+    pub async fn bootstrap_with_random_id(
+        address: SocketAddrV4,
+        known_nodes: Vec<SocketAddrV4>,
+    ) -> Result<Self, DhtServiceFailure> {
         let inner = DhtServiceInnerV4::new_with_random_id(address).await?;
         let inner = Arc::new(inner);
         let dht = Self {
             inner: inner.clone(),
         };
-
 
         // ask all the known nodes for ourselves
         let mut tasks = Vec::new();
@@ -467,15 +474,13 @@ impl DhtServiceV4 {
     async fn bootstrap_single(dht: Arc<DhtServiceInnerV4>, contact: SocketAddrV4) {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(
-            transaction_id.to_be_bytes(),
-            our_id,
-            our_id.clone(),
-        );
-
+        let query = Krpc::new_find_node_query(transaction_id.to_be_bytes(), our_id, our_id.clone());
 
         info!("bootstrapping with {contact}");
-        let response = timeout(Duration::from_secs(5), async { dht.send_message(&query, &contact).await.unwrap() }).await;
+        let response = timeout(Duration::from_secs(5), async {
+            dht.send_message(&query, &contact).await.unwrap()
+        })
+        .await;
         let response = match response {
             Ok(response) => {
                 info!("bootstrapping node {contact} responded back");
@@ -496,7 +501,10 @@ impl DhtServiceV4 {
             {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
-                table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
+                table.add_new_node(CompactNodeContact::from_node_id_and_addr(
+                    &response.body.id,
+                    &contact,
+                ));
             }
 
             nodes.dedup();
@@ -504,7 +512,6 @@ impl DhtServiceV4 {
             for node in &nodes {
                 dht.routing_table.write().await.add_new_node(node.clone());
             }
-
 
             let mut find_node_tasks = Vec::new();
             for node in nodes {
@@ -516,7 +523,10 @@ impl DhtServiceV4 {
                 let recursive_find_with_timeout = tokio::spawn(async move {
                     if let Ok(node) = timeout(
                         Duration::from_secs(15),
-                        dht.recursive_find(&our_id, &node, 64)).await {
+                        dht.recursive_find(&our_id, &node, 64),
+                    )
+                    .await
+                    {
                         trace!("found node {:?}", node);
                         return Some(node.unwrap());
                     } else {
@@ -533,20 +543,21 @@ impl DhtServiceV4 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::str::FromStr;
+    use crate::dht_service::DhtServiceV4;
     use num_bigint::BigUint;
     use rand::RngCore;
-    use tokio::{net, time};
-    use tokio::net::UdpSocket;
-    use tokio::time::timeout;
-    use tracing::info;
-    use tracing::subscriber::set_global_default;
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        str::FromStr,
+    };
+    use tokio::{
+        net::{self, UdpSocket},
+        time::{self, timeout},
+    };
+    use tracing::{info, subscriber::set_global_default};
     use tracing_subscriber::fmt::format::Format;
-    use crate::dht_service::DhtServiceV4;
 
     #[tokio::test]
     async fn bootstrap() -> color_eyre::Result<()> {
@@ -568,14 +579,18 @@ mod tests {
                 "67.215.246.10:6881".parse().unwrap(),
                 // router.bitcomet.com
                 "82.221.103.244:6881".parse().unwrap(),
-            ]);
+            ],
+        );
 
         let dht = timeout(time::Duration::from_secs(60), dht).await?;
         let dht = dht?;
 
         info!("Now I'm bootstrapped!");
         let table = dht.inner.routing_table.read().await;
-        info!("we've found {:?} nodes and recorded in our routing table", table.node_count());
+        info!(
+            "we've found {:?} nodes and recorded in our routing table",
+            table.node_count()
+        );
 
         Ok(())
     }

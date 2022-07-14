@@ -1,8 +1,6 @@
-use std::ops::BitXor;
-use std::str::FromStr;
-use std::time::Instant;
-use num_bigint::BigUint;
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
+use num_bigint::BigUint;
+use std::{ops::BitXor, str::FromStr, time::Instant};
 
 #[derive(Debug)]
 pub struct RoutingTable {
@@ -39,7 +37,8 @@ impl RoutingTable {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
-            upper_bound: BigUint::from_str("1461501637330902918203684832716283019655932542976").unwrap(),
+            upper_bound: BigUint::from_str("1461501637330902918203684832716283019655932542976")
+                .unwrap(),
             nodes: Vec::new(),
         };
 
@@ -62,7 +61,6 @@ impl RoutingTable {
         let node_id = contact.node_id();
         let node_id = BigUint::from_bytes_be(node_id);
 
-
         let our_id = &self.id;
         let distance = our_id.bitxor(BigUint::from_bytes_be(contact.node_id()));
 
@@ -70,13 +68,13 @@ impl RoutingTable {
         let target_bucket = self
             .buckets
             .iter_mut()
-            .find(|bucket| {
-                bucket.lower_bound <= distance && distance < bucket.upper_bound
-            })
+            .find(|bucket| bucket.lower_bound <= distance && distance < bucket.upper_bound)
             .unwrap();
 
-
-        let (full, within_our_bucket) = (target_bucket.full(), &target_bucket.lower_bound <= our_id && our_id < &target_bucket.upper_bound);
+        let (full, within_our_bucket) = (
+            target_bucket.full(),
+            &target_bucket.lower_bound <= our_id && our_id < &target_bucket.upper_bound,
+        );
         match (full, within_our_bucket) {
             // if the bucket is full and our id is within our bucket, we need to split it
             (true, true) => {
@@ -87,12 +85,12 @@ impl RoutingTable {
                     nodes: Vec::new(),
                 };
 
-
                 // transfer all the nodes that should go into the new bucket into the right place
                 // do I prefer the draining_filter API? yes but that's sadly nightly only
                 let mut i = 0;
                 while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id());
+                    let target_bucket_node_id =
+                        BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id());
                     if &target_bucket_node_id <= &new_bucket.lower_bound {
                         let node = target_bucket.nodes.remove(i);
                         new_bucket.nodes.push(node);
@@ -100,7 +98,6 @@ impl RoutingTable {
                         i += 1;
                     }
                 }
-
 
                 target_bucket.upper_bound = &target_bucket.upper_bound / 2u8;
                 self.buckets.push(new_bucket);
@@ -123,44 +120,32 @@ impl RoutingTable {
             .buckets
             .iter()
             .map(|bucket| {
-                bucket
-                    .nodes
-                    .iter()
-                    .map(|node| {
-                        let node_id = node.contact.node_id();
-                        let mut distance = [0u8; 20];
+                bucket.nodes.iter().map(|node| {
+                    let node_id = node.contact.node_id();
+                    let mut distance = [0u8; 20];
 
-                        // zip for array is sadly unstable
-                        let mut i = 0;
-                        while i < 20 {
-                            distance[i] = node_id[i] ^ target[i];
-                            i += 1;
-                        }
+                    // zip for array is sadly unstable
+                    let mut i = 0;
+                    while i < 20 {
+                        distance[i] = node_id[i] ^ target[i];
+                        i += 1;
+                    }
 
-                        (BigUint::from_bytes_be(&distance), node)
-                    })
+                    (BigUint::from_bytes_be(&distance), node)
+                })
             })
             .flatten()
             .collect();
 
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
-        closest_nodes
-            .iter()
-            .take(8)
-            .map(|x| x.1)
-            .collect()
+        closest_nodes.iter().take(8).map(|x| x.1).collect()
     }
 
     pub fn find(&self, target: &NodeId) -> Option<&Node> {
-        self
-            .buckets
+        self.buckets
             .iter()
-            .map(|bucket|
-                bucket
-                    .nodes
-                    .iter()
-            )
+            .map(|bucket| bucket.nodes.iter())
             .flatten()
-            .find(|node| { node.contact.node_id() == target })
+            .find(|node| node.contact.node_id() == target)
     }
 }
