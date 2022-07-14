@@ -320,7 +320,7 @@ impl DhtServiceInnerV4 {
         let returned_nodes = closest
             .iter()
             .map(|node| {
-                let ip: SocketAddrV4 = (&node.contact).into();
+                let ip: SocketAddrV4 = node.into();
                 ip
             })
             .map(|ip| self.clone().ask_her_for_nodes(ip, *target))
@@ -372,7 +372,7 @@ impl DhtServiceInnerV4 {
             .map(|(node, _)| self.recursive_find(target, node, 32))
             .collect::<Vec<_>>();
 
-        return recursive_find.par_spawn_and_await().await?;
+        todo!();
 
         todo!()
     }

@@ -115,8 +115,8 @@ impl RoutingTable {
         }
     }
 
-    pub fn find_closest(&self, target: &NodeId) -> Vec<&Node> {
-        let mut closest_nodes: Vec<(BigUint, &Node)> = self
+    pub fn find_closest(&self, target: &NodeId) -> Vec<&CompactNodeContact> {
+        let mut closest_nodes: Vec<_> = self
             .buckets
             .iter()
             .map(|bucket| {
@@ -131,7 +131,7 @@ impl RoutingTable {
                         i += 1;
                     }
 
-                    (BigUint::from_bytes_be(&distance), node)
+                    (BigUint::from_bytes_be(&distance), &node.contact)
                 })
             })
             .flatten()
