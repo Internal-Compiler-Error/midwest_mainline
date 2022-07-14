@@ -1,9 +1,26 @@
 use num_bigint::BigUint;
-use serde_with::{serde_as, Bytes};
+use serde_with::{Bytes, serde_as};
 use serde::{Deserialize, Serialize};
-use crate::message::query::{AnnouncePeerArgs, FindNodeArgs, GetPeersArgs, PingArgs};
-use crate::message::response::{FindNodeResponseBody, GetPeersSuccessResponseBody, PingAnnouncePeerResponseBody};
+use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
+use find_node_query::{FindNodeArgs, FindNodeQuery};
+use find_node_response::{FindNodeResponse, FindNodeResponseBody};
+use get_peers_deferred_response::GetPeersDeferredResponse;
+use get_peers_query::{GetPeersArgs, GetPeersQuery};
+use get_peers_success_response::GetPeersSuccessResponse;
+use ping_announce_peer_response::{PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
+use ping_query::PingArgs;
+use get_peers_success_response::GetPeersSuccessResponseBody;
 use crate::domain_knowledge::{CompactPeerContact, NodeId};
+use crate::message::ping_query::PingQuery;
+
+pub mod ping_query;
+pub mod find_node_query;
+pub mod get_peers_query;
+pub mod announce_peer_query;
+pub mod ping_announce_peer_response;
+pub mod find_node_response;
+pub mod get_peers_success_response;
+pub mod get_peers_deferred_response;
 
 
 pub type InfoHash = [u8; 20];
@@ -21,144 +38,12 @@ pub enum Krpc {
     GetPeersSuccessResponse(GetPeersSuccessResponse),
     GetPeersDeferredResponse(GetPeersDeferredResponse),
     PingAnnouncePeerResponse(PingAnnouncePeerResponse),
-    Error(ErrorMessage),
+    Error(Error),
 }
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PingQuery {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "q")]
-    pub(crate) query_method: QueryMethod,
-
-    #[serde(rename = "a")]
-    pub(crate) body: PingArgs,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FindNodeQuery {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "q")]
-    pub(crate) query_method: QueryMethod,
-
-    #[serde(rename = "a")]
-    pub(crate) body: FindNodeArgs,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FindNodeResponse {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "r")]
-    pub(crate) body: FindNodeResponseBody,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetPeersQuery {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "q")]
-    pub(crate) query_method: QueryMethod,
-
-    #[serde(rename = "a")]
-    pub(crate) body: GetPeersArgs,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetPeersSuccessResponse {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "r")]
-    pub(crate) body: response::GetPeersSuccessResponseBody,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetPeersDeferredResponse {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "r")]
-    pub(crate) body: response::GetPeersDeferredResponseBody,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnouncePeerQuery {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "q")]
-    pub(crate) query_method: QueryMethod,
-
-    #[serde(rename = "a")]
-    pub(crate) body: AnnouncePeerArgs,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PingAnnouncePeerResponse {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "r")]
-    pub(crate) body: response::PingAnnouncePeerResponseBody,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorMessage {
+pub struct Error {
     #[serde_as(as = "Bytes")]
     #[serde(rename = "t")]
     pub(crate) transaction_id: TransactionId,
@@ -373,7 +258,7 @@ impl Krpc {
         let get_peers_deferred_response = GetPeersDeferredResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
-            body: response::GetPeersDeferredResponseBody {
+            body: get_peers_deferred_response::GetPeersDeferredResponseBody {
                 id: responding_id,
                 token: response_token,
                 nodes: closest_nodes,
@@ -387,7 +272,7 @@ impl Krpc {
         let announce_peer_response = PingAnnouncePeerResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
-            body: response::PingAnnouncePeerResponseBody {
+            body: PingAnnouncePeerResponseBody {
                 id: responding_id,
             },
         };
@@ -427,102 +312,6 @@ impl Krpc {
     }
 }
 
-pub mod query {
-    use super::*;
-    use serde::Serialize;
-
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct PingArgs {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-    }
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FindNodeArgs {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-
-        #[serde_as(as = "Bytes")]
-        pub target: NodeId,
-    }
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GetPeersArgs {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-
-        #[serde_as(as = "Bytes")]
-        pub info_hash: InfoHash,
-    }
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct AnnouncePeerArgs {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-        pub implied_port: u8,
-
-        #[serde_as(as = "Bytes")]
-        pub info_hash: InfoHash,
-        pub port: u16,
-
-        #[serde_as(as = "Bytes")]
-        pub token: Token,
-    }
-}
-
-pub mod response {
-    use crate::domain_knowledge::CompactNodeContact;
-    use super::*;
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    // ping and announce peer response look exactly the same, no can't distinguish them by just
-    // looking at the fields
-    pub struct PingAnnouncePeerResponseBody {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-    }
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FindNodeResponseBody {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-
-        #[serde_as(as = "Bytes")]
-        pub nodes: Box<[u8]>,
-    }
-
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GetPeersSuccessResponseBody {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-
-        #[serde_as(as = "Bytes")]
-        pub token: Token,
-
-        pub values: Vec<CompactPeerContact>,
-    }
-
-    #[serde_as]
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GetPeersDeferredResponseBody {
-        #[serde_as(as = "Bytes")]
-        pub id: NodeId,
-
-        #[serde_as(as = "Bytes")]
-        pub token: Token,
-
-        pub nodes: Box<[u8]>,
-    }
-}
 
 #[cfg(test)]
 mod test {
@@ -559,7 +348,7 @@ mod test {
 
     mod serializing {
         use super::*;
-        use bendy::serde::{to_bytes};
+        use bendy::serde::to_bytes;
 
         #[test]
         fn serialize_ping_query() {
