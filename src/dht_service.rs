@@ -11,6 +11,7 @@ use crate::{
     utils::ParSpawnAndAwait,
 };
 use async_recursion::async_recursion;
+use derive_more::Unwrap;
 use either::Either;
 use futures::future::join_all;
 use num_bigint::BigUint;
@@ -36,7 +37,7 @@ use tokio::{
     runtime::{Handle, Runtime},
     spawn,
     sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
-    task::{self, JoinHandle},
+    task::{self, JoinError, JoinHandle},
     time::{error::Elapsed, timeout},
 };
 use tower::Service;
@@ -66,13 +67,32 @@ struct DhtServiceFailure {
 }
 
 #[derive(Debug)]
-struct BottomedOut;
+pub enum RecursiveSearchError {
+    BottomedOut,
+    Cancelled,
+    JoinError,
+    DhtServiceFailure,
+}
 
-impl Display for BottomedOut {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Bottomed out")
+impl From<DhtServiceFailure> for RecursiveSearchError {
+    fn from(error: DhtServiceFailure) -> Self {
+        RecursiveSearchError::DhtServiceFailure
     }
 }
+
+impl From<JoinError> for RecursiveSearchError {
+    fn from(error: JoinError) -> Self {
+        RecursiveSearchError::JoinError
+    }
+}
+
+impl Display for RecursiveSearchError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for RecursiveSearchError {}
 
 impl Display for DhtServiceFailure {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -342,7 +362,7 @@ impl DhtServiceInnerV4 {
 
         // if we don't have the node, then we find the alpha closest nodes and ask them in turn
         let mut sorted_by_distance: Vec<_> = returned_nodes
-            .iter()
+            .into_iter()
             .flatten()
             .map(|node| {
                 let node_id = BigUint::from_bytes_be(node.node_id());
@@ -354,28 +374,53 @@ impl DhtServiceInnerV4 {
             .collect();
         sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
 
-        let recursive_find = sorted_by_distance
-            .into_iter()
-            .take(3)
-            .map(|(node, _)| self.recursive_find(target, node, 32))
-            .collect::<Vec<_>>();
+        // add all the nodes we have visited so far
+        let mut seen_node: Arc<Mutex<HashSet<CompactNodeContact>>> = Arc::new(Mutex::new(HashSet::new()));
+        {
+            let mut seen = seen_node.lock().await;
+            sorted_by_distance.iter().for_each(|(node, _)| {
+                seen.insert(node.clone());
+            });
+        }
 
-        todo!();
+        let (tx, rx) = oneshot::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
 
-        todo!()
+        let starting_pool: Vec<CompactNodeContact> =
+            sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
+
+        let dht = self.clone();
+        let target = target.clone();
+        let mut parallel_find = tokio::spawn(async move {
+            dht.recurse_find_from_pool(starting_pool, target.clone(), seen_node, tx)
+                .await;
+        });
+
+        tokio::select! {
+             _ = &mut parallel_find => {
+                Err(DhtServiceFailure {
+                    message: "Could not find node, all nodes requests ended in failure".to_string(),
+                })
+            },
+            target = rx => {
+                parallel_find.abort();
+                Ok(target.unwrap())
+            },
+        }
     }
 
     #[async_recursion]
     #[instrument]
     /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
-    /// looking for
+    /// looking for, the target return is observed via the slot variable, once it has been filled,
+    /// the caller should drop the future to cancel all remaining tasks
     async fn recurse_find_from_pool(
         self: Arc<Self>,
         mut starting_pool: Vec<CompactNodeContact>,
         finding: NodeId,
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
         slot: Arc<Mutex<Option<Sender<CompactNodeContact>>>>,
-    ) -> Result<(), BottomedOut> {
+    ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
             let mut seen = seen.lock().await;
@@ -389,41 +434,48 @@ impl DhtServiceInnerV4 {
         // it's ok to assume that this will never get hit for the first time, since the starting
         // pool is always unseen
         if starting_pool.len() == 0 {
-            return Err(BottomedOut);
+            return Err(RecursiveSearchError::BottomedOut);
         }
 
         // ask all the nodes for target!
-        starting_pool.into_iter().map(|node| {
-            let seen = seen.clone();
-            let dht = self.clone();
-            let slot = slot.clone();
-            async move {
-                let response = dht.ask_her_for_nodes((&node).into(), finding).await?;
+        let parallel_tasks: Vec<_> = starting_pool
+            .into_iter()
+            .map(|starting_node| {
+                let seen = seen.clone();
+                let dht = self.clone();
+                let slot = slot.clone();
+                async move {
+                    let returned_nodes = dht.clone().ask_her_for_nodes((&starting_node).into(), finding).await?;
 
-                // see if we got the node we're looking for
-                if let Some(node) = response.iter().find(|node| node.node_id() == &finding) {
-                    // if we did, then we're done
-                    let mut slot = slot.lock().await;
+                    // see if we got the node we're looking for
+                    return if let Some(node) = returned_nodes.iter().find(|node| node.node_id() == &finding) {
+                        // if we did, then we're done
+                        let mut slot = slot.lock().await;
+                        let slot = slot.deref_mut();
+                        // lock the sender and sent the value
+                        if let Some(sender) = slot {
+                            let slot = slot.take();
+                            slot.expect("some one else should ready have ").send(node.clone());
+                            Ok(())
+                        } else {
+                            Err(RecursiveSearchError::Cancelled)
+                        }
+                    } else {
+                        // if we didn't, then we add the nodes we got to the seen list and recurse
+                        seen.lock().await.insert(starting_node.clone());
 
-                    let huh = slot.deref_mut();
-
-                    if let Some(sender) = huh {
-                        let slot = huh.take();
-                        slot.unwrap().send(node.clone());
-                    }
-
-                    return Ok(());
-                } else {
-                    seen.lock().await.insert(node.clone());
+                        dht.recurse_find_from_pool(returned_nodes, finding, seen, slot).await
+                    };
                 }
+            })
+            .collect();
 
-                seen.lock().await;
+        // spawn all the tasks and await them
+        let results = parallel_tasks.par_spawn_and_await().await?;
 
-                Ok::<_, Box<dyn Error>>(())
-            }
-        });
-
-        todo!()
+        // if we ever reach here, that means we haven't been cancelled, which means nothing were
+        // found
+        Err(RecursiveSearchError::BottomedOut)
     }
 
     #[async_recursion]
@@ -563,9 +615,10 @@ impl DhtServiceV4 {
                 let dht = dht.clone();
 
                 let recursive_find_with_timeout = tokio::spawn(async move {
-                    if let Ok(node) = timeout(Duration::from_secs(15), dht.recursive_find(&our_id, &node, 64)).await {
+                    if let Ok(Ok(node)) = timeout(Duration::from_secs(15), dht.recursive_find(&our_id, &node, 64)).await
+                    {
                         trace!("found node {:?}", node);
-                        return Some(node.unwrap());
+                        return Some(node);
                     } else {
                         trace!("failed to contact {:?}, timed out", node_ip);
                         None
@@ -578,16 +631,22 @@ impl DhtServiceV4 {
             info!("finished attempt to bootstrap with {:?}", contact);
         }
     }
+
+    async fn find_node(&self, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
+        let dht = self.inner.clone();
+        dht.find_node(target).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::dht_service::DhtServiceV4;
     use num_bigint::BigUint;
-    use rand::RngCore;
+    use rand::{Rng, RngCore};
     use std::{
         net::{Ipv4Addr, SocketAddrV4},
         str::FromStr,
+        sync::Arc,
     };
     use tokio::{
         net::{self, UdpSocket},
@@ -619,15 +678,28 @@ mod tests {
             ],
         );
 
-        let dht = timeout(time::Duration::from_secs(60), dht).await?;
-        let dht = dht?;
-
+        let dht = timeout(time::Duration::from_secs(60), dht).await??;
         info!("Now I'm bootstrapped!");
-        let table = dht.inner.routing_table.read().await;
-        info!(
-            "we've found {:?} nodes and recorded in our routing table",
-            table.node_count()
-        );
+        {
+            let table = dht.inner.routing_table.read().await;
+            info!(
+                "we've found {:?} nodes and recorded in our routing table",
+                table.node_count()
+            );
+        }
+
+        let dht = Arc::new(dht);
+
+        let mut rng = rand::thread_rng();
+        let mut bytes = [0u8; 20];
+        rng.fill_bytes(&mut bytes);
+
+        let node = dht.find_node(&bytes).await;
+        if let Ok(node) = node {
+            info!("found node {:?}", node);
+        } else {
+            info!("I guess we just didn't find anything")
+        }
 
         Ok(())
     }
