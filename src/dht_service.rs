@@ -1,11 +1,11 @@
 use crate::{
     dht_service::transaction_id_pool::TransactionIdPool,
-    domain_knowledge::{CompactNodeContact, NodeId},
+    domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
     message::{
         announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, find_node_response::FindNodeResponse,
         get_peers_deferred_response::GetPeersDeferredResponse, get_peers_query::GetPeersQuery,
         get_peers_success_response::GetPeersSuccessResponse, ping_announce_peer_response::PingAnnouncePeerResponse,
-        ping_query::PingQuery, Krpc,
+        ping_query::PingQuery, InfoHash, Krpc, Token,
     },
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -250,28 +250,27 @@ impl DhtServiceInnerV4 {
         Ok(response)
     }
 
-    // async fn ping(&self, recipient: &SocketAddrV4) -> Result<(), DhtServiceFailure> {
-    //     let transaction_id = self.transaction_id_pool.next();
-    //     let ping_msg = Message::new_ping_query(transaction_id.to_be_bytes(), &self.id);
-    //
-    //     let response = self.send_message(&ping_msg, recipient).await?;
-    //
-    //     if response.message_type == MessageType::Response {
-    //         if let MessageBody::Response(ResponseBody::Ping(ping_response)) = response.body {
-    //             self.routing_table.write().await.add_node(ping_response.);
-    //         } else {
-    //             return Err(DhtServiceFailure {
-    //                 message: "received a response that was not a ping response".to_string(),
-    //             });
-    //         }
-    //     } else {
-    //         return Err(DhtServiceFailure {
-    //             message: "expected a ping response".to_string(),
-    //         });
-    //     }
-    //
-    //     Ok(())
-    // }
+    async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
+        let this = &self;
+        let transaction_id = self.transaction_id_pool.next();
+        let ping_msg = Krpc::new_ping_query(transaction_id.to_be_bytes(), this.our_id);
+
+        let response = self.send_message(&ping_msg, &recipient).await?;
+
+        return if let Krpc::PingAnnouncePeerResponse(response) = response {
+            this.routing_table
+                .write()
+                .await
+                .add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &recipient));
+
+            Ok(())
+        } else {
+            warn!("Unexpected response to ping: {:?}", response);
+            Err(DhtServiceFailure {
+                message: "Unexpected response to ping".to_string(),
+            })
+        };
+    }
 
     // you peers means something special here so you can't use it
     // ask_node_for_nodes just sounds stupid so fuck it, it's her then.
@@ -312,6 +311,58 @@ impl DhtServiceInnerV4 {
                 message: "Did not get an find node response".to_string(),
             })
         }
+    }
+
+    async fn ask_her_for_peers(
+        self: Arc<Self>,
+        interlocutor: SocketAddrV4,
+        target: InfoHash,
+    ) -> Result<(Token, Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>), DhtServiceFailure> {
+        // construct the message to query our friends
+        let transaction_id = self.transaction_id_pool.next();
+        let query = Krpc::new_get_peers_query(transaction_id.to_be_bytes(), self.our_id, target);
+
+        // send the message and await for a response
+        let time_out = Duration::from_secs(5);
+        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+
+        return match response {
+            Krpc::GetPeersDeferredResponse(response) => {
+                // make sure we don't get duplicate nodes
+                let mut nodes: Vec<_> = response
+                    .body
+                    .nodes
+                    .windows(26)
+                    .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
+                    .collect();
+
+                // todo: define an order for nodes??
+                // nodes.sort_unstable_by_key(|node| node.into());
+                nodes.dedup();
+
+                Ok((response.body.token, Either::Left(nodes)))
+            }
+            Krpc::GetPeersSuccessResponse(response) => {
+                let mut values = response.body.values;
+                // todo: define an order for nodes??
+                // values.sort_unstable_by_key(|value| value.into());
+                values.dedup();
+
+                Ok((response.body.token, Either::Right(values)))
+            }
+            Krpc::Error(response) => {
+                warn!("Got an error response to get peers: {:?}", response);
+                Err(DhtServiceFailure {
+                    message: "Got an error response to get peers".to_string(),
+                })
+            }
+            other => {
+                warn!("Unexpected response to get peers: {:?}", other);
+                Err(DhtServiceFailure {
+                    message: "Unexpected response to get peers".to_string(),
+                })
+            }
+        };
     }
 
     /// starting point of trying to find any nodes on the network
@@ -480,6 +531,72 @@ impl DhtServiceInnerV4 {
 
     #[async_recursion]
     #[instrument]
+    async fn recursive_get_peers_from_pool(
+        self: Arc<Self>,
+        mut starting_pool: Vec<CompactNodeContact>,
+        finding: InfoHash,
+        seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
+        slot: Arc<Mutex<Option<Sender<(Token, Vec<CompactPeerContact>)>>>>,
+    ) -> Result<(), RecursiveSearchError> {
+        // filter the pool to only include nodes that we haven't seen yet
+        starting_pool = async {
+            let seen = seen.lock().await;
+            starting_pool
+                .into_iter()
+                .filter(|node| !seen.contains(&node))
+                .collect::<Vec<_>>()
+        }
+        .await;
+
+        if starting_pool.len() == 0 {
+            return Err(RecursiveSearchError::BottomedOut);
+        }
+
+        // ask all the nodes for target!
+        let parallel_tasks: Vec<_> = starting_pool
+            .into_iter()
+            .map(|starting_node| {
+                let seen = seen.clone();
+                let dht = self.clone();
+                let slot = slot.clone();
+                async move {
+                    let (token, returned) = dht.clone().ask_her_for_peers((&starting_node).into(), finding).await?;
+
+                    return match returned {
+                        Either::Left(mut deferred) => {
+                            // make sure we don't get duplicate nodes
+                            deferred.dedup();
+                            {
+                                let mut seen = seen.lock().await;
+                                seen.insert(starting_node.clone());
+                            }
+
+                            dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
+                        }
+                        Either::Right(mut success) => {
+                            let mut slot = slot.lock().await;
+                            let slot = slot.take();
+
+                            match slot {
+                                Some(sender) => {
+                                    sender.send((token, success));
+                                    Ok(())
+                                }
+                                None => Err(RecursiveSearchError::Cancelled),
+                            }
+                        }
+                    };
+                }
+            })
+            .collect();
+
+        // spawn all the tasks and await them
+        let results = parallel_tasks.par_spawn_and_await().await?;
+        Err(RecursiveSearchError::BottomedOut)
+    }
+
+    #[async_recursion]
+    #[instrument]
     async fn recursive_find(
         &self,
         target: &NodeId,
@@ -535,6 +652,43 @@ impl DhtServiceInnerV4 {
         }
 
         unreachable!()
+    }
+
+    /// obtain all the peers that c
+    pub async fn get_peers(
+        self: Arc<Self>,
+        info_hash: InfoHash,
+    ) -> Result<(Token, Vec<CompactPeerContact>), DhtServiceFailure> {
+        // get all the closest nodes to the info_hash
+        let closest_nodes: Vec<_> = self
+            .routing_table
+            .read()
+            .await
+            .find_closest(&info_hash)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let seen = Arc::new(Mutex::new(HashSet::new()));
+        let (tx, rx) = oneshot::channel();
+        let slot = Arc::new(Mutex::new(Some(tx)));
+
+        let mut search = tokio::spawn(async move {
+            self.recursive_get_peers_from_pool(closest_nodes, info_hash.clone(), seen.clone(), slot.clone())
+                .await
+        });
+
+        return tokio::select! {
+            _ = &mut search => {
+                Err(DhtServiceFailure {
+                    message: "search all failed".to_string(),
+                })
+            }
+            result = rx => {
+                search.abort();
+                Ok(result.unwrap())
+            }
+        };
     }
 }
 

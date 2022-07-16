@@ -14,12 +14,7 @@ pub struct CompactNodeContact {
 
 impl Into<SocketAddrV4> for &CompactNodeContact {
     fn into(self) -> SocketAddrV4 {
-        let ip = Ipv4Addr::new(
-            self.bytes[20],
-            self.bytes[21],
-            self.bytes[22],
-            self.bytes[23],
-        );
+        let ip = Ipv4Addr::new(self.bytes[20], self.bytes[21], self.bytes[22], self.bytes[23]);
         let port = u16::from_be_bytes([self.bytes[24], self.bytes[25]]);
 
         SocketAddrV4::new(ip, port)
@@ -54,4 +49,19 @@ impl CompactNodeContact {
 pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
     bytes: [u8; 6],
+}
+
+impl Into<SocketAddrV4> for &CompactPeerContact {
+    fn into(self) -> SocketAddrV4 {
+        let ip = Ipv4Addr::new(self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]);
+        let port = u16::from_be_bytes([self.bytes[4], self.bytes[5]]);
+
+        SocketAddrV4::new(ip, port)
+    }
+}
+
+impl Into<SocketAddrV4> for CompactPeerContact {
+    fn into(self) -> SocketAddrV4 {
+        (&self).into()
+    }
 }
