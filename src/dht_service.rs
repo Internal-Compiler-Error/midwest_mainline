@@ -323,7 +323,13 @@ impl DhtServiceInnerV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: InfoHash,
-    ) -> Result<(Option<Box<[u8]>>, Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>), DhtServiceFailure> {
+    ) -> Result<
+        (
+            Option<Box<[u8]>>,
+            Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
+        ),
+        DhtServiceFailure,
+    > {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
@@ -332,7 +338,6 @@ impl DhtServiceInnerV4 {
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
         let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
-        info!("{:?}", &response);
         return match response {
             Krpc::GetPeersDeferredResponse(response) => {
                 // make sure we don't get duplicate nodes
@@ -347,10 +352,10 @@ impl DhtServiceInnerV4 {
                 // nodes.sort_unstable_by_key(|node| node.into());
                 nodes.dedup();
 
-                info!(
-                    "got a deferred response from {}, returned nodes size {}",
+                trace!(
+                    "got a deferred response from {}, returned nodes: {:#?}",
                     interlocutor,
-                    nodes.len()
+                    &nodes
                 );
                 Ok((Some(response.body.token), Either::Left(nodes)))
             }
@@ -366,10 +371,10 @@ impl DhtServiceInnerV4 {
                 // todo: define an order for nodes??
                 // nodes.sort_unstable_by_key(|node| node.into());
                 nodes.dedup();
-                info!(
-                    "got a deferred response from {} (token missing), returned nodes size {}",
+                trace!(
+                    "got a deferred response from {} (token missing), returned nodes {:#?}",
                     interlocutor,
-                    nodes.len()
+                    &nodes
                 );
 
                 Ok((None, Either::Left(nodes)))
@@ -380,7 +385,7 @@ impl DhtServiceInnerV4 {
                 // values.sort_unstable_by_key(|value| value.into());
                 values.dedup();
 
-                info!("got a success response from {}", interlocutor);
+                trace!("got a success response from {}, values {:#?}", interlocutor, &values);
                 Ok((Some(response.body.token), Either::Right(values)))
             }
             Krpc::Error(response) => {
@@ -390,7 +395,7 @@ impl DhtServiceInnerV4 {
                 })
             }
             other => {
-                panic!("Unexpected response to get peers: {:?}", other);
+                warn!("Unexpected response to get peers: {:?}", other);
                 Err(DhtServiceFailure {
                     message: "Unexpected response to get peers".to_string(),
                 })
@@ -610,7 +615,7 @@ impl DhtServiceInnerV4 {
                             dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
                         }
                         Either::Right(mut success) => {
-                            info!("got success response, {success:#?}");
+                            trace!("got success response, {success:#?}");
                             let mut slot = slot.lock().await;
                             let slot = slot.take();
 
@@ -723,12 +728,12 @@ impl DhtServiceInnerV4 {
                 })
             }
             Ok(result) = &mut rx => {
-                eprintln!("are all the tasks done = {:?}", search.is_finished());
+                trace!("Received peers from channel, cancelling search");
                 search.abort();
-                Ok(dbg!(result))
+                Ok(result)
             }
             else => {
-                eprintln!("are all the tasks done = {:?}", search.is_finished());
+                warn!("are all the tasks done = {:?}", search.is_finished());
                 eprintln!("rx = {:?}",rx);
                 panic!()
             }
