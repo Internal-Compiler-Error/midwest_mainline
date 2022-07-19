@@ -1,5 +1,5 @@
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
-use num_bigint::BigUint;
+use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
 
 #[derive(Debug)]

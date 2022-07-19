@@ -48,7 +48,7 @@ impl CompactNodeContact {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
-    bytes: [u8; 6],
+    pub(crate) bytes: [u8; 6],
 }
 
 impl Into<SocketAddrV4> for &CompactPeerContact {

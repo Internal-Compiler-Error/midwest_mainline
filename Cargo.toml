@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-num-bigint = "^0.4"
+num = { version = "^0.4", features = ["alloc"] }
 bendy = { version = "^0.3", features = ["serde", "serde_bytes"] }
 serde = { version = "^1.0", features = ["derive"] }
 serde_with = "^1.14"
@@ -27,3 +27,4 @@ async-trait = "^0.1"
 serde_json = "^1.0"
 console-subscriber = "^0.1.6"
 tracing-subscriber = "^0.3"
+hex = "^0.4"
