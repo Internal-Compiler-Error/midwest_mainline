@@ -1,15 +1,25 @@
 use rand::Fill;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 pub type NodeId = [u8; 20];
 
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
     bytes: [u8; 26],
+}
+
+impl Debug for CompactNodeContact {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let ip: SocketAddrV4 = self.into();
+        write!(f, "id: {}, ip =  {ip}", hex::encode(&self.bytes[0..20]))
+    }
 }
 
 impl Into<SocketAddrV4> for &CompactNodeContact {

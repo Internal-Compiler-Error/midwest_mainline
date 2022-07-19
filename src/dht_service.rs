@@ -2,10 +2,11 @@ use crate::{
     dht_service::transaction_id_pool::TransactionIdPool,
     domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
     message::{
-        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, find_node_get_peers_non_compliant_response::FindNodeGetPeersNonCompliantResponse,
-        get_peers_deferred_response::GetPeersDeferredResponse, get_peers_query::GetPeersQuery,
-        get_peers_success_response::GetPeersSuccessResponse, ping_announce_peer_response::PingAnnouncePeerResponse,
-        ping_query::PingQuery, InfoHash, Krpc, Token,
+        announce_peer_query::AnnouncePeerQuery,
+        find_node_get_peers_non_compliant_response::FindNodeGetPeersNonCompliantResponse,
+        find_node_query::FindNodeQuery, get_peers_deferred_response::GetPeersDeferredResponse,
+        get_peers_query::GetPeersQuery, get_peers_success_response::GetPeersSuccessResponse,
+        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, InfoHash, Krpc, Token,
     },
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -15,7 +16,7 @@ use derive_more::Unwrap;
 use either::Either;
 use futures::future::join_all;
 use num::BigUint;
-use rand::{rngs, rngs::SmallRng, Rng, RngCore, SeedableRng};
+use rand::{rngs, rngs::SmallRng, thread_rng, Rng, RngCore, SeedableRng};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -184,12 +185,10 @@ impl From<tokio::task::JoinError> for DhtServiceFailure {
 impl DhtServiceInnerV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
-    async fn new_with_random_id(address: SocketAddrV4) -> Result<Self, DhtServiceFailure> {
-        let socket = UdpSocket::bind(&address).await?;
+    async fn new_with_random_id(bind_addr: SocketAddrV4, external_addr: Ipv4Addr) -> Result<Self, DhtServiceFailure> {
+        let socket = UdpSocket::bind(&bind_addr).await?;
 
-        // randomly pick our ID
-        let mut id = [0u8; 20];
-        rand::thread_rng().fill_bytes(&mut id);
+        let id = random_idv4(&external_addr, rand::thread_rng().gen::<u8>());
 
         let socket = Arc::new(socket);
         let routing_table = RoutingTable::new(&id);
@@ -236,7 +235,7 @@ impl DhtServiceInnerV4 {
             request_registry: message_registry,
             our_id: id,
             routing_table: RwLock::new(routing_table),
-            socket_address: address,
+            socket_address: bind_addr,
             transaction_id_pool: TransactionIdPool::new(),
             helper_tasks: vec![handle1, handle2],
         })
@@ -291,7 +290,7 @@ impl DhtServiceInnerV4 {
         let query = Krpc::new_find_node_query(transaction_id.to_be_bytes(), self.our_id, target);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(5);
+        let time_out = Duration::from_secs(15);
         let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
 
         if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
@@ -319,28 +318,28 @@ impl DhtServiceInnerV4 {
         }
     }
 
+    #[instrument(skip(self))]
     async fn ask_her_for_peers(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: InfoHash,
     ) -> Result<(Option<Token>, Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>), DhtServiceFailure> {
-        debug!("Asking {:?} for peers for {:?}", interlocutor, target);
+        // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
         let query = Krpc::new_get_peers_query(transaction_id.to_be_bytes(), self.our_id, target);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(5);
+        let time_out = Duration::from_secs(15);
         let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
-        debug!("we got a response from get_peers: {:?}", response);
+        info!("{:?}", &response);
         return match response {
             Krpc::GetPeersDeferredResponse(response) => {
-                debug!("got a deferred response");
                 // make sure we don't get duplicate nodes
                 let mut nodes: Vec<_> = response
                     .body
                     .nodes
-                    .windows(26)
+                    .chunks_exact(26)
                     .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
                     .collect();
 
@@ -348,31 +347,40 @@ impl DhtServiceInnerV4 {
                 // nodes.sort_unstable_by_key(|node| node.into());
                 nodes.dedup();
 
+                info!(
+                    "got a deferred response from {}, returned nodes size {}",
+                    interlocutor,
+                    nodes.len()
+                );
                 Ok((Some(response.body.token), Either::Left(nodes)))
             }
             Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
-                debug!("got a deferred response but missing the token");
                 // make sure we don't get duplicate nodes
                 let mut nodes: Vec<_> = response
                     .body
                     .nodes
-                    .windows(26)
+                    .chunks_exact(26)
                     .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
                     .collect();
 
                 // todo: define an order for nodes??
                 // nodes.sort_unstable_by_key(|node| node.into());
                 nodes.dedup();
+                info!(
+                    "got a deferred response from {} (token missing), returned nodes size {}",
+                    interlocutor,
+                    nodes.len()
+                );
 
                 Ok((None, Either::Left(nodes)))
             }
             Krpc::GetPeersSuccessResponse(response) => {
-                debug!("got a success response");
                 let mut values = response.body.values;
                 // todo: define an order for nodes??
                 // values.sort_unstable_by_key(|value| value.into());
                 values.dedup();
 
+                info!("got a success response from {}", interlocutor);
                 Ok((Some(response.body.token), Either::Right(values)))
             }
             Krpc::Error(response) => {
@@ -478,15 +486,15 @@ impl DhtServiceInnerV4 {
                     message: "Could not find node, all nodes requests ended in failure".to_string(),
                 })
             },
-            target = rx => {
+            Ok(target) = rx => {
                 parallel_find.abort();
-                Ok(target.unwrap())
+                Ok(target)
             },
         }
     }
 
     #[async_recursion]
-    #[instrument]
+    #[instrument(skip_all)]
     /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
     /// looking for, the target return is observed via the slot variable, once it has been filled,
     /// the caller should drop the future to cancel all remaining tasks
@@ -555,7 +563,7 @@ impl DhtServiceInnerV4 {
     }
 
     #[async_recursion]
-    #[instrument]
+    #[instrument(skip_all)]
     async fn recursive_get_peers_from_pool(
         self: Arc<Self>,
         mut starting_pool: Vec<CompactNodeContact>,
@@ -572,6 +580,7 @@ impl DhtServiceInnerV4 {
                 .collect::<Vec<_>>()
         }
         .await;
+        info!("Starting pool size: {:?}", starting_pool.len());
 
         if starting_pool.len() == 0 {
             debug!("bottomed out");
@@ -590,7 +599,7 @@ impl DhtServiceInnerV4 {
 
                     return match returned {
                         Either::Left(mut deferred) => {
-                            debug!("got deferred response, {deferred:?}");
+                            info!("got deferred response, {deferred:#?}");
                             // make sure we don't get duplicate nodes
                             deferred.dedup();
                             {
@@ -601,7 +610,7 @@ impl DhtServiceInnerV4 {
                             dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
                         }
                         Either::Right(mut success) => {
-                            debug!("got success response, {success:?}");
+                            info!("got success response, {success:#?}");
                             let mut slot = slot.lock().await;
                             let slot = slot.take();
 
@@ -621,12 +630,11 @@ impl DhtServiceInnerV4 {
         // spawn all the tasks and await them
         debug!("spawning {} tasks", parallel_tasks.len());
         let results = parallel_tasks.par_spawn_and_await().await?;
-        debug!("we're back?? this is very worrying");
         Err(RecursiveSearchError::BottomedOut)
     }
 
     #[async_recursion]
-    #[instrument]
+    #[instrument(skip_all)]
     async fn recursive_find(
         &self,
         target: &NodeId,
@@ -648,7 +656,7 @@ impl DhtServiceInnerV4 {
         if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
             let nodes = response.body.nodes;
             let mut nodes: Vec<_> = nodes
-                .windows(26)
+                .chunks_exact(26)
                 .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
                 .collect();
 
@@ -710,9 +718,8 @@ impl DhtServiceInnerV4 {
 
         return tokio::select! {
             _ = &mut search => {
-                debug!("you can't be seriously telling me the search is finished??? {:?}", search.is_finished());
                 Err(DhtServiceFailure {
-                    message: "search all failed".to_string(),
+                    message: "all branches in get peers failed".to_string(),
                 })
             }
             Ok(result) = &mut rx => {
@@ -736,13 +743,39 @@ impl Drop for DhtServiceInnerV4 {
     }
 }
 
+fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
+    let mut rng = rand::thread_rng();
+    let r = rand & 0x07;
+    let mut id = [0u8; 20];
+    let mut ip = external_ip.octets();
+    let mask = [0x03, 0x0f, 0x3f, 0xff];
+
+    for (ip, mask) in ip.iter_mut().zip(mask.iter()) {
+        *ip &= mask;
+    }
+
+    ip[0] |= r << 5;
+    let crc = crc32c::crc32c(&ip);
+
+    id[0] = (crc >> 24) as u8;
+    id[1] = (crc >> 16) as u8;
+    id[2] = (((crc >> 8) & 0xf8) as u8) | (rng.gen::<u8>() & 0x7);
+
+    rng.fill_bytes(&mut id[3..19]);
+
+    id[19] = rand;
+
+    id
+}
+
 impl DhtServiceV4 {
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn bootstrap_with_random_id(
-        address: SocketAddrV4,
+        bind_addr: SocketAddrV4,
+        external_addr: Ipv4Addr,
         known_nodes: Vec<SocketAddrV4>,
     ) -> Result<Self, DhtServiceFailure> {
-        let inner = DhtServiceInnerV4::new_with_random_id(address).await?;
+        let inner = DhtServiceInnerV4::new_with_random_id(bind_addr, external_addr).await?;
         let inner = Arc::new(inner);
         let dht = Self { inner: inner.clone() };
 
@@ -758,7 +791,7 @@ impl DhtServiceV4 {
         Ok(dht)
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     async fn bootstrap_single(dht: Arc<DhtServiceInnerV4>, contact: SocketAddrV4) {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
@@ -783,7 +816,7 @@ impl DhtServiceV4 {
         if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
             let nodes = response.body.nodes;
             let mut nodes: Vec<_> = nodes
-                .windows(26)
+                .chunks_exact(26)
                 .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
                 .collect();
             {
@@ -831,11 +864,11 @@ impl DhtServiceV4 {
 
 #[cfg(test)]
 mod tests {
-    use crate::dht_service::DhtServiceV4;
+    use crate::dht_service::{random_idv4, DhtServiceV4};
     use num::{BigUint, Num};
     use rand::{Rng, RngCore};
     use std::{
-        net::{Ipv4Addr, SocketAddrV4},
+        net::{IpAddr, Ipv4Addr, SocketAddrV4},
         str::FromStr,
         sync::Arc,
     };
@@ -857,14 +890,17 @@ mod tests {
             .finish();
         set_global_default(fmt_sub);
 
+        let external_ip = public_ip::addr_v4().await.unwrap();
+
         let dht = DhtServiceV4::bootstrap_with_random_id(
             SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+            external_ip,
             vec![
                 // dht.tansmissionbt.com
                 "87.98.162.88:6881".parse().unwrap(),
                 // router.utorrent.com
                 "67.215.246.10:6881".parse().unwrap(),
-                // router.bitcomet.com
+                // router.bittorrent.com, ironically that this almost never responds
                 "82.221.103.244:6881".parse().unwrap(),
             ],
         );
@@ -906,15 +942,16 @@ mod tests {
             .finish();
         set_global_default(fmt_sub);
 
+        let external_ip = public_ip::addr_v4().await.unwrap();
+
         let dht = DhtServiceV4::bootstrap_with_random_id(
             SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+            external_ip,
             vec![
                 // dht.tansmissionbt.com
                 "87.98.162.88:6881".parse().unwrap(),
                 // router.utorrent.com
                 "67.215.246.10:6881".parse().unwrap(),
-                // router.bitcomet.com
-                "82.221.103.244:6881".parse().unwrap(),
             ],
         );
 
