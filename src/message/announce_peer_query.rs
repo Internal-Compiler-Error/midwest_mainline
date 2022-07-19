@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{InfoHash, QueryMethod, Token, TransactionId},
+    message::{InfoHash, QueryMethod, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -27,7 +27,7 @@ impl AnnouncePeerQuery {
     pub fn new(
         transaction_id: TransactionId,
         id: NodeId,
-        token: Token,
+        token: Box<[u8]>,
         port: u16,
         implied_port: bool,
         info_hash: InfoHash,
@@ -59,5 +59,5 @@ pub struct AnnouncePeerArgs {
     pub port: u16,
 
     #[serde_as(as = "Bytes")]
-    pub token: Token,
+    pub token: Box<[u8]>,
 }

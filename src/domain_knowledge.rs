@@ -10,6 +10,7 @@ pub type NodeId = [u8; 20];
 
 #[serde_as]
 #[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Hash)]
+#[serde(transparent)]
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
     bytes: [u8; 26],
@@ -56,9 +57,25 @@ impl CompactNodeContact {
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
     pub(crate) bytes: [u8; 6],
+}
+
+impl From<SocketAddrV4> for CompactPeerContact {
+    fn from(addr: SocketAddrV4) -> Self {
+        (&addr).into()
+    }
+}
+
+impl From<&SocketAddrV4> for CompactPeerContact {
+    fn from(addr: &SocketAddrV4) -> Self {
+        let mut bytes = [0u8; 6];
+        bytes[..4].copy_from_slice(&addr.ip().octets());
+        bytes[4..6].copy_from_slice(&addr.port().to_be_bytes());
+        CompactPeerContact { bytes }
+    }
 }
 
 impl Into<SocketAddrV4> for &CompactPeerContact {

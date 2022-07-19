@@ -6,7 +6,7 @@ use crate::{
         find_node_get_peers_non_compliant_response::FindNodeGetPeersNonCompliantResponse,
         find_node_query::FindNodeQuery, get_peers_deferred_response::GetPeersDeferredResponse,
         get_peers_query::GetPeersQuery, get_peers_success_response::GetPeersSuccessResponse,
-        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, InfoHash, Krpc, Token,
+        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, InfoHash, Krpc,
     },
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -323,7 +323,7 @@ impl DhtServiceInnerV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: InfoHash,
-    ) -> Result<(Option<Token>, Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>), DhtServiceFailure> {
+    ) -> Result<(Option<Box<[u8]>>, Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>), DhtServiceFailure> {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
@@ -569,7 +569,7 @@ impl DhtServiceInnerV4 {
         mut starting_pool: Vec<CompactNodeContact>,
         finding: InfoHash,
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
-        slot: Arc<Mutex<Option<Sender<(Token, Vec<CompactPeerContact>)>>>>,
+        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<CompactPeerContact>)>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -696,7 +696,7 @@ impl DhtServiceInnerV4 {
     pub async fn get_peers(
         self: Arc<Self>,
         info_hash: InfoHash,
-    ) -> Result<(Token, Vec<CompactPeerContact>), DhtServiceFailure> {
+    ) -> Result<(Box<[u8]>, Vec<CompactPeerContact>), DhtServiceFailure> {
         // get all the closest nodes to the info_hash
         let closest_nodes: Vec<_> = self
             .routing_table

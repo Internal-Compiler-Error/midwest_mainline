@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{QueryMethod, Token, TransactionId},
+    message::{QueryMethod, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -27,7 +27,7 @@ pub struct GetPeersDeferredResponseBody {
     pub id: NodeId,
 
     #[serde_as(as = "Bytes")]
-    pub token: Token,
+    pub token: Box<[u8]>,
 
     pub nodes: Box<[u8]>,
 }

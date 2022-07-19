@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::{CompactPeerContact, NodeId},
-    message::{ping_query::PingArgs, QueryMethod, Token, TransactionId},
+    message::{ping_query::PingArgs, QueryMethod, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -27,7 +27,7 @@ pub struct GetPeersSuccessResponseBody {
     pub id: NodeId,
 
     #[serde_as(as = "Bytes")]
-    pub token: Token,
+    pub token: Box<[u8]>,
 
     pub values: Vec<CompactPeerContact>,
 }
