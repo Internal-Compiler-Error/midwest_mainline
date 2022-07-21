@@ -37,8 +37,7 @@ impl RoutingTable {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
-            upper_bound: BigUint::from_str("1461501637330902918203684832716283019655932542976")
-                .unwrap(),
+            upper_bound: BigUint::from_str("1461501637330902918203684832716283019655932542976").unwrap(),
             nodes: Vec::new(),
         };
 
@@ -89,8 +88,7 @@ impl RoutingTable {
                 // do I prefer the draining_filter API? yes but that's sadly nightly only
                 let mut i = 0;
                 while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id =
-                        BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id());
+                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id());
                     if &target_bucket_node_id <= &new_bucket.lower_bound {
                         let node = target_bucket.nodes.remove(i);
                         new_bucket.nodes.push(node);

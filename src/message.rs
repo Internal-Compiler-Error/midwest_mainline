@@ -424,7 +424,7 @@ mod test {
                 403918979a78abacbf3267657c26e095e73f75abf9398e0f6e6bd9a26b5bda70000000000000000000000\
                 0000000000000000005778ea621cb6",
                     )?
-                        .as_slice(),
+                    .as_slice(),
                 ),
                 // Box::from(hex::decode("b8972559c8d6")?.as_slice()),
             );
@@ -447,7 +447,6 @@ mod test {
             // taken directly from the spec
             assert_eq!(bytes, b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe");
         }
-
 
         #[test]
         fn serialize_find_node_query() {
