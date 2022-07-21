@@ -92,3 +92,23 @@ impl Into<SocketAddrV4> for CompactPeerContact {
         (&self).into()
     }
 }
+
+pub(crate) trait ToConcatedNodeContact {
+    fn to_concated_node_contact(&self) -> Box<[u8]>;
+}
+
+// todo: use some trait magic to allow vec of owned values, references and as well as poniters to
+// be converted to a concated array of bytes.
+
+impl ToConcatedNodeContact for Vec<CompactNodeContact> {
+    fn to_concated_node_contact(&self) -> Box<[u8]> {
+        let bytes = self.iter().map(|contact| contact.bytes).flatten().collect::<Vec<_>>();
+        bytes.into_boxed_slice()
+    }
+}
+
+impl ToConcatedNodeContact for Vec<&CompactNodeContact> {
+    fn to_concated_node_contact(&self) -> Box<[u8]> {
+        todo!()
+    }
+}

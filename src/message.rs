@@ -238,7 +238,7 @@ impl Krpc {
         transaction_id: TransactionId,
         responding_id: NodeId,
         response_token: Box<[u8]>,
-        node: Vec<CompactPeerContact>,
+        peers: Vec<CompactPeerContact>,
     ) -> Krpc {
         let get_peers_success_response = GetPeersSuccessResponse {
             transaction_id,
@@ -246,7 +246,7 @@ impl Krpc {
             body: GetPeersSuccessResponseBody {
                 id: responding_id,
                 token: response_token,
-                values: node,
+                values: peers,
             },
         };
 
