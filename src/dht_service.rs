@@ -50,6 +50,7 @@ use tracing::{
     span, trace, Level,
 };
 
+mod dht_server;
 mod transaction_id_pool;
 
 #[derive(Debug)]
@@ -58,7 +59,7 @@ struct DhtServiceV4 {
 }
 
 #[derive(Debug)]
-struct DhtServiceInnerV4 {
+pub(crate) struct DhtServiceInnerV4 {
     socket: Arc<UdpSocket>,
     our_id: [u8; 20],
     request_registry: Arc<RequestRegistry>,
@@ -69,7 +70,7 @@ struct DhtServiceInnerV4 {
 }
 
 #[derive(Debug)]
-struct DhtServiceFailure {
+pub(crate) struct DhtServiceFailure {
     message: String,
 }
 
@@ -299,7 +300,7 @@ impl DhtServiceInnerV4 {
             let mut nodes: Vec<_> = find_node_response
                 .body
                 .nodes
-                .windows(26)
+                .chunks_exact(26)
                 .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
                 .collect();
 

@@ -13,7 +13,7 @@ pub type NodeId = [u8; 20];
 #[serde(transparent)]
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
-    bytes: [u8; 26],
+    pub(crate) bytes: [u8; 26],
 }
 
 impl Debug for CompactNodeContact {
@@ -56,7 +56,7 @@ impl CompactNodeContact {
 }
 
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Clone, Hash, Deserialize)]
 #[serde(transparent)]
 pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
