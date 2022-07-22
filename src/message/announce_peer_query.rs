@@ -17,6 +17,8 @@ pub struct AnnouncePeerQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
+    #[serde(default = "QueryMethod::announce_peer")]
+    #[serde(skip_deserializing)]
     pub(crate) query_method: QueryMethod,
 
     #[serde(rename = "a")]

@@ -17,6 +17,8 @@ pub struct FindNodeQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
+    #[serde(default = "QueryMethod::find_node")]
+    #[serde(skip_deserializing)]
     pub(crate) query_method: QueryMethod,
 
     #[serde(rename = "a")]
