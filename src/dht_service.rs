@@ -1,18 +1,11 @@
 use crate::{
-    dht_service::transaction_id_pool::TransactionIdPool,
+    dht_service::{dht_server::DHTServer, transaction_id_pool::TransactionIdPool},
     domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
-    message::{
-        announce_peer_query::AnnouncePeerQuery,
-        find_node_get_peers_non_compliant_response::FindNodeGetPeersNonCompliantResponse,
-        find_node_query::FindNodeQuery, get_peers_deferred_response::GetPeersDeferredResponse,
-        get_peers_query::GetPeersQuery, get_peers_success_response::GetPeersSuccessResponse,
-        ping_announce_peer_response::PingAnnouncePeerResponse, ping_query::PingQuery, InfoHash, Krpc,
-    },
+    message::{InfoHash, Krpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
 };
 use async_recursion::async_recursion;
-use derive_more::Unwrap;
 use either::Either;
 use futures::future::join_all;
 use num::BigUint;
@@ -34,14 +27,13 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::{self, UdpSocket},
+    net::UdpSocket,
     runtime::{Handle, Runtime},
-    spawn,
     sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
     task::{self, JoinError, JoinHandle},
     time::{error::Elapsed, timeout},
 };
-use tower::Service;
+
 use tracing::{
     debug, error, event,
     field::debug,
@@ -62,8 +54,8 @@ struct DhtServiceV4 {
 pub(crate) struct DhtServiceInnerV4 {
     socket: Arc<UdpSocket>,
     our_id: [u8; 20],
-    request_registry: Arc<RequestRegistry>,
-    routing_table: RwLock<RoutingTable>,
+    request_registry: Arc<PacketDemultiplexer>,
+    routing_table: Arc<RwLock<RoutingTable>>,
     socket_address: SocketAddrV4,
     transaction_id_pool: TransactionIdPool,
     helper_tasks: Vec<JoinHandle<()>>,
@@ -111,47 +103,47 @@ impl Display for DhtServiceFailure {
 impl Error for DhtServiceFailure {}
 
 #[derive(Debug)]
-struct RequestRegistry {
-    slots: Mutex<HashMap<u16, oneshot::Sender<Krpc>>>,
-    query_queue: Mutex<mpsc::Sender<Krpc>>,
-    packet_queue: Mutex<mpsc::Receiver<Krpc>>,
+struct PacketDemultiplexer {
+    pending_responses: Mutex<HashMap<u16, oneshot::Sender<Krpc>>>,
+    query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
+    incoming_messages: Mutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>,
 }
 
-impl RequestRegistry {
-    pub fn new(incoming_queue: mpsc::Receiver<Krpc>, query_channel: mpsc::Sender<Krpc>) -> Self {
+impl PacketDemultiplexer {
+    pub fn new(
+        incoming_queue: mpsc::Receiver<(Krpc, SocketAddrV4)>,
+        query_channel: mpsc::Sender<(Krpc, SocketAddrV4)>,
+    ) -> Self {
         Self {
-            slots: Mutex::new(HashMap::new()),
+            pending_responses: Mutex::new(HashMap::new()),
             query_queue: Mutex::new(query_channel),
-            packet_queue: Mutex::new(incoming_queue),
+            incoming_messages: Mutex::new(incoming_queue),
         }
     }
 
+    #[instrument(skip_all)]
     pub async fn lifetime_loop(&self) {
-        let mut queue = self.packet_queue.lock().await;
-        loop {
-            if let Some(msg) = queue.recv().await {
-                let id = u16::from_be_bytes(msg.transaction_id().clone());
+        let mut incoming_messages = self.incoming_messages.lock().await;
+        while let Some((msg, socket_addr)) = incoming_messages.recv().await {
+            let id = u16::from_be_bytes(msg.transaction_id().clone());
+            info!("received message for transaction id {}", id);
 
-                // see if we have a slot for this transaction id, if we do, that means one of the
-                // messages that we expect, otherwise the message is a query we need to handle
-
-                if let Some(sender) = self.slots.lock().await.remove(&id) {
-                    match sender.send(msg) {
-                        Err(err) => {
-                            info!("Failed to send response to request: {err:?}");
-                        }
-                        _ => {}
-                    }
-                } else {
-                    self.query_queue.lock().await.send(msg);
-                }
+            // see if we have a slot for this transaction id, if we do, that means one of the
+            // messages that we expect, otherwise the message is a query we need to handle
+            if let Some(sender) = self.pending_responses.lock().await.remove(&id) {
+                info!("we got responses");
+                // failing means we're no longer interested, which is ok
+                sender.send(msg);
+            } else {
+                info!("we got requests!");
+                self.query_queue.lock().await.send((msg, socket_addr)).await;
             }
         }
     }
 
     /// Tell the placer we should expect some messages
     pub async fn register(&self, transaction_id: u16, sending_half: oneshot::Sender<Krpc>) {
-        let mut guard = self.slots.lock().await;
+        let mut guard = self.pending_responses.lock().await;
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
         let occupied = guard.insert(transaction_id, sending_half);
@@ -194,11 +186,8 @@ impl DhtServiceInnerV4 {
         let socket = Arc::new(socket);
         let routing_table = RoutingTable::new(&id);
 
-        let (incoming_tx, incoming_rx) = mpsc::channel(128);
+        let (incoming_packets_tx, incoming_packets_rx) = mpsc::channel(128);
         let (queries_tx, queries_rx) = mpsc::channel(128);
-
-        // todo: eventually we to read the queries
-        forget(queries_rx);
 
         // keep reading from sockets and place them on a queue for another task to place them into
         // the right slot
@@ -206,9 +195,21 @@ impl DhtServiceInnerV4 {
         let socket_reader = async move {
             let mut buf = [0u8; 1024];
             loop {
-                let (amount, _) = reading_socket.recv_from(&mut buf).await?;
-                if let Ok(msg) = bendy::serde::from_bytes(&buf[..amount]) {
-                    incoming_tx.send(msg).await.unwrap();
+                let (amount, socket_addr) = reading_socket.recv_from(&mut buf).await?;
+                trace!("packet from {socket_addr}");
+                if let Ok(msg) = bendy::serde::from_bytes::<Krpc>(&buf[..amount]) {
+                    let socket_addr = {
+                        match socket_addr {
+                            SocketAddr::V4(addr) => addr,
+                            _ => panic!("Expected V4 socket address"),
+                        }
+                    };
+
+                    incoming_packets_tx.send((msg, socket_addr)).await.unwrap();
+                } else {
+                    let read = &buf[..amount];
+                    let hex_dump = pretty_hex::pretty_hex(&read);
+                    panic!("Failed to parse message from {socket_addr}, dump = {hex_dump}");
                 }
             }
             Ok::<_, DhtServiceFailure>(())
@@ -218,7 +219,7 @@ impl DhtServiceInnerV4 {
             socket_reader.await;
         });
 
-        let message_registry = RequestRegistry::new(incoming_rx, queries_tx);
+        let message_registry = PacketDemultiplexer::new(incoming_packets_rx, queries_tx);
         let message_registry = Arc::new(message_registry);
 
         // place the messages into the right slot
@@ -231,14 +232,28 @@ impl DhtServiceInnerV4 {
 
         let handle2 = task::Builder::new().name("message registry").spawn(message_placing);
 
+        let routing_table = Arc::new(RwLock::new(routing_table));
+
+        let server = Arc::new(DHTServer::new(
+            queries_rx,
+            socket.clone(),
+            id.clone(),
+            routing_table.clone(),
+        ));
+        // let mut server = Arc::new(server);
+        let handle3 = task::Builder::new().name("server").spawn(async move {
+            server.handle_requests().await;
+            ()
+        });
+
         Ok(DhtServiceInnerV4 {
             socket,
             request_registry: message_registry,
             our_id: id,
-            routing_table: RwLock::new(routing_table),
+            routing_table,
             socket_address: bind_addr,
             transaction_id_pool: TransactionIdPool::new(),
-            helper_tasks: vec![handle1, handle2],
+            helper_tasks: vec![handle1, handle2, handle3],
         })
     }
 
@@ -389,7 +404,7 @@ impl DhtServiceInnerV4 {
                 trace!("got a success response from {}, values {:#?}", interlocutor, &values);
                 Ok((Some(response.body.token), Either::Right(values)))
             }
-            Krpc::Error(response) => {
+            Krpc::ErrorResponse(response) => {
                 warn!("Got an error response to get peers: {:?}", response);
                 Err(DhtServiceFailure {
                     message: "Got an error response to get peers".to_string(),
@@ -683,7 +698,7 @@ impl DhtServiceInnerV4 {
                     self.recursive_find(target, &node, recursion_limit.sub(1)).await
                 };
             }
-        } else if let Krpc::Error(err) = response {
+        } else if let Krpc::ErrorResponse(err) = response {
             info!("error response from DHT node: {:?}", err.error);
             return Err(DhtServiceFailure {
                 message: format!("node responded with an error to our find node request {err:?}"),
@@ -870,31 +885,49 @@ impl DhtServiceV4 {
 
 #[cfg(test)]
 mod tests {
-    use crate::dht_service::{random_idv4, DhtServiceV4};
+    use crate::{
+        dht_service::{random_idv4, DhtServiceInnerV4, DhtServiceV4},
+        message::Krpc,
+    };
     use num::{BigUint, Num};
     use rand::{Rng, RngCore};
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddrV4},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, Once},
     };
     use tokio::{
         net::{self, UdpSocket},
-        time::{self, timeout},
+        time::{self, sleep, timeout},
     };
-    use tracing::{info, subscriber::set_global_default};
-    use tracing_subscriber::fmt::format::Format;
+    use tracing::{info, subscriber::set_global_default, Metadata};
+    use tracing_subscriber::{
+        filter::LevelFilter,
+        fmt,
+        fmt::{format::Format, writer::MakeWriterExt},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+        EnvFilter, Layer,
+    };
 
-    #[tokio::test]
-    async fn bootstrap() -> color_eyre::Result<()> {
-        color_eyre::install()?;
-        // console_subscriber::init();
-        let fmt_sub = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
+    static TEST_INIT: Once = Once::new();
+
+    fn set_up_tracing() {
+        color_eyre::install();
+        let fmt_layer = fmt::layer()
             .compact()
             .with_line_number(true)
-            .finish();
-        set_global_default(fmt_sub);
+            .with_filter(LevelFilter::DEBUG);
+
+        tracing_subscriber::registry()
+            .with(console_subscriber::spawn())
+            .with(fmt_layer)
+            .init();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bootstrap() -> color_eyre::Result<()> {
+        TEST_INIT.call_once(set_up_tracing);
 
         let external_ip = public_ip::addr_v4().await.unwrap();
 
@@ -937,16 +970,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn find_peers() -> color_eyre::Result<()> {
-        color_eyre::install()?;
-        // console_subscriber::init();
-        let fmt_sub = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .compact()
-            .with_line_number(true)
-            .finish();
-        set_global_default(fmt_sub);
+        TEST_INIT.call_once(set_up_tracing);
 
         let external_ip = public_ip::addr_v4().await.unwrap();
 
@@ -968,6 +994,46 @@ mod tests {
 
         let (token, peers) = dht.inner.get_peers(info_hash.as_slice().try_into()?).await?;
         info!("token {token:?}, peers {peers:?}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server() -> color_eyre::Result<()> {
+        TEST_INIT.call_once(set_up_tracing);
+
+        let external_ip = public_ip::addr_v4().await.unwrap();
+
+        let dht = DhtServiceInnerV4::new_with_random_id(SocketAddrV4::from_str("0.0.0.0:51413")?, external_ip).await?;
+        info!("dht created");
+
+        let fake_client = async move {
+            info!("starting to bind");
+            let fake_peer_socket = UdpSocket::bind(SocketAddrV4::from_str("127.0.0.1:0")?).await?;
+            fake_peer_socket
+                .connect(SocketAddrV4::from_str("127.0.0.1:51413")?)
+                .await?;
+            info!("connected to dht");
+
+            for i in 0..5 {
+                let ping = Krpc::new_ping_query([b'a', b'a' + i], b"abcdefghij0123456789".clone());
+                let serialized = bendy::serde::to_bytes(&ping)?;
+
+                fake_peer_socket.send(&serialized).await?;
+
+                let mut buf = [0u8; 1024];
+                let mut len = fake_peer_socket.recv(&mut buf).await?;
+
+                let msg = bendy::serde::from_bytes::<Krpc>(&buf[..len])?;
+
+                // add some checks to ensure this is the stuff we actually expect in the future
+                // but since there is no way to know the id of the dht right now, we can't do that
+            }
+            Ok::<_, color_eyre::Report>(())
+        };
+        let client_handle = tokio::spawn(fake_client);
+
+        client_handle.await?;
+
         Ok(())
     }
 }

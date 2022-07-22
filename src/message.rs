@@ -577,7 +577,7 @@ mod test {
 
     mod serializing {
         use super::*;
-        use bendy::serde::{from_bytes, to_bytes};
+        use bendy::serde::{to_bytes};
 
         #[test]
         fn serialize_ping_query() -> color_eyre::Result<()> {

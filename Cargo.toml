@@ -14,7 +14,7 @@ juicy_bencode = "^0.1"
 derive_more = "^0.99"
 tower = "^0.4"
 rand = { version = "^0.8", features = ["small_rng"] }
-tokio = { version = "^1.19", features = ["full"] }
+tokio = { version = "^1.20", features = ["full"] }
 task-group = "0.2.2"
 either = "^1.7"
 async-recursion = "1.0.0"
