@@ -9,38 +9,24 @@ use async_recursion::async_recursion;
 use either::Either;
 use futures::future::join_all;
 use num::BigUint;
-use rand::{rngs, rngs::SmallRng, thread_rng, Rng, RngCore, SeedableRng};
+use rand::{Rng, RngCore};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt::{Display, Formatter},
-    future::Future,
-    mem::forget,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    ops::{BitXor, Deref, DerefMut, Sub},
-    pin::Pin,
+    ops::{BitXor, DerefMut, Sub},
     sync::Arc,
-    task::{
-        Context,
-        Poll::{self, Ready},
-    },
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    runtime::{Handle, Runtime},
     sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
     task::{self, JoinError, JoinHandle},
-    time::{error::Elapsed, timeout},
+    time::timeout,
 };
 
-use tracing::{
-    debug, error, event,
-    field::debug,
-    info, instrument,
-    log::{warn, Level::Debug},
-    span, trace, Level,
-};
+use tracing::{debug, info, instrument, log::warn, trace};
 
 mod dht_server;
 mod transaction_id_pool;
@@ -126,17 +112,20 @@ impl PacketDemultiplexer {
         let mut incoming_messages = self.incoming_messages.lock().await;
         while let Some((msg, socket_addr)) = incoming_messages.recv().await {
             let id = u16::from_be_bytes(msg.transaction_id().clone());
-            info!("received message for transaction id {}", id);
+            trace!("received message for transaction id {}", id);
 
             // see if we have a slot for this transaction id, if we do, that means one of the
             // messages that we expect, otherwise the message is a query we need to handle
             if let Some(sender) = self.pending_responses.lock().await.remove(&id) {
-                info!("we got responses");
                 // failing means we're no longer interested, which is ok
-                sender.send(msg);
+                let _ = sender.send(msg);
             } else {
-                info!("we got requests!");
-                self.query_queue.lock().await.send((msg, socket_addr)).await;
+                self.query_queue
+                    .lock()
+                    .await
+                    .send((msg, socket_addr))
+                    .await
+                    .expect("the server died before the demultiplexer could send the message");
             }
         }
     }
@@ -207,16 +196,17 @@ impl DhtServiceInnerV4 {
 
                     incoming_packets_tx.send((msg, socket_addr)).await.unwrap();
                 } else {
-                    let read = &buf[..amount];
-                    let hex_dump = pretty_hex::pretty_hex(&read);
-                    panic!("Failed to parse message from {socket_addr}, dump = {hex_dump}");
+                    warn!(
+                        "Failed to parse message from {socket_addr}, bytes = {:?}",
+                        &buf[..amount]
+                    );
                 }
             }
             Ok::<_, DhtServiceFailure>(())
         };
 
         let handle1 = task::Builder::new().name("socket reader").spawn(async move {
-            socket_reader.await;
+            let _ = socket_reader.await;
         });
 
         let message_registry = PacketDemultiplexer::new(incoming_packets_rx, queries_tx);
@@ -242,7 +232,7 @@ impl DhtServiceInnerV4 {
         ));
         // let mut server = Arc::new(server);
         let handle3 = task::Builder::new().name("server").spawn(async move {
-            server.handle_requests().await;
+            let _ = server.handle_requests().await;
             ()
         });
 
@@ -459,7 +449,7 @@ impl DhtServiceInnerV4 {
 
         // it's possible that some of the nodes returned are actually the node we're looking for
         // so we check for that and return it if it's the case
-        let mut target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
+        let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
 
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
@@ -480,7 +470,7 @@ impl DhtServiceInnerV4 {
         sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
 
         // add all the nodes we have visited so far
-        let mut seen_node: Arc<Mutex<HashSet<CompactNodeContact>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_node: Arc<Mutex<HashSet<CompactNodeContact>>> = Arc::new(Mutex::new(HashSet::new()));
         {
             let mut seen = seen_node.lock().await;
             sorted_by_distance.iter().for_each(|(node, _)| {
@@ -497,7 +487,8 @@ impl DhtServiceInnerV4 {
         let dht = self.clone();
         let target = target.clone();
         let mut parallel_find = tokio::spawn(async move {
-            dht.recurse_find_from_pool(starting_pool, target.clone(), seen_node, tx)
+            let _ = dht
+                .recurse_find_from_pool(starting_pool, target.clone(), seen_node, tx)
                 .await;
         });
 
@@ -528,7 +519,7 @@ impl DhtServiceInnerV4 {
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
-            let mut seen = seen.lock().await;
+            let seen = seen.lock().await;
             starting_pool
                 .into_iter()
                 .filter(|node| !seen.contains(&node))
@@ -560,7 +551,9 @@ impl DhtServiceInnerV4 {
                         // lock the sender and sent the value
                         if let Some(sender) = slot {
                             let slot = slot.take();
-                            slot.expect("some one else should ready have ").send(node.clone());
+                            slot.expect("some one else should ready have finished sending and killed us")
+                                .send(node.clone())
+                                .expect("some one else should ready have finished sending and killed us");
                             Ok(())
                         } else {
                             Err(RecursiveSearchError::Cancelled)
@@ -630,14 +623,15 @@ impl DhtServiceInnerV4 {
 
                             dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
                         }
-                        Either::Right(mut success) => {
+                        Either::Right(success) => {
                             trace!("got success response, {success:#?}");
                             let mut slot = slot.lock().await;
                             let slot = slot.take();
 
                             match slot {
                                 Some(sender) => {
-                                    sender.send((token.expect("success response must have the token"), success));
+                                    let _ =
+                                        sender.send((token.expect("success response must have the token"), success));
                                     Ok(())
                                 }
                                 None => Err(RecursiveSearchError::Cancelled),
@@ -886,34 +880,27 @@ impl DhtServiceV4 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dht_service::{random_idv4, DhtServiceInnerV4, DhtServiceV4},
+        dht_service::{DhtServiceInnerV4, DhtServiceV4},
         message::Krpc,
     };
     use num::{BigUint, Num};
-    use rand::{Rng, RngCore};
+    use rand::RngCore;
     use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddrV4},
+        net::SocketAddrV4,
         str::FromStr,
         sync::{Arc, Once},
     };
     use tokio::{
-        net::{self, UdpSocket},
-        time::{self, sleep, timeout},
+        net::UdpSocket,
+        time::{self, timeout},
     };
-    use tracing::{info, subscriber::set_global_default, Metadata};
-    use tracing_subscriber::{
-        filter::LevelFilter,
-        fmt,
-        fmt::{format::Format, writer::MakeWriterExt},
-        layer::SubscriberExt,
-        util::SubscriberInitExt,
-        EnvFilter, Layer,
-    };
+    use tracing::info;
+    use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
     static TEST_INIT: Once = Once::new();
 
     fn set_up_tracing() {
-        color_eyre::install();
+        let _ = color_eyre::install();
         let fmt_layer = fmt::layer()
             .compact()
             .with_line_number(true)
@@ -1021,7 +1008,7 @@ mod tests {
                 fake_peer_socket.send(&serialized).await?;
 
                 let mut buf = [0u8; 1024];
-                let mut len = fake_peer_socket.recv(&mut buf).await?;
+                let len = fake_peer_socket.recv(&mut buf).await?;
 
                 let msg = bendy::serde::from_bytes::<Krpc>(&buf[..len])?;
 
@@ -1032,7 +1019,7 @@ mod tests {
         };
         let client_handle = tokio::spawn(fake_client);
 
-        client_handle.await?;
+        let _ = client_handle.await?;
 
         Ok(())
     }

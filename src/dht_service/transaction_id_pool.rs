@@ -1,10 +1,4 @@
-use rand::{prelude::SmallRng, Rng, SeedableRng};
-use std::{
-    collections::HashSet,
-    ops::Deref,
-    sync::atomic::{AtomicU16, Ordering},
-};
-use tokio::{runtime::Handle, sync::Mutex};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 /// Ensures we never use the same ID for two different requests
 #[derive(Debug)]

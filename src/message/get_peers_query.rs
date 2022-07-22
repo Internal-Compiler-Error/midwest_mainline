@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{ping_query::PingArgs, InfoHash, QueryMethod, TransactionId},
+    message::{InfoHash, QueryMethod, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};

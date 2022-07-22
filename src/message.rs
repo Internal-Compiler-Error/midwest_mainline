@@ -3,7 +3,7 @@ use crate::{
     message::{error_response::ErrorResponse, ping_query::PingQuery},
 };
 use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
-use bendy::value::Value;
+
 use find_node_get_peers_non_compliant_response::{
     FindNodeGetPeersNonCompliantResponse, FindNodeGetPeersNonCompliantResponseBody,
 };
@@ -14,8 +14,7 @@ use get_peers_success_response::{GetPeersSuccessResponse, GetPeersSuccessRespons
 use ping_announce_peer_response::{PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
 use ping_query::PingArgs;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, Bytes};
-use std::borrow::Cow;
+use serde_with::serde_as;
 
 pub mod announce_peer_query;
 pub mod error_response;
@@ -363,7 +362,7 @@ mod test {
 
     mod deserializing {
         use super::*;
-        use bendy::serde::{from_bytes, to_bytes};
+        use bendy::serde::from_bytes;
         use std::net::{Ipv4Addr, SocketAddrV4};
 
         #[test]
@@ -577,7 +576,7 @@ mod test {
 
     mod serializing {
         use super::*;
-        use bendy::serde::{to_bytes};
+        use bendy::serde::to_bytes;
 
         #[test]
         fn serialize_ping_query() -> color_eyre::Result<()> {

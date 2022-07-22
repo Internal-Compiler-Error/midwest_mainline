@@ -1,8 +1,7 @@
-use rand::Fill;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
-    fmt::{Debug, Display, Formatter},
+    fmt::{Debug, Formatter},
     net::{Ipv4Addr, SocketAddrV4},
 };
 

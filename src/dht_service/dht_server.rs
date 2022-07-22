@@ -11,9 +11,7 @@ use rand::RngCore;
 use crate::message::InfoHash;
 use sha3::{Digest, Sha3_256};
 use std::{
-    cell::RefCell,
-    collections::{hash_map::Entry, HashMap, HashSet},
-    mem::take,
+    collections::{hash_map::Entry, HashMap},
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
@@ -23,7 +21,7 @@ use tokio::{
     sync::{mpsc::Receiver, Mutex, RwLock},
     time::Instant,
 };
-use tracing::{error, info, trace};
+use tracing::{error, trace};
 
 #[derive(Debug)]
 struct TokenPool {
@@ -59,7 +57,7 @@ impl TokenPool {
         };
 
         let task = tokio::spawn(new_salt_every_five_minutes);
-        task.await;
+        let _ = task.await;
     }
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
