@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{ping_query::PingArgs, InfoHash, QueryMethod, TransactionId},
+    message::{InfoHash, QueryMethod, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -17,6 +17,8 @@ pub struct GetPeersQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
+    #[serde(default = "QueryMethod::get_peers")]
+    #[serde(skip_deserializing)]
     pub(crate) query_method: QueryMethod,
 
     #[serde(rename = "a")]

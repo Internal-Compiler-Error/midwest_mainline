@@ -1,8 +1,9 @@
 use crate::{
     domain_knowledge::{CompactPeerContact, NodeId},
-    message::ping_query::PingQuery,
+    message::{error_response::ErrorResponse, ping_query::PingQuery},
 };
 use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
+
 use find_node_get_peers_non_compliant_response::{
     FindNodeGetPeersNonCompliantResponse, FindNodeGetPeersNonCompliantResponseBody,
 };
@@ -10,17 +11,16 @@ use find_node_query::{FindNodeArgs, FindNodeQuery};
 use get_peers_deferred_response::GetPeersDeferredResponse;
 use get_peers_query::{GetPeersArgs, GetPeersQuery};
 use get_peers_success_response::{GetPeersSuccessResponse, GetPeersSuccessResponseBody};
-use num::BigUint;
 use ping_announce_peer_response::{PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
 use ping_query::PingArgs;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, Bytes};
+use serde_with::serde_as;
 
 pub mod announce_peer_query;
+pub mod error_response;
 pub mod find_node_get_peers_non_compliant_response;
 pub mod find_node_query;
 pub mod get_peers_deferred_response;
-//pub mod get_peers_deferred_response_non_compliant;
 pub mod get_peers_query;
 pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
@@ -37,31 +37,15 @@ pub type TransactionId = [u8; 2];
 //
 // RUN THE UNIT TESTS IF YOU MESS WITH THE ORDER
 pub enum Krpc {
-    PingQuery(PingQuery),
-    FindNodeQuery(FindNodeQuery),
     AnnouncePeerQuery(AnnouncePeerQuery),
+    FindNodeQuery(FindNodeQuery),
     GetPeersQuery(GetPeersQuery),
+    PingQuery(PingQuery),
     GetPeersSuccessResponse(GetPeersSuccessResponse),
     GetPeersDeferredResponse(GetPeersDeferredResponse),
-    // GetPeersDeferredResponseNonCompliant(GetPeersDeferredResponseNonCompliant),
     FindNodeGetPeersNonCompliantResponse(FindNodeGetPeersNonCompliantResponse),
     PingAnnouncePeerResponse(PingAnnouncePeerResponse),
-    Error(Error),
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Error {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "e")]
-    pub(crate) error: Vec<Box<[u8]>>,
+    ErrorResponse(ErrorResponse),
 }
 
 #[serde_as]
@@ -99,6 +83,22 @@ impl QueryMethod {
         }
     }
 
+    fn ping() -> Self {
+        QueryMethod::Ping
+    }
+
+    fn find_node() -> Self {
+        QueryMethod::FindNode
+    }
+
+    fn get_peers() -> Self {
+        QueryMethod::GetPeers
+    }
+
+    fn announce_peer() -> Self {
+        QueryMethod::AnnouncePeer
+    }
+
     fn not_a_query() -> QueryMethod {
         QueryMethod::None
     }
@@ -126,13 +126,13 @@ impl Krpc {
             Krpc::GetPeersQuery(msg) => msg.transaction_id,
             Krpc::AnnouncePeerQuery(msg) => msg.transaction_id,
             Krpc::PingQuery(msg) => msg.transaction_id,
-            Krpc::Error(msg) => msg.transaction_id,
+            Krpc::ErrorResponse(msg) => msg.transaction_id,
         }
     }
 
     pub fn is_error(&self) -> bool {
         match self {
-            Krpc::Error(_) => true,
+            Krpc::ErrorResponse(_) => true,
             _ => false,
         }
     }
@@ -238,7 +238,7 @@ impl Krpc {
         transaction_id: TransactionId,
         responding_id: NodeId,
         response_token: Box<[u8]>,
-        node: Vec<CompactPeerContact>,
+        peers: Vec<CompactPeerContact>,
     ) -> Krpc {
         let get_peers_success_response = GetPeersSuccessResponse {
             transaction_id,
@@ -246,7 +246,7 @@ impl Krpc {
             body: GetPeersSuccessResponseBody {
                 id: responding_id,
                 token: response_token,
-                values: node,
+                values: peers,
             },
         };
 
@@ -284,7 +284,7 @@ impl Krpc {
         let get_peers_deferred_response = FindNodeGetPeersNonCompliantResponse {
             transaction_id,
             message_type: Box::new(b"r".clone()),
-            body: find_node_get_peers_non_compliant_response::FindNodeGetPeersNonCompliantResponseBody {
+            body: FindNodeGetPeersNonCompliantResponseBody {
                 id: responding_id,
                 nodes: closest_nodes,
             },
@@ -302,13 +302,48 @@ impl Krpc {
         Krpc::PingAnnouncePeerResponse(announce_peer_response)
     }
 
+    pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Krpc {
+        let error_response = ErrorResponse {
+            transaction_id,
+            message_type: Box::new(b"e".clone()),
+            error: (201 as u32, "A Generic Error Occurred".to_string()),
+        };
+        Krpc::ErrorResponse(error_response)
+    }
+
+    pub fn new_standard_server_error(transaction_id: TransactionId) -> Krpc {
+        let error_response = ErrorResponse {
+            transaction_id,
+            message_type: Box::new(b"e".clone()),
+            error: (202 as u32, "A Server Error Occurred".to_string()),
+        };
+        Krpc::ErrorResponse(error_response)
+    }
+
+    pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Krpc {
+        let error_response = ErrorResponse {
+            transaction_id,
+            message_type: Box::new(b"e".clone()),
+            error: (203 as u32, "A Protocol Error Occurred".to_string()),
+        };
+        Krpc::ErrorResponse(error_response)
+    }
+
+    pub fn new_unsupported_error(transaction_id: TransactionId) -> Krpc {
+        let error_response = ErrorResponse {
+            transaction_id,
+            message_type: Box::new(b"e".clone()),
+            error: (204 as u32, "A Unsupported Method Error Occurred".to_string()),
+        };
+        Krpc::ErrorResponse(error_response)
+    }
+
     pub fn id_as_u16(&self) -> u16 {
         match self {
-            Krpc::Error(error) => u16::from_be_bytes(error.transaction_id),
+            Krpc::ErrorResponse(error) => u16::from_be_bytes(error.transaction_id),
             Krpc::PingAnnouncePeerResponse(ping) => u16::from_be_bytes(ping.transaction_id),
             Krpc::GetPeersDeferredResponse(peers) => u16::from_be_bytes(peers.transaction_id),
             Krpc::GetPeersSuccessResponse(peers) => u16::from_be_bytes(peers.transaction_id),
-            // Krpc::GetPeersDeferredResponseNonCompliant(peers) => u16::from_be_bytes(peers.transaction_id),
             Krpc::FindNodeGetPeersNonCompliantResponse(node) => u16::from_be_bytes(node.transaction_id),
             Krpc::PingQuery(ping) => u16::from_be_bytes(ping.transaction_id),
             Krpc::FindNodeQuery(node) => u16::from_be_bytes(node.transaction_id),
@@ -321,25 +356,116 @@ impl Krpc {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::Once;
+
+    static COLOR_EYRE_INIT: Once = Once::new();
 
     mod deserializing {
         use super::*;
-        use bendy::serde::{from_bytes, to_bytes};
-        use pretty_hex::PrettyHex;
+        use bendy::serde::from_bytes;
         use std::net::{Ipv4Addr, SocketAddrV4};
 
         #[test]
-        fn ping_response_deserializing() {
+        fn ping_query_deserializing() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
+            let message = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe";
+            let deserialized = from_bytes::<Krpc>(message)?;
+            let expected = Krpc::new_ping_query([b'a', b'a'], b"abcdefghij0123456789".clone());
+
+            assert_eq!(deserialized, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn find_node_query_deserializing() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
+            let message =
+                b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q9:find_node1:t2:aa1:y1:qe";
+            let deserialized = from_bytes::<Krpc>(message)?;
+
+            let expected = Krpc::new_find_node_query(
+                b"aa".clone(),
+                b"abcdefghij0123456789".clone(),
+                b"mnopqrstuvwxyz123456".clone(),
+            );
+
+            assert_eq!(deserialized, expected);
+            Ok(())
+        }
+
+        #[test]
+        fn get_peers_query_deserializing() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
+            let message =
+                b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz123456e1:q9:get_peers1:t2:aa1:y1:qe";
+            let deserialized = from_bytes::<Krpc>(message)?;
+
+            let expected = Krpc::new_get_peers_query(
+                b"aa".clone(),
+                b"abcdefghij0123456789".clone(),
+                b"mnopqrstuvwxyz123456".clone(),
+            );
+
+            // taken directly from the spec
+            assert_eq!(deserialized, expected);
+
+            Ok(())
+        }
+
+        #[test]
+        fn announce_peers_query_deserializing() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
+            let message =
+               b"d1:ad2:id20:abcdefghij012345678912:implied_porti1e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe";
+            let deserialized = from_bytes::<Krpc>(message)?;
+
+            let expected = Krpc::new_announce_peer_query(
+                b"aa".clone(),
+                b"mnopqrstuvwxyz123456".clone(),
+                b"abcdefghij0123456789".clone(),
+                6881,
+                true,
+                Box::from(b"aoeusnth".as_slice()),
+            );
+
+            // taken directly from the spec
+            assert_eq!(deserialized, expected);
+
+            Ok(())
+        }
+
+        #[test]
+        fn ping_response_deserializing() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Krpc = from_bytes(message).unwrap();
 
             let expected = Krpc::new_ping_response(b"aa".clone(), b"mnopqrstuvwxyz123456".clone());
             assert_eq!(decoded, expected);
+
+            Ok(())
         }
 
         #[test]
         fn get_peers_success_response_deserializing() -> color_eyre::Result<()> {
-            color_eyre::install()?;
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
 
             let bencoded = hex::decode("64323a6970363a434545f1c8d6313a7264323a696432303a23307bc01f5e7cc56ba66314b36e69246304f870353a6e6f6465733230383a233b7b388eaded578cb8b62a1ddfef3277bf01945c202537c8d5233a010302bab6e6726e991228571f8807a9f77eb2aae6fd12a42339069106980533f8df5b5b9a17d6b704740b7bde6241279f032338bd5ff8d5779c7170d17343b8b3fe405fe71eb96b5f496d86233f9938fa19e256821896495e11e0f63ff032706ad22134e1ed233e6bd6ae529049f1f1bbe9ebb3a6db3c870ce15a9a5df9bbc8233dafab3b38a789a3e53433380dd825c45b3f57b9a76343c8d5233cddccbe1f9e5041e3b3d4d124f9c252697ef0755dab53c8d5353a746f6b656e32303a3704f7737408c5fef0f96bca389e4100f972859d363a76616c7565736c363ab28f20fc5f41363ab025e789900e363a5bd6f27f042e6565313a74323a11ec313a76343a5554b50c313a79313a7265")?;
             let decoded: Krpc = from_bytes(bencoded.as_slice())?;
@@ -364,18 +490,12 @@ mod test {
             Ok(())
         }
 
-        // #[test]
-        // // if you're a good person, you'll want to finish the test, but I'm not a good person rn
-        // fn oi() -> color_eyre::Result<()> {
-        //     let bencoded = hex::decode("64313a7264323a696432303a2338bd5ff8d5779c7170d17343b8b3fe405fe71e353a746f6b656e383aa183d7b6e8b1ee6a363a76616c7565736c363a4fad5883bce9363ac21f9852ed93363a6dad07be4f67363a2e2737301758363a51d61a1313e7363ab2215d58148a363a5515f03ea4fb363a50ed7b37f066363a5d5410fca6e3363a4ebe3df4b541363ad55783f5e11a363a5ee9ec6debc1363a2e939d708c6a363a4eae7dae1c57363a5f0f003186ab363a1fad6c5e28336565313a74323a0d62313a76343a6c740d60313a79313a7265")?;
-        //     let decoded: Krpc = from_bytes(bencoded.as_slice())?;
-        //
-        //     println!("{:?}", decoded);
-        //     Ok(())
-        // }
-
         #[test]
-        fn find_node_response_deserialize() {
+        fn find_node_response_deserialize() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
             let decoded: Krpc = from_bytes(message).unwrap();
 
@@ -384,11 +504,30 @@ mod test {
                 b"0123456789abcdefghij".clone(),
                 Box::new(b"mnopqrstuvwxyz123456".clone()),
             );
-            assert_eq!(expected, decoded)
+            assert_eq!(expected, decoded);
+            Ok(())
+        }
+
+        #[test]
+        fn deserialize_generic_error() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
+            let message = b"d1:eli201e24:A Generic Error Occurrede1:t2:aa1:y1:ee";
+            let decoded: Krpc = from_bytes(message).unwrap();
+
+            let expected = Krpc::new_standard_generic_error_response(b"aa".clone());
+            assert_eq!(expected, decoded);
+            Ok(())
         }
 
         #[test]
         fn deserialize_con_compliant_get_peers() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             // if all this following is painful to read, trust me, it was painful to write
             // and even more painful to realize this has to be supported
             let bencoded = hex::decode(
@@ -424,7 +563,7 @@ mod test {
                 403918979a78abacbf3267657c26e095e73f75abf9398e0f6e6bd9a26b5bda70000000000000000000000\
                 0000000000000000005778ea621cb6",
                     )?
-                        .as_slice(),
+                    .as_slice(),
                 ),
                 // Box::from(hex::decode("b8972559c8d6")?.as_slice()),
             );
@@ -437,20 +576,29 @@ mod test {
 
     mod serializing {
         use super::*;
-        use bendy::serde::{from_bytes, to_bytes};
+        use bendy::serde::to_bytes;
 
         #[test]
-        fn serialize_ping_query() {
+        fn serialize_ping_query() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             let message = Krpc::new_ping_query(b"aa".clone(), b"abcdefghij0123456789".clone());
             let bytes = to_bytes(&message).unwrap();
 
             // taken directly from the spec
             assert_eq!(bytes, b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe");
+
+            Ok(())
         }
 
-
         #[test]
-        fn serialize_find_node_query() {
+        fn serialize_find_node_query() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             let message = Krpc::new_find_node_query(
                 b"aa".clone(),
                 b"abcdefghij0123456789".clone(),
@@ -463,10 +611,16 @@ mod test {
                 bytes,
                 b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q9:find_node1:t2:aa1:y1:qe"
             );
+
+            Ok(())
         }
 
         #[test]
-        fn serialize_get_peers_query() {
+        fn serialize_get_peers_query() -> color_eyre::Result<()> {
+            COLOR_EYRE_INIT.call_once(|| {
+                color_eyre::install().expect("Initialization is only called once");
+            });
+
             let message = Krpc::new_get_peers_query(
                 b"aa".clone(),
                 b"abcdefghij0123456789".clone(),
@@ -479,6 +633,8 @@ mod test {
                 bytes,
                 b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz123456e1:q9:get_peers1:t2:aa1:y1:qe"
             );
+
+            Ok(())
         }
     }
 }

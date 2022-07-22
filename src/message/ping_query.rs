@@ -17,6 +17,8 @@ pub struct PingQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
+    #[serde(default = "QueryMethod::ping")]
+    #[serde(skip_deserializing)]
     pub(crate) query_method: QueryMethod,
 
     #[serde(rename = "a")]

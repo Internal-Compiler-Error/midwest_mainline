@@ -1,8 +1,7 @@
-use rand::Fill;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
-    fmt::{Debug, Display, Formatter},
+    fmt::{Debug, Formatter},
     net::{Ipv4Addr, SocketAddrV4},
 };
 
@@ -13,7 +12,7 @@ pub type NodeId = [u8; 20];
 #[serde(transparent)]
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
-    bytes: [u8; 26],
+    pub(crate) bytes: [u8; 26],
 }
 
 impl Debug for CompactNodeContact {
@@ -56,7 +55,7 @@ impl CompactNodeContact {
 }
 
 #[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Clone, Hash, Deserialize)]
 #[serde(transparent)]
 pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
@@ -90,5 +89,25 @@ impl Into<SocketAddrV4> for &CompactPeerContact {
 impl Into<SocketAddrV4> for CompactPeerContact {
     fn into(self) -> SocketAddrV4 {
         (&self).into()
+    }
+}
+
+pub(crate) trait ToConcatedNodeContact {
+    fn to_concated_node_contact(&self) -> Box<[u8]>;
+}
+
+// todo: use some trait magic to allow vec of owned values, references and as well as poniters to
+// be converted to a concated array of bytes.
+
+impl ToConcatedNodeContact for Vec<CompactNodeContact> {
+    fn to_concated_node_contact(&self) -> Box<[u8]> {
+        let bytes = self.iter().map(|contact| contact.bytes).flatten().collect::<Vec<_>>();
+        bytes.into_boxed_slice()
+    }
+}
+
+impl ToConcatedNodeContact for Vec<&CompactNodeContact> {
+    fn to_concated_node_contact(&self) -> Box<[u8]> {
+        todo!()
     }
 }
