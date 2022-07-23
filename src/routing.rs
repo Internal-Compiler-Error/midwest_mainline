@@ -3,9 +3,13 @@ use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
 use tracing::{info, trace};
 
+/// The routing table at the heart of the Kademlia DHT. It keep the near neighbors of ourself.
 #[derive(Debug)]
 pub struct RoutingTable {
+    /// The node id of the ourself.
     id: BigUint,
+
+    /// each bucket contains
     pub(crate) buckets: Vec<Bucket>,
 }
 
@@ -52,15 +56,8 @@ impl RoutingTable {
         self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
-    pub fn our_id(&self) -> &BigUint {
-        &self.id
-    }
-
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
     pub fn add_new_node(&mut self, contact: CompactNodeContact) {
-        let node_id = contact.node_id();
-        let node_id = BigUint::from_bytes_be(node_id);
-
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
         if let Some(node) = self

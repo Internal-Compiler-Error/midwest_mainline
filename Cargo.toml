@@ -1,7 +1,10 @@
 [package]
 name = "midwest_mainline"
-version = "0.1.0"
+version = "0.1.0-beta"
 edition = "2021"
+license = "MIT"
+description = "A BitTorrent DHT implementation in async Rust"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,10 +15,8 @@ serde = { version = "^1.0", features = ["derive"] }
 serde_with = "^1.14"
 juicy_bencode = "^0.1"
 derive_more = "^0.99"
-tower = "^0.4"
 rand = { version = "^0.8", features = ["small_rng"] }
 tokio = { version = "^1.20", features = ["full", "tracing"] }
-task-group = "0.2.2"
 either = "^1.7"
 async-recursion = "1.0.0"
 futures = "0.3.21"

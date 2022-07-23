@@ -335,7 +335,7 @@ mod test {
 
     mod deserializing {
         use super::*;
-        use bendy::serde::{from_bytes, to_bytes};
+        use bendy::serde::from_bytes;
         use std::net::{Ipv4Addr, SocketAddrV4};
 
         #[test]

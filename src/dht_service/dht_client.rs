@@ -1,5 +1,5 @@
 use crate::{
-    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, PacketDemultiplexer},
+    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
     domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
     message::{InfoHash, Krpc},
     routing::RoutingTable,
@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt::{Display, Formatter},
-    net::{Ipv4Addr, SocketAddrV4},
+    net::SocketAddrV4,
     ops::{BitXor, DerefMut},
     sync::Arc,
     time::Duration,
@@ -23,16 +23,13 @@ use tokio::{
     task::JoinError,
     time::timeout,
 };
-use tracing::{
-    debug, info, instrument,
-    log::{trace, warn},
-};
+use tracing::{debug, info, instrument, trace, warn};
 
 #[derive(Debug)]
-pub(crate) struct DhtClientV4 {
+pub struct DhtClientV4 {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) our_id: [u8; 20],
-    pub(crate) demultiplexer: Arc<PacketDemultiplexer>,
+    pub(crate) demultiplexer: Arc<MessageDemultiplexer>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: TransactionIdPool,
@@ -47,13 +44,13 @@ pub enum RecursiveSearchError {
 }
 
 impl From<DhtServiceFailure> for RecursiveSearchError {
-    fn from(error: DhtServiceFailure) -> Self {
+    fn from(_: DhtServiceFailure) -> Self {
         RecursiveSearchError::DhtServiceFailure
     }
 }
 
 impl From<JoinError> for RecursiveSearchError {
-    fn from(error: JoinError) -> Self {
+    fn from(_: JoinError) -> Self {
         RecursiveSearchError::JoinError
     }
 }
@@ -71,9 +68,8 @@ impl DhtClientV4 {
     /// a port and IP address
     pub(crate) fn new(
         bind_addr: SocketAddrV4,
-        external_addr: Ipv4Addr,
         socket: Arc<UdpSocket>,
-        demultiplexer: Arc<PacketDemultiplexer>,
+        demultiplexer: Arc<MessageDemultiplexer>,
         routing_table: Arc<RwLock<RoutingTable>>,
         our_id: NodeId,
     ) -> Self {
@@ -123,7 +119,7 @@ impl DhtClientV4 {
         };
     }
 
-    // you peers means something special here so you can't use it
+    // peers means something special here so you can't use it
     // ask_node_for_nodes just sounds stupid so fuck it, it's her then.
     // Why her and not them? Because I want to piss people off
     async fn ask_her_for_nodes(
@@ -400,7 +396,7 @@ impl DhtClientV4 {
                         let mut slot = slot.lock().await;
                         let slot = slot.deref_mut();
                         // lock the sender and sent the value
-                        if let Some(sender) = slot {
+                        if let Some(_sender) = slot {
                             let slot = slot.take();
                             slot.expect("some one else should ready have finished sending and killed us")
                                 .send(node.clone())
@@ -420,7 +416,7 @@ impl DhtClientV4 {
             .collect();
 
         // spawn all the tasks and await them
-        let results = parallel_tasks.par_spawn_and_await().await?;
+        let _results = parallel_tasks.par_spawn_and_await().await?;
 
         // if we ever reach here, that means we haven't been cancelled, which means nothing were
         // found
@@ -464,7 +460,7 @@ impl DhtClientV4 {
 
                     return match returned {
                         Either::Left(mut deferred) => {
-                            info!("got deferred response, {deferred:#?}");
+                            trace!("got deferred response, {deferred:#?}");
                             // make sure we don't get duplicate nodes
                             deferred.dedup();
                             {
@@ -495,11 +491,10 @@ impl DhtClientV4 {
 
         // spawn all the tasks and await them
         debug!("spawning {} tasks", parallel_tasks.len());
-        let results = parallel_tasks.par_spawn_and_await().await?;
+        let _results = parallel_tasks.par_spawn_and_await().await?;
         Err(RecursiveSearchError::BottomedOut)
     }
 
-    /// obtain all the peers that c
     pub async fn get_peers(
         self: Arc<Self>,
         info_hash: InfoHash,

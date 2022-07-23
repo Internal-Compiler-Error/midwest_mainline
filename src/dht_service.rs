@@ -1,7 +1,7 @@
 use crate::{
     dht_service::dht_server::DhtServer,
-    domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
-    message::{InfoHash, Krpc},
+    domain_knowledge::{CompactNodeContact, NodeId},
+    message::Krpc,
     routing::RoutingTable,
 };
 
@@ -23,23 +23,27 @@ use tokio::{
 
 use crate::message::TransactionId;
 use dht_client::DhtClientV4;
-use tracing::{info, info_span, instrument, log::warn, trace, Instrument};
+use tracing::{info, info_span, instrument, trace, warn, Instrument};
 
 pub mod dht_client;
-mod dht_server;
+pub mod dht_server;
 mod transaction_id_pool;
 
+/// The DHT service, it contains pointers to a server and client, it's main role is to run the
+/// tasks required to make DHT alive
 #[derive(Debug)]
-struct DhtV4 {
+#[allow(dead_code)]
+pub struct DhtV4 {
     client: Arc<DhtClientV4>,
     server: Arc<DhtServer>,
-    demultiplexer: Arc<PacketDemultiplexer>,
+    demultiplexer: Arc<MessageDemultiplexer>,
     routing_table: Arc<RwLock<RoutingTable>>,
     helper_tasks: JoinSet<()>,
 }
 
+/// A very unhelpful error type. This will be replaced with a more helpful error type in the future.
 #[derive(Debug)]
-pub(crate) struct DhtServiceFailure {
+pub struct DhtServiceFailure {
     message: String,
 }
 
@@ -51,14 +55,22 @@ impl Display for DhtServiceFailure {
 
 impl Error for DhtServiceFailure {}
 
+/// A message demultiplexer keeps reading Krpc messages from a queue and place them either into the
+/// server response queue when we haven't seen this transaction id before, or into a oneshot channel
+/// so the client and await the response.
 #[derive(Debug)]
-pub(crate) struct PacketDemultiplexer {
+pub(crate) struct MessageDemultiplexer {
+    /// a map to keep track of the responses we await from the client
     pending_responses: Mutex<HashMap<TransactionId, Sender<Krpc>>>,
+
+    /// all messages belong to the server are put into this queue.
     query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
+
+    /// a channel to receive new krpc read from the socket
     incoming_messages: Mutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>,
 }
 
-impl PacketDemultiplexer {
+impl MessageDemultiplexer {
     pub fn new(
         incoming_queue: mpsc::Receiver<(Krpc, SocketAddrV4)>,
         query_channel: mpsc::Sender<(Krpc, SocketAddrV4)>,
@@ -98,8 +110,7 @@ impl PacketDemultiplexer {
         let mut guard = self.pending_responses.lock().await;
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
-        let occupied = guard.insert(transaction_id, sending_half);
-        // warn!("Transaction ID {transaction_id} already occupied, new sender inserted");
+        let _ = guard.insert(transaction_id, sending_half);
     }
 }
 
@@ -164,6 +175,9 @@ impl From<Elapsed> for BootstrapError {
 }
 
 impl DhtV4 {
+    /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
+    /// external IP address of the machine. Note there is no way to verify the external IP address
+    /// is correct and it's duty to make sure it's correct.
     #[instrument(skip_all)]
     pub async fn bootstrap_with_random_id(
         bind_addr: SocketAddrV4,
@@ -220,7 +234,7 @@ impl DhtV4 {
             .name(&*format!("socket reader for {bind_addr}"))
             .spawn(socket_reader.instrument(info_span!("socket reader")));
 
-        let demultiplexer = PacketDemultiplexer::new(incoming_packets_rx, queries_tx);
+        let demultiplexer = MessageDemultiplexer::new(incoming_packets_rx, queries_tx);
         let demultiplexer = Arc::new(demultiplexer);
 
         let demultiplexer_clone = demultiplexer.clone();
@@ -235,7 +249,6 @@ impl DhtV4 {
 
         let client = DhtClientV4::new(
             bind_addr,
-            external_addr,
             socket.clone(),
             demultiplexer.clone(),
             routing_table.clone(),
@@ -253,7 +266,7 @@ impl DhtV4 {
                 .spawn(Self::bootstrap_from(client.clone(), contact));
         }
 
-        while let Some(t) = bootstrap_join_set.join_next().await {}
+        while let Some(_) = bootstrap_join_set.join_next().await {}
 
         info!(
             "DHT bootstrapped, routing table has {} nodes",
@@ -282,10 +295,17 @@ impl DhtV4 {
         Ok(dht)
     }
 
+    /// Keep the DHT running so you can't use the clients and servers, usually you put spawn this
+    /// and abort the task when desired
     pub async fn run(mut self) {
         while let Some(_) = self.helper_tasks.join_next().await {}
     }
 
+    /// Given a known know, perform one find node to ourself add the response to the routing table
+    /// *and* do one additional round of find node to all the returned nodes from the bootstrapping
+    /// node.
+    ///
+    /// This is subject to change in the future.
     #[instrument(skip_all)]
     async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
         let our_id = dht.our_id.clone();
@@ -339,12 +359,13 @@ impl DhtV4 {
                                 .chunks_exact(26)
                                 .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
                                 .collect();
-                            {
-                                // add the bootstrapping node to our routing table
+
+                            for node in nodes {
+                                // add the leave level responses to our routing table
                                 let mut table = dht.routing_table.write().await;
                                 table.add_new_node(CompactNodeContact::from_node_id_and_addr(
                                     &response.body.id,
-                                    &contact,
+                                    &node.into(),
                                 ));
                             }
                         }
@@ -356,46 +377,25 @@ impl DhtV4 {
         Ok(())
     }
 
-    async fn find_node(&self, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
-        let dht = self.client.clone();
-        dht.find_node(target).await
+    /// Returns a handle to the client so you can perform queries
+    pub fn client(&self) -> Arc<DhtClientV4> {
+        self.client.clone()
     }
 
-    async fn get_peers(&self, info_hash: &InfoHash) -> Result<(Box<[u8]>, Vec<CompactPeerContact>), DhtServiceFailure> {
-        let dht = self.client.clone();
-        dht.get_peers(*info_hash).await
-    }
-
-    async fn ping(&self, contact: &SocketAddrV4) -> Result<(), DhtServiceFailure> {
-        let dht = self.client.clone();
-        dht.ping(*contact).await
-    }
-
-    async fn announce_peer(
-        &self,
-        info_hash: &InfoHash,
-        contact: &SocketAddrV4,
-        port: Option<u16>,
-        token: Box<[u8]>,
-    ) -> Result<(), DhtServiceFailure> {
-        let dht = self.client.clone();
-        dht.announce_peers(*contact, *info_hash, port, token).await
+    /// Returns a handle to the server, currently there is no public API for the server. In the
+    /// the sever will support some APIs to allow you to query about its state
+    pub fn server(&self) -> Arc<DhtServer> {
+        self.server.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        dht_service::{dht_client::DhtClientV4, DhtV4},
-        message::Krpc,
-    };
+    use crate::dht_service::DhtV4;
+    use num::{BigUint, Num};
     use opentelemetry::global;
     use rand::RngCore;
-    use std::{
-        net::SocketAddrV4,
-        str::FromStr,
-        sync::{Arc, Once},
-    };
+    use std::{net::SocketAddrV4, str::FromStr, sync::Once};
     use tokio::time::{self, timeout};
     use tracing::info;
     use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
@@ -436,7 +436,7 @@ mod tests {
                 // router.utorrent.com
                 "67.215.246.10:6881".parse().unwrap(),
                 // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:6881".parse().unwrap(),
+                "82.221.103.244:8991".parse().unwrap(),
                 // dht.aelitis.com
                 "174.129.43.152:6881".parse().unwrap(),
             ],
@@ -452,13 +452,13 @@ mod tests {
             );
         }
 
-        let dht = Arc::new(dht);
+        let client = dht.client;
 
         let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 20];
         rng.fill_bytes(&mut bytes);
 
-        let node = dht.find_node(&bytes).await;
+        let node = client.find_node(&bytes).await;
         if let Ok(node) = node {
             info!("found node {:?}", node);
         } else {
@@ -488,13 +488,14 @@ mod tests {
                 "174.129.43.152:6881".parse().unwrap(),
             ],
         )
-        .await;
+        .await?;
 
-        // let info_hash = BigUint::from_str_radix("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b", 16).unwrap();
-        // let info_hash = info_hash.to_bytes_be();
-        //
-        // let (token, peers) = dht.inner.get_peers(info_hash.as_slice().try_into()?).await?;
-        // info!("token {token:?}, peers {peers:?}");
+        let info_hash = BigUint::from_str_radix("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b", 16).unwrap();
+        let info_hash = info_hash.to_bytes_be();
+
+        let client = dht.client();
+        let (token, peers) = client.get_peers(info_hash.as_slice().try_into()?).await?;
+        info!("token {token:?}, peers {peers:?}");
         Ok(())
     }
 
