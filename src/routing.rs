@@ -1,6 +1,7 @@
 use crate::domain_knowledge::{CompactNodeContact, NodeId};
 use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
+use tracing::{info, trace};
 
 #[derive(Debug)]
 pub struct RoutingTable {
@@ -60,6 +61,19 @@ impl RoutingTable {
         let node_id = contact.node_id();
         let node_id = BigUint::from_bytes_be(node_id);
 
+        // there is a special case, when we already know this node, in that case, we just update the
+        // last_checked timestamp.
+        if let Some(node) = self
+            .buckets
+            .iter_mut()
+            .map(|b| b.nodes.iter_mut())
+            .flatten()
+            .find(|node| node.contact.node_id() == contact.node_id())
+        {
+            node.last_checked = Instant::now();
+            return;
+        }
+
         let our_id = &self.id;
         let distance = our_id.bitxor(BigUint::from_bytes_be(contact.node_id()));
 
@@ -99,18 +113,23 @@ impl RoutingTable {
 
                 target_bucket.upper_bound = &target_bucket.upper_bound / 2u8;
                 self.buckets.push(new_bucket);
+                trace!("bucket split");
             }
             // if the bucket id range is not within our id and the bucket is full, we don't need to do
             // anything
-            (true, false) => {}
+            (true, false) => {
+                trace!("node not added, bucket full and not within our id");
+            }
             // if the buckets are not full, then happy days, we just add the new node
             (false, _) => {
                 target_bucket.nodes.push(Node {
                     contact,
                     last_checked: Instant::now(),
                 });
+                trace!("node added");
             }
         }
+        info!("node process, node_count: {}", self.node_count());
     }
 
     pub fn find_closest(&self, target: &NodeId) -> Vec<&CompactNodeContact> {
@@ -136,7 +155,12 @@ impl RoutingTable {
             .collect();
 
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
-        closest_nodes.iter().take(8).map(|x| x.1).collect()
+        closest_nodes
+            .iter()
+            .filter(|(_, node)| node.node_id() != target)
+            .take(8)
+            .map(|x| x.1)
+            .collect()
     }
 
     pub fn find(&self, target: &NodeId) -> Option<&Node> {

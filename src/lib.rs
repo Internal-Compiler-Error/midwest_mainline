@@ -3,8 +3,8 @@
 #![allow(unused_results)]
 #![allow(unreachable_code)]
 
-mod dht_service;
-mod domain_knowledge;
-mod message;
-mod routing;
-mod utils;
+pub mod dht_service;
+pub mod domain_knowledge;
+pub(crate) mod message;
+pub(crate) mod routing;
+pub(crate) mod utils;

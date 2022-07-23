@@ -8,7 +8,7 @@ use crate::{
 };
 use rand::RngCore;
 
-use crate::message::InfoHash;
+use crate::{domain_knowledge::CompactNodeContact, message::InfoHash};
 use sha3::{Digest, Sha3_256};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -168,16 +168,14 @@ impl DhtServer {
         }
     }
     #[tracing::instrument]
-    async fn generate_response(&self, request: Krpc, socket_addr: SocketAddrV4) -> Option<Krpc> {
+    async fn generate_response(&self, request: Krpc, from: SocketAddrV4) -> Option<Krpc> {
         let response = match request {
-            Krpc::PingQuery(ping) => Some(self.generate_ping_response(ping)),
-            Krpc::FindNodeQuery(find_node) => Some(self.generate_find_node_response(find_node).await),
+            Krpc::PingQuery(ping) => Some(self.generate_ping_response(ping, from).await),
+            Krpc::FindNodeQuery(find_node) => Some(self.generate_find_node_response(find_node, from).await),
             Krpc::AnnouncePeerQuery(announce_peer) => {
-                Some(self.generate_announce_peer_response(announce_peer, socket_addr).await)
+                Some(self.generate_announce_peer_response(announce_peer, from).await)
             }
-            Krpc::GetPeersQuery(get_peers) => {
-                Some(self.generate_get_peers_response(get_peers, *socket_addr.ip()).await)
-            }
+            Krpc::GetPeersQuery(get_peers) => Some(self.generate_get_peers_response(get_peers, from).await),
             _ => {
                 // TODO: implement Value for Krpc so we can use structured logging
                 error!("unexpected message in the server response queue, {request:?}");
@@ -188,14 +186,29 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    fn generate_ping_response(&self, ping: PingQuery) -> Krpc {
+    async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
+        // add the node into our routing table
+        {
+            let mut routing_table = self.routing_table.write().await;
+            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&ping.body.id, &origin));
+        }
+
         Krpc::new_ping_response(ping.transaction_id, self.our_id)
     }
 
     #[tracing::instrument]
-    async fn generate_find_node_response(&self, query: FindNodeQuery) -> Krpc {
+    async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
+        // add the node into our routing table
+        {
+            let mut routing_table = self.routing_table.write().await;
+            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&query.body.id, &origin));
+        }
+
         let table = self.routing_table.read().await;
-        let closest_eight: Vec<_> = table.find_closest(&query.body.target).into_iter().take(8).collect();
+        let closest_eight: Vec<_> = table
+            .find_closest(&query.body.target)
+            .into_iter()
+            .collect();
 
         // if we have an exact match, it will be the first element in the vector
         return if closest_eight[0].node_id() == &query.body.target {
@@ -211,7 +224,13 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: Ipv4Addr) -> Krpc {
+    async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
+        // add the node into our routing table
+        {
+            let mut routing_table = self.routing_table.write().await;
+            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&query.body.id, &origin));
+        }
+
         // see if know about the info hash
         let table = self.hash_table.read().await;
         let token_pool = &self.token_pool;
@@ -219,7 +238,7 @@ impl DhtServer {
         return if let Some(peers) = table.get(&query.body.info_hash) {
             let peers: Vec<_> = peers.iter().cloned().collect();
 
-            let token = token_pool.token_for_addr(&origin).await;
+            let token = token_pool.token_for_addr(origin.ip()).await;
             Krpc::new_get_peers_success_response(query.transaction_id, self.our_id, token, peers)
         } else {
             let closest_eight: Vec<_> = self
@@ -228,11 +247,10 @@ impl DhtServer {
                 .await
                 .find_closest(&query.body.info_hash)
                 .into_iter()
-                .take(8)
                 .cloned()
                 .collect();
 
-            let token = token_pool.token_for_addr(&origin).await;
+            let token = token_pool.token_for_addr(&origin.ip()).await;
             let bytes = closest_eight.to_concated_node_contact();
 
             Krpc::new_get_peers_deferred_response(query.transaction_id, self.our_id, token, bytes)
@@ -244,6 +262,12 @@ impl DhtServer {
         // see if the token is valid
         if !self.token_pool.is_valid_token(&origin.ip(), &announce.body.token).await {
             return Krpc::new_standard_protocol_error(announce.transaction_id);
+        }
+
+        // add the node into our routing table
+        {
+            let mut routing_table = self.routing_table.write().await;
+            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&announce.body.id, &origin));
         }
 
         // generate the correct peer contact according to the implied port argument, the port
