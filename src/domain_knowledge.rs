@@ -108,6 +108,7 @@ impl ToConcatedNodeContact for Vec<CompactNodeContact> {
 
 impl ToConcatedNodeContact for Vec<&CompactNodeContact> {
     fn to_concated_node_contact(&self) -> Box<[u8]> {
-        todo!()
+        let bytes = self.iter().map(|contact| contact.bytes).flatten().collect::<Vec<_>>();
+        bytes.into_boxed_slice()
     }
 }

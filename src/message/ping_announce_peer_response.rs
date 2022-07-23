@@ -1,7 +1,4 @@
-use crate::{
-    domain_knowledge::NodeId,
-    message::{TransactionId},
-};
+use crate::{domain_knowledge::NodeId, message::TransactionId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 

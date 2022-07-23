@@ -26,5 +26,6 @@ pub struct GetPeersDeferredResponseBody {
     #[serde_as(as = "Bytes")]
     pub token: Box<[u8]>,
 
+    #[serde_as(as = "Bytes")]
     pub nodes: Box<[u8]>,
 }

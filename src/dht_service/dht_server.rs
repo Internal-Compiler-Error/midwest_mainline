@@ -21,7 +21,7 @@ use tokio::{
     sync::{mpsc::Receiver, Mutex, RwLock},
     time::Instant,
 };
-use tracing::{error, trace};
+use tracing::{error, info, info_span, trace, Instrument};
 
 #[derive(Debug)]
 struct TokenPool {
@@ -62,8 +62,8 @@ impl TokenPool {
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
     /// existing token.
-    pub(crate) fn token_for_addr(&self, addr: &Ipv4Addr) -> Box<[u8]> {
-        let mut assigned = self.assigned.blocking_lock();
+    pub(crate) async fn token_for_addr(&self, addr: &Ipv4Addr) -> Box<[u8]> {
+        let mut assigned = self.assigned.lock().await;
         let entry = assigned.entry(*addr);
 
         // we need to assign the ip a new token if the
@@ -74,7 +74,7 @@ impl TokenPool {
                 let (token, last_update) = e.get_mut();
 
                 if last_update.elapsed() > TOKEN_EXPIRATION_TIME {
-                    *token = self.generate_token(addr);
+                    *token = self.generate_token(addr).await;
                     *last_update = Instant::now();
                 }
 
@@ -82,9 +82,9 @@ impl TokenPool {
             }
             Entry::Vacant(v) => {
                 let hasher = Sha3_256::new();
-                let salt = self.salt.blocking_read();
+                let salt = self.salt.read();
 
-                let token = self.generate_token(addr);
+                let token = self.generate_token(addr).await;
                 let last_update = Instant::now();
 
                 let (token, _) = v.insert((token, last_update));
@@ -95,15 +95,15 @@ impl TokenPool {
     }
 
     /// See as the moment of calling, is the token correct?
-    pub(crate) fn is_valid_token(&self, addr: &Ipv4Addr, token: &[u8]) -> bool {
-        let expected_token = self.generate_token(addr);
+    pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &[u8]) -> bool {
+        let expected_token = self.generate_token(addr).await;
         &*expected_token == token
     }
 
     /// generate what the token for the address should be as this current moment
-    fn generate_token(&self, addr: &Ipv4Addr) -> Box<[u8]> {
+    async fn generate_token(&self, addr: &Ipv4Addr) -> Box<[u8]> {
         let mut hasher = Sha3_256::new();
-        let salt = self.salt.blocking_read();
+        let salt = self.salt.read().await;
         hasher.update(&*salt);
         hasher.update(addr.octets());
 
@@ -114,7 +114,7 @@ impl TokenPool {
 }
 
 #[derive(Debug)]
-pub(crate) struct DHTServer {
+pub(crate) struct DhtServer {
     routing_table: Arc<RwLock<RoutingTable>>,
     our_id: NodeId,
     requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
@@ -123,7 +123,7 @@ pub(crate) struct DHTServer {
     socket: Arc<UdpSocket>,
 }
 
-impl DHTServer {
+impl DhtServer {
     pub(crate) fn new(
         requests: Receiver<(Krpc, SocketAddrV4)>,
         socket: Arc<UdpSocket>,
@@ -140,25 +140,31 @@ impl DHTServer {
         }
     }
 
+    #[tracing::instrument]
     pub(crate) async fn handle_requests(self: Arc<Self>) {
         let mut requests = (&self).requests.lock().await;
         while let Some((request, socket_addr)) = requests.recv().await {
             trace!("Received request: {:?}", request);
 
             let server = self.clone();
-            tokio::spawn(async move {
-                let server = &*server;
-                let response = server.generate_response(request, socket_addr).await;
-                trace!("Handling request from {socket_addr}");
 
-                if let Some(response) = response {
-                    let serialized = bendy::serde::to_bytes(&response)?;
-                    server.socket.send_to(&serialized, socket_addr).await?;
-                    trace!("response sent for {socket_addr}");
+            tokio::spawn(
+                async move {
+                    let server = &*server;
+                    let response = server.generate_response(request, socket_addr).await;
+                    trace!("Handling request from {socket_addr}");
+
+                    if let Some(response) = response {
+                        let serialized = bendy::serde::to_bytes(&response)?;
+                        server.socket.send_to(&serialized, socket_addr).await?;
+                        trace!("response sent for {socket_addr}");
+                    }
+
+                    info!("table = {:#?}", server.hash_table.read().await.len());
+                    Ok::<_, color_eyre::Report>(())
                 }
-
-                Ok::<_, color_eyre::Report>(())
-            });
+                .instrument(info_span!("handle_requests")),
+            );
         }
     }
     #[tracing::instrument]
@@ -213,7 +219,7 @@ impl DHTServer {
         return if let Some(peers) = table.get(&query.body.info_hash) {
             let peers: Vec<_> = peers.iter().cloned().collect();
 
-            let token = token_pool.token_for_addr(&origin);
+            let token = token_pool.token_for_addr(&origin).await;
             Krpc::new_get_peers_success_response(query.transaction_id, self.our_id, token, peers)
         } else {
             let closest_eight: Vec<_> = self
@@ -226,7 +232,7 @@ impl DHTServer {
                 .cloned()
                 .collect();
 
-            let token = token_pool.token_for_addr(&origin);
+            let token = token_pool.token_for_addr(&origin).await;
             let bytes = closest_eight.to_concated_node_contact();
 
             Krpc::new_get_peers_deferred_response(query.transaction_id, self.our_id, token, bytes)
@@ -236,7 +242,7 @@ impl DHTServer {
     #[tracing::instrument]
     async fn generate_announce_peer_response(&self, announce: AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
-        if !self.token_pool.is_valid_token(&origin.ip(), &announce.body.token) {
+        if !self.token_pool.is_valid_token(&origin.ip(), &announce.body.token).await {
             return Krpc::new_standard_protocol_error(announce.transaction_id);
         }
 
