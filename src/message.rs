@@ -48,6 +48,25 @@ pub enum Krpc {
     ErrorResponse(ErrorResponse),
 }
 
+#[allow(non_camel_case_types)]
+pub(crate) mod query_methods {
+    use serde_unit_struct::{Deserialize_unit_struct, Serialize_unit_struct};
+
+    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
+    pub(crate) struct find_node;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
+    //#[serde(rename = "ping")]
+    pub(crate) struct ping;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
+
+    pub(crate) struct announce_peer;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
+    pub(crate) struct get_peers;
+}
+
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
@@ -57,51 +76,6 @@ pub(crate) enum MessageType {
     Response,
     #[serde(rename = "e")]
     Error,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum QueryMethod {
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "find_node")]
-    FindNode,
-    #[serde(rename = "get_peers")]
-    GetPeers,
-    #[serde(rename = "announce_peer")]
-    AnnouncePeer,
-    // this is a massive hack, the bendy crate will treat Some(T) as a list of T, but we want a
-    // single T, so this stands in for the None case
-    None,
-}
-
-impl QueryMethod {
-    // see the comment in the enum for why is idiotic function exists
-    fn is_none(&self) -> bool {
-        match self {
-            QueryMethod::None => true,
-            _ => false,
-        }
-    }
-
-    fn ping() -> Self {
-        QueryMethod::Ping
-    }
-
-    fn find_node() -> Self {
-        QueryMethod::FindNode
-    }
-
-    fn get_peers() -> Self {
-        QueryMethod::GetPeers
-    }
-
-    fn announce_peer() -> Self {
-        QueryMethod::AnnouncePeer
-    }
-
-    fn not_a_query() -> QueryMethod {
-        QueryMethod::None
-    }
 }
 
 impl Krpc {
@@ -150,7 +124,7 @@ impl Krpc {
         let ping_query = PingQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
-            query_method: QueryMethod::Ping,
+            query_method: query_methods::ping,
             body: PingArgs { id: querying_id },
         };
 
@@ -161,7 +135,7 @@ impl Krpc {
         let find_node_query = FindNodeQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
-            query_method: QueryMethod::FindNode,
+            query_method: query_methods::find_node,
             body: FindNodeArgs {
                 id: querying_id,
                 target: target_id,
@@ -175,7 +149,7 @@ impl Krpc {
         let get_peers_query = GetPeersQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
-            query_method: QueryMethod::GetPeers,
+            query_method: query_methods::get_peers,
             body: GetPeersArgs {
                 id: querying_id,
                 info_hash,
@@ -196,7 +170,7 @@ impl Krpc {
         let announce_peer_query = AnnouncePeerQuery {
             transaction_id,
             message_type: Box::new(b"q".clone()),
-            query_method: QueryMethod::AnnouncePeer,
+            query_method: query_methods::announce_peer,
             body: AnnouncePeerArgs {
                 id: querying_id,
                 implied_port: if implied_port { 1 } else { 0 },
@@ -361,7 +335,7 @@ mod test {
 
     mod deserializing {
         use super::*;
-        use bendy::serde::from_bytes;
+        use bendy::serde::{from_bytes, to_bytes};
         use std::net::{Ipv4Addr, SocketAddrV4};
 
         #[test]
@@ -373,7 +347,7 @@ mod test {
             let message = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe";
             let deserialized = from_bytes::<Krpc>(message)?;
             let expected = Krpc::new_ping_query(Box::new([b'a', b'a']), b"abcdefghij0123456789".clone());
-
+            //println!("{:?}", String::from_utf8_lossy(&to_bytes(&expected)?));
             assert_eq!(deserialized, expected);
             Ok(())
         }

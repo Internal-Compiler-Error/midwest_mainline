@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{InfoHash, QueryMethod, TransactionId},
+    message::{query_methods, InfoHash, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -17,9 +17,7 @@ pub struct AnnouncePeerQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
-    #[serde(default = "QueryMethod::announce_peer")]
-    #[serde(skip_deserializing)]
-    pub(crate) query_method: QueryMethod,
+    pub(crate) query_method: query_methods::announce_peer,
 
     #[serde(rename = "a")]
     pub(crate) body: AnnouncePeerArgs,
@@ -37,7 +35,7 @@ impl AnnouncePeerQuery {
         AnnouncePeerQuery {
             transaction_id,
             message_type: b"q".to_vec().into_boxed_slice(),
-            query_method: QueryMethod::AnnouncePeer,
+            query_method: query_methods::announce_peer,
             body: AnnouncePeerArgs {
                 id,
                 token,

@@ -17,13 +17,13 @@ use std::{
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
-    task::{JoinError, JoinSet},
+    task::{Builder, JoinError, JoinSet},
     time::{error::Elapsed, timeout},
 };
 
 use crate::message::TransactionId;
 use dht_client::DhtClientV4;
-use tracing::{info, instrument, log::warn, trace};
+use tracing::{info, info_span, instrument, log::warn, trace, Instrument};
 
 pub mod dht_client;
 mod dht_server;
@@ -71,7 +71,7 @@ impl PacketDemultiplexer {
     }
 
     #[instrument(skip_all)]
-    pub async fn lifetime_loop(&self) {
+    pub async fn run(&self) {
         let mut incoming_messages = self.incoming_messages.lock().await;
         while let Some((msg, socket_addr)) = incoming_messages.recv().await {
             let id = msg.transaction_id();
@@ -218,7 +218,7 @@ impl DhtV4 {
         join_set
             .build_task()
             .name(&*format!("socket reader for {bind_addr}"))
-            .spawn(socket_reader);
+            .spawn(socket_reader.instrument(info_span!("socket reader")));
 
         let demultiplexer = PacketDemultiplexer::new(incoming_packets_rx, queries_tx);
         let demultiplexer = Arc::new(demultiplexer);
@@ -228,7 +228,7 @@ impl DhtV4 {
             .build_task()
             .name(&*format!("message demultiplexer for {bind_addr}"))
             .spawn(async move {
-                demultiplexer_clone.lifetime_loop().await;
+                demultiplexer_clone.run().await;
             });
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(&our_id)));
@@ -268,7 +268,7 @@ impl DhtV4 {
         join_set
             .build_task()
             .name(&*format!("DHT server for {bind_addr}"))
-            .spawn(server.clone().handle_requests());
+            .spawn(server.clone().run());
 
         let dht = DhtV4 {
             client: client.clone(),
@@ -316,6 +316,40 @@ impl DhtV4 {
 
             for node in &nodes {
                 dht.routing_table.write().await.add_new_node(node.clone());
+
+                let dht = dht.clone();
+                let contact: SocketAddrV4 = node.into();
+                let our_id = dht.our_id.clone();
+                let transaction_id = dht.transaction_id_pool.next();
+                let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
+                Builder::new()
+                    .name(&*format!("leave level bootstrap to {}", contact))
+                    .spawn(async move {
+                        let response = timeout(Duration::from_secs(5), async {
+                            dht.send_message(&query, &contact)
+                                .await
+                                .expect("failure to send message")
+                        })
+                        .await?;
+
+                        if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
+                            let nodes: Vec<_> = response
+                                .body
+                                .nodes
+                                .chunks_exact(26)
+                                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+                                .collect();
+                            {
+                                // add the bootstrapping node to our routing table
+                                let mut table = dht.routing_table.write().await;
+                                table.add_new_node(CompactNodeContact::from_node_id_and_addr(
+                                    &response.body.id,
+                                    &contact,
+                                ));
+                            }
+                        }
+                        Ok::<_, color_eyre::Report>(())
+                    });
             }
             info!("bootstrapping with {contact} succeeded");
         }
@@ -447,7 +481,11 @@ mod tests {
                 // dht.tansmissionbt.com
                 "87.98.162.88:6881".parse().unwrap(),
                 // router.utorrent.com
-                // "67.215.246.10:6881".parse().unwrap(),
+                "67.215.246.10:6881".parse().unwrap(),
+                // router.bittorrent.com, ironically that this almost never responds
+                "82.221.103.244:6881".parse().unwrap(),
+                // dht.aelitis.com
+                "174.129.43.152:6881".parse().unwrap(),
             ],
         )
         .await;
@@ -515,6 +553,8 @@ mod tests {
                 "67.215.246.10:6881".parse().unwrap(),
                 // router.bittorrent.com, ironically that this almost never responds
                 "82.221.103.244:6881".parse().unwrap(),
+                // dht.aelitis.com
+                "174.129.43.152:6881".parse().unwrap(),
             ],
         )
         .await?;

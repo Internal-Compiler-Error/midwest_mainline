@@ -19,6 +19,7 @@ use std::{
 use tokio::{
     net::UdpSocket,
     sync::{mpsc::Receiver, Mutex, RwLock},
+    task::Builder,
     time::Instant,
 };
 use tracing::{error, info, info_span, trace, Instrument};
@@ -56,7 +57,9 @@ impl TokenPool {
             }
         };
 
-        let task = tokio::spawn(new_salt_every_five_minutes);
+        let task = Builder::new()
+            .name("five minute salt")
+            .spawn(new_salt_every_five_minutes);
         let _ = task.await;
     }
 
@@ -141,14 +144,14 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    pub(crate) async fn handle_requests(self: Arc<Self>) {
+    pub(crate) async fn run(self: Arc<Self>) {
         let mut requests = (&self).requests.lock().await;
         while let Some((request, socket_addr)) = requests.recv().await {
             trace!("Received request: {:?}", request);
 
             let server = self.clone();
 
-            tokio::spawn(
+            Builder::new().name(&*format!("responding to {socket_addr}")).spawn(
                 async move {
                     let server = &*server;
                     let response = server.generate_response(request, socket_addr).await;
@@ -205,10 +208,7 @@ impl DhtServer {
         }
 
         let table = self.routing_table.read().await;
-        let closest_eight: Vec<_> = table
-            .find_closest(&query.body.target)
-            .into_iter()
-            .collect();
+        let closest_eight: Vec<_> = table.find_closest(&query.body.target).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
         return if closest_eight[0].node_id() == &query.body.target {

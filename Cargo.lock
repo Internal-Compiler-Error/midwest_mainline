@@ -1122,6 +1122,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "serde_unit_struct",
  "serde_with",
  "sha3",
  "task-group",
@@ -1792,6 +1793,25 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_unit_struct"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcf8ef7c4929da5ad6c02e115231fab5ad3c0b4abfc03adcb75f5699e79b4a5a"
+dependencies = [
+ "serde_unit_struct_derive",
+]
+
+[[package]]
+name = "serde_unit_struct_derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9da3c73dc33190768a0e4acf9d8e8c4ba9e4e439fb28100bf9446eb386cb8af"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]

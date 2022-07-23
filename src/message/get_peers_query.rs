@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{InfoHash, QueryMethod, TransactionId},
+    message::{query_methods, InfoHash, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -17,9 +17,7 @@ pub struct GetPeersQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
-    #[serde(default = "QueryMethod::get_peers")]
-    #[serde(skip_deserializing)]
-    pub(crate) query_method: QueryMethod,
+    pub(crate) query_method: query_methods::get_peers,
 
     #[serde(rename = "a")]
     pub(crate) body: GetPeersArgs,
@@ -30,7 +28,7 @@ impl GetPeersQuery {
         GetPeersQuery {
             transaction_id,
             message_type: b"q".to_vec().into_boxed_slice(),
-            query_method: QueryMethod::GetPeers,
+            query_method: query_methods::get_peers,
             body: GetPeersArgs { info_hash, id },
         }
     }

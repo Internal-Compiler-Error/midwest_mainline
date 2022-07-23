@@ -129,7 +129,7 @@ impl RoutingTable {
                 trace!("node added");
             }
         }
-        info!("node process, node_count: {}", self.node_count());
+        info!("node processed, node count: {}", self.node_count());
     }
 
     pub fn find_closest(&self, target: &NodeId) -> Vec<&CompactNodeContact> {

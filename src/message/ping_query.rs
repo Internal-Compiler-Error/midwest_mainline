@@ -1,6 +1,6 @@
 use crate::{
     domain_knowledge::NodeId,
-    message::{QueryMethod, TransactionId},
+    message::{query_methods, TransactionId},
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -17,9 +17,7 @@ pub struct PingQuery {
     pub(crate) message_type: Box<[u8]>,
 
     #[serde(rename = "q")]
-    #[serde(default = "QueryMethod::ping")]
-    #[serde(skip_deserializing)]
-    pub(crate) query_method: QueryMethod,
+    pub(crate) query_method: query_methods::ping,
 
     #[serde(rename = "a")]
     pub(crate) body: PingArgs,
@@ -30,7 +28,7 @@ impl PingQuery {
         PingQuery {
             transaction_id,
             message_type: b"q".to_vec().into_boxed_slice(),
-            query_method: QueryMethod::Ping,
+            query_method: query_methods::ping,
             body,
         }
     }
