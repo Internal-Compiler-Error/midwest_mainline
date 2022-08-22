@@ -1,4 +1,7 @@
-use crate::{domain_knowledge::NodeId, message::TransactionId};
+use crate::{
+    domain_knowledge::{CompactNodeContact, NodeId, ToCompactNodeContactVec},
+    message::TransactionId,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
@@ -28,4 +31,10 @@ pub struct GetPeersDeferredResponseBody {
 
     #[serde_as(as = "Bytes")]
     pub nodes: Box<[u8]>,
+}
+
+impl ToCompactNodeContactVec for GetPeersDeferredResponse {
+    fn to_node_contact_vec(&self) -> Vec<CompactNodeContact> {
+        self.body.nodes.to_node_contact_vec()
+    }
 }

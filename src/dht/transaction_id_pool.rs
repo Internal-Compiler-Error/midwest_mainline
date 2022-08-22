@@ -16,4 +16,12 @@ impl TransactionIdPool {
     pub fn next(&self) -> u32 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
+
+    pub fn next_boxed(&self) -> Box<u32> {
+        Box::new(self.next())
+    }
+
+    pub fn next_boxed_bytes(&self) -> Box<[u8]> {
+        Box::new(self.next().to_be_bytes())
+    }
 }

@@ -12,8 +12,8 @@ pub trait ParSpawnAndAwait {
 #[async_trait]
 impl<F, R> ParSpawnAndAwait for Vec<F>
 where
-    R: Send + 'static,
     F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
 {
     type Awaited = Vec<R>;
 

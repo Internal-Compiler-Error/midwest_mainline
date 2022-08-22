@@ -1,10 +1,12 @@
 use crate::{
-    dht_service::{
-        message_broker::{MessageBroker, UdpMessageDemultiplexer},
+    dht::{
+        message_broker::{MessageBroker, MessageDemultiplexer},
         transaction_id_pool::TransactionIdPool,
-        DhtServiceFailure,
+        BootstrapError, DhtServiceFailure,
     },
-    domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
+    domain_knowledge::{
+        CompactNodeContact, CompactPeerContact, NodeId, ToCompactNodeContactVec, ToCompactNodeContactVecUnchecked,
+    },
     message::{InfoHash, Krpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -14,11 +16,13 @@ use either::Either;
 use num::BigUint;
 use std::{
     collections::HashSet,
+    future::Future,
     net::SocketAddrV4,
     ops::{BitXor, DerefMut},
     sync::Arc,
     time::Duration,
 };
+use thiserror::Error;
 use tokio::{
     sync::{oneshot, oneshot::Sender, Mutex, RwLock},
     task::JoinError,
@@ -26,14 +30,16 @@ use tokio::{
 };
 use tracing::{debug, info, instrument, trace, warn};
 
-use thiserror::Error;
 #[derive(Debug)]
-pub struct DhtClientV4 {
+pub struct DhtClientV4<D>
+where
+    D: MessageDemultiplexer + 'static + Send + Sync,
+{
     pub(crate) our_id: [u8; 20],
-    pub(crate) message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
+    pub(crate) message_broker: Arc<MessageBroker<D>>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
-    pub(crate) transaction_id_pool: TransactionIdPool,
+    pub(crate) transaction_id_pool: Arc<TransactionIdPool>,
 }
 
 #[derive(Debug, Error)]
@@ -54,18 +60,21 @@ pub enum RequestError {
     TimedOut(#[from] tokio::time::error::Elapsed),
 
     #[error("failed to send ping")]
-    SendError(#[from] crate::dht_service::message_broker::SendMessageError),
+    SendError(#[from] crate::dht::message_broker::SendMessageError),
 
     #[error("wrong response to ping query {0}")]
     WrongResponse(String),
 }
 
-impl DhtClientV4 {
+impl<D> DhtClientV4<D>
+where
+    D: MessageDemultiplexer + 'static + Send + Sync,
+{
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     pub(crate) fn new(
         bind_addr: SocketAddrV4,
-        message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
+        message_broker: Arc<MessageBroker<D>>,
         routing_table: Arc<RwLock<RoutingTable>>,
         our_id: NodeId,
     ) -> Self {
@@ -74,19 +83,18 @@ impl DhtClientV4 {
             our_id,
             routing_table,
             socket_address: bind_addr,
-            transaction_id_pool: TransactionIdPool::new(),
+            transaction_id_pool: Arc::new(TransactionIdPool::new()),
         }
     }
 
-    pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), RequestError> {
-        let this = &self;
-        let transaction_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(Box::new(transaction_id.to_be_bytes()), this.our_id);
+    pub async fn ping(self: &Self, recipient: SocketAddrV4) -> Result<(), RequestError> {
+        let transaction_id = self.transaction_id_pool.next_boxed_bytes();
+        let ping_msg = Krpc::new_ping_query(transaction_id, self.our_id);
 
-        let response = self.message_broker.send(ping_msg, recipient).await?;
+        let response = self.message_broker.send_queries(ping_msg, recipient).await?;
 
         return if let Krpc::PingAnnouncePeerResponse(response) = response {
-            this.routing_table
+            self.routing_table
                 .write()
                 .await
                 .add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &recipient));
@@ -101,125 +109,111 @@ impl DhtClientV4 {
     // peers means something special here so you can't use it
     // ask_node_for_nodes just sounds stupid so fuck it, it's her then.
     // Why her and not them? Because I want to piss people off
-    async fn ask_her_for_nodes(
-        self: Arc<Self>,
+    fn ask_her_for_nodes(
+        &self,
         interlocutor: SocketAddrV4,
         target: NodeId,
-    ) -> Result<Vec<CompactNodeContact>, RequestError> {
-        // construct the message to query our friends
-        let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
+        time_out: Duration,
+    ) -> impl Future<Output = Result<Vec<CompactNodeContact>, RequestError>> {
+        let transaction_id_pool = Arc::clone(&self.transaction_id_pool);
+        let our_id = self.our_id;
+        let message_broker = Arc::clone(&self.message_broker);
 
-        // send the message and await for a response
-        let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.message_broker.send(query, interlocutor)).await??;
+        async move {
+            // construct the message to query our friends
+            let transaction_id = transaction_id_pool.next_boxed_bytes();
+            let query = Krpc::new_find_node_query(transaction_id, our_id, target);
 
-        if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
-            // the nodes come back as one giant byte string, each 26 bytes is a node
-            // we split them up and create a vector of them
-            let mut nodes: Vec<_> = find_node_response
-                .body
-                .nodes
-                .chunks_exact(26)
-                .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                .collect();
+            // send the message and await for a response
+            let response = timeout(time_out, message_broker.send_queries(query, interlocutor)).await??;
 
-            // some clients will return duplicate nodes, so we remove them
-            nodes.sort_unstable_by_key(|node| {
-                let ip: SocketAddrV4 = node.into();
-                ip
-            });
-            nodes.dedup();
-
-            Ok(nodes)
-        } else {
-            Err(RequestError::WrongResponse(format!("wrong response{:?}", response)))
+            if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
+                let nodes = unsafe { find_node_response.to_node_contact_vec_unchecked() };
+                Ok(nodes)
+            } else {
+                Err(RequestError::WrongResponse(format!("wrong response{:?}", response)))
+            }
         }
     }
 
     #[instrument(skip(self))]
-    async fn ask_her_for_peers(
-        self: Arc<Self>,
+    fn ask_her_for_peers(
+        &self,
         interlocutor: SocketAddrV4,
         target: InfoHash,
-    ) -> Result<
-        (
-            Option<Box<[u8]>>,
-            Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
-        ),
-        RequestError,
+        time_out: Duration,
+    ) -> impl Future<
+        Output = Result<
+            (
+                Option<Box<[u8]>>,
+                Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
+            ),
+            RequestError,
+        >,
     > {
-        // trace!("Asking {:?} for peers", interlocutor);
-        // construct the message to query our friends
-        let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_get_peers_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
+        let transaction_id_pool = Arc::clone(&self.transaction_id_pool);
+        let our_id = self.our_id;
+        let message_broker = Arc::clone(&self.message_broker);
 
-        // send the message and await for a response
-        let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.message_broker.send(query, interlocutor)).await??;
-        return match response {
-            Krpc::GetPeersDeferredResponse(response) => {
-                // make sure we don't get duplicate nodes
-                let mut nodes: Vec<_> = response
-                    .body
-                    .nodes
-                    .chunks_exact(26)
-                    .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                    .collect();
+        async move {
+            // trace!("Asking {:?} for peers", interlocutor);
+            // construct the message to query our friends
+            let transaction_id = transaction_id_pool.next_boxed_bytes();
+            let query = Krpc::new_get_peers_query(transaction_id, our_id, target);
 
-                // todo: define an order for nodes??
-                // nodes.sort_unstable_by_key(|node| node.into());
-                nodes.dedup();
+            // send the message and await for a response
+            let response = timeout(time_out, message_broker.send_queries(query, interlocutor)).await??;
+            return match response {
+                Krpc::GetPeersDeferredResponse(response) => {
+                    // make sure we don't get duplicate nodes
+                    let nodes: Vec<_> = response.to_node_contact_vec();
 
-                trace!(
-                    "got a deferred response from {}, returned nodes: {:#?}",
-                    interlocutor,
-                    &nodes
-                );
-                Ok((Some(response.body.token), Either::Left(nodes)))
-            }
-            Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
-                // make sure we don't get duplicate nodes
-                let mut nodes: Vec<_> = response
-                    .body
-                    .nodes
-                    .chunks_exact(26)
-                    .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                    .collect();
+                    trace!(
+                        "got a deferred response from {}, returned nodes: {:#?}",
+                        interlocutor,
+                        &nodes
+                    );
+                    Ok((Some(response.body.token), Either::Left(nodes)))
+                }
+                Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
+                    // make sure we don't get duplicate nodes
+                    let nodes: Vec<_> = unsafe { response.to_node_contact_vec_unchecked() };
 
-                // todo: define an order for nodes??
-                // nodes.sort_unstable_by_key(|node| node.into());
-                nodes.dedup();
-                trace!(
-                    "got a deferred response from {} (token missing), returned nodes {:#?}",
-                    interlocutor,
-                    &nodes
-                );
+                    trace!(
+                        "got a deferred response from {} (token missing), returned nodes {:#?}",
+                        interlocutor,
+                        &nodes
+                    );
 
-                Ok((None, Either::Left(nodes)))
-            }
-            Krpc::GetPeersSuccessResponse(response) => {
-                let mut values = response.body.values;
-                // todo: define an order for nodes??
-                // values.sort_unstable_by_key(|value| value.into());
-                values.dedup();
+                    Ok((None, Either::Left(nodes)))
+                }
+                Krpc::GetPeersSuccessResponse(response) => {
+                    let mut values = response.body.values;
+                    // todo: define an order for nodes??
+                    // values.sort_unstable_by_key(|value| value.into());
+                    values.dedup();
 
-                trace!("got a success response from {}, values {:#?}", interlocutor, &values);
-                Ok((Some(response.body.token), Either::Right(values)))
-            }
-            Krpc::ErrorResponse(response) => {
-                warn!("Got an error response to get peers: {:?}", response);
-                Err(RequestError::WrongResponse(format!("{:?}", response)))
-            }
-            other => {
-                warn!("Unexpected response to get peers: {:?}", other);
-                Err(RequestError::WrongResponse(format!("{:?}", other)))
-            }
-        };
+                    trace!("got a success response from {}, values {:#?}", interlocutor, &values);
+                    Ok((Some(response.body.token), Either::Right(values)))
+                }
+                Krpc::ErrorResponse(response) => {
+                    warn!("Got an error response to get peers: {:?}", response);
+                    Err(RequestError::WrongResponse(format!("{:?}", response)))
+                }
+                other => {
+                    warn!("Unexpected response to get peers: {:?}", other);
+                    Err(RequestError::WrongResponse(format!("{:?}", other)))
+                }
+            };
+        }
     }
 
     /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
+    pub async fn find_node(
+        self: Arc<Self>,
+        target: &NodeId,
+        time_out: Duration,
+    ) -> Result<CompactNodeContact, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.read().await.find(target) {
             return Ok(node.contact.clone());
@@ -232,14 +226,14 @@ impl DhtClientV4 {
             closest = table.find_closest(target).into_iter().cloned().collect::<Vec<_>>();
         }
 
-        let returned_nodes = closest
+        let returned_nodes: Vec<_> = closest
             .iter()
             .map(|node| {
-                let ip: SocketAddrV4 = node.into();
-                ip
+                let sock_addr: SocketAddrV4 = node.into();
+                sock_addr
             })
-            .map(|ip| self.clone().ask_her_for_nodes(ip, *target))
-            .collect::<Vec<_>>();
+            .map(|sock_addr| self.ask_her_for_nodes(sock_addr, *target, time_out))
+            .collect();
 
         let returned_nodes = returned_nodes.par_spawn_and_await().await?;
 
@@ -297,7 +291,7 @@ impl DhtClientV4 {
         let target = target.clone();
         let mut parallel_find = tokio::spawn(async move {
             let _ = dht
-                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, tx)
+                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, tx, time_out)
                 .await;
         });
 
@@ -319,12 +313,18 @@ impl DhtClientV4 {
     /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
     /// looking for, the target return is observed via the slot variable, once it has been filled,
     /// the caller should drop the future to cancel all remaining tasks
+    ///
+    /// # Note
+    /// The time_out parameter does not get reduced for each level of recursion, i.e. if time_out is
+    /// 15s and it took 14s for one layer of search to return, the next level will still get another
+    /// 15s rather than just 1s.
     async fn recursive_find_from_pool(
         self: Arc<Self>,
         mut starting_pool: Vec<CompactNodeContact>,
         finding: NodeId,
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
         slot: Arc<Mutex<Option<Sender<CompactNodeContact>>>>,
+        time_out: Duration,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -353,7 +353,9 @@ impl DhtClientV4 {
                 let dht = self.clone();
                 let slot = slot.clone();
                 async move {
-                    let returned_nodes = dht.clone().ask_her_for_nodes((&starting_node).into(), finding).await?;
+                    let returned_nodes = dht
+                        .ask_her_for_nodes((&starting_node).into(), finding, time_out)
+                        .await?;
 
                     // add the nodes to our routing table
                     {
@@ -382,7 +384,8 @@ impl DhtClientV4 {
                         // if we didn't, then we add the nodes we got to the seen list and recurse
                         seen.lock().await.insert(starting_node.clone());
 
-                        dht.recursive_find_from_pool(returned_nodes, finding, seen, slot).await
+                        dht.recursive_find_from_pool(returned_nodes, finding, seen, slot, time_out)
+                            .await
                     };
                 }
             })
@@ -404,6 +407,7 @@ impl DhtClientV4 {
         finding: InfoHash,
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
         slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<CompactPeerContact>)>>>>,
+        time_out: Duration,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -429,7 +433,10 @@ impl DhtClientV4 {
                 let dht = self.clone();
                 let slot = slot.clone();
                 async move {
-                    let (token, returned) = dht.clone().ask_her_for_peers((&starting_node).into(), finding).await?;
+                    let (token, returned) = dht
+                        .clone()
+                        .ask_her_for_peers((&starting_node).into(), finding, time_out)
+                        .await?;
 
                     return match returned {
                         Either::Left(mut deferred) => {
@@ -441,7 +448,8 @@ impl DhtClientV4 {
                                 seen.insert(starting_node.clone());
                             }
 
-                            dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
+                            dht.recursive_get_peers_from_pool(deferred, finding, seen, slot, time_out)
+                                .await
                         }
                         Either::Right(success) => {
                             trace!("got success response, {success:#?}");
@@ -471,6 +479,7 @@ impl DhtClientV4 {
     pub async fn get_peers(
         self: Arc<Self>,
         info_hash: InfoHash,
+        time_out: Duration,
     ) -> Result<(Box<[u8]>, Vec<CompactPeerContact>), DhtServiceFailure> {
         // get all the closest nodes to the info_hash
         let closest_nodes: Vec<_> = self
@@ -487,7 +496,7 @@ impl DhtClientV4 {
         let slot = Arc::new(Mutex::new(Some(tx)));
 
         let mut search = tokio::spawn(async move {
-            self.recursive_get_peers_from_pool(closest_nodes, info_hash.clone(), seen.clone(), slot.clone())
+            self.recursive_get_peers_from_pool(closest_nodes, info_hash.clone(), seen.clone(), slot.clone(), time_out)
                 .await
         });
 
@@ -517,19 +526,12 @@ impl DhtClientV4 {
         port: Option<u16>,
         token: Box<[u8]>,
     ) -> Result<(), RequestError> {
-        let transaction_id = self.transaction_id_pool.next();
+        let transaction_id = self.transaction_id_pool.next_boxed_bytes();
         let query = if let Some(port) = port {
-            Krpc::new_announce_peer_query(
-                Box::new(transaction_id.to_be_bytes()),
-                info_hash,
-                self.our_id,
-                port,
-                true,
-                token,
-            )
+            Krpc::new_announce_peer_query(transaction_id, info_hash, self.our_id, port, true, token)
         } else {
             Krpc::new_announce_peer_query(
-                Box::new(transaction_id.to_be_bytes()),
+                transaction_id,
                 info_hash,
                 self.our_id,
                 self.socket_address.port(),
@@ -538,7 +540,7 @@ impl DhtClientV4 {
             )
         };
 
-        let response = self.message_broker.send(query, recipient).await?;
+        let response = self.message_broker.send_queries(query, recipient).await?;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
@@ -549,5 +551,93 @@ impl DhtClientV4 {
                 "non-compliant response from DHT node".to_string(),
             )),
         };
+    }
+
+    /// Given a list of known nodes, bootstrap ourselves to the network by doing a `find_node` to
+    /// ourselves to each of the bootstrapping nodes, then performing `find_node` with random id to
+    /// each of the nodes the bootstrapping nodes returned.
+    #[instrument(skip_all)]
+    async fn bootstrap_from(
+        our_id: NodeId,
+        table: Arc<RwLock<RoutingTable>>,
+        address: SocketAddrV4,
+        message_broker: Arc<MessageBroker<D>>,
+        known_nodes: Vec<SocketAddrV4>,
+        time_out: Duration,
+    ) -> Result<Arc<DhtClientV4<D>>, BootstrapError>
+    where
+        D: MessageDemultiplexer,
+    {
+        use tokio::task::Builder;
+
+        let client = Arc::new(DhtClientV4::new(address, message_broker, table, our_id));
+
+        // for each of the known nodes, first send a find_node request to find ourselves, then send
+        // send a random find_node request in the bucket range for all the returned nodes
+        for known_node in known_nodes {
+            // first we ask the known_node about ourselves
+            let transaction_id = (&client).transaction_id_pool.next_boxed_bytes();
+            let query = Krpc::new_find_node_query(transaction_id, our_id, our_id);
+
+            info!("bootstrapping with {known_node}");
+            let response = timeout(time_out, async {
+                (&client)
+                    .message_broker
+                    .send_queries(query, known_node)
+                    .await
+                    .expect("failure to send message")
+            })
+            .await?;
+
+            if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
+                let nodes = unsafe { response.to_node_contact_vec_unchecked() };
+                {
+                    // add the bootstrapping node to our routing table
+                    let mut table = (&client).routing_table.write().await;
+                    table.add_new_node(CompactNodeContact::from_node_id_and_addr(
+                        &response.body.id,
+                        &known_node,
+                    ));
+                }
+
+                // second, ask for a random node within the bucket as find_node
+                for node in &nodes {
+                    (&client).routing_table.write().await.add_new_node(node.clone());
+                    let contact: SocketAddrV4 = node.into();
+                    let our_id = (&client).our_id.clone();
+                    let transaction_id = (&client).transaction_id_pool.next_boxed_bytes();
+                    let query = Krpc::new_find_node_query(transaction_id, our_id, our_id.clone());
+                    let client = Arc::clone(&client);
+                    Builder::new()
+                        .name(&*format!("leave level bootstrap to {}", contact))
+                        .spawn(async move {
+                            let response = timeout(time_out, async {
+                                (&client)
+                                    .message_broker
+                                    .send_queries(query, contact)
+                                    .await
+                                    .expect("failure to send message")
+                            })
+                            .await?;
+
+                            if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
+                                let nodes = unsafe { response.to_node_contact_vec_unchecked() };
+
+                                for node in nodes {
+                                    // add the leave level responses to our routing table
+                                    let mut table = (&client).routing_table.write().await;
+                                    table.add_new_node(CompactNodeContact::from_node_id_and_addr(
+                                        &response.body.id,
+                                        &node.into(),
+                                    ));
+                                }
+                            }
+                            Ok::<_, color_eyre::Report>(())
+                        });
+                }
+                info!("bootstrapping with {known_node} succeeded");
+            }
+        }
+        Ok(client)
     }
 }

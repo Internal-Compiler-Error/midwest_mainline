@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use crate::message::{Krpc, TransactionId};
 use std::{
     collections::HashMap,
@@ -36,7 +38,7 @@ where
     outgoing_messages: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
 
     /// a demultiplexer to handle the messages we receive from a source, currently the socket.
-    demultiplexer: Arc<D>,
+    demultiplexer: Option<D>,
 }
 
 /// A message demultiplexer will continuously read a source of IO and demultiplex messages into a
@@ -46,14 +48,14 @@ where
 /// Currently the trait doesn't really convey the information about the queues, I would love to use
 /// the type system to make this more explicit but I don't know how to do that yet.
 #[async_trait::async_trait]
-pub(crate) trait MessageDemultiplexer {
+pub trait MessageDemultiplexer {
     type Error: Error + Send + Sync + 'static;
-    async fn run(self: Arc<Self>) -> Result<(), Self::Error>;
+    async fn run(self) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]
 pub(crate) struct UdpMessageDemultiplexer {
-    socket: net::UdpSocket,
+    socket: Arc<net::UdpSocket>,
 
     /// a channel to put messages to the UDP socket
     outgoing_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
@@ -69,7 +71,7 @@ impl UdpMessageDemultiplexer {
         incoming_messages: mpsc::Sender<(Krpc, SocketAddrV4)>,
     ) -> Self {
         UdpMessageDemultiplexer {
-            socket,
+            socket: Arc::new(socket),
             outgoing_messages,
             incoming_messages,
         }
@@ -91,11 +93,12 @@ pub(crate) enum MessageDemultiplexerError {
 #[async_trait::async_trait]
 impl MessageDemultiplexer for UdpMessageDemultiplexer {
     type Error = std::io::Error;
-    async fn run(self: Arc<Self>) -> Result<(), Self::Error> {
+    async fn run(mut self) -> Result<(), Self::Error> {
+        let socket = Arc::clone(&self.socket);
         let put_message_to_socket = async move {
             while let Some((msg, recipient)) = self.outgoing_messages.recv().await {
                 if let Ok(encoded) = bendy::serde::to_bytes(&msg) {
-                    self.socket.send_to(&encoded, &recipient).await.unwrap();
+                    socket.send_to(&encoded, &recipient).await.unwrap();
                 } else {
                     tracing::warn!("Failed to encode message");
                 }
@@ -104,9 +107,10 @@ impl MessageDemultiplexer for UdpMessageDemultiplexer {
             Ok::<_, MessageDemultiplexerError>(())
         };
 
-        let get_message_from_socket = async {
+        let socket = Arc::clone(&self.socket);
+        let get_message_from_socket = async move {
             let mut buf = [0u8; 2048];
-            while let Ok((amt, src)) = self.socket.recv_from(&mut buf).await {
+            while let Ok((amt, src)) = socket.recv_from(&mut buf).await {
                 // we only accept ipv4 addresses
                 let src = match src {
                     SocketAddr::V4(src) => src,
@@ -149,7 +153,7 @@ pub enum SendMessageError {
 
 impl<D> MessageBroker<D>
 where
-    D: MessageDemultiplexer + Send + Sync + 'static,
+    D: MessageDemultiplexer + Send + 'static,
 {
     pub fn new(
         incoming_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
@@ -162,22 +166,21 @@ where
             query_queue: Mutex::new(query_channel),
             incoming_messages: Mutex::new(incoming_messages),
             outgoing_messages: Mutex::new(outgoing_channel),
-            demultiplexer: Arc::new(demultiplexer),
+            demultiplexer: Some(demultiplexer),
         }
     }
 
     #[instrument(skip_all)]
-    pub async fn run(self: Arc<Self>) {
-        let this = self.clone();
+    pub async fn run(mut self) {
         let forward_messages_into_right_queue = async move {
-            let mut incoming_messages = this.incoming_messages.lock().await;
+            let mut incoming_messages = self.incoming_messages.lock().await;
             while let Some((msg, socket_addr)) = incoming_messages.recv().await {
                 let id = msg.transaction_id();
                 trace!("received message for transaction id {:?}", hex::encode_upper(&*id));
 
                 // if the message is a query, we put it into the queue to be sent to the server
                 if msg.is_query() {
-                    let query_queue = this.query_queue.lock().await;
+                    let query_queue = self.query_queue.lock().await;
                     query_queue
                         .send((msg, socket_addr))
                         .await
@@ -185,7 +188,7 @@ where
                 } else {
                     // if the message is a response, we check if we have a pending request for this
                     // transaction id, if so, we send the response to the client, otherwise we drop it.
-                    let mut pending_responses = this.pending_responses.lock().await;
+                    let mut pending_responses = self.pending_responses.lock().await;
                     if let Some(sender) = pending_responses.remove(id) {
                         // totally normal if the receiver is gone, this usually happens when the client
                         // is no longer interested in the request
@@ -201,7 +204,7 @@ where
                 .spawn(forward_messages_into_right_queue),
             Builder::new()
                 .name("demultiplex messages")
-                .spawn(self.demultiplexer.clone().run())
+                .spawn(self.demultiplexer.take().unwrap().run())
         );
     }
 
@@ -213,7 +216,7 @@ where
         let _ = guard.insert(transaction_id, sending_half);
     }
 
-    pub async fn send(&self, msg: Krpc, socket_addr: SocketAddrV4) -> Result<Krpc, SendMessageError> {
+    pub async fn send_queries(&self, msg: Krpc, socket_addr: SocketAddrV4) -> Result<Krpc, SendMessageError> {
         let transaction_id = msg.transaction_id();
 
         let (tx, rx) = oneshot::channel();
@@ -226,9 +229,8 @@ where
         Ok(rx.await?)
     }
 
-    pub async fn recv(&self) -> Result<(Krpc, SocketAddrV4), SendMessageError> {
-        let mut query_queue = self.query_queue.lock().await;
-        let (msg, socket_addr) = query_queue.().await?;
-        Ok((msg, socket_addr))
+    pub async fn send_responses(&self, msg: Krpc, socket_addr: SocketAddrV4) -> Result<(), SendMessageError> {
+        let outgoing_messages = self.outgoing_messages.lock().await;
+        Ok(outgoing_messages.send((msg, socket_addr)).await?)
     }
 }

@@ -1,4 +1,7 @@
-use crate::{domain_knowledge::NodeId, message::TransactionId};
+use crate::{
+    domain_knowledge::{CompactNodeContact, NodeId, ToCompactNodeContactVec, ToCompactNodeContactVecUnchecked},
+    message::TransactionId,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
@@ -28,4 +31,10 @@ pub struct FindNodeGetPeersNonCompliantResponseBody {
 
     #[serde_as(as = "Bytes")]
     pub nodes: Box<[u8]>,
+}
+
+unsafe impl ToCompactNodeContactVecUnchecked for FindNodeGetPeersNonCompliantResponse {
+    unsafe fn to_node_contact_vec_unchecked(&self) -> Vec<CompactNodeContact> {
+        self.body.nodes.to_node_contact_vec()
+    }
 }

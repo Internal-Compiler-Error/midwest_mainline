@@ -1,5 +1,5 @@
 use crate::{
-    dht_service::dht_server::DhtServer,
+    dht::dht_server::DhtServer,
     domain_knowledge::{CompactNodeContact, NodeId},
     message::Krpc,
     routing::RoutingTable,
@@ -7,10 +7,9 @@ use crate::{
 
 use rand::{Rng, RngCore};
 use std::{
-    collections::HashMap,
     error::Error,
     fmt::{Display, Formatter},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
 };
@@ -21,10 +20,10 @@ use tokio::{
     time::{error::Elapsed, timeout},
 };
 
-use crate::dht_service::message_broker::UdpMessageDemultiplexer;
+use crate::dht::message_broker::MessageDemultiplexer;
 use dht_client::DhtClientV4;
 use message_broker::MessageBroker;
-use tracing::{info, info_span, instrument, trace, warn, Instrument};
+use tracing::{info, instrument};
 
 pub mod dht_client;
 pub mod dht_server;
@@ -35,10 +34,13 @@ mod transaction_id_pool;
 /// tasks required to make DHT alive
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct DhtV4 {
-    client: Arc<DhtClientV4>,
+pub struct DhtV4<D>
+where
+    D: MessageDemultiplexer + 'static + Send + Sync,
+{
+    client: Arc<DhtClientV4<D>>,
     server: Arc<DhtServer>,
-    message_broker: Arc<MessageBroker<UdpMessageDemultiplexer>>,
+    message_broker: Arc<MessageBroker<D>>,
     routing_table: Arc<RwLock<RoutingTable>>,
     helper_tasks: JoinSet<()>,
 }
@@ -117,7 +119,10 @@ impl From<Elapsed> for BootstrapError {
     }
 }
 
-impl DhtV4 {
+impl<D> DhtV4<D>
+where
+    D: MessageDemultiplexer + 'static + Send + Sync,
+{
     /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
     /// external IP address of the machine. Note there is no way to verify the external IP address
     /// is correct and it's duty to make sure it's correct.
@@ -126,6 +131,7 @@ impl DhtV4 {
         bind_addr: SocketAddrV4,
         external_addr: Ipv4Addr,
         known_nodes: Vec<SocketAddrV4>,
+        demulitplexer: D,
     ) -> Result<Self, DhtServiceFailure> {
         let socket = UdpSocket::bind(&bind_addr).await?;
         // let socket = Arc::new(socket);
@@ -146,10 +152,9 @@ impl DhtV4 {
         // all outgoing messages are sent on this channel
         let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
 
-        let udp_message_demultiplexer = UdpMessageDemultiplexer::new(socket, outgoing_rx, incoming_packets_tx);
+        //let udp_message_demultiplexer = UdpMessageDemultiplexer::new(socket, outgoing_rx, incoming_packets_tx);
 
-        let message_broker =
-            MessageBroker::new(incoming_packets_rx, queries_tx, outgoing_tx, udp_message_demultiplexer);
+        let message_broker = MessageBroker::new(incoming_packets_rx, queries_tx.clone(), outgoing_tx, demulitplexer);
         let message_broker = Arc::new(message_broker);
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(&our_id)));
@@ -176,7 +181,7 @@ impl DhtV4 {
         drop(bootstrap_join_set);
 
         // only spawn the server after the bootstrap has completed
-        let server = DhtServer::new(queries_rx, socket.clone(), our_id, routing_table.clone());
+        let server = DhtServer::new(queries_rx, queries_tx.clone(), our_id, routing_table.clone());
         let server = Arc::new(server);
 
         join_set
@@ -208,7 +213,7 @@ impl DhtV4 {
     ///
     /// This is subject to change in the future.
     #[instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
+    async fn bootstrap_from(dht: Arc<DhtClientV4<D>>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
         let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
@@ -216,7 +221,7 @@ impl DhtV4 {
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
             dht.message_broker
-                .send(query, contact)
+                .send_queries(query, contact)
                 .await
                 .expect("failure to send message")
         })
@@ -248,7 +253,8 @@ impl DhtV4 {
                     .name(&*format!("leave level bootstrap to {}", contact))
                     .spawn(async move {
                         let response = timeout(Duration::from_secs(5), async {
-                            dht.send_message(&query, &contact)
+                            dht.message_broker
+                                .send_queries(query, contact)
                                 .await
                                 .expect("failure to send message")
                         })
@@ -280,7 +286,7 @@ impl DhtV4 {
     }
 
     /// Returns a handle to the client so you can perform queries
-    pub fn client(&self) -> Arc<DhtClientV4> {
+    pub fn client(&self) -> Arc<DhtClientV4<D>> {
         self.client.clone()
     }
 
@@ -293,7 +299,7 @@ impl DhtV4 {
 
 #[cfg(test)]
 mod tests {
-    use crate::dht_service::DhtV4;
+    use crate::dht::DhtV4;
     use num::{BigUint, Num};
     use opentelemetry::global;
     use rand::RngCore;
@@ -323,83 +329,83 @@ mod tests {
             .init();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn bootstrap() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn bootstrap() -> color_eyre::Result<()> {
+    //     TEST_INIT.call_once(set_up_tracing);
+    //
+    //     let external_ip = public_ip::addr_v4().await.unwrap();
+    //
+    //     let dht = DhtV4::bootstrap_with_random_id(
+    //         SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+    //         external_ip,
+    //         vec![
+    //             // dht.tansmissionbt.com
+    //             "87.98.162.88:6881".parse().unwrap(),
+    //             // router.utorrent.com
+    //             "67.215.246.10:6881".parse().unwrap(),
+    //             // router.bittorrent.com, ironically that this almost never responds
+    //             "82.221.103.244:8991".parse().unwrap(),
+    //             // dht.aelitis.com
+    //             "174.129.43.152:6881".parse().unwrap(),
+    //         ],
+    //     );
+    //
+    //     let dht = timeout(time::Duration::from_secs(60), dht).await??;
+    //     info!("Now I'm bootstrapped!");
+    //     {
+    //         let table = dht.client.routing_table.read().await;
+    //         info!(
+    //             "we've found {:?} nodes and recorded in our routing table",
+    //             table.node_count()
+    //         );
+    //     }
+    //
+    //     let client = dht.client;
+    //
+    //     let mut rng = rand::thread_rng();
+    //     let mut bytes = [0u8; 20];
+    //     rng.fill_bytes(&mut bytes);
+    //
+    //     let node = client.find_node(&bytes).await;
+    //     if let Ok(node) = node {
+    //         info!("found node {:?}", node);
+    //     } else {
+    //         info!("I guess we just didn't find anything")
+    //     }
+    //
+    //     Ok(())
+    // }
 
-        let external_ip = public_ip::addr_v4().await.unwrap();
-
-        let dht = DhtV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:8991".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        );
-
-        let dht = timeout(time::Duration::from_secs(60), dht).await??;
-        info!("Now I'm bootstrapped!");
-        {
-            let table = dht.client.routing_table.read().await;
-            info!(
-                "we've found {:?} nodes and recorded in our routing table",
-                table.node_count()
-            );
-        }
-
-        let client = dht.client;
-
-        let mut rng = rand::thread_rng();
-        let mut bytes = [0u8; 20];
-        rng.fill_bytes(&mut bytes);
-
-        let node = client.find_node(&bytes).await;
-        if let Ok(node) = node {
-            info!("found node {:?}", node);
-        } else {
-            info!("I guess we just didn't find anything")
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn find_peers() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
-
-        let external_ip = public_ip::addr_v4().await.unwrap();
-
-        let dht = DhtV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:6881".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        )
-        .await?;
-
-        let info_hash = BigUint::from_str_radix("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b", 16).unwrap();
-        let info_hash = info_hash.to_bytes_be();
-
-        let client = dht.client();
-        let (token, peers) = client.get_peers(info_hash.as_slice().try_into()?).await?;
-        info!("token {token:?}, peers {peers:?}");
-        Ok(())
-    }
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn find_peers() -> color_eyre::Result<()> {
+    //     TEST_INIT.call_once(set_up_tracing);
+    //
+    //     let external_ip = public_ip::addr_v4().await.unwrap();
+    //
+    //     let dht = DhtV4::bootstrap_with_random_id(
+    //         SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+    //         external_ip,
+    //         vec![
+    //             // dht.tansmissionbt.com
+    //             "87.98.162.88:6881".parse().unwrap(),
+    //             // router.utorrent.com
+    //             "67.215.246.10:6881".parse().unwrap(),
+    //             // router.bittorrent.com, ironically that this almost never responds
+    //             "82.221.103.244:6881".parse().unwrap(),
+    //             // dht.aelitis.com
+    //             "174.129.43.152:6881".parse().unwrap(),
+    //         ],
+    //     )
+    //     .await?;
+    //
+    //     let info_hash = BigUint::from_str_radix("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b", 16).unwrap();
+    //     let info_hash = info_hash.to_bytes_be();
+    //
+    //     let client = dht.client();
+    //     let (token, peers) = client.get_peers(info_hash.as_slice().try_into()?).await?;
+    //     info!("token {token:?}, peers {peers:?}");
+    //     Ok(())
+    // }
 
     // #[tokio::test(flavor = "multi_thread")]
     // async fn server() -> color_eyre::Result<()> {
@@ -441,29 +447,29 @@ mod tests {
     //     Ok(())
     // }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn run() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
-        let external_ip = public_ip::addr_v4().await.unwrap();
-
-        let dht = DhtV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:6881".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        )
-        .await?;
-
-        dht.run().await;
-
-        Ok(())
-    }
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn run() -> color_eyre::Result<()> {
+    //     TEST_INIT.call_once(set_up_tracing);
+    //     let external_ip = public_ip::addr_v4().await.unwrap();
+    //
+    //     let dht = DhtV4::bootstrap_with_random_id(
+    //         SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+    //         external_ip,
+    //         vec![
+    //             // dht.tansmissionbt.com
+    //             "87.98.162.88:6881".parse().unwrap(),
+    //             // router.utorrent.com
+    //             "67.215.246.10:6881".parse().unwrap(),
+    //             // router.bittorrent.com, ironically that this almost never responds
+    //             "82.221.103.244:6881".parse().unwrap(),
+    //             // dht.aelitis.com
+    //             "174.129.43.152:6881".parse().unwrap(),
+    //         ],
+    //     )
+    //     .await?;
+    //
+    //     dht.run().await;
+    //
+    //     Ok(())
+    // }
 }

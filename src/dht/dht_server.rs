@@ -17,8 +17,10 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::UdpSocket,
-    sync::{mpsc::Receiver, Mutex, RwLock},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Mutex, RwLock,
+    },
     task::Builder,
     time::Instant,
 };
@@ -117,19 +119,22 @@ impl TokenPool {
 pub struct DhtServer {
     routing_table: Arc<RwLock<RoutingTable>>,
     our_id: NodeId,
-    requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
+    queries_rx: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
+    responses_tx: Mutex<Sender<(Krpc, SocketAddrV4)>>,
     hash_table: Arc<RwLock<HashMap<InfoHash, Vec<CompactPeerContact>>>>,
     token_pool: Arc<TokenPool>,
 }
 
 impl DhtServer {
     pub(crate) fn new(
-        requests: Receiver<(Krpc, SocketAddrV4)>,
+        queries_rx: Receiver<(Krpc, SocketAddrV4)>,
+        responses_tx: Sender<(Krpc, SocketAddrV4)>,
         id: NodeId,
         routing_table: Arc<RwLock<RoutingTable>>,
     ) -> Self {
         Self {
-            requests: Mutex::new(requests),
+            queries_rx: Mutex::new(queries_rx),
+            responses_tx: Mutex::new(responses_tx),
             hash_table: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
             our_id: id,
@@ -141,7 +146,7 @@ impl DhtServer {
     pub(crate) async fn run(self: Arc<Self>) {
         Builder::new().name("token pool").spawn(self.token_pool.clone().run());
 
-        let mut requests = (&self).requests.lock().await;
+        let mut requests = (&self).queries_rx.lock().await;
         while let Some((request, socket_addr)) = requests.recv().await {
             trace!("Received request: {:?}", request);
 
@@ -154,8 +159,7 @@ impl DhtServer {
                     trace!("Handling request from {socket_addr}");
 
                     if let Some(response) = response {
-                        let serialized = bendy::serde::to_bytes(&response)?;
-                        server.socket.send_to(&serialized, socket_addr).await?;
+                        server.responses_tx.lock().await.send((response, socket_addr)).await?;
                         trace!("response sent for {socket_addr}");
                     }
 
@@ -285,5 +289,84 @@ impl DhtServer {
             .push(peer_contact);
 
         Krpc::new_announce_peer_response(announce.transaction_id, self.our_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_back_to_ping() {
+        let id = b"test-node-id-1234567";
+        let (queries_tx, queries_rx) = mpsc::channel(100);
+        let (responses_tx, mut responses_rx) = mpsc::channel(100);
+
+        let routing_table = RoutingTable::new(&id);
+
+        let server = DhtServer::new(
+            queries_rx,
+            responses_tx.clone(),
+            id.clone(),
+            Arc::new(RwLock::new(routing_table)),
+        );
+
+        let server = Arc::new(server);
+        let server = tokio::spawn(async move {
+            server.run().await;
+        });
+
+        let pings = vec![
+            (
+                Krpc::new_ping_query(Box::new(b"00".clone()), b"test-node-id-1111111".clone()),
+                SocketAddrV4::new(Ipv4Addr::new(99, 99, 99, 1), 6881),
+            ),
+            (
+                Krpc::new_ping_query(Box::new(b"01".clone()), b"test-node-id-2222222".clone()),
+                SocketAddrV4::new(Ipv4Addr::new(99, 99, 99, 2), 6881),
+            ),
+            (
+                Krpc::new_ping_query(Box::new(b"02".clone()), b"test-node-id-3333333".clone()),
+                SocketAddrV4::new(Ipv4Addr::new(99, 99, 99, 3), 6881),
+            ),
+            (
+                Krpc::new_ping_query(Box::new(b"03".clone()), b"test-node-id-4444444".clone()),
+                SocketAddrV4::new(Ipv4Addr::new(99, 99, 99, 4), 6881),
+            ),
+            (
+                Krpc::new_ping_query(Box::new(b"04".clone()), b"test-node-id-5555555".clone()),
+                SocketAddrV4::new(Ipv4Addr::new(99, 99, 99, 5), 6881),
+            ),
+        ];
+
+        for (ping, sock_addr) in pings {
+            queries_tx.send((ping, sock_addr)).await.unwrap();
+        }
+
+        let mut i = 0;
+        let mut actual_responses = Vec::new();
+        while i != 5 {
+            if let Some((response, _)) = responses_rx.recv().await {
+                i += 1;
+                actual_responses.push(response);
+            }
+        }
+
+        let expected = vec![
+            Krpc::new_ping_response(Box::new(b"00".clone()), b"test-node-id-1234567".clone()),
+            Krpc::new_ping_response(Box::new(b"01".clone()), b"test-node-id-1234567".clone()),
+            Krpc::new_ping_response(Box::new(b"02".clone()), b"test-node-id-1234567".clone()),
+            Krpc::new_ping_response(Box::new(b"03".clone()), b"test-node-id-1234567".clone()),
+            Krpc::new_ping_response(Box::new(b"04".clone()), b"test-node-id-1234567".clone()),
+        ];
+
+        actual_responses
+            .sort_unstable_by_key(|r| {
+                r.transaction_id().clone()
+            });
+
+        server.abort();
+        assert_eq!(actual_responses, expected);
     }
 }

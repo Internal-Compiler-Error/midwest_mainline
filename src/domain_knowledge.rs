@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
+    collections::HashSet,
     fmt::{Debug, Formatter},
     net::{Ipv4Addr, SocketAddrV4},
 };
@@ -13,6 +14,34 @@ pub type NodeId = [u8; 20];
 pub struct CompactNodeContact {
     #[serde_as(as = "Bytes")]
     pub(crate) bytes: [u8; 26],
+}
+
+trait ToCompactNodeContact {
+    fn to_node_contact(&self) -> CompactNodeContact;
+}
+
+pub(crate) trait ToCompactNodeContactVec {
+    fn to_node_contact_vec(&self) -> Vec<CompactNodeContact>;
+}
+
+/// A special snow flake function solely exist for the `FindNodeGetPeersNonCompliantResponse` type,
+/// since its body could be a list of nodes or a list of peers, the user needs to ensure
+pub(crate) unsafe trait ToCompactNodeContactVecUnchecked {
+    unsafe fn to_node_contact_vec_unchecked(&self) -> Vec<CompactNodeContact>;
+}
+
+impl ToCompactNodeContactVec for Box<[u8]> {
+    fn to_node_contact_vec(&self) -> Vec<CompactNodeContact> {
+        let mut nodes: Vec<_> = self
+            .chunks_exact(26)
+            .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+            .collect();
+        let mut set = HashSet::new();
+
+        nodes.retain(|x| set.insert(x.clone()));
+
+        nodes
+    }
 }
 
 impl Debug for CompactNodeContact {
