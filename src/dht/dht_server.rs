@@ -361,10 +361,7 @@ mod tests {
             Krpc::new_ping_response(Box::new(b"04".clone()), b"test-node-id-1234567".clone()),
         ];
 
-        actual_responses
-            .sort_unstable_by_key(|r| {
-                r.transaction_id().clone()
-            });
+        actual_responses.sort_unstable_by_key(|r| r.transaction_id().clone());
 
         server.abort();
         assert_eq!(actual_responses, expected);

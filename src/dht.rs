@@ -1,9 +1,4 @@
-use crate::{
-    dht::dht_server::DhtServer,
-    domain_knowledge::{CompactNodeContact, NodeId},
-    message::Krpc,
-    routing::RoutingTable,
-};
+use crate::{dht::dht_server::DhtServer, domain_knowledge::NodeId, routing::RoutingTable};
 
 use rand::{Rng, RngCore};
 use std::{
@@ -17,12 +12,11 @@ use tokio::{
     net::UdpSocket,
     sync::{mpsc, RwLock},
     task::{Builder, JoinError, JoinSet},
-    time::{error::Elapsed, timeout},
+    time::error::Elapsed,
 };
 
-use crate::dht::message_broker::MessageDemultiplexer;
+use crate::dht::message_broker::{MailBoxes, PostalOffice};
 use dht_client::DhtClientV4;
-use message_broker::MessageBroker;
 use tracing::{info, instrument};
 
 pub mod dht_client;
@@ -34,13 +28,15 @@ mod transaction_id_pool;
 /// tasks required to make DHT alive
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct DhtV4<D>
+pub struct DhtV4<M, P>
 where
-    D: MessageDemultiplexer + 'static + Send + Sync,
+    // D: MessageDemultiplexer + 'static + Send + Sync,
+    M: MailBoxes + 'static + Send + Sync,
+    P: PostalOffice + 'static + Send + Sync,
 {
-    client: Arc<DhtClientV4<D>>,
+    client: Arc<DhtClientV4<M, P>>,
     server: Arc<DhtServer>,
-    message_broker: Arc<MessageBroker<D>>,
+    // message_broker: Arc<MessageBroker<D>>,
     routing_table: Arc<RwLock<RoutingTable>>,
     helper_tasks: JoinSet<()>,
 }
@@ -108,20 +104,13 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     id
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapError {
-    TimedOut,
-}
-
-impl From<Elapsed> for BootstrapError {
-    fn from(_: Elapsed) -> Self {
-        BootstrapError::TimedOut
-    }
-}
-
-impl<D> DhtV4<D>
+impl<M, P> DhtV4<M, P>
 where
-    D: MessageDemultiplexer + 'static + Send + Sync,
+    // D: MessageDemultiplexer + 'static + Send + Sync,
+    M: MailBoxes + 'static + Send + Sync,
+    P: PostalOffice + 'static + Send + Sync,
+    // BootstrapError: From<<P as PostalOffice>::SendAddrError>,
+    // RequestError: From<<P as PostalOffice>::SendAddrError>,
 {
     /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
     /// external IP address of the machine. Note there is no way to verify the external IP address
@@ -131,7 +120,8 @@ where
         bind_addr: SocketAddrV4,
         external_addr: Ipv4Addr,
         known_nodes: Vec<SocketAddrV4>,
-        demulitplexer: D,
+        mail_boxes: M,
+        postal_office: P,
     ) -> Result<Self, DhtServiceFailure> {
         let socket = UdpSocket::bind(&bind_addr).await?;
         // let socket = Arc::new(socket);
@@ -144,41 +134,46 @@ where
 
         // all udp packets are sent to the channel, and the demultiplexer will route them into either
         // oneshot senders or a queue for severs to handle
-        let (incoming_packets_tx, incoming_packets_rx) = mpsc::channel(1024);
+        // let (incoming_packets_tx, incoming_packets_rx) = mpsc::channel(1024);
 
         // all queries that servers should handle are sent on this channel
         let (queries_tx, queries_rx) = mpsc::channel(1024);
 
         // all outgoing messages are sent on this channel
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
+        // let (outgoing_tx, outgoing_rx) = mpsc::channel(1024);
 
         //let udp_message_demultiplexer = UdpMessageDemultiplexer::new(socket, outgoing_rx, incoming_packets_tx);
 
-        let message_broker = MessageBroker::new(incoming_packets_rx, queries_tx.clone(), outgoing_tx, demulitplexer);
-        let message_broker = Arc::new(message_broker);
+        // let message_broker = MessageBroker::new(incoming_packets_rx, queries_tx.clone(), outgoing_tx, demulitplexer);
+        // let message_broker = Arc::new(message_broker);
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(&our_id)));
 
-        let client = DhtClientV4::new(bind_addr, message_broker.clone(), routing_table.clone(), our_id);
-        let client = Arc::new(client);
-
-        // ask all the known nodes for ourselves
-        let mut bootstrap_join_set = JoinSet::new();
-
-        for contact in known_nodes {
-            bootstrap_join_set
-                .build_task()
-                .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(client.clone(), contact));
-        }
-
-        while let Some(_) = bootstrap_join_set.join_next().await {}
+        // bootstrap the DHT network
+        let table = Arc::clone(&routing_table);
+        let client = Builder::new()
+            .name("Bootstrapping onto DHT")
+            .spawn(async move {
+                DhtClientV4::bootstrap_from(
+                    our_id,
+                    table,
+                    bind_addr,
+                    mail_boxes,
+                    postal_office,
+                    known_nodes,
+                    Duration::from_secs(180),
+                )
+                .await
+            })
+            .await
+            .expect("Failed to bootstrap DHT")
+            .expect("Failed to bootstrap DHT");
 
         info!(
             "DHT bootstrapped, routing table has {} nodes",
             routing_table.read().await.node_count()
         );
-        drop(bootstrap_join_set);
+        // drop(bootstrap_join_set);
 
         // only spawn the server after the bootstrap has completed
         let server = DhtServer::new(queries_rx, queries_tx.clone(), our_id, routing_table.clone());
@@ -192,7 +187,7 @@ where
         let dht = DhtV4 {
             client: client.clone(),
             server: server.clone(),
-            message_broker,
+            // message_broker,
             routing_table: routing_table.clone(),
 
             helper_tasks: join_set,
@@ -207,86 +202,8 @@ where
         while let Some(_) = self.helper_tasks.join_next().await {}
     }
 
-    /// Given a known know, perform one find node to ourself add the response to the routing table
-    /// *and* do one additional round of find node to all the returned nodes from the bootstrapping
-    /// node.
-    ///
-    /// This is subject to change in the future.
-    #[instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtClientV4<D>>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
-        let our_id = dht.our_id.clone();
-        let transaction_id = dht.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
-
-        info!("bootstrapping with {contact}");
-        let response = timeout(Duration::from_secs(5), async {
-            dht.message_broker
-                .send_queries(query, contact)
-                .await
-                .expect("failure to send message")
-        })
-        .await?;
-
-        if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-            let nodes = response.body.nodes;
-            let mut nodes: Vec<_> = nodes
-                .chunks_exact(26)
-                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                .collect();
-            {
-                // add the bootstrapping node to our routing table
-                let mut table = dht.routing_table.write().await;
-                table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
-            }
-
-            nodes.dedup();
-
-            for node in &nodes {
-                dht.routing_table.write().await.add_new_node(node.clone());
-
-                let dht = dht.clone();
-                let contact: SocketAddrV4 = node.into();
-                let our_id = dht.our_id.clone();
-                let transaction_id = dht.transaction_id_pool.next();
-                let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
-                Builder::new()
-                    .name(&*format!("leave level bootstrap to {}", contact))
-                    .spawn(async move {
-                        let response = timeout(Duration::from_secs(5), async {
-                            dht.message_broker
-                                .send_queries(query, contact)
-                                .await
-                                .expect("failure to send message")
-                        })
-                        .await?;
-
-                        if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-                            let nodes: Vec<_> = response
-                                .body
-                                .nodes
-                                .chunks_exact(26)
-                                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                                .collect();
-
-                            for node in nodes {
-                                // add the leave level responses to our routing table
-                                let mut table = dht.routing_table.write().await;
-                                table.add_new_node(CompactNodeContact::from_node_id_and_addr(
-                                    &response.body.id,
-                                    &node.into(),
-                                ));
-                            }
-                        }
-                        Ok::<_, color_eyre::Report>(())
-                    });
-            }
-            info!("bootstrapping with {contact} succeeded");
-        }
-        Ok(())
-    }
-
     /// Returns a handle to the client so you can perform queries
-    pub fn client(&self) -> Arc<DhtClientV4<D>> {
+    pub fn client(&self) -> Arc<DhtClientV4<M, P>> {
         self.client.clone()
     }
 
@@ -299,13 +216,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::dht::DhtV4;
-    use num::{BigUint, Num};
     use opentelemetry::global;
-    use rand::RngCore;
-    use std::{net::SocketAddrV4, str::FromStr, sync::Once};
-    use tokio::time::{self, timeout};
-    use tracing::info;
+    use std::sync::Once;
+
     use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
     static TEST_INIT: Once = Once::new();

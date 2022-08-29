@@ -1,12 +1,13 @@
 use crate::{
     dht::{
-        message_broker::{MessageBroker, MessageDemultiplexer},
+        message_broker::{MailBoxes, PostalOffice},
         transaction_id_pool::TransactionIdPool,
-        BootstrapError, DhtServiceFailure,
+        DhtServiceFailure,
     },
     domain_knowledge::{
         CompactNodeContact, CompactPeerContact, NodeId, ToCompactNodeContactVec, ToCompactNodeContactVecUnchecked,
     },
+    error::{Error, ErrorKind},
     message::{InfoHash, Krpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -16,13 +17,13 @@ use either::Either;
 use num::BigUint;
 use std::{
     collections::HashSet,
+    fmt::Debug,
     future::Future,
-    net::SocketAddrV4,
+    net::{SocketAddr, SocketAddrV4},
     ops::{BitXor, DerefMut},
     sync::Arc,
     time::Duration,
 };
-use thiserror::Error;
 use tokio::{
     sync::{oneshot, oneshot::Sender, Mutex, RwLock},
     task::JoinError,
@@ -31,68 +32,56 @@ use tokio::{
 use tracing::{debug, info, instrument, trace, warn};
 
 #[derive(Debug)]
-pub struct DhtClientV4<D>
+pub struct DhtClientV4<M, P>
 where
-    D: MessageDemultiplexer + 'static + Send + Sync,
+    M: MailBoxes + 'static + Send + Sync,
+    P: PostalOffice + 'static + Send + Sync,
 {
     pub(crate) our_id: [u8; 20],
-    pub(crate) message_broker: Arc<MessageBroker<D>>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: Arc<TransactionIdPool>,
+    pub(crate) mail_boxes: Arc<M>,
+    pub(crate) postal_office: Arc<P>,
 }
 
-#[derive(Debug, Error)]
-pub enum RecursiveSearchError {
-    #[error("Failed to send search request:")]
-    BottomedOut,
-    #[error("search cancelled")]
-    Cancelled,
-    #[error("failure when trying to join")]
-    JoinError(#[from] JoinError),
-    #[error("failed to send search request: {0}")]
-    RequestError(#[from] RequestError),
-}
-
-#[derive(Debug, Error)]
-pub enum RequestError {
-    #[error("timed out")]
-    TimedOut(#[from] tokio::time::error::Elapsed),
-
-    #[error("failed to send ping")]
-    SendError(#[from] crate::dht::message_broker::SendMessageError),
-
-    #[error("wrong response to ping query {0}")]
-    WrongResponse(String),
-}
-
-impl<D> DhtClientV4<D>
+impl<M, P> DhtClientV4<M, P>
 where
-    D: MessageDemultiplexer + 'static + Send + Sync,
+    M: MailBoxes + 'static + Send + Sync,
+    P: PostalOffice + 'static + Send + Sync,
 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     pub(crate) fn new(
         bind_addr: SocketAddrV4,
-        message_broker: Arc<MessageBroker<D>>,
         routing_table: Arc<RwLock<RoutingTable>>,
         our_id: NodeId,
+        mail_boxes: M,
+        postal_office: P,
     ) -> Self {
         DhtClientV4 {
-            message_broker,
             our_id,
             routing_table,
             socket_address: bind_addr,
             transaction_id_pool: Arc::new(TransactionIdPool::new()),
+            mail_boxes: Arc::new(mail_boxes),
+            postal_office: Arc::new(postal_office),
         }
     }
 
-    pub async fn ping(self: &Self, recipient: SocketAddrV4) -> Result<(), RequestError> {
+    pub async fn ping(self: &Self, recipient: SocketAddrV4) -> Result<(), Error> {
         let transaction_id = self.transaction_id_pool.next_boxed_bytes();
-        let ping_msg = Krpc::new_ping_query(transaction_id, self.our_id);
+        let ping_msg = Krpc::new_ping_query(transaction_id.clone(), self.our_id);
 
-        let response = self.message_broker.send_queries(ping_msg, recipient).await?;
+        // send the ping
+        self.postal_office
+            .send_to_addr(&ping_msg, &SocketAddr::V4(recipient))
+            .await?;
 
+        // await the response
+        let response = self.mail_boxes.wait_for(&transaction_id).await;
+
+        // check if the response is the right type, add to our routing table if it is
         return if let Krpc::PingAnnouncePeerResponse(response) = response {
             self.routing_table
                 .write()
@@ -102,7 +91,10 @@ where
             Ok(())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
-            Err(RequestError::WrongResponse(format!("{:?}", response)))
+            Err(Error {
+                kind: ErrorKind::WrongResponse(format!("{:?}", response)),
+                source: None,
+            })
         };
     }
 
@@ -114,24 +106,32 @@ where
         interlocutor: SocketAddrV4,
         target: NodeId,
         time_out: Duration,
-    ) -> impl Future<Output = Result<Vec<CompactNodeContact>, RequestError>> {
+    ) -> impl Future<Output = Result<Vec<CompactNodeContact>, Error>> {
         let transaction_id_pool = Arc::clone(&self.transaction_id_pool);
         let our_id = self.our_id;
-        let message_broker = Arc::clone(&self.message_broker);
+        let postal_office = Arc::clone(&self.postal_office);
+        let mail_box = Arc::clone(&self.mail_boxes);
 
         async move {
             // construct the message to query our friends
             let transaction_id = transaction_id_pool.next_boxed_bytes();
-            let query = Krpc::new_find_node_query(transaction_id, our_id, target);
+            let query = Krpc::new_find_node_query(transaction_id.clone(), our_id, target);
 
-            // send the message and await for a response
-            let response = timeout(time_out, message_broker.send_queries(query, interlocutor)).await??;
+            // send the message out, sending should not take long so we don't need a timeout right???
+            // just wait until this is proven wrong
+            postal_office
+                .send_to_addr(&query, &SocketAddr::V4(interlocutor))
+                .await?;
+
+            // wait for the response with a timeout
+
+            let response = timeout(time_out, mail_box.wait_for(&transaction_id)).await?;
 
             if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
                 let nodes = unsafe { find_node_response.to_node_contact_vec_unchecked() };
                 Ok(nodes)
             } else {
-                Err(RequestError::WrongResponse(format!("wrong response{:?}", response)))
+                Err(Error::wrong_response(format!("wrong response{:?}", response)))
             }
         }
     }
@@ -148,22 +148,34 @@ where
                 Option<Box<[u8]>>,
                 Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
             ),
-            RequestError,
+            Error,
         >,
     > {
         let transaction_id_pool = Arc::clone(&self.transaction_id_pool);
         let our_id = self.our_id;
-        let message_broker = Arc::clone(&self.message_broker);
+        let postal_office = Arc::clone(&self.postal_office);
+        let mail_box = Arc::clone(&self.mail_boxes);
 
         async move {
             // trace!("Asking {:?} for peers", interlocutor);
             // construct the message to query our friends
             let transaction_id = transaction_id_pool.next_boxed_bytes();
-            let query = Krpc::new_get_peers_query(transaction_id, our_id, target);
+            let query = Krpc::new_get_peers_query(transaction_id.clone(), our_id, target);
 
-            // send the message and await for a response
-            let response = timeout(time_out, message_broker.send_queries(query, interlocutor)).await??;
+            // send out the message
+            postal_office
+                .send_to_addr(&query, &SocketAddr::V4(interlocutor))
+                .await?;
+
+            // wait for the response with a timeout
+            let response = timeout(time_out, mail_box.wait_for(&transaction_id)).await?;
+
+            // we could get a response that:
+            // 1. contains all the peers => we return the Right variant of Either
+            // 2. contains their K closest nodes => we return the Left variant of Either
+            // 3. totally wrong response => we return an error
             return match response {
+                // 2. contains their K closest nodes => we return the Left variant of Either
                 Krpc::GetPeersDeferredResponse(response) => {
                     // make sure we don't get duplicate nodes
                     let nodes: Vec<_> = response.to_node_contact_vec();
@@ -175,6 +187,8 @@ where
                     );
                     Ok((Some(response.body.token), Either::Left(nodes)))
                 }
+
+                // 1. contains all the peers => we return the Right variant of Either
                 Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
                     // make sure we don't get duplicate nodes
                     let nodes: Vec<_> = unsafe { response.to_node_contact_vec_unchecked() };
@@ -187,6 +201,8 @@ where
 
                     Ok((None, Either::Left(nodes)))
                 }
+
+                // 1. contains all the peers => we return the Right variant of Either
                 Krpc::GetPeersSuccessResponse(response) => {
                     let mut values = response.body.values;
                     // todo: define an order for nodes??
@@ -196,13 +212,15 @@ where
                     trace!("got a success response from {}, values {:#?}", interlocutor, &values);
                     Ok((Some(response.body.token), Either::Right(values)))
                 }
+
+                // 3. totally wrong response => we return an error
                 Krpc::ErrorResponse(response) => {
                     warn!("Got an error response to get peers: {:?}", response);
-                    Err(RequestError::WrongResponse(format!("{:?}", response)))
+                    Err(Error::wrong_response(format!("{:?}", response)))
                 }
                 other => {
                     warn!("Unexpected response to get peers: {:?}", other);
-                    Err(RequestError::WrongResponse(format!("{:?}", other)))
+                    Err(Error::wrong_response(format!("{:?}", other)))
                 }
             };
         }
@@ -325,7 +343,7 @@ where
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
         slot: Arc<Mutex<Option<Sender<CompactNodeContact>>>>,
         time_out: Duration,
-    ) -> Result<(), RecursiveSearchError> {
+    ) -> Result<(), Error> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
             let seen = seen.lock().await;
@@ -342,7 +360,7 @@ where
         // it's ok to assume that this will never get hit for the first time, since the starting
         // pool is always unseen
         if starting_pool.len() == 0 {
-            return Err(RecursiveSearchError::BottomedOut);
+            return Err(Error::bottomed_out());
         }
 
         // ask all the nodes for target!
@@ -378,7 +396,7 @@ where
                                 .expect("some one else should ready have finished sending and killed us");
                             Ok(())
                         } else {
-                            Err(RecursiveSearchError::Cancelled)
+                            Err(Error::cancelled())
                         }
                     } else {
                         // if we didn't, then we add the nodes we got to the seen list and recurse
@@ -396,7 +414,7 @@ where
 
         // if we ever reach here, that means we haven't been cancelled, which means nothing were
         // found
-        Err(RecursiveSearchError::BottomedOut)
+        Err(Error::bottomed_out())
     }
 
     #[async_recursion]
@@ -408,7 +426,7 @@ where
         seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
         slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<CompactPeerContact>)>>>>,
         time_out: Duration,
-    ) -> Result<(), RecursiveSearchError> {
+    ) -> Result<(), Error> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
             let seen = seen.lock().await;
@@ -422,7 +440,7 @@ where
 
         if starting_pool.len() == 0 {
             debug!("bottomed out");
-            return Err(RecursiveSearchError::BottomedOut);
+            return Err(Error::bottomed_out());
         }
 
         // ask all the nodes for target!
@@ -462,7 +480,7 @@ where
                                         sender.send((token.expect("success response must have the token"), success));
                                     Ok(())
                                 }
-                                None => Err(RecursiveSearchError::Cancelled),
+                                None => Err(Error::cancelled()),
                             }
                         }
                     };
@@ -473,7 +491,7 @@ where
         // spawn all the tasks and await them
         debug!("spawning {} tasks", parallel_tasks.len());
         let _results = parallel_tasks.par_spawn_and_await().await?;
-        Err(RecursiveSearchError::BottomedOut)
+        Err(Error::bottomed_out())
     }
 
     pub async fn get_peers(
@@ -525,13 +543,13 @@ where
         info_hash: InfoHash,
         port: Option<u16>,
         token: Box<[u8]>,
-    ) -> Result<(), RequestError> {
+    ) -> Result<(), Error> {
         let transaction_id = self.transaction_id_pool.next_boxed_bytes();
         let query = if let Some(port) = port {
-            Krpc::new_announce_peer_query(transaction_id, info_hash, self.our_id, port, true, token)
+            Krpc::new_announce_peer_query(transaction_id.clone(), info_hash, self.our_id, port, true, token)
         } else {
             Krpc::new_announce_peer_query(
-                transaction_id,
+                transaction_id.clone(),
                 info_hash,
                 self.our_id,
                 self.socket_address.port(),
@@ -540,14 +558,18 @@ where
             )
         };
 
-        let response = self.message_broker.send_queries(query, recipient).await?;
+        self.postal_office
+            .send_to_addr(&query, &SocketAddr::V4(recipient))
+            .await?;
+
+        let response = self.mail_boxes.wait_for(&transaction_id).await;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
-            Krpc::ErrorResponse(err) => Err(RequestError::WrongResponse(format!(
+            Krpc::ErrorResponse(err) => Err(Error::wrong_response(format!(
                 "node responded with an error to our announce peer request {err:?}"
             ))),
-            _ => Err(RequestError::WrongResponse(
+            _ => Err(Error::wrong_response(
                 "non-compliant response from DHT node".to_string(),
             )),
         };
@@ -557,38 +579,38 @@ where
     /// ourselves to each of the bootstrapping nodes, then performing `find_node` with random id to
     /// each of the nodes the bootstrapping nodes returned.
     #[instrument(skip_all)]
-    async fn bootstrap_from(
+    pub async fn bootstrap_from(
         our_id: NodeId,
         table: Arc<RwLock<RoutingTable>>,
-        address: SocketAddrV4,
-        message_broker: Arc<MessageBroker<D>>,
+        bind_addr: SocketAddrV4,
+        mail_boxes: M,
+        postal_office: P,
         known_nodes: Vec<SocketAddrV4>,
         time_out: Duration,
-    ) -> Result<Arc<DhtClientV4<D>>, BootstrapError>
-    where
-        D: MessageDemultiplexer,
-    {
+    ) -> Result<Arc<DhtClientV4<M, P>>, Error> {
         use tokio::task::Builder;
 
-        let client = Arc::new(DhtClientV4::new(address, message_broker, table, our_id));
+        let client = Arc::new(DhtClientV4::new(bind_addr, table, our_id, mail_boxes, postal_office));
 
         // for each of the known nodes, first send a find_node request to find ourselves, then send
         // send a random find_node request in the bucket range for all the returned nodes
         for known_node in known_nodes {
             // first we ask the known_node about ourselves
             let transaction_id = (&client).transaction_id_pool.next_boxed_bytes();
-            let query = Krpc::new_find_node_query(transaction_id, our_id, our_id);
+            let query = Krpc::new_find_node_query(transaction_id.clone(), our_id, our_id);
 
             info!("bootstrapping with {known_node}");
-            let response = timeout(time_out, async {
-                (&client)
-                    .message_broker
-                    .send_queries(query, known_node)
-                    .await
-                    .expect("failure to send message")
-            })
-            .await?;
 
+            // send the query to the known_node
+            (&client)
+                .postal_office
+                .send_to_addr(&query, &SocketAddr::V4(known_node))
+                .await?;
+
+            // wait for a response with timeout
+            let response = timeout(time_out, (&client).mail_boxes.wait_for(&transaction_id)).await?;
+
+            // if we got a response, then add the nodes to the routing table
             if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
                 let nodes = unsafe { response.to_node_contact_vec_unchecked() };
                 {
@@ -606,19 +628,21 @@ where
                     let contact: SocketAddrV4 = node.into();
                     let our_id = (&client).our_id.clone();
                     let transaction_id = (&client).transaction_id_pool.next_boxed_bytes();
-                    let query = Krpc::new_find_node_query(transaction_id, our_id, our_id.clone());
+                    let query = Krpc::new_find_node_query(transaction_id.clone(), our_id, our_id.clone());
                     let client = Arc::clone(&client);
                     Builder::new()
                         .name(&*format!("leave level bootstrap to {}", contact))
                         .spawn(async move {
-                            let response = timeout(time_out, async {
-                                (&client)
-                                    .message_broker
-                                    .send_queries(query, contact)
-                                    .await
-                                    .expect("failure to send message")
-                            })
-                            .await?;
+                            // send the message
+
+                            (&client)
+                                .postal_office
+                                .send_to_addr(&query, &SocketAddr::V4(contact))
+                                .await?;
+
+                            let response =
+                                timeout(time_out, async { (&client).mail_boxes.wait_for(&transaction_id).await })
+                                    .await?;
 
                             if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
                                 let nodes = unsafe { response.to_node_contact_vec_unchecked() };
@@ -639,5 +663,106 @@ where
             }
         }
         Ok(client)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::message::TransactionId;
+    use std::{
+        collections::HashMap,
+        fmt::{Display, Formatter},
+        net::Ipv4Addr,
+        sync,
+    };
+
+    #[derive(Debug, Clone)]
+    struct HashMapMailBox {
+        mail_boxes: Arc<sync::Mutex<HashMap<TransactionId, Krpc>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MailBoxes for HashMapMailBox {
+        fn get(&self, transaction_id: &TransactionId) -> Option<Krpc> {
+            self.mail_boxes.lock().unwrap().remove(transaction_id)
+        }
+
+        fn has(&self, transaction_id: &TransactionId) -> bool {
+            self.mail_boxes.lock().unwrap().contains_key(transaction_id)
+        }
+
+        async fn wait_for(&self, transaction_id: &TransactionId) -> Krpc {
+            match self.mail_boxes.lock().unwrap().remove(transaction_id) {
+                Some(response) => response,
+                None => panic!("no response for transaction id {:#?}", transaction_id),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LoggedPostalOffice {
+        log: Arc<Mutex<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PostalOffice for LoggedPostalOffice {
+        async fn send_to_addr(&self, message: &Krpc, addr: &SocketAddr) -> Result<(), Error> {
+            self.log
+                .lock()
+                .await
+                .push_str(&format!("{:#?} to {:#?}\n", message, addr));
+            Ok(())
+        }
+
+        async fn send_to_peer(&self, message: &Krpc, to: &CompactPeerContact) -> Result<(), Error> {
+            let socket_addr: SocketAddrV4 = to.into();
+            self.send_to_addr(&message, &SocketAddr::from(socket_addr)).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn can_create() {
+        let our_id = {
+            let mut id = [0u8; 20];
+            let mut letter = b'a';
+
+            for digit in &mut id {
+                *digit = letter;
+                letter += 1
+            }
+
+            id
+        };
+
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
+        let table = RoutingTable::new(&our_id);
+        let mail_boxes = HashMapMailBox {
+            mail_boxes: Arc::new(sync::Mutex::new(HashMap::new())),
+        };
+        let postal_office = LoggedPostalOffice {
+            log: Arc::new(Mutex::new(String::new())),
+        };
+        let _client = DhtClientV4::bootstrap_from(
+            our_id,
+            Arc::new(RwLock::new(table)),
+            bind_addr,
+            mail_boxes,
+            postal_office.clone(),
+            vec![
+                // dht.tansmissionbt.com
+                "87.98.162.88:6881".parse().unwrap(),
+                // router.utorrent.com
+                "67.215.246.10:6881".parse().unwrap(),
+                // router.bittorrent.com, ironically that this almost never responds
+                "82.221.103.244:6881".parse().unwrap(),
+                // dht.aelitis.com
+                "174.129.43.152:6881".parse().unwrap(),
+            ],
+            Duration::from_secs(60),
+        )
+        .await;
+
+        println!("{}", &postal_office.log.lock().await);
     }
 }

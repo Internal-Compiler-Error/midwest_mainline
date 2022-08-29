@@ -86,6 +86,7 @@
 
 pub mod dht;
 pub mod domain_knowledge;
+pub mod error;
 pub(crate) mod message;
 pub(crate) mod routing;
 pub(crate) mod utils;
