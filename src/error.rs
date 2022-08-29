@@ -16,6 +16,8 @@ pub(crate) enum ErrorKind {
     JoinError,
     TimedOut,
     WrongResponse(String),
+    SerializationError,
+    IoError,
 }
 
 #[derive(Debug, From)]
@@ -57,11 +59,18 @@ impl Error {
             source: None,
         }
     }
+
+    pub(crate) fn serialization_error() -> Self {
+        Self {
+            kind: ErrorKind::SerializationError,
+            source: None,
+        }
+    }
 }
 
 impl From<JoinError> for Error {
     fn from(e: JoinError) -> Self {
-        Error {
+        Self {
             kind: ErrorKind::JoinError,
             source: Some(Box::new(e)),
         }
@@ -70,8 +79,26 @@ impl From<JoinError> for Error {
 
 impl From<Elapsed> for Error {
     fn from(e: Elapsed) -> Self {
-        Error {
+        Self {
             kind: ErrorKind::TimedOut,
+            source: Some(Box::new(e)),
+        }
+    }
+}
+
+impl From<bendy::serde::Error> for Error {
+    fn from(e: bendy::serde::Error) -> Self {
+        Self {
+            kind: ErrorKind::SerializationError,
+            source: Some(Box::new(e)),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self {
+            kind: ErrorKind::IoError,
             source: Some(Box::new(e)),
         }
     }
