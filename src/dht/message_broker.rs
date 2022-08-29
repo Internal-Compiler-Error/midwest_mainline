@@ -5,6 +5,8 @@ use crate::{
     error::Error,
     message::{Krpc, TransactionId},
 };
+use futures::TryFutureExt;
+use redis::RedisResult;
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -17,7 +19,9 @@ use tokio::{
     task::Builder,
     try_join,
 };
-use tracing::{instrument, trace};
+use tracing::{instrument, trace, warn};
+use crate::error::ErrorKind;
+use crate::message::MessageType;
 
 /// A PostalOffice is responsible for delivering messages to the appropriate nodes. *It is not
 /// responsible for storing the messages sent to ourselves.*
@@ -52,5 +56,43 @@ impl PostalOffice for UdpV4PostalOffice {
     async fn send_to_peer(&self, message: &Krpc, to: &CompactPeerContact) -> Result<(), Error> {
         let sock_addr: SocketAddrV4 = to.into();
         self.send_to_addr(message, &SocketAddr::from(sock_addr)).await
+    }
+}
+
+pub struct RedisMailBoxes {
+    redis_client: redis::Client,
+    redis_connection: redis::aio::Connection,
+    socket: Arc<net::UdpSocket>,
+}
+
+impl RedisMailBoxes {
+    pub async fn new(udp_sock: Arc<net::UdpSocket>, redis_client: redis::Client) -> RedisResult<Self> {
+        let redis_connection = redis_client.get_async_connection().await?;
+
+        Ok(Self {
+            redis_client,
+            redis_connection,
+            socket: udp_sock,
+        })
+    }
+
+    pub async fn run(&mut self) {
+        loop {
+            let mut buf = [0u8; 2048];
+            let read_result = self.socket.recv_from(&mut buf)
+                .map_err(|e| {
+                    Error {
+                        kind: ErrorKind::IoError,
+                        source: Some(Box::new(e)),
+                    }
+                })
+                .and_then(|(read_size, sender)| async {
+                use redis::AsyncCommands;
+
+                let message= bendy::serde::from_bytes::<Krpc>(&buf)?;
+
+                message
+            });
+        }
     }
 }
