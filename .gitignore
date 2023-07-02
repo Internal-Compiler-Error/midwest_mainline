@@ -1,1 +1,5 @@
 /target
+
+# stupid things that can't help themselves but to pollute the repo
+.idea/
+.DS_Store
