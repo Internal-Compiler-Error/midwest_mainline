@@ -1,3 +1,4 @@
+use bendy::decoding::{Decoder, Object};
 use crate::{
     domain_knowledge::{CompactPeerContact, NodeId},
     message::{error_response::ErrorResponse, ping_query::PingQuery},
@@ -25,9 +26,40 @@ pub mod get_peers_query;
 pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
+pub mod error;
 
 pub type InfoHash = [u8; 20];
 pub type TransactionId = Box<[u8]>;
+
+pub(crate) trait ToRawKrpc {
+    fn to_raw_krpc(&self) -> Box<[u8]>;
+}
+
+pub(crate) trait ParseKrpc {
+    fn parse(&self) -> Result<Krpc, ()>;
+}
+
+impl ParseKrpc for &[u8] {
+    fn parse(&self) -> Result<Krpc, ()> {
+        let mut decoder = Decoder::new(self);
+        let message = decoder
+            .next_object()
+            .map_err(|_| ())?
+            .ok_or(())?;
+
+        let Object::Dict(dict) = message else {
+            return Err(());
+        };
+
+        // get all the keys of the dict
+        let mut keys = vec![];
+
+        while let Ok(Some((key, value))) in dict.next_pair() {
+            keys.push(key);
+        }
+    }
+}
+
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -60,7 +92,6 @@ pub(crate) mod query_methods {
     pub(crate) struct ping;
 
     #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-
     pub(crate) struct announce_peer;
 
     #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
@@ -401,7 +432,7 @@ mod test {
             });
 
             let message =
-               b"d1:ad2:id20:abcdefghij012345678912:implied_porti1e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe";
+                b"d1:ad2:id20:abcdefghij012345678912:implied_porti1e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe";
             let deserialized = from_bytes::<Krpc>(message)?;
 
             let expected = Krpc::new_announce_peer_query(
@@ -549,7 +580,7 @@ mod test {
                 403918979a78abacbf3267657c26e095e73f75abf9398e0f6e6bd9a26b5bda70000000000000000000000\
                 0000000000000000005778ea621cb6",
                     )?
-                    .as_slice(),
+                        .as_slice(),
                 ),
                 // Box::from(hex::decode("b8972559c8d6")?.as_slice()),
             );

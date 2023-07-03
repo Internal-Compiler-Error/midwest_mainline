@@ -1,10 +1,70 @@
+use bendy::{encoding::ToBencode, decoding::FromBencode};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
     fmt::{Debug, Formatter},
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4}, ops::Deref,
 };
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct BetterNodeId(String);
+
+impl BetterNodeId {
+    // todo: think of a better error type
+    pub fn new(id: String) -> Result<Self, ()> {
+        if !id.is_ascii() || id.len() != 20 {
+            return Err(());
+        }
+
+        Ok(BetterNodeId(id))
+    }
+}
+
+impl Deref for BetterNodeId {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToBencode for BetterNodeId {
+    const MAX_DEPTH: usize = 0 as usize;
+
+    fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
+        encoder.emit_str(&self.0)
+    }
+}
+
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct BetterInfoHash(String);
+impl BetterInfoHash {
+    // todo: think of a better error type
+    pub fn new(id: String) -> Result<Self, ()> {
+        if !id.is_ascii() || id.len() != 20 {
+            return Err(());
+        }
+
+        Ok(Self(id))
+    }
+}
+
+impl Deref for BetterInfoHash {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToBencode for BetterInfoHash {
+    const MAX_DEPTH: usize = 0 as usize;
+
+    fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
+        encoder.emit_str(&self.0)
+    }
+}
 pub type NodeId = [u8; 20];
 
 #[serde_as]
@@ -61,6 +121,9 @@ pub struct CompactPeerContact {
     #[serde_as(as = "Bytes")]
     pub(crate) bytes: [u8; 6],
 }
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct BetterPeerContact(pub SocketAddrV4);
 
 impl From<SocketAddrV4> for CompactPeerContact {
     fn from(addr: SocketAddrV4) -> Self {
