@@ -1,13 +1,13 @@
 use crate::message::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct GeneralError {
+pub struct KrpcError {
     transaction_id: String,
     code: u32,
     message: String,
 }
 
-impl GeneralError {
+impl KrpcError {
     pub fn new(transaction_id: String, code: u32, message: String) -> Self {
         Self {
             transaction_id,
@@ -49,8 +49,8 @@ impl GeneralError {
     }
 }
 
-impl ToRawKrpc for GeneralError {
-    
+impl ToRawKrpc for KrpcError {
+
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -66,8 +66,8 @@ impl ToRawKrpc for GeneralError {
                 })
             })
         });
-        
+
         encoder.get_output().expect("we know the stuff upfont").into_boxed_slice()
     }
-    
+
 }
