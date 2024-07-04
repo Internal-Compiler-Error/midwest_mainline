@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{BetterCompactPeerInfo, CompactNodeContact, NodeId};
+use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId};
 use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
 use tracing::{info, trace};
@@ -33,12 +33,12 @@ impl Bucket {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub(crate) contact: CompactNodeContact,
+    pub(crate) contact: BetterCompactNodeInfo,
     pub(crate) last_checked: Instant,
 }
 
 impl RoutingTable {
-    pub fn new(id: &NodeId) -> Self {
+    pub fn new(id: &BetterNodeId) -> Self {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
@@ -57,7 +57,7 @@ impl RoutingTable {
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
-    pub fn add_new_node(&mut self, contact: BetterCompactPeerInfo) {
+    pub fn add_new_node(&mut self, contact: BetterCompactNodeInfo) {
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
         if let Some(node) = self
@@ -65,14 +65,14 @@ impl RoutingTable {
             .iter_mut()
             .map(|b| b.nodes.iter_mut())
             .flatten()
-            .find(|node| node.contact.node_id() == contact.node_id())
+            .find(|node| node.contact.id == contact.id)
         {
             node.last_checked = Instant::now();
             return;
         }
 
         let our_id = &self.id;
-        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.node_id()));
+        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.id));
 
         // first, find the bucket that this node belongs in
         let target_bucket = self
@@ -99,7 +99,7 @@ impl RoutingTable {
                 // do I prefer the draining_filter API? yes but that's sadly nightly only
                 let mut i = 0;
                 while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id());
+                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.id);
                     if &target_bucket_node_id <= &new_bucket.lower_bound {
                         let node = target_bucket.nodes.remove(i);
                         new_bucket.nodes.push(node);
@@ -129,13 +129,13 @@ impl RoutingTable {
         info!("node processed, node count: {}", self.node_count());
     }
 
-    pub fn find_closest(&self, target: &NodeId) -> Vec<&CompactNodeContact> {
+    pub fn find_closest(&self, target: &BetterNodeId) -> Vec<&BetterCompactNodeInfo> {
         let mut closest_nodes: Vec<_> = self
             .buckets
             .iter()
             .map(|bucket| {
                 bucket.nodes.iter().map(|node| {
-                    let node_id = node.contact.node_id();
+                    let node_id = node.contact.id;
                     let mut distance = [0u8; 20];
 
                     // zip for array is sadly unstable
@@ -154,17 +154,17 @@ impl RoutingTable {
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
         closest_nodes
             .iter()
-            .filter(|(_, node)| node.node_id() != target)
+            .filter(|(_, node)| node.id != *target)
             .take(8)
             .map(|x| x.1)
             .collect()
     }
 
-    pub fn find(&self, target: &NodeId) -> Option<&Node> {
+    pub fn find(&self, target: &BetterNodeId) -> Option<&Node> {
         self.buckets
             .iter()
             .map(|bucket| bucket.nodes.iter())
             .flatten()
-            .find(|node| node.contact.node_id() == target)
+            .find(|node| node.contact.id == *target)
     }
 }

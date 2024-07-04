@@ -1,6 +1,6 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo, BetterInfoHash, BetterNodeId, CompactNodeContact, CompactPeerContact, NodeId},
+    domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo, BetterInfoHash, BetterNodeId, CompactNodeContact, CompactPeerContact, NodeId},
     message::{InfoHash, Krpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -126,10 +126,9 @@ impl DhtClientV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: BetterNodeId,
-    ) -> Result<Vec<CompactNodeContact>, DhtServiceFailure> {
+    ) -> Result<Vec<BetterCompactNodeInfo>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        // let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
         let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), self.our_id, target);
 
         // send the message and await for a response
@@ -140,11 +139,7 @@ impl DhtClientV4 {
             // the nodes come back as one giant byte string, each 26 bytes is a node
             // we split them up and create a vector of them
             let mut nodes: Vec<_> = find_node_response
-                .body
-                .nodes
-                .chunks_exact(26)
-                .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                .collect();
+                .nodes;
 
             // some clients will return duplicate nodes, so we remove them
             nodes.sort_unstable_by_key(|node| {
@@ -165,11 +160,11 @@ impl DhtClientV4 {
     async fn ask_her_for_peers(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
-        target: BetterInfoHash,
+        target: BetterNodeId,
     ) -> Result<
         (
             Option<String>,
-            Either<Vec<BetterCompactPeerInfo>, Vec<BetterCompactPeerContact>>,
+            Either<Vec<BetterCompactNodeInfo>, Vec<BetterCompactPeerContact>>,
         ),
         DhtServiceFailure,
     > {
@@ -237,7 +232,7 @@ impl DhtClientV4 {
     }
 
     /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<CompactNodeContact, DhtServiceFailure> {
+    pub async fn find_node(self: Arc<Self>, target: &BetterNodeId) -> Result<BetterCompactNodeInfo, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.read().await.find(target) {
             return Ok(node.contact.clone());
@@ -339,10 +334,10 @@ impl DhtClientV4 {
     /// the caller should drop the future to cancel all remaining tasks
     async fn recursive_find_from_pool(
         self: Arc<Self>,
-        mut starting_pool: Vec<CompactNodeContact>,
+        mut starting_pool: Vec<BetterCompactPeerContact>,
         finding: NodeId,
-        seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
-        slot: Arc<Mutex<Option<Sender<CompactNodeContact>>>>,
+        seen: Arc<Mutex<HashSet<BetterCompactPeerContact>>>,
+        slot: Arc<Mutex<Option<Sender<BetterCompactPeerContact>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -418,10 +413,10 @@ impl DhtClientV4 {
     #[instrument(skip_all)]
     async fn recursive_get_peers_from_pool(
         self: Arc<Self>,
-        mut starting_pool: Vec<CompactNodeContact>,
-        finding: InfoHash,
-        seen: Arc<Mutex<HashSet<CompactNodeContact>>>,
-        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<CompactPeerContact>)>>>>,
+        mut starting_pool: Vec<BetterCompactNodeInfo>,
+        finding: BetterNodeId,
+        seen: Arc<Mutex<HashSet<BetterCompactNodeInfo>>>,
+        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<BetterCompactNodeInfo>)>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {

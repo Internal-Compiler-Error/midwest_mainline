@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bendy::decoding::{Decoder, Object};
-use crate::domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo};
+use crate::domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo};
 
 use find_node_get_peers_non_compliant_response::
     BetterFindNodeResponse
@@ -223,7 +223,7 @@ impl ParseKrpc for &[u8] {
                         let port = u16::from_be_bytes([contact[4], contact[5]]);
                         let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
 
-                        BetterCompactPeerInfo {
+                        BetterCompactNodeInfo {
                             id: node_id,
                             contact
                         }
@@ -282,7 +282,7 @@ impl ParseKrpc for &[u8] {
                             let port = u16::from_be_bytes([contact[4], contact[5]]);
                             let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
 
-                            BetterCompactPeerInfo {
+                            BetterCompactNodeInfo {
                                 id: node_id,
                                 contact
                             }
@@ -337,7 +337,6 @@ pub(crate) mod query_methods {
     pub(crate) struct find_node;
 
     #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-    //#[serde(rename = "ping")]
     pub(crate) struct ping;
 
     #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
@@ -472,7 +471,7 @@ impl Krpc {
     }
 
     // construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: String, responding_id: BetterNodeId, nodes: Vec<BetterCompactPeerInfo>) -> Krpc {
+    pub fn new_find_node_response(transaction_id: String, responding_id: BetterNodeId, nodes: Vec<BetterCompactNodeInfo>) -> Krpc {
         // let find_node_response = FindNodeGetPeersNonCompliantResponse {
         //     transaction_id,
         //     message_type: Box::new(b"r".clone()),
@@ -518,7 +517,7 @@ impl Krpc {
         transaction_id: String,
         responding_id: BetterNodeId,
         response_token: String,
-        closest_nodes: Vec<BetterCompactPeerInfo>
+        closest_nodes: Vec<BetterCompactNodeInfo>
     ) -> Krpc {
         // let get_peers_deferred_response = GetPeersDeferredResponse {
         //     transaction_id,
@@ -539,7 +538,7 @@ impl Krpc {
     pub fn new_get_peers_deferred_response_con_compliant(
         transaction_id: String,
         responding_id: BetterNodeId,
-        closest_nodes: Vec<BetterCompactPeerInfo>,
+        closest_nodes: Vec<BetterCompactNodeInfo>,
     ) -> Krpc {
         // let get_peers_deferred_response = FindNodeGetPeersNonCompliantResponse {
         //     transaction_id,

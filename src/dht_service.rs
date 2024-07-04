@@ -21,7 +21,6 @@ use tokio::{
     time::{error::Elapsed, timeout},
 };
 
-use crate::message::TransactionId;
 use dht_client::DhtClientV4;
 use tracing::{info, info_span, instrument, trace, warn, Instrument};
 
@@ -61,7 +60,7 @@ impl Error for DhtServiceFailure {}
 #[derive(Debug)]
 pub(crate) struct MessageDemultiplexer {
     /// a map to keep track of the responses we await from the client
-    pending_responses: Mutex<HashMap<TransactionId, Sender<Krpc>>>,
+    pending_responses: Mutex<HashMap<String, Sender<Krpc>>>,
 
     /// all messages belong to the server are put into this queue.
     query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
@@ -106,7 +105,7 @@ impl MessageDemultiplexer {
     }
 
     /// Tell the placer we should expect some messages
-    pub async fn register(&self, transaction_id: TransactionId, sending_half: oneshot::Sender<Krpc>) {
+    pub async fn register(&self, transaction_id: String, sending_half: oneshot::Sender<Krpc>) {
         let mut guard = self.pending_responses.lock().await;
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
@@ -321,11 +320,11 @@ impl DhtV4 {
         .await?;
 
         if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-            let nodes = response.body.nodes;
-            let mut nodes: Vec<_> = nodes
-                .chunks_exact(26)
-                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                .collect();
+            let nodes = response.nodes;
+            // let mut nodes: Vec<_> = nodes
+            //     .chunks_exact(26)
+            //     .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+            //     .collect();
             {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
@@ -364,7 +363,7 @@ impl DhtV4 {
                                 // add the leave level responses to our routing table
                                 let mut table = dht.routing_table.write().await;
                                 table.add_new_node(CompactNodeContact::from_node_id_and_addr(
-                                    &response.body.id,
+                                    &response.transaction_id,
                                     &node.into(),
                                 ));
                             }
