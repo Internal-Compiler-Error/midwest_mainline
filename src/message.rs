@@ -20,11 +20,9 @@ use crate::message::get_peers_query::BetterGetPeersQuery;
 use crate::message::ping_query::BetterPingQuery;
 
 pub mod announce_peer_query;
-pub mod error_response;
 pub mod find_node_get_peers_non_compliant_response;
 pub mod find_node_query;
-pub mod get_peers_deferred_response;
-pub mod get_peers_query;
+pub mod get_peers_deferred_response; pub mod get_peers_query;
 pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
 pub mod ping_query;

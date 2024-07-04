@@ -1,39 +1,6 @@
-use crate::{
-    domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo, BetterNodeId, NodeId},
-    message::TransactionId,
-};
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, Bytes};
+use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId};
 
 use super::ToRawKrpc;
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetPeersDeferredResponse {
-    #[serde_as(as = "Bytes")]
-    #[serde(rename = "t")]
-    pub(crate) transaction_id: TransactionId,
-
-    #[serde(rename = "y")]
-    #[serde_as(as = "Bytes")]
-    pub(crate) message_type: Box<[u8]>,
-
-    #[serde(rename = "r")]
-    pub(crate) body: GetPeersDeferredResponseBody,
-}
-
-#[serde_as]
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetPeersDeferredResponseBody {
-    #[serde_as(as = "Bytes")]
-    pub id: NodeId,
-
-    #[serde_as(as = "Bytes")]
-    pub token: Box<[u8]>,
-
-    #[serde_as(as = "Bytes")]
-    pub nodes: Box<[u8]>,
-}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersDeferredResponse {
