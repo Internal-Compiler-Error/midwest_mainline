@@ -1,4 +1,4 @@
-use crate::{domain_knowledge::NodeId, message::TransactionId};
+use crate::{domain_knowledge::{BetterCompactPeerInfo, BetterNodeId, NodeId}, message::TransactionId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
@@ -29,3 +29,11 @@ pub struct FindNodeGetPeersNonCompliantResponseBody {
     #[serde_as(as = "Bytes")]
     pub nodes: Box<[u8]>,
 }
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct BetterFindNodeResponse {
+    pub transaction_id: String,
+    pub target_id: BetterNodeId,
+    pub nodes: Vec<BetterCompactPeerInfo>,
+}
+

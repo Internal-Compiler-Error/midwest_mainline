@@ -1,20 +1,24 @@
+use core::slice::SlicePattern;
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use bendy::decoding::{Decoder, Object};
+use color_eyre::eyre::Ok;
 use crate::{
-    domain_knowledge::{CompactPeerContact, NodeId},
+    domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo, CompactPeerContact, NodeId},
     message::{error_response::ErrorResponse, ping_query::PingQuery},
 };
 use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
 
 use find_node_get_peers_non_compliant_response::{
-    FindNodeGetPeersNonCompliantResponse, FindNodeGetPeersNonCompliantResponseBody,
+    BetterFindNodeResponse, FindNodeGetPeersNonCompliantResponse, FindNodeGetPeersNonCompliantResponseBody
 };
 use find_node_query::{FindNodeArgs, FindNodeQuery};
-use get_peers_deferred_response::GetPeersDeferredResponse;
+use get_peers_deferred_response::{BetterGetPeersDeferredResponse, GetPeersDeferredResponse};
 use get_peers_query::{GetPeersArgs, GetPeersQuery};
-use get_peers_success_response::{GetPeersSuccessResponse, GetPeersSuccessResponseBody};
-use ping_announce_peer_response::{PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
+use get_peers_success_response::{BetterGetPeersSuccessResponse, GetPeersSuccessResponse, GetPeersSuccessResponseBody};
+use ping_announce_peer_response::{BetterPingAnnouncePeerResponse, PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
 use ping_query::PingArgs;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error, ser::Error, Deserialize, Serialize};
 use serde_with::serde_as;
 
 use juicy_bencode;
@@ -67,21 +71,22 @@ impl ParseKrpc for &[u8] {
         // we're only using it to validate the message structure
         dict.consume_all().map_err(|_| ())?;
 
-        let (_remaining, parsed) = juicy_bencode::parse_bencode_dict(self).map_err(|_| ())?;
+        let (_remaining, parsed) = parse_bencode_dict(self).map_err(|_| ())?;
 
         let message_type_indicator = parsed.get(b"y".as_slice()).ok_or(())?;
-        let BencodeItemView::ByteString(message_type) = message_type_indicator else {
+        let BencodeItemView::ByteString(ref message_type) = message_type_indicator else {
             // invalid message
             return Err(());
         };
 
         let transaction_id = parsed.get(&b"t".as_slice()).ok_or(())?;
-        let BencodeItemView::ByteString(transaction_id) = transaction_id else {
+        let BencodeItemView::ByteString(ref transaction_id) = transaction_id else {
             return Err(());
         };
+        // TODO: are all transaction ids strings?
         let transaction_id = str::from_utf8(transaction_id).map_err(|_| ())?.to_string();
 
-        if message_type == &b"e" {
+        if message_type == b"e" { // Error message
             let code_and_message = parsed.get(b"e".as_slice()).ok_or(())?;
             let BencodeItemView::List(code_and_message) = code_and_message else {
                 return Err(());
@@ -93,7 +98,7 @@ impl ParseKrpc for &[u8] {
                 return Err(());
             };
 
-            let BencodeItemView::ByteString(message) = message else {
+            let BencodeItemView::ByteString(ref message) = message else {
                 return Err(());
             };
             let message = str::from_utf8(message).map_err(|_| ())?.to_string();
@@ -104,7 +109,8 @@ impl ParseKrpc for &[u8] {
                 code,
                 message,
             )));
-        } else if message_type == &b"q" {
+
+        } else if message_type == &b"q" { // queries
             // pull out common fields
             let query_type = parsed.get(&b"q".as_slice()).ok_or(())?;
             let BencodeItemView::ByteString(query_type) = query_type else {
@@ -191,9 +197,122 @@ impl ParseKrpc for &[u8] {
             } else {
                 return Err(());
             }
-        } else if message_type == &b"r" {
-            todo!()
-        } else {
+        } else if message_type == &b"r" { // responses
+            let body = parsed.get(b"r".as_slice()).ok_or(())?;
+            let BencodeItemView::Dictionary(response) = body else {
+                return Err(());
+            };
+
+            let id = response.get(b"id".as_slice()).ok_or(())?;
+            let BencodeItemView::ByteString(ref target_id) = id else {
+                return Err(());
+            };
+            let target_id = BetterNodeId::new(String::from_utf8(target_id.to_vec()).unwrap()).unwrap();
+
+
+            if response.contains_key(b"nodes".as_slice()) {
+                let nodes = response.get(b"nodes".as_slice()).unwrap();
+                let BencodeItemView::ByteString(ref nodes) = nodes else {
+                    return Err(());
+                };
+
+                let contacts: Vec<_> = nodes
+                    .chunks(26)
+                    .map(|info| {
+                        let node_id = &info[0..20];
+                        let contact = &info[20..26];
+
+                        let node_id = BetterNodeId::new(String::from_utf8(node_id.to_vec()).unwrap()).unwrap();
+
+                        let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
+                        let port = u16::from_be_bytes([contact[4], contact[5]]);
+                        let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
+
+                        BetterCompactPeerContact {
+                            id: node_id,
+                            contact
+                        }
+                    })
+                    .collect();
+
+                let res = BetterFindNodeResponse {
+                    transaction_id,
+                    target_id,
+                    nodes: contacts,
+                };
+                let msg = Krpc::FindNodeGetPeersNonCompliantResponse(res) ;
+                return Ok(msg);
+                // find nodes response
+            } else if response.contains_key(b"token".as_slice()) {
+                // get_peers response
+                let token = response.get(b"token".as_slice()).unwrap();
+                let BencodeItemView::ByteString(token) = token else {
+                    return Err(());
+                };
+                let token = String::from_utf8(token.to_vec()).unwrap();
+
+                if let Some(BencodeItemView::List(values)) = response.get(b"values".as_slice()) {
+                    // success, the peers can be contacted immediately
+
+                    let contacts: Vec<_> = values
+                        .iter()
+                        .filter_map(|x| {
+                            match x {
+                                BencodeItemView::ByteString(s) => Some(s),
+                                _ => None,
+                            }
+                        })
+                        .map(|sock_addr| {
+                            // TODO: worry about segfault later
+                            let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
+                            let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
+
+                            BetterCompactPeerContact(SocketAddrV4::new(ip, port))
+                        }).collect();
+
+                    let res = BetterGetPeersSuccessResponse::new(transaction_id, target_id, token, contacts);
+                    let msg = Krpc::GetPeersSuccessResponse(res);
+                    return Ok(msg);
+                } else if let Some(BencodeItemView::ByteString(nodes)) =  response.get(b"nodes".as_slice()) {
+                    // deferred, nearest nodes returned
+                    let contacts: Vec<_> = nodes
+                        .chunks(26)
+                        .map(|info| {
+                            let node_id = &info[0..20];
+                            let contact = &info[20..26];
+
+                            let node_id = BetterNodeId::new(String::from_utf8(node_id.to_vec()).unwrap()).unwrap();
+
+                            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
+                            let port = u16::from_be_bytes([contact[4], contact[5]]);
+                            let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
+
+                            BetterCompactPeerInfo {
+                                id: node_id,
+                                contact
+                            }
+                        })
+                        .collect();
+
+                    let res = BetterGetPeersDeferredResponse::new(transaction_id, target_id, token, contacts);
+                    let msg = Krpc::GetPeersDeferredResponse(res);
+                    return Ok(msg);
+                } else {
+                    // invalid message
+                    return Err(());
+                }
+            } else if response.len() == 1 {
+                // only has id in the response
+                //
+                // could be a ping, or, announce peer, due to the horrible protocol design of KRPC
+                let res = BetterPingAnnouncePeerResponse::new(transaction_id, target_id);
+                let msg = Krpc::PingAnnouncePeerResponse(res);
+                return Ok(msg);
+            } else {
+                // non-comliant response
+                return Err(());
+            }
+        } else { // invalid message
             return Err(());
         }
     }
@@ -207,10 +326,10 @@ pub enum Krpc {
     GetPeersQuery(BetterGetPeersQuery),
     PingQuery(BetterPingQuery),
 
-    GetPeersSuccessResponse(GetPeersSuccessResponse),
-    GetPeersDeferredResponse(GetPeersDeferredResponse),
-    FindNodeGetPeersNonCompliantResponse(FindNodeGetPeersNonCompliantResponse),
-    PingAnnouncePeerResponse(PingAnnouncePeerResponse),
+    GetPeersSuccessResponse(BetterGetPeersSuccessResponse),
+    GetPeersDeferredResponse(BetterGetPeersDeferredResponse),
+    FindNodeGetPeersNonCompliantResponse(BetterFindNodeResponse),
+    PingAnnouncePeerResponse(BetterPingAnnouncePeerResponse),
 
     ErrorResponse(KrpcError),
 }

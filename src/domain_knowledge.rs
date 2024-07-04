@@ -123,7 +123,13 @@ pub struct CompactPeerContact {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterPeerContact(pub SocketAddrV4);
+pub struct BetterCompactPeerContact(pub SocketAddrV4);
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct BetterCompactPeerInfo {
+    pub id: BetterNodeId,
+    pub contact: BetterCompactPeerContact,
+}
 
 impl From<SocketAddrV4> for CompactPeerContact {
     fn from(addr: SocketAddrV4) -> Self {
