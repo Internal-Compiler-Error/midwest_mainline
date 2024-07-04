@@ -82,14 +82,18 @@ impl ToRawKrpc for BetterGetPeersDeferredResponse {
                         use std::str;
 
                         let combined = self.nodes.iter().map(|peer| {
-                            let octets = peer.0.ip().octets();
-                            let port_in_ne = peer.0.port().to_be_bytes();
+                            let node_id = &peer.id;
+                            let id_as_ascii = node_id.0.as_bytes();
+
+                            let octets = peer.contact.0.ip().octets();
+                            let port_in_ne = peer.contact.0.port().to_be_bytes();
 
                             let ip_as_ascii = str::from_utf8(octets.as_slice()).expect("we know the ip is ascii");
                             let port_as_ascii =
                                 str::from_utf8(port_in_ne.as_slice()).expect("we know the port is ascii");
 
-                            format!("{}{}", ip_as_ascii, port_as_ascii)
+                            // TODO: shouldn't they be transmitted raw instead?
+                            format!("{}{}{}", node_id.0, ip_as_ascii, port_as_ascii)
                         });
                         e.emit_unchecked_list(combined)
                     })

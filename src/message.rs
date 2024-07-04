@@ -1,22 +1,14 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bendy::decoding::{Decoder, Object};
-use color_eyre::eyre::Ok;
-use crate::{
-    domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo, CompactPeerContact, NodeId},
-    message::{error_response::ErrorResponse, ping_query::PingQuery},
-};
-use announce_peer_query::{AnnouncePeerArgs, AnnouncePeerQuery};
+use crate::domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo};
 
-use find_node_get_peers_non_compliant_response::{
-    BetterFindNodeResponse, FindNodeGetPeersNonCompliantResponse, FindNodeGetPeersNonCompliantResponseBody
-};
-use find_node_query::{FindNodeArgs, FindNodeQuery};
-use get_peers_deferred_response::{BetterGetPeersDeferredResponse, GetPeersDeferredResponse};
-use get_peers_query::{GetPeersArgs, GetPeersQuery};
-use get_peers_success_response::{BetterGetPeersSuccessResponse, GetPeersSuccessResponse, GetPeersSuccessResponseBody};
-use ping_announce_peer_response::{BetterPingAnnouncePeerResponse, PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
-use ping_query::PingArgs;
+use find_node_get_peers_non_compliant_response::
+    BetterFindNodeResponse
+;
+use get_peers_deferred_response::BetterGetPeersDeferredResponse;
+use get_peers_success_response::BetterGetPeersSuccessResponse;
+use ping_announce_peer_response::BetterPingAnnouncePeerResponse;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -158,7 +150,13 @@ impl ParseKrpc for &[u8] {
             } else if query_type == &b"announce_peer" {
                 // todo: some stupid clients might not send this
                 let implied_port = parsed.get(&b"implied_port".as_slice()).ok_or(())?;
-                let port = if implied_port {
+                let implied_port = match implied_port {
+                    BencodeItemView::Integer(i) => Some(i),
+                    _ => None
+                };
+
+                // TODO: revisit this, the semantics seems wrong
+                let port = if implied_port.is_some() {
                     let port = parsed.get(&b"port".as_slice()).ok_or(())?;
                     let BencodeItemView::Integer(port) = port else {
                         return Err(());
@@ -404,91 +402,107 @@ impl Krpc {
         }
     }
 
-    // pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
-    //     let ping_query = PingQuery {
-    //         transaction_id,
-    //         message_type: Box::new(b"q".clone()),
-    //         query_method: query_methods::ping,
-    //         body: PingArgs { id: querying_id },
-    //     };
-    //
-    //     Krpc::PingQuery(ping_query)
-    // }
+    pub fn new_ping_query(transaction_id: String, querying_id: BetterNodeId) -> Krpc {
+        // let ping_query = PingQuery {
+        //     transaction_id,
+        //     message_type: Box::new(b"q".clone()),
+        //     query_method: query_methods::ping,
+        //     body: PingArgs { id: querying_id },
+        // };
 
-    // pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
-    //     let find_node_query = FindNodeQuery {
-    //         transaction_id,
-    //         message_type: Box::new(b"q".clone()),
-    //         query_method: query_methods::find_node,
-    //         body: FindNodeArgs {
-    //             id: querying_id,
-    //             target: target_id,
-    //         },
-    //     };
-    //
-    //     Krpc::FindNodeQuery(find_node_query)
-    // }
+        // Krpc::PingQuery(ping_query)
+        let ping = BetterPingQuery::new(transaction_id, querying_id);
+        Krpc::PingQuery(ping)
+    }
 
-    // pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
-    //     let get_peers_query = GetPeersQuery {
-    //         transaction_id,
-    //         message_type: Box::new(b"q".clone()),
-    //         query_method: query_methods::get_peers,
-    //         body: GetPeersArgs {
-    //             id: querying_id,
-    //             info_hash,
-    //         },
-    //     };
-    //
-    //     Krpc::GetPeersQuery(get_peers_query)
-    // }
+    pub fn new_find_node_query(transaction_id: String, querying_id: BetterNodeId, target_id: BetterNodeId) -> Krpc {
+        // let find_node_query = FindNodeQuery {
+        //     transaction_id,
+        //     message_type: Box::new(b"q".clone()),
+        //     query_method: query_methods::find_node,
+        //     body: FindNodeArgs {
+        //         id: querying_id,
+        //         target: target_id,
+        //     },
+        // };
+        //
+        // Krpc::FindNodeQuery(find_node_query)
+        let find_node = BetterFindNodeQuery::new(transaction_id, querying_id, target_id);
+        Krpc::FindNodeQuery(find_node)
+    }
 
-    // pub fn new_announce_peer_query(
-    //     transaction_id: TransactionId,
-    //     info_hash: InfoHash,
-    //     querying_id: NodeId,
-    //     port: u16,
-    //     implied_port: bool,
-    //     token: Box<[u8]>,
-    // ) -> Krpc {
-    //     let announce_peer_query = AnnouncePeerQuery {
-    //         transaction_id,
-    //         message_type: Box::new(b"q".clone()),
-    //         query_method: query_methods::announce_peer,
-    //         body: AnnouncePeerArgs {
-    //             id: querying_id,
-    //             implied_port: if implied_port { 1 } else { 0 },
-    //             info_hash,
-    //             port,
-    //             token,
-    //         },
-    //     };
-    //
-    //     Krpc::AnnouncePeerQuery(announce_peer_query)
-    // }
+    pub fn new_get_peers_query(transaction_id: String, querying_id: BetterNodeId, info_hash: BetterInfoHash) -> Krpc {
+        // let get_peers_query = GetPeersQuery {
+        //     transaction_id,
+        //     message_type: Box::new(b"q".clone()),
+        //     query_method: query_methods::get_peers,
+        //     body: GetPeersArgs {
+        //         id: querying_id,
+        //         info_hash,
+        //     },
+        // };
 
-    // pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-    //     let ping_response = PingAnnouncePeerResponse {
-    //         transaction_id,
-    //         message_type: Box::new(b"r".clone()),
-    //         body: PingAnnouncePeerResponseBody { id: responding_id },
-    //     };
-    //     Krpc::PingAnnouncePeerResponse(ping_response)
-    // }
+        // Krpc::GetPeersQuery(get_peers_query)
+        let get_peers = BetterGetPeersQuery::new(transaction_id, querying_id, info_hash);
+        Krpc::GetPeersQuery(get_peers)
+    }
 
-    /// construct a response to a find_node query
-    // pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Krpc {
-    //     let find_node_response = FindNodeGetPeersNonCompliantResponse {
-    //         transaction_id,
-    //         message_type: Box::new(b"r".clone()),
-    //         body: FindNodeGetPeersNonCompliantResponseBody {
-    //             id: responding_id,
-    //             nodes,
-    //         },
-    //     };
-    //
-    //     Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response)
-    // }
+    pub fn new_announce_peer_query(
+        transaction_id: String,
+        info_hash: BetterInfoHash,
+        querying_id: BetterNodeId,
+        port: u16,
+        implied_port: bool,
+        token: String,
+    ) -> Krpc {
+        // let announce_peer_query = AnnouncePeerQuery {
+        //     transaction_id,
+        //     message_type: Box::new(b"q".clone()),
+        //     query_method: query_methods::announce_peer,
+        //     body: AnnouncePeerArgs {
+        //         id: querying_id,
+        //         implied_port: if implied_port { 1 } else { 0 },
+        //         info_hash,
+        //         port,
+        //         token,
+        //     },
+        // };
+        //
+        // Krpc::AnnouncePeerQuery(announce_peer_query)
+        let port = if implied_port {Some(port)} else {None};
+        let announce_peer = BetterAnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
+        Krpc::AnnouncePeerQuery(announce_peer)
+    }
+
+    pub fn new_ping_response(transaction_id: String, responding_id: BetterNodeId) -> Krpc {
+        // let ping_response = PingAnnouncePeerResponse {
+        //     transaction_id,
+        //     message_type: Box::new(b"r".clone()),
+        //     body: PingAnnouncePeerResponseBody { id: responding_id },
+        // };
+        let ping_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
+        Krpc::PingAnnouncePeerResponse(ping_res)
+    }
+
+    // construct a response to a find_node query
+    pub fn new_find_node_response(transaction_id: String, responding_id: BetterNodeId, nodes: Vec<BetterCompactPeerInfo>) -> Krpc {
+        // let find_node_response = FindNodeGetPeersNonCompliantResponse {
+        //     transaction_id,
+        //     message_type: Box::new(b"r".clone()),
+        //     body: FindNodeGetPeersNonCompliantResponseBody {
+        //         id: responding_id,
+        //         nodes,
+        //     },
+        // };
+        //
+        // Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response)
+        let find_node_res = BetterFindNodeResponse {
+            transaction_id,
+            target_id: responding_id,
+            nodes,
+        };
+        Krpc::FindNodeGetPeersNonCompliantResponse(find_node_res)
+    }
 
     /// construct a response to a get_peers query when the peer is directly found
     // pub fn new_get_peers_success_response(

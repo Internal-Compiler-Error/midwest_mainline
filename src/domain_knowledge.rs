@@ -1,4 +1,4 @@
-use bendy::{encoding::ToBencode, decoding::FromBencode};
+use bendy::encoding::ToBencode;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
@@ -7,7 +7,7 @@ use std::{
 };
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterNodeId(String);
+pub struct BetterNodeId(pub String);
 
 impl BetterNodeId {
     // todo: think of a better error type
@@ -38,7 +38,7 @@ impl ToBencode for BetterNodeId {
 
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterInfoHash(String);
+pub struct BetterInfoHash(pub String);
 impl BetterInfoHash {
     // todo: think of a better error type
     pub fn new(id: String) -> Result<Self, ()> {
