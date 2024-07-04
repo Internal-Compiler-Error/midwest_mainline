@@ -1,6 +1,6 @@
 use crate::{
     dht_service::dht_server::DhtServer,
-    domain_knowledge::{CompactNodeContact, NodeId},
+    domain_knowledge::{BetterCompactNodeInfo, CompactNodeContact, NodeId},
     message::Krpc,
     routing::RoutingTable,
 };
@@ -328,7 +328,8 @@ impl DhtV4 {
             {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
-                table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
+                // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
+                table.add_new_node(BetterCompactNodeInfo { id: response., contact: () })
             }
 
             nodes.dedup();

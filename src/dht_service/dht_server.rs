@@ -1,14 +1,13 @@
 use crate::{
-    domain_knowledge::{CompactPeerContact, NodeId, ToConcatedNodeContact},
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, CompactPeerContact},
     message::{
-        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-        ping_query::PingQuery, Krpc,
+        announce_peer_query::{ BetterAnnouncePeerQuery}, find_node_query::BetterFindNodeQuery, get_peers_query::BetterGetPeersQuery,
+        ping_query::BetterPingQuery, Krpc,
     },
     routing::RoutingTable,
 };
 use rand::RngCore;
 
-use crate::{domain_knowledge::CompactNodeContact, message::InfoHash};
 use sha3::{Digest, Sha3_256};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -26,7 +25,8 @@ use tracing::{error, info, info_span, trace, Instrument};
 
 #[derive(Debug)]
 struct TokenPool {
-    assigned: Arc<Mutex<HashMap<Ipv4Addr, (Box<[u8]>, Instant)>>>,
+    // TODO: define a type for token
+    assigned: Arc<Mutex<HashMap<Ipv4Addr, (String, Instant)>>>,
     salt: Arc<RwLock<[u8; 128]>>,
 }
 
@@ -65,7 +65,7 @@ impl TokenPool {
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
     /// existing token.
-    pub(crate) async fn token_for_addr(&self, addr: &Ipv4Addr) -> Box<[u8]> {
+    pub(crate) async fn token_for_addr(&self, addr: &Ipv4Addr) -> String {
         let mut assigned = self.assigned.lock().await;
         let entry = assigned.entry(*addr);
 
@@ -95,30 +95,30 @@ impl TokenPool {
     }
 
     /// See as the moment of calling, is the token correct?
-    pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &[u8]) -> bool {
+    pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &str) -> bool {
         let expected_token = self.generate_token(addr).await;
         &*expected_token == token
     }
 
     /// generate what the token for the address should be as this current moment
-    async fn generate_token(&self, addr: &Ipv4Addr) -> Box<[u8]> {
+    async fn generate_token(&self, addr: &Ipv4Addr) -> String {
         let mut hasher = Sha3_256::new();
         let salt = self.salt.read().await;
         hasher.update(&*salt);
         hasher.update(addr.octets());
 
         let digest = hasher.finalize();
-
-        Box::from(digest.as_slice())
+        String::from_utf8(digest.as_slice().to_vec()).unwrap()
+        // Box::from(digest.as_slice())
     }
 }
 
 #[derive(Debug)]
 pub struct DhtServer {
     routing_table: Arc<RwLock<RoutingTable>>,
-    our_id: NodeId,
+    our_id: BetterNodeId,
     requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
-    hash_table: Arc<RwLock<HashMap<InfoHash, Vec<CompactPeerContact>>>>,
+    hash_table: Arc<RwLock<HashMap<BetterInfoHash, Vec<BetterCompactPeerContact>>>>,
     token_pool: Arc<TokenPool>,
     socket: Arc<UdpSocket>,
 }
@@ -127,7 +127,7 @@ impl DhtServer {
     pub(crate) fn new(
         requests: Receiver<(Krpc, SocketAddrV4)>,
         socket: Arc<UdpSocket>,
-        id: NodeId,
+        id: BetterNodeId,
         routing_table: Arc<RwLock<RoutingTable>>,
     ) -> Self {
         Self {
@@ -189,92 +189,110 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_ping_response(&self, ping: BetterPingQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&ping.body.id, &origin));
+            // TODO: use new
+            let peer = BetterCompactNodeInfo {
+                id: ping.target_id().clone(),
+                contact: BetterCompactPeerContact(origin),
+            };
+
+            routing_table.add_new_node(peer);
         }
 
-        Krpc::new_ping_response(ping.transaction_id, self.our_id)
+        Krpc::new_ping_response(ping.txn_id().to_string(), self.our_id.clone())
     }
 
     #[tracing::instrument]
-    async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_find_node_response(&self, query: BetterFindNodeQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&query.body.id, &origin));
+            let peer = BetterCompactNodeInfo {
+                id: query.target_id().clone(),
+                contact: BetterCompactPeerContact(origin),
+            };
+            routing_table.add_new_node(peer);
         }
 
         let table = self.routing_table.read().await;
-        let closest_eight: Vec<_> = table.find_closest(&query.body.target).into_iter().collect();
+        let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
-        return if closest_eight[0].node_id() == &query.body.target {
+        return if &closest_eight[0].id == query.target_id() {
             Krpc::new_find_node_response(
-                query.transaction_id,
-                self.our_id,
-                Box::new(closest_eight[0].node_id().clone()),
+                query.txn_id().to_string(),
+                self.our_id.clone(),
+                vec![closest_eight[0].clone()],
             )
         } else {
-            let bytes = closest_eight.to_concated_node_contact();
-            Krpc::new_find_node_response(query.transaction_id, self.our_id, bytes)
+            // let bytes = closest_eight.to_concated_node_contact();
+            Krpc::new_find_node_response(query.txn_id().to_string(), self.our_id.clone(), closest_eight.into_iter().cloned().collect())
         };
     }
 
     #[tracing::instrument]
-    async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_get_peers_response(&self, query: BetterGetPeersQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&query.body.id, &origin));
+            let peer = BetterCompactNodeInfo {
+                id: query.our_id().clone(),
+                contact: BetterCompactPeerContact(origin),
+            };
+            routing_table.add_new_node(peer);
         }
 
         // see if know about the info hash
         let table = self.hash_table.read().await;
         let token_pool = &self.token_pool;
 
-        return if let Some(peers) = table.get(&query.body.info_hash) {
+        return if let Some(peers) = table.get(query.info_hash()) {
             let peers: Vec<_> = peers.iter().cloned().collect();
 
             let token = token_pool.token_for_addr(origin.ip()).await;
-            Krpc::new_get_peers_success_response(query.transaction_id, self.our_id, token, peers)
+            Krpc::new_get_peers_success_response(query.txn_id().to_string(), self.our_id.clone(), token, peers)
         } else {
             let closest_eight: Vec<_> = self
                 .routing_table
                 .read()
                 .await
-                .find_closest(&query.body.info_hash)
+                .find_closest(query.our_id())   // TODO: wtf, why are we finding via info_hash
+                                                // before
                 .into_iter()
                 .cloned()
                 .collect();
 
             let token = token_pool.token_for_addr(&origin.ip()).await;
-            let bytes = closest_eight.to_concated_node_contact();
 
-            Krpc::new_get_peers_deferred_response(query.transaction_id, self.our_id, token, bytes)
+            Krpc::new_get_peers_deferred_response(query.txn_id().to_string(), self.our_id.clone(), token, closest_eight)
         };
     }
 
     #[tracing::instrument]
-    async fn generate_announce_peer_response(&self, announce: AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_announce_peer_response(&self, announce: BetterAnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
-        if !self.token_pool.is_valid_token(&origin.ip(), &announce.body.token).await {
-            return Krpc::new_standard_protocol_error(announce.transaction_id);
+        if !self.token_pool.is_valid_token(&origin.ip(), announce.token()).await {
+            return Krpc::new_standard_protocol_error(announce.txn_id().to_string());
         }
 
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            routing_table.add_new_node(CompactNodeContact::from_node_id_and_addr(&announce.body.id, &origin));
+            let peer = BetterCompactNodeInfo {
+                id: announce.querying().clone(),
+                contact: BetterCompactPeerContact(origin),
+            };
+            routing_table.add_new_node(peer);
         }
 
         // generate the correct peer contact according to the implied port argument, the port
         // argument is ignored if the implied port is not 0 and we use the origin port instead
         let peer_contact = {
-            if announce.body.implied_port == 0 {
-                CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.body.port))
+            if !announce.implied_port() {
+                CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.port()))
             } else {
                 CompactPeerContact::from(origin)
             }
@@ -283,10 +301,10 @@ impl DhtServer {
         // add the peer contact to the hash table, if it already exists, we don't care
         let mut table = self.hash_table.write().await;
         table
-            .entry(announce.body.info_hash)
+            .entry(announce.info_hash().clone())
             .or_insert_with(Vec::new)
             .push(peer_contact);
 
-        Krpc::new_announce_peer_response(announce.transaction_id, self.our_id)
+        Krpc::new_announce_peer_response(announce.txn_id().to_string(), self.our_id)
     }
 }

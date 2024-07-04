@@ -1,6 +1,8 @@
-use crate::{domain_knowledge::{BetterCompactPeerInfo, BetterNodeId, NodeId}, message::TransactionId};
+use crate::{domain_knowledge::{BetterCompactNodeInfo, BetterNodeId, NodeId}, message::TransactionId};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
+
+use super::ToRawKrpc;
 
 #[serde_as]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,9 +33,14 @@ pub struct FindNodeGetPeersNonCompliantResponseBody {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterFindNodeResponse {
+pub struct BetterFindNodeNonComGetPeersResponse {
     pub transaction_id: String,
     pub target_id: BetterNodeId,
-    pub nodes: Vec<BetterCompactPeerInfo>,
+    pub nodes: Vec<BetterCompactNodeInfo>,
 }
 
+impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
+    fn to_raw_krpc(&self) -> Box<[u8]> {
+        todo!()
+    }
+}

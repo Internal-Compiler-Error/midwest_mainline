@@ -86,8 +86,29 @@ impl BetterAnnouncePeerQuery {
         }
     }
 
+    /// Transaction id
     pub fn txn_id(&self) -> &str {
         &self.transaction_id
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn querying(&self) -> &BetterNodeId {
+        &self.ourself
+    }
+
+    pub fn implied_port(&self) -> bool {
+        self.implied_port
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn info_hash(&self) -> &BetterInfoHash {
+        &self.info_hash
     }
 }
 

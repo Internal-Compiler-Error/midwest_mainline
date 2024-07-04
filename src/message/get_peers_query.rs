@@ -66,6 +66,15 @@ impl BetterGetPeersQuery {
     pub fn txn_id(&self) -> &str {
         &self.transaction_id
     }
+
+    // TODO: horrible name, when we recive a request, it's clearly not from ourself
+    pub fn our_id(&self) -> &BetterNodeId {
+        &self.ourself
+    }
+
+    pub fn info_hash(&self) -> &BetterInfoHash {
+        &self.info_hash
+    }
 }
 
 impl ToRawKrpc for BetterGetPeersQuery {

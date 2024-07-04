@@ -4,7 +4,7 @@ use bendy::decoding::{Decoder, Object};
 use crate::domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo};
 
 use find_node_get_peers_non_compliant_response::
-    BetterFindNodeResponse
+    BetterFindNodeNonComGetPeersResponse
 ;
 use get_peers_deferred_response::BetterGetPeersDeferredResponse;
 use get_peers_success_response::BetterGetPeersSuccessResponse;
@@ -230,7 +230,7 @@ impl ParseKrpc for &[u8] {
                     })
                     .collect();
 
-                let res = BetterFindNodeResponse {
+                let res = BetterFindNodeNonComGetPeersResponse {
                     transaction_id,
                     target_id,
                     nodes: contacts,
@@ -323,10 +323,26 @@ pub enum Krpc {
 
     GetPeersSuccessResponse(BetterGetPeersSuccessResponse),
     GetPeersDeferredResponse(BetterGetPeersDeferredResponse),
-    FindNodeGetPeersNonCompliantResponse(BetterFindNodeResponse),
+    FindNodeGetPeersNonCompliantResponse(BetterFindNodeNonComGetPeersResponse),
     PingAnnouncePeerResponse(BetterPingAnnouncePeerResponse),
 
     ErrorResponse(KrpcError),
+}
+
+impl ToRawKrpc for Krpc {
+    fn to_raw_krpc(&self) -> Box<[u8]> {
+        match self {
+            Krpc::AnnouncePeerQuery(a) => a.to_raw_krpc(),
+            Krpc::FindNodeQuery(a) => a.to_raw_krpc(),
+            Krpc::GetPeersQuery(a) => a.to_raw_krpc(),
+            Krpc::PingQuery(a) => a.to_raw_krpc(),
+            Krpc::GetPeersSuccessResponse(a) => a.to_raw_krpc(),
+            Krpc::GetPeersDeferredResponse(a) => a.to_raw_krpc(),
+            Krpc::FindNodeGetPeersNonCompliantResponse(a) => a.to_raw_krpc(),
+            Krpc::PingAnnouncePeerResponse(a) => a.to_raw_krpc(),
+            Krpc::ErrorResponse(a) => a.to_raw_krpc(),
+        }
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -482,7 +498,7 @@ impl Krpc {
         // };
         //
         // Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response)
-        let find_node_res = BetterFindNodeResponse {
+        let find_node_res = BetterFindNodeNonComGetPeersResponse {
             transaction_id,
             target_id: responding_id,
             nodes,
@@ -529,7 +545,7 @@ impl Krpc {
         //     },
         // };
 
-        let get_peers_deferred_response = BetterGetPeersDeferredResponse::new(transaction_id, responding_id, token, nodes);
+        let get_peers_deferred_response = BetterGetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
         Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
     }
 

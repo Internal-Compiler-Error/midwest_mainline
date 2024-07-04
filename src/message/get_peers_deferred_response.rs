@@ -1,5 +1,5 @@
 use crate::{
-    domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo, BetterNodeId, NodeId},
+    domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo, BetterNodeId, NodeId},
     message::TransactionId,
 };
 use serde::{Deserialize, Serialize};
@@ -41,11 +41,11 @@ pub struct BetterGetPeersDeferredResponse {
     transaction_id: String,
     pub querier: BetterNodeId,
     pub token: String,
-    pub nodes: Vec<BetterCompactPeerInfo>,
+    pub nodes: Vec<BetterCompactNodeInfo>,
 }
 
 impl BetterGetPeersDeferredResponse {
-    pub fn new(transaction_id: String, querier: BetterNodeId, token: String, nodes: Vec<BetterCompactPeerInfo>) -> Self {
+    pub fn new(transaction_id: String, querier: BetterNodeId, token: String, nodes: Vec<BetterCompactNodeInfo>) -> Self {
         Self {
             transaction_id,
             querier,

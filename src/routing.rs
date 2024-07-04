@@ -99,7 +99,7 @@ impl RoutingTable {
                 // do I prefer the draining_filter API? yes but that's sadly nightly only
                 let mut i = 0;
                 while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.id);
+                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.id.0.as_bytes());
                     if &target_bucket_node_id <= &new_bucket.lower_bound {
                         let node = target_bucket.nodes.remove(i);
                         new_bucket.nodes.push(node);

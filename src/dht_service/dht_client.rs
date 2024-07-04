@@ -100,7 +100,7 @@ impl DhtClientV4 {
     pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
         let this = &self;
         let transaction_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(hex::encode(transaction_id.to_be_bytes()), this.our_id);
+        let ping_msg = Krpc::new_ping_query(hex::encode(transaction_id.to_be_bytes()), this.our_id.clone());
 
         let response = self.send_message(&ping_msg, &recipient).await?;
 
@@ -108,7 +108,7 @@ impl DhtClientV4 {
             this.routing_table
                 .write()
                 .await
-                .add_new_node(CompactNodeContact::from_node_id_and_addr(&response.id, &recipient));
+                .add_new_node(BetterCompactNodeInfo::new(response.target_id().clone(), BetterCompactPeerContact(recipient)));
 
             Ok(())
         } else {
@@ -129,7 +129,7 @@ impl DhtClientV4 {
     ) -> Result<Vec<BetterCompactNodeInfo>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), self.our_id, target);
+        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), self.our_id.clone(), target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -141,11 +141,12 @@ impl DhtClientV4 {
             let mut nodes: Vec<_> = find_node_response
                 .nodes;
 
+            // TODO: fix this
             // some clients will return duplicate nodes, so we remove them
-            nodes.sort_unstable_by_key(|node| {
-                let ip: SocketAddrV4 = node.into();
-                ip
-            });
+            // nodes.sort_unstable_by_key(|node| {
+            //     let ip: SocketAddrV4 = node.into();
+            //     ip
+            // });
             nodes.dedup();
 
             Ok(nodes)
@@ -171,7 +172,8 @@ impl DhtClientV4 {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_get_peers_query(hex::encode(transaction_id.to_be_bytes()), self.our_id, target);
+        // TODO: wtf, it expects a token?
+        let query = Krpc::new_get_peers_query(hex::encode(transaction_id.to_be_bytes()), self.our_id.clone(), BetterInfoHash("borken!".to_string()));
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -246,9 +248,10 @@ impl DhtClientV4 {
         }
 
         let returned_nodes = closest
-            .iter()
+            .into_iter()
             .map(|node| {
-                let ip: SocketAddrV4 = node.into();
+                // TODO: smelly
+                let ip: SocketAddrV4 = node.contact.0;
                 ip
             })
             .map(|ip| self.clone().ask_her_for_nodes(ip, *target))
@@ -271,7 +274,7 @@ impl DhtClientV4 {
 
         // it's possible that some of the nodes returned are actually the node we're looking for
         // so we check for that and return it if it's the case
-        let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
+        let target_node = returned_nodes.into_iter().flatten().find(|node| node.node_id() == target);
 
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
@@ -282,8 +285,8 @@ impl DhtClientV4 {
             .into_iter()
             .flatten()
             .map(|node| {
-                let node_id = BigUint::from_bytes_be(node.node_id());
-                let our_id = BigUint::from_bytes_be(&self.our_id);
+                let node_id = BigUint::from_bytes_be(node.node_id().0.as_bytes());
+                let our_id = BigUint::from_bytes_be(self.our_id.0.as_bytes());
                 let distance = our_id.bitxor(node_id);
 
                 (node, distance)
@@ -292,7 +295,7 @@ impl DhtClientV4 {
         sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
 
         // add all the nodes we have visited so far
-        let seen_node: Arc<Mutex<HashSet<CompactNodeContact>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_node: Arc<Mutex<HashSet<BetterCompactNodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
         {
             let mut seen = seen_node.lock().await;
             sorted_by_distance.iter().for_each(|(node, _)| {
@@ -303,7 +306,7 @@ impl DhtClientV4 {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
 
-        let starting_pool: Vec<CompactNodeContact> =
+        let starting_pool: Vec<BetterCompactPeerContact> =
             sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
 
         let dht = self.clone();

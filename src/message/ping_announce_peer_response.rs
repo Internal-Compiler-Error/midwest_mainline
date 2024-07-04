@@ -46,6 +46,10 @@ impl BetterPingAnnouncePeerResponse {
     pub fn txn_id(&self) -> &str {
         &self.transaction_id
     }
+
+    pub fn target_id(&self) -> &BetterNodeId {
+        &self.target_id
+    }
 }
 
 impl ToRawKrpc for BetterPingAnnouncePeerResponse {

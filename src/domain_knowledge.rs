@@ -131,6 +131,19 @@ pub struct BetterCompactNodeInfo {
     pub contact: BetterCompactPeerContact,
 }
 
+impl BetterCompactNodeInfo {
+    pub fn new(id: BetterNodeId, contact: BetterCompactPeerContact) -> BetterCompactNodeInfo {
+        BetterCompactNodeInfo {
+            id,
+            contact
+        }
+    }
+
+    pub fn node_id(&self) -> &BetterNodeId {
+        &self.id
+    }
+}
+
 impl From<SocketAddrV4> for CompactPeerContact {
     fn from(addr: SocketAddrV4) -> Self {
         (&addr).into()
