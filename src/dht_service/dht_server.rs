@@ -1,8 +1,8 @@
 use crate::{
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, CompactPeerContact},
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId},
     message::{
-        announce_peer_query::{ BetterAnnouncePeerQuery}, find_node_query::BetterFindNodeQuery, get_peers_query::BetterGetPeersQuery,
-        ping_query::BetterPingQuery, Krpc,
+        announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery, get_peers_query::BetterGetPeersQuery,
+        ping_query::BetterPingQuery, Krpc, ToRawKrpc,
     },
     routing::RoutingTable,
 };
@@ -57,10 +57,11 @@ impl TokenPool {
             }
         };
 
+        // huh?
         let task = Builder::new()
             .name("five minute salt")
             .spawn(new_salt_every_five_minutes);
-        let _ = task.await;
+        // let _ = task.await;
     }
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
@@ -157,7 +158,7 @@ impl DhtServer {
                     trace!("Handling request from {socket_addr}");
 
                     if let Some(response) = response {
-                        let serialized = bendy::serde::to_bytes(&response)?;
+                        let serialized = response.to_raw_krpc();
                         server.socket.send_to(&serialized, socket_addr).await?;
                         trace!("response sent for {socket_addr}");
                     }
@@ -292,9 +293,11 @@ impl DhtServer {
         // argument is ignored if the implied port is not 0 and we use the origin port instead
         let peer_contact = {
             if !announce.implied_port() {
-                CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.port()))
+                BetterCompactPeerContact(SocketAddrV4::new(*origin.ip(), announce.port()))
+                // CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.port()))
             } else {
-                CompactPeerContact::from(origin)
+                BetterCompactPeerContact(origin)
+                // CompactPeerContact::from(origin)
             }
         };
 
@@ -305,6 +308,6 @@ impl DhtServer {
             .or_insert_with(Vec::new)
             .push(peer_contact);
 
-        Krpc::new_announce_peer_response(announce.txn_id().to_string(), self.our_id)
+        Krpc::new_announce_peer_response(announce.txn_id().to_string(), self.our_id.clone())
     }
 }

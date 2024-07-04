@@ -1,7 +1,7 @@
 use crate::{
     dht_service::dht_server::DhtServer,
-    domain_knowledge::{BetterCompactNodeInfo, CompactNodeContact, NodeId},
-    message::Krpc,
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterNodeId},
+    message::{Krpc, ParseKrpc},
     routing::RoutingTable,
 };
 
@@ -137,7 +137,7 @@ impl From<JoinError> for DhtServiceFailure {
     }
 }
 
-fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
+fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> BetterNodeId {
     let mut rng = rand::thread_rng();
     let r = rand & 0x07;
     let mut id = [0u8; 20];
@@ -159,7 +159,8 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
 
     id[19] = rand;
 
-    id
+    let id = String::from_utf8(id.to_vec()).unwrap();
+    BetterNodeId(id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +211,7 @@ impl DhtV4 {
                     .await
                     .expect("common MTU 1500 exceeded");
                 trace!("packet from {socket_addr}");
-                if let Ok(msg) = bendy::serde::from_bytes::<Krpc>(&buf[..amount]) {
+                if let Ok(msg) = (&buf[..amount]).parse() {
                     let socket_addr = {
                         match socket_addr {
                             SocketAddr::V4(addr) => addr,
@@ -251,7 +252,7 @@ impl DhtV4 {
             socket.clone(),
             demultiplexer.clone(),
             routing_table.clone(),
-            our_id,
+            our_id.clone(),
         );
         let client = Arc::new(client);
 
@@ -274,7 +275,7 @@ impl DhtV4 {
         drop(bootstrap_join_set);
 
         // only spawn the server after the bootstrap has completed
-        let server = DhtServer::new(queries_rx, socket.clone(), our_id, routing_table.clone());
+        let server = DhtServer::new(queries_rx, socket.clone(), our_id.clone(), routing_table.clone());
         let server = Arc::new(server);
 
         join_set
@@ -309,7 +310,8 @@ impl DhtV4 {
     async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
+        // TODO: clearly wrong
+        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), our_id.clone(), our_id.clone());
 
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
@@ -320,7 +322,7 @@ impl DhtV4 {
         .await?;
 
         if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-            let nodes = response.nodes;
+            let mut nodes = response.nodes().clone();
             // let mut nodes: Vec<_> = nodes
             //     .chunks_exact(26)
             //     .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
@@ -329,7 +331,7 @@ impl DhtV4 {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
                 // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
-                table.add_new_node(BetterCompactNodeInfo { id: response., contact: () })
+                table.add_new_node(BetterCompactNodeInfo::new(response.target_id().clone(), BetterCompactPeerContact(contact)))
             }
 
             nodes.dedup();
@@ -338,10 +340,10 @@ impl DhtV4 {
                 dht.routing_table.write().await.add_new_node(node.clone());
 
                 let dht = dht.clone();
-                let contact: SocketAddrV4 = node.into();
+                let contact: SocketAddrV4 = node.contact().0;
                 let our_id = dht.our_id.clone();
                 let transaction_id = dht.transaction_id_pool.next();
-                let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), our_id, our_id.clone());
+                let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), our_id.clone(), node.node_id().clone());
                 Builder::new()
                     .name(&*format!("leave level bootstrap to {}", contact))
                     .spawn(async move {
@@ -353,20 +355,13 @@ impl DhtV4 {
                         .await?;
 
                         if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-                            let nodes: Vec<_> = response
-                                .body
-                                .nodes
-                                .chunks_exact(26)
-                                .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-                                .collect();
+                            let nodes: Vec<_> = response.nodes;
 
                             for node in nodes {
                                 // add the leave level responses to our routing table
                                 let mut table = dht.routing_table.write().await;
-                                table.add_new_node(CompactNodeContact::from_node_id_and_addr(
-                                    &response.transaction_id,
-                                    &node.into(),
-                                ));
+                                let peer = BetterCompactNodeInfo::new(node.node_id().clone(), BetterCompactPeerContact(contact));
+                                table.add_new_node(peer);
                             }
                         }
                         Ok::<_, color_eyre::Report>(())
@@ -404,21 +399,21 @@ mod tests {
 
     fn set_up_tracing() {
         let _ = color_eyre::install();
-        let fmt_layer = fmt::layer()
-            .compact()
-            .with_line_number(true)
-            .with_filter(LevelFilter::DEBUG);
-
-        global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-        let tracer = opentelemetry_jaeger::new_pipeline().install_simple().unwrap();
-
-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-
-        tracing_subscriber::registry()
-            .with(console_subscriber::spawn())
-            .with(telemetry)
-            .with(fmt_layer)
-            .init();
+        // let fmt_layer = fmt::layer()
+        //     .compact()
+        //     .with_line_number(true)
+        //     .with_filter(LevelFilter::DEBUG);
+        //
+        // global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
+        // let tracer = opentelemetry_jaeger::new_pipeline().install_simple().unwrap();
+        //
+        // let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+        //
+        // tracing_subscriber::registry()
+        //     .with(console_subscriber::spawn())
+        //     .with(telemetry)
+        //     .with(fmt_layer)
+        //     .init();
     }
 
     #[tokio::test(flavor = "multi_thread")]

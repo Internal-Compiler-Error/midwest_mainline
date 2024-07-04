@@ -1,7 +1,7 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo, BetterInfoHash, BetterNodeId, CompactNodeContact, CompactPeerContact, NodeId},
-    message::{InfoHash, Krpc},
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId},
+    message::{Krpc, ToRawKrpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
 };
@@ -89,8 +89,10 @@ impl DhtClientV4 {
     pub async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
         let (tx, rx) = oneshot::channel();
 
-        if let Ok(bytes) = bendy::serde::to_bytes(message) {
-            self.demultiplexer.register(message.transaction_id().clone(), tx).await;
+        // TODO: why was it assumed that serailization could fail?
+        let bytes = message.to_raw_krpc(); 
+        {
+            self.demultiplexer.register(message.transaction_id().to_string(), tx).await;
             self.socket.send_to(&bytes, recipient).await?;
         }
         let response = rx.await.unwrap();
@@ -254,7 +256,7 @@ impl DhtClientV4 {
                 let ip: SocketAddrV4 = node.contact.0;
                 ip
             })
-            .map(|ip| self.clone().ask_her_for_nodes(ip, *target))
+            .map(|ip| self.clone().ask_her_for_nodes(ip, target.clone()))
             .collect::<Vec<_>>();
 
         let returned_nodes = returned_nodes.par_spawn_and_await().await?;
@@ -274,7 +276,7 @@ impl DhtClientV4 {
 
         // it's possible that some of the nodes returned are actually the node we're looking for
         // so we check for that and return it if it's the case
-        let target_node = returned_nodes.into_iter().flatten().find(|node| node.node_id() == target);
+        let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
 
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
@@ -306,7 +308,7 @@ impl DhtClientV4 {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
 
-        let starting_pool: Vec<BetterCompactPeerContact> =
+        let starting_pool: Vec<BetterCompactNodeInfo> =
             sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
 
         let dht = self.clone();
@@ -337,10 +339,10 @@ impl DhtClientV4 {
     /// the caller should drop the future to cancel all remaining tasks
     async fn recursive_find_from_pool(
         self: Arc<Self>,
-        mut starting_pool: Vec<BetterCompactPeerContact>,
-        finding: NodeId,
-        seen: Arc<Mutex<HashSet<BetterCompactPeerContact>>>,
-        slot: Arc<Mutex<Option<Sender<BetterCompactPeerContact>>>>,
+        mut starting_pool: Vec<BetterCompactNodeInfo>,
+        finding: BetterNodeId,
+        seen: Arc<Mutex<HashSet<BetterCompactNodeInfo>>>,
+        slot: Arc<Mutex<Option<Sender<BetterCompactNodeInfo>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -368,8 +370,9 @@ impl DhtClientV4 {
                 let seen = seen.clone();
                 let dht = self.clone();
                 let slot = slot.clone();
+                let finding = finding.clone();
                 async move {
-                    let returned_nodes = dht.clone().ask_her_for_nodes((&starting_node).into(), finding).await?;
+                    let returned_nodes = dht.clone().ask_her_for_nodes(starting_node.contact().0, finding.clone()).await?;
 
                     // add the nodes to our routing table
                     {
@@ -419,7 +422,7 @@ impl DhtClientV4 {
         mut starting_pool: Vec<BetterCompactNodeInfo>,
         finding: BetterNodeId,
         seen: Arc<Mutex<HashSet<BetterCompactNodeInfo>>>,
-        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<BetterCompactNodeInfo>)>>>>,
+        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<BetterCompactPeerContact>)>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -444,8 +447,9 @@ impl DhtClientV4 {
                 let seen = seen.clone();
                 let dht = self.clone();
                 let slot = slot.clone();
+                let finding = finding.clone();
                 async move {
-                    let (token, returned) = dht.clone().ask_her_for_peers((&starting_node).into(), finding).await?;
+                    let (token, returned) = dht.clone().ask_her_for_peers(starting_node.contact().0, finding.clone()).await?;
 
                     return match returned {
                         Either::Left(mut deferred) => {
@@ -457,7 +461,7 @@ impl DhtClientV4 {
                                 seen.insert(starting_node.clone());
                             }
 
-                            dht.recursive_get_peers_from_pool(deferred, finding, seen, slot).await
+                            dht.recursive_get_peers_from_pool(deferred, finding.clone(), seen, slot).await
                         }
                         Either::Right(success) => {
                             trace!("got success response, {success:#?}");
@@ -466,8 +470,9 @@ impl DhtClientV4 {
 
                             match slot {
                                 Some(sender) => {
+                                    // TODO: revisit this
                                     let _ =
-                                        sender.send((token.expect("success response must have the token"), success));
+                                        sender.send((token.expect("success response must have the token").as_bytes().into(), success));
                                     Ok(())
                                 }
                                 None => Err(RecursiveSearchError::Cancelled),
@@ -486,14 +491,20 @@ impl DhtClientV4 {
 
     pub async fn get_peers(
         self: Arc<Self>,
-        info_hash: InfoHash,
-    ) -> Result<(Box<[u8]>, Vec<CompactPeerContact>), DhtServiceFailure> {
+        info_hash: BetterInfoHash,
+    ) -> Result<(Box<[u8]>, Vec<BetterCompactPeerContact>), DhtServiceFailure> {
+        // TODO: verify this
+
+        // the info hash and node is occupy the same address space, nodes are supposed to store
+        // info_hashes close to its id
+        let target = BetterNodeId(info_hash.0);
+
         // get all the closest nodes to the info_hash
         let closest_nodes: Vec<_> = self
             .routing_table
             .read()
             .await
-            .find_closest(&info_hash)
+            .find_closest(&target)
             .into_iter()
             .cloned()
             .collect();
@@ -503,7 +514,7 @@ impl DhtClientV4 {
         let slot = Arc::new(Mutex::new(Some(tx)));
 
         let mut search = tokio::spawn(async move {
-            self.recursive_get_peers_from_pool(closest_nodes, info_hash.clone(), seen.clone(), slot.clone())
+            self.recursive_get_peers_from_pool(closest_nodes, target.clone(), seen.clone(), slot.clone())
                 .await
         });
 

@@ -142,6 +142,10 @@ impl BetterCompactNodeInfo {
     pub fn node_id(&self) -> &BetterNodeId {
         &self.id
     }
+
+    pub fn contact(&self) -> &BetterCompactPeerContact {
+        &self.contact
+    }
 }
 
 impl From<SocketAddrV4> for CompactPeerContact {

@@ -47,7 +47,7 @@ impl RoutingTable {
         };
 
         RoutingTable {
-            id: BigUint::from_bytes_be(id),
+            id: BigUint::from_bytes_be(id.0.as_bytes()),
             buckets: vec![default_bucket],
         }
     }
@@ -72,7 +72,7 @@ impl RoutingTable {
         }
 
         let our_id = &self.id;
-        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.id));
+        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.id.0.as_bytes()));
 
         // first, find the bucket that this node belongs in
         let target_bucket = self
@@ -135,7 +135,9 @@ impl RoutingTable {
             .iter()
             .map(|bucket| {
                 bucket.nodes.iter().map(|node| {
-                    let node_id = node.contact.id;
+                    let node_id = node.contact.id.0.as_bytes();
+                    let target = target.0.as_bytes();
+
                     let mut distance = [0u8; 20];
 
                     // zip for array is sadly unstable
