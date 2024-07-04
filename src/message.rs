@@ -1,4 +1,3 @@
-use core::slice::SlicePattern;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bendy::decoding::{Decoder, Object};
@@ -18,7 +17,7 @@ use get_peers_query::{GetPeersArgs, GetPeersQuery};
 use get_peers_success_response::{BetterGetPeersSuccessResponse, GetPeersSuccessResponse, GetPeersSuccessResponseBody};
 use ping_announce_peer_response::{BetterPingAnnouncePeerResponse, PingAnnouncePeerResponse, PingAnnouncePeerResponseBody};
 use ping_query::PingArgs;
-use serde::{de::Error, ser::Error, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use juicy_bencode;
@@ -228,7 +227,7 @@ impl ParseKrpc for &[u8] {
                         let port = u16::from_be_bytes([contact[4], contact[5]]);
                         let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
 
-                        BetterCompactPeerContact {
+                        BetterCompactPeerInfo {
                             id: node_id,
                             contact
                         }
@@ -374,17 +373,17 @@ impl Krpc {
         }
     }
 
-    pub fn transaction_id(&self) -> &TransactionId {
+    pub fn transaction_id(&self) -> &str {
         match self {
-            Krpc::PingAnnouncePeerResponse(msg) => &msg.transaction_id,
+            Krpc::PingAnnouncePeerResponse(msg) => msg.txn_id(),
             Krpc::FindNodeGetPeersNonCompliantResponse(msg) => &msg.transaction_id,
-            Krpc::GetPeersSuccessResponse(msg) => &msg.transaction_id,
-            Krpc::GetPeersDeferredResponse(msg) => &msg.transaction_id,
-            Krpc::FindNodeQuery(msg) => &msg.transaction_id,
-            Krpc::GetPeersQuery(msg) => &msg.transaction_id,
-            Krpc::AnnouncePeerQuery(msg) => &msg.transaction_id,
-            Krpc::PingQuery(msg) => &msg.transaction_id,
-            Krpc::ErrorResponse(msg) => &msg.transaction_id,
+            Krpc::GetPeersSuccessResponse(msg) => msg.txn_id(),
+            Krpc::GetPeersDeferredResponse(msg) => msg.txn_id(),
+            Krpc::FindNodeQuery(msg) => msg.txn_id(),
+            Krpc::GetPeersQuery(msg) => msg.txn_id(),
+            Krpc::AnnouncePeerQuery(msg) => msg.txn_id(),
+            Krpc::PingQuery(msg) => msg.txn_id(),
+            Krpc::ErrorResponse(msg) => msg.txn_id(),
         }
     }
 
@@ -405,196 +404,196 @@ impl Krpc {
         }
     }
 
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
-        let ping_query = PingQuery {
-            transaction_id,
-            message_type: Box::new(b"q".clone()),
-            query_method: query_methods::ping,
-            body: PingArgs { id: querying_id },
-        };
+    // pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
+    //     let ping_query = PingQuery {
+    //         transaction_id,
+    //         message_type: Box::new(b"q".clone()),
+    //         query_method: query_methods::ping,
+    //         body: PingArgs { id: querying_id },
+    //     };
+    //
+    //     Krpc::PingQuery(ping_query)
+    // }
 
-        Krpc::PingQuery(ping_query)
-    }
+    // pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
+    //     let find_node_query = FindNodeQuery {
+    //         transaction_id,
+    //         message_type: Box::new(b"q".clone()),
+    //         query_method: query_methods::find_node,
+    //         body: FindNodeArgs {
+    //             id: querying_id,
+    //             target: target_id,
+    //         },
+    //     };
+    //
+    //     Krpc::FindNodeQuery(find_node_query)
+    // }
 
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
-        let find_node_query = FindNodeQuery {
-            transaction_id,
-            message_type: Box::new(b"q".clone()),
-            query_method: query_methods::find_node,
-            body: FindNodeArgs {
-                id: querying_id,
-                target: target_id,
-            },
-        };
+    // pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
+    //     let get_peers_query = GetPeersQuery {
+    //         transaction_id,
+    //         message_type: Box::new(b"q".clone()),
+    //         query_method: query_methods::get_peers,
+    //         body: GetPeersArgs {
+    //             id: querying_id,
+    //             info_hash,
+    //         },
+    //     };
+    //
+    //     Krpc::GetPeersQuery(get_peers_query)
+    // }
 
-        Krpc::FindNodeQuery(find_node_query)
-    }
+    // pub fn new_announce_peer_query(
+    //     transaction_id: TransactionId,
+    //     info_hash: InfoHash,
+    //     querying_id: NodeId,
+    //     port: u16,
+    //     implied_port: bool,
+    //     token: Box<[u8]>,
+    // ) -> Krpc {
+    //     let announce_peer_query = AnnouncePeerQuery {
+    //         transaction_id,
+    //         message_type: Box::new(b"q".clone()),
+    //         query_method: query_methods::announce_peer,
+    //         body: AnnouncePeerArgs {
+    //             id: querying_id,
+    //             implied_port: if implied_port { 1 } else { 0 },
+    //             info_hash,
+    //             port,
+    //             token,
+    //         },
+    //     };
+    //
+    //     Krpc::AnnouncePeerQuery(announce_peer_query)
+    // }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
-        let get_peers_query = GetPeersQuery {
-            transaction_id,
-            message_type: Box::new(b"q".clone()),
-            query_method: query_methods::get_peers,
-            body: GetPeersArgs {
-                id: querying_id,
-                info_hash,
-            },
-        };
-
-        Krpc::GetPeersQuery(get_peers_query)
-    }
-
-    pub fn new_announce_peer_query(
-        transaction_id: TransactionId,
-        info_hash: InfoHash,
-        querying_id: NodeId,
-        port: u16,
-        implied_port: bool,
-        token: Box<[u8]>,
-    ) -> Krpc {
-        let announce_peer_query = AnnouncePeerQuery {
-            transaction_id,
-            message_type: Box::new(b"q".clone()),
-            query_method: query_methods::announce_peer,
-            body: AnnouncePeerArgs {
-                id: querying_id,
-                implied_port: if implied_port { 1 } else { 0 },
-                info_hash,
-                port,
-                token,
-            },
-        };
-
-        Krpc::AnnouncePeerQuery(announce_peer_query)
-    }
-
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let ping_response = PingAnnouncePeerResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: PingAnnouncePeerResponseBody { id: responding_id },
-        };
-        Krpc::PingAnnouncePeerResponse(ping_response)
-    }
+    // pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
+    //     let ping_response = PingAnnouncePeerResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: PingAnnouncePeerResponseBody { id: responding_id },
+    //     };
+    //     Krpc::PingAnnouncePeerResponse(ping_response)
+    // }
 
     /// construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Krpc {
-        let find_node_response = FindNodeGetPeersNonCompliantResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: FindNodeGetPeersNonCompliantResponseBody {
-                id: responding_id,
-                nodes,
-            },
-        };
-
-        Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response)
-    }
+    // pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Box<[u8]>) -> Krpc {
+    //     let find_node_response = FindNodeGetPeersNonCompliantResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: FindNodeGetPeersNonCompliantResponseBody {
+    //             id: responding_id,
+    //             nodes,
+    //         },
+    //     };
+    //
+    //     Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response)
+    // }
 
     /// construct a response to a get_peers query when the peer is directly found
-    pub fn new_get_peers_success_response(
-        transaction_id: TransactionId,
-        responding_id: NodeId,
-        response_token: Box<[u8]>,
-        peers: Vec<CompactPeerContact>,
-    ) -> Krpc {
-        let get_peers_success_response = GetPeersSuccessResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: GetPeersSuccessResponseBody {
-                id: responding_id,
-                token: response_token,
-                values: peers,
-            },
-        };
-
-        Krpc::GetPeersSuccessResponse(get_peers_success_response)
-    }
-
-    /// construct a response to a get_peers query when the peer is not directly found and the closest
-    /// nodes are returned
-    pub fn new_get_peers_deferred_response(
-        transaction_id: TransactionId,
-        responding_id: NodeId,
-        response_token: Box<[u8]>,
-        closest_nodes: Box<[u8]>,
-    ) -> Krpc {
-        let get_peers_deferred_response = GetPeersDeferredResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: get_peers_deferred_response::GetPeersDeferredResponseBody {
-                id: responding_id,
-                token: response_token,
-                nodes: closest_nodes,
-            },
-        };
-
-        Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
-    }
+    // pub fn new_get_peers_success_response(
+    //     transaction_id: TransactionId,
+    //     responding_id: NodeId,
+    //     response_token: Box<[u8]>,
+    //     peers: Vec<CompactPeerContact>,
+    // ) -> Krpc {
+    //     let get_peers_success_response = GetPeersSuccessResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: GetPeersSuccessResponseBody {
+    //             id: responding_id,
+    //             token: response_token,
+    //             values: peers,
+    //         },
+    //     };
+    //
+    //     Krpc::GetPeersSuccessResponse(get_peers_success_response)
+    // }
 
     /// construct a response to a get_peers query when the peer is not directly found and the closest
     /// nodes are returned
-    pub fn new_get_peers_deferred_response_con_compliant(
-        transaction_id: TransactionId,
-        responding_id: NodeId,
-        closest_nodes: Box<[u8]>,
-    ) -> Krpc {
-        let get_peers_deferred_response = FindNodeGetPeersNonCompliantResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: FindNodeGetPeersNonCompliantResponseBody {
-                id: responding_id,
-                nodes: closest_nodes,
-            },
-        };
+    // pub fn new_get_peers_deferred_response(
+    //     transaction_id: TransactionId,
+    //     responding_id: NodeId,
+    //     response_token: Box<[u8]>,
+    //     closest_nodes: Box<[u8]>,
+    // ) -> Krpc {
+    //     let get_peers_deferred_response = GetPeersDeferredResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: get_peers_deferred_response::GetPeersDeferredResponseBody {
+    //             id: responding_id,
+    //             token: response_token,
+    //             nodes: closest_nodes,
+    //         },
+    //     };
+    //
+    //     Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
+    // }
 
-        Krpc::FindNodeGetPeersNonCompliantResponse(get_peers_deferred_response)
-    }
+    /// construct a response to a get_peers query when the peer is not directly found and the closest
+    /// nodes are returned
+    // pub fn new_get_peers_deferred_response_con_compliant(
+    //     transaction_id: TransactionId,
+    //     responding_id: NodeId,
+    //     closest_nodes: Box<[u8]>,
+    // ) -> Krpc {
+    //     let get_peers_deferred_response = FindNodeGetPeersNonCompliantResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: FindNodeGetPeersNonCompliantResponseBody {
+    //             id: responding_id,
+    //             nodes: closest_nodes,
+    //         },
+    //     };
+    //
+    //     Krpc::FindNodeGetPeersNonCompliantResponse(get_peers_deferred_response)
+    // }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let announce_peer_response = PingAnnouncePeerResponse {
-            transaction_id,
-            message_type: Box::new(b"r".clone()),
-            body: PingAnnouncePeerResponseBody { id: responding_id },
-        };
-        Krpc::PingAnnouncePeerResponse(announce_peer_response)
-    }
+    // pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
+    //     let announce_peer_response = PingAnnouncePeerResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"r".clone()),
+    //         body: PingAnnouncePeerResponseBody { id: responding_id },
+    //     };
+    //     Krpc::PingAnnouncePeerResponse(announce_peer_response)
+    // }
 
-    pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Krpc {
-        let error_response = ErrorResponse {
-            transaction_id,
-            message_type: Box::new(b"e".clone()),
-            error: (201 as u32, "A Generic Error Occurred".to_string()),
-        };
-        Krpc::ErrorResponse(error_response)
-    }
+    // pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Krpc {
+    //     let error_response = ErrorResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"e".clone()),
+    //         error: (201 as u32, "A Generic Error Occurred".to_string()),
+    //     };
+    //     Krpc::ErrorResponse(error_response)
+    // }
 
-    pub fn new_standard_server_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = ErrorResponse {
-            transaction_id,
-            message_type: Box::new(b"e".clone()),
-            error: (202 as u32, "A Server Error Occurred".to_string()),
-        };
-        Krpc::ErrorResponse(error_response)
-    }
+    // pub fn new_standard_server_error(transaction_id: TransactionId) -> Krpc {
+    //     let error_response = ErrorResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"e".clone()),
+    //         error: (202 as u32, "A Server Error Occurred".to_string()),
+    //     };
+    //     Krpc::ErrorResponse(error_response)
+    // }
 
-    pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = ErrorResponse {
-            transaction_id,
-            message_type: Box::new(b"e".clone()),
-            error: (203 as u32, "A Protocol Error Occurred".to_string()),
-        };
-        Krpc::ErrorResponse(error_response)
-    }
+    // pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Krpc {
+    //     let error_response = ErrorResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"e".clone()),
+    //         error: (203 as u32, "A Protocol Error Occurred".to_string()),
+    //     };
+    //     Krpc::ErrorResponse(error_response)
+    // }
 
-    pub fn new_unsupported_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = ErrorResponse {
-            transaction_id,
-            message_type: Box::new(b"e".clone()),
-            error: (204 as u32, "A Unsupported Method Error Occurred".to_string()),
-        };
-        Krpc::ErrorResponse(error_response)
-    }
+    // pub fn new_unsupported_error(transaction_id: TransactionId) -> Krpc {
+    //     let error_response = ErrorResponse {
+    //         transaction_id,
+    //         message_type: Box::new(b"e".clone()),
+    //         error: (204 as u32, "A Unsupported Method Error Occurred".to_string()),
+    //     };
+    //     Krpc::ErrorResponse(error_response)
+    // }
 
     // pub fn id_as_u16(&self) -> u16 {
     //     match self {

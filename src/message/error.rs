@@ -47,6 +47,10 @@ impl KrpcError {
             message: "Method Unknown".to_string(),
         }
     }
+
+    pub fn txn_id(&self) -> &str {
+        &self.transaction_id
+    }
 }
 
 impl ToRawKrpc for KrpcError {

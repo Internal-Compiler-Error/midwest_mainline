@@ -84,7 +84,6 @@
 //! }
 //! ```
 
-pub mod ascii;
 pub mod dht_service;
 pub mod domain_knowledge;
 pub(crate) mod message;

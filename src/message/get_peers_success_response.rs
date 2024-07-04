@@ -1,5 +1,5 @@
 use crate::{
-    domain_knowledge::{CompactPeerContact, NodeId, BetterPeerContact, BetterNodeId},
+    domain_knowledge::{CompactPeerContact, NodeId, BetterCompactPeerContact, BetterNodeId},
     message::TransactionId,
 };
 use serde::{Deserialize, Serialize};
@@ -39,12 +39,11 @@ pub struct BetterGetPeersSuccessResponse {
     transaction_id: String,
     target_id: BetterNodeId,
     token: String,
-    values: Vec<BetterPeerContact>, 
+    values: Vec<BetterCompactPeerContact>, 
 }
 
 impl BetterGetPeersSuccessResponse {
-    pub fn new(transaction_id: String, target_id: BetterNodeId, token: String, values: Vec<BetterPeerContact>) ->  Self {
-
+    pub fn new(transaction_id: String, target_id: BetterNodeId, token: String, values: Vec<BetterCompactPeerContact>) ->  Self {
         Self {
             transaction_id,
             target_id,
@@ -53,10 +52,14 @@ impl BetterGetPeersSuccessResponse {
         }
     }
 
-
-    pub fn add_peer(&mut self, peer: BetterPeerContact) {
+    pub fn add_peer(&mut self, peer: BetterCompactPeerContact) {
         self.values.push(peer);
-    } 
+    }
+
+    pub fn txn_id(&self) -> &str {
+        &self.transaction_id
+    }
+
 }
 
 impl ToRawKrpc for BetterGetPeersSuccessResponse {
@@ -115,8 +118,8 @@ mod tests {
             BetterNodeId::new("abcdefghij0123456789".to_string()).unwrap(),
             "aoeusnth".to_string(),
            vec![
-            BetterPeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),
-            BetterPeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)),
+            BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),
+            BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)),
            ]);
        
         let encoded = response.to_raw_krpc(); 

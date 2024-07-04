@@ -36,12 +36,15 @@ pub struct BetterPingAnnouncePeerResponse {
 }
 
 impl BetterPingAnnouncePeerResponse {
-
     pub fn new(transaction_id: String, target_id: BetterNodeId) -> Self {
         Self {
             transaction_id,
             target_id,
         }
+    }
+
+    pub fn txn_id(&self) -> &str {
+        &self.transaction_id
     }
 }
 

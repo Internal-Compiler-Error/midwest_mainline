@@ -61,6 +61,10 @@ impl BetterFindNodeQuery {
             target,
         }
     }
+
+    pub fn txn_id(&self) -> &str {
+        &self.transaction_id
+    }
 }
 
 impl ToRawKrpc for BetterFindNodeQuery {
