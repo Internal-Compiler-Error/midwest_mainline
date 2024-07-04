@@ -1,6 +1,6 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{CompactNodeContact, CompactPeerContact, NodeId},
+    domain_knowledge::{BetterCompactPeerContact, BetterCompactPeerInfo, BetterInfoHash, BetterNodeId, CompactNodeContact, CompactPeerContact, NodeId},
     message::{InfoHash, Krpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -28,7 +28,7 @@ use tracing::{debug, info, instrument, trace, warn};
 #[derive(Debug)]
 pub struct DhtClientV4 {
     pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) our_id: [u8; 20],
+    pub(crate) our_id: BetterNodeId,
     pub(crate) demultiplexer: Arc<MessageDemultiplexer>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
@@ -71,7 +71,7 @@ impl DhtClientV4 {
         socket: Arc<UdpSocket>,
         demultiplexer: Arc<MessageDemultiplexer>,
         routing_table: Arc<RwLock<RoutingTable>>,
-        our_id: NodeId,
+        our_id: BetterNodeId,
     ) -> Self {
         DhtClientV4 {
             socket,
@@ -100,7 +100,7 @@ impl DhtClientV4 {
     pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
         let this = &self;
         let transaction_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(Box::new(transaction_id.to_be_bytes()), this.our_id);
+        let ping_msg = Krpc::new_ping_query(hex::encode(transaction_id.to_be_bytes()), this.our_id);
 
         let response = self.send_message(&ping_msg, &recipient).await?;
 
@@ -108,7 +108,7 @@ impl DhtClientV4 {
             this.routing_table
                 .write()
                 .await
-                .add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &recipient));
+                .add_new_node(CompactNodeContact::from_node_id_and_addr(&response.id, &recipient));
 
             Ok(())
         } else {
@@ -125,11 +125,12 @@ impl DhtClientV4 {
     async fn ask_her_for_nodes(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
-        target: NodeId,
+        target: BetterNodeId,
     ) -> Result<Vec<CompactNodeContact>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
+        // let query = Krpc::new_find_node_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
+        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), self.our_id, target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -164,18 +165,18 @@ impl DhtClientV4 {
     async fn ask_her_for_peers(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
-        target: InfoHash,
+        target: BetterInfoHash,
     ) -> Result<
         (
-            Option<Box<[u8]>>,
-            Either<Vec<CompactNodeContact>, Vec<CompactPeerContact>>,
+            Option<String>,
+            Either<Vec<BetterCompactPeerInfo>, Vec<BetterCompactPeerContact>>,
         ),
         DhtServiceFailure,
     > {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_get_peers_query(Box::new(transaction_id.to_be_bytes()), self.our_id, target);
+        let query = Krpc::new_get_peers_query(hex::encode(transaction_id.to_be_bytes()), self.our_id, target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -183,15 +184,10 @@ impl DhtClientV4 {
         return match response {
             Krpc::GetPeersDeferredResponse(response) => {
                 // make sure we don't get duplicate nodes
-                let mut nodes: Vec<_> = response
-                    .body
-                    .nodes
-                    .chunks_exact(26)
-                    .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                    .collect();
+                let mut nodes = response.nodes;
 
-                // todo: define an order for nodes??
-                // nodes.sort_unstable_by_key(|node| node.into());
+                // TODO: define an order for nodes??
+                // nodes.sort_unstable_by_key(|node| *node.);
                 nodes.dedup();
 
                 trace!(
@@ -199,18 +195,13 @@ impl DhtClientV4 {
                     interlocutor,
                     &nodes
                 );
-                Ok((Some(response.body.token), Either::Left(nodes)))
+                Ok((Some(response.token), Either::Left(nodes)))
             }
             Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
                 // make sure we don't get duplicate nodes
-                let mut nodes: Vec<_> = response
-                    .body
-                    .nodes
-                    .chunks_exact(26)
-                    .map(|node| CompactNodeContact::new(node.try_into().unwrap()))
-                    .collect();
+                let mut nodes = response.nodes;
 
-                // todo: define an order for nodes??
+                // TODO: define an order for nodes??
                 // nodes.sort_unstable_by_key(|node| node.into());
                 nodes.dedup();
                 trace!(
@@ -222,13 +213,13 @@ impl DhtClientV4 {
                 Ok((None, Either::Left(nodes)))
             }
             Krpc::GetPeersSuccessResponse(response) => {
-                let mut values = response.body.values;
-                // todo: define an order for nodes??
+                let mut values = response.values;
+                // TODO: define an order for nodes??
                 // values.sort_unstable_by_key(|value| value.into());
                 values.dedup();
 
                 trace!("got a success response from {}, values {:#?}", interlocutor, &values);
-                Ok((Some(response.body.token), Either::Right(values)))
+                Ok((Some(response.token), Either::Right(values)))
             }
             Krpc::ErrorResponse(response) => {
                 warn!("Got an error response to get peers: {:?}", response);
@@ -540,25 +531,25 @@ impl DhtClientV4 {
     pub async fn announce_peers(
         self: Arc<Self>,
         recipient: SocketAddrV4,
-        info_hash: InfoHash,
+        info_hash: BetterInfoHash,
         port: Option<u16>,
-        token: Box<[u8]>,
+        token: String,
     ) -> Result<(), DhtServiceFailure> {
         let transaction_id = self.transaction_id_pool.next();
         let query = if let Some(port) = port {
             Krpc::new_announce_peer_query(
-                Box::new(transaction_id.to_be_bytes()),
+                hex::encode(transaction_id.to_be_bytes()),
                 info_hash,
-                self.our_id,
+                self.our_id.clone(),
                 port,
                 true,
                 token,
             )
         } else {
             Krpc::new_announce_peer_query(
-                Box::new(transaction_id.to_be_bytes()),
+                hex::encode(transaction_id.to_be_bytes()),
                 info_hash,
-                self.our_id,
+                self.our_id.clone(),
                 self.socket_address.port(),
                 true,
                 token,

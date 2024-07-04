@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{CompactNodeContact, NodeId};
+use crate::domain_knowledge::{BetterCompactPeerInfo, CompactNodeContact, NodeId};
 use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
 use tracing::{info, trace};
@@ -57,7 +57,7 @@ impl RoutingTable {
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
-    pub fn add_new_node(&mut self, contact: CompactNodeContact) {
+    pub fn add_new_node(&mut self, contact: BetterCompactPeerInfo) {
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
         if let Some(node) = self

@@ -36,10 +36,11 @@ pub struct GetPeersSuccessResponseBody {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersSuccessResponse {
+    // TODO: make them private
     transaction_id: String,
     target_id: BetterNodeId,
-    token: String,
-    values: Vec<BetterCompactPeerContact>, 
+    pub token: String,
+    pub values: Vec<BetterCompactPeerContact>, 
 }
 
 impl BetterGetPeersSuccessResponse {

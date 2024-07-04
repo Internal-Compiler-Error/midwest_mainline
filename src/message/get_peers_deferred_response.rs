@@ -37,10 +37,11 @@ pub struct GetPeersDeferredResponseBody {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersDeferredResponse {
+    // TODO: make them private
     transaction_id: String,
-    querier: BetterNodeId,
-    token: String,
-    nodes: Vec<BetterCompactPeerInfo>,
+    pub querier: BetterNodeId,
+    pub token: String,
+    pub nodes: Vec<BetterCompactPeerInfo>,
 }
 
 impl BetterGetPeersDeferredResponse {

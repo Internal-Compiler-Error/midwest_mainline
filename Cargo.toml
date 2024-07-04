@@ -9,8 +9,8 @@ authors = ["Liang Wang"]
 repository = "https://github.com/Internal-Compiler-Error/midwest_mainline"
 documentation = "https://docs.rs/crate/midwest_mainline/"
 
-[package.metadata.docs.rs]
-rustc-args = ["--cfg", "tokio_unstable"]
+# [package.metadata.docs.rs]
+# rustc-args = ["--cfg", "tokio_unstable"]
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -126,7 +126,7 @@ pub struct CompactPeerContact {
 pub struct BetterCompactPeerContact(pub SocketAddrV4);
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterCompactPeerInfo {
+pub struct BetterCompactNodeInfo {
     pub id: BetterNodeId,
     pub contact: BetterCompactPeerContact,
 }
