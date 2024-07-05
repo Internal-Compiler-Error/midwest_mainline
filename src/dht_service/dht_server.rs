@@ -1,8 +1,8 @@
 use crate::{
     domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId},
     message::{
-        announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery, get_peers_query::BetterGetPeersQuery,
-        ping_query::BetterPingQuery, Krpc, ToRawKrpc,
+        announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery,
+        get_peers_query::BetterGetPeersQuery, ping_query::BetterPingQuery, Krpc, ToRawKrpc,
     },
     routing::RoutingTable,
 };
@@ -230,7 +230,11 @@ impl DhtServer {
             )
         } else {
             // let bytes = closest_eight.to_concated_node_contact();
-            Krpc::new_find_node_response(query.txn_id().to_string(), self.our_id.clone(), closest_eight.into_iter().cloned().collect())
+            Krpc::new_find_node_response(
+                query.txn_id().to_string(),
+                self.our_id.clone(),
+                closest_eight.into_iter().cloned().collect(),
+            )
         };
     }
 
@@ -260,8 +264,8 @@ impl DhtServer {
                 .routing_table
                 .read()
                 .await
-                .find_closest(query.our_id())   // TODO: wtf, why are we finding via info_hash
-                                                // before
+                .find_closest(query.our_id()) // TODO: wtf, why are we finding via info_hash
+                // before
                 .into_iter()
                 .cloned()
                 .collect();

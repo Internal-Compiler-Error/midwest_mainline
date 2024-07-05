@@ -54,7 +54,6 @@ impl KrpcError {
 }
 
 impl ToRawKrpc for KrpcError {
-
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -71,7 +70,9 @@ impl ToRawKrpc for KrpcError {
             })
         });
 
-        encoder.get_output().expect("we know the stuff upfont").into_boxed_slice()
+        encoder
+            .get_output()
+            .expect("we know the stuff upfont")
+            .into_boxed_slice()
     }
-
 }

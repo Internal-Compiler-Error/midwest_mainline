@@ -1,7 +1,6 @@
 use crate::domain_knowledge::{BetterInfoHash, BetterNodeId};
 use crate::message::ToRawKrpc;
 
-
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterAnnouncePeerQuery {
     transaction_id: String,
@@ -13,7 +12,13 @@ pub struct BetterAnnouncePeerQuery {
 }
 
 impl BetterAnnouncePeerQuery {
-    pub fn new(transaction_id: String, ourself: BetterNodeId, port: Option<u16>, info_hash: BetterInfoHash, token: String) -> Self {
+    pub fn new(
+        transaction_id: String,
+        ourself: BetterNodeId,
+        port: Option<u16>,
+        info_hash: BetterInfoHash,
+        token: String,
+    ) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -72,7 +77,10 @@ impl ToRawKrpc for BetterAnnouncePeerQuery {
             })
         });
 
-        encoder.get_output().expect("we know the encoder is valid").into_boxed_slice()
+        encoder
+            .get_output()
+            .expect("we know the encoder is valid")
+            .into_boxed_slice()
     }
 }
 

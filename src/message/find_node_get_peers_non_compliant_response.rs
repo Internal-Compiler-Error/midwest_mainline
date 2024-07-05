@@ -10,7 +10,11 @@ pub struct BetterFindNodeNonComGetPeersResponse {
 }
 
 impl BetterFindNodeNonComGetPeersResponse {
-    pub fn new(txn_id: String, target: BetterNodeId, nodes: Vec<BetterCompactNodeInfo>) -> BetterFindNodeNonComGetPeersResponse {
+    pub fn new(
+        txn_id: String,
+        target: BetterNodeId,
+        nodes: Vec<BetterCompactNodeInfo>,
+    ) -> BetterFindNodeNonComGetPeersResponse {
         BetterFindNodeNonComGetPeersResponse {
             transaction_id: txn_id,
             target_id: target,

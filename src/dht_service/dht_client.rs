@@ -90,9 +90,11 @@ impl DhtClientV4 {
         let (tx, rx) = oneshot::channel();
 
         // TODO: why was it assumed that serailization could fail?
-        let bytes = message.to_raw_krpc(); 
+        let bytes = message.to_raw_krpc();
         {
-            self.demultiplexer.register(message.transaction_id().to_string(), tx).await;
+            self.demultiplexer
+                .register(message.transaction_id().to_string(), tx)
+                .await;
             self.socket.send_to(&bytes, recipient).await?;
         }
         let response = rx.await.unwrap();
@@ -110,7 +112,10 @@ impl DhtClientV4 {
             this.routing_table
                 .write()
                 .await
-                .add_new_node(BetterCompactNodeInfo::new(response.target_id().clone(), BetterCompactPeerContact(recipient)));
+                .add_new_node(BetterCompactNodeInfo::new(
+                    response.target_id().clone(),
+                    BetterCompactPeerContact(recipient),
+                ));
 
             Ok(())
         } else {
@@ -140,8 +145,7 @@ impl DhtClientV4 {
         if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
             // the nodes come back as one giant byte string, each 26 bytes is a node
             // we split them up and create a vector of them
-            let mut nodes: Vec<_> = find_node_response
-                .nodes;
+            let mut nodes: Vec<_> = find_node_response.nodes;
 
             // TODO: fix this
             // some clients will return duplicate nodes, so we remove them
@@ -175,7 +179,11 @@ impl DhtClientV4 {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
         // TODO: wtf, it expects a token?
-        let query = Krpc::new_get_peers_query(hex::encode(transaction_id.to_be_bytes()), self.our_id.clone(), BetterInfoHash("borken!".to_string()));
+        let query = Krpc::new_get_peers_query(
+            hex::encode(transaction_id.to_be_bytes()),
+            self.our_id.clone(),
+            BetterInfoHash("borken!".to_string()),
+        );
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -372,7 +380,10 @@ impl DhtClientV4 {
                 let slot = slot.clone();
                 let finding = finding.clone();
                 async move {
-                    let returned_nodes = dht.clone().ask_her_for_nodes(starting_node.contact().0, finding.clone()).await?;
+                    let returned_nodes = dht
+                        .clone()
+                        .ask_her_for_nodes(starting_node.contact().0, finding.clone())
+                        .await?;
 
                     // add the nodes to our routing table
                     {
@@ -449,7 +460,10 @@ impl DhtClientV4 {
                 let slot = slot.clone();
                 let finding = finding.clone();
                 async move {
-                    let (token, returned) = dht.clone().ask_her_for_peers(starting_node.contact().0, finding.clone()).await?;
+                    let (token, returned) = dht
+                        .clone()
+                        .ask_her_for_peers(starting_node.contact().0, finding.clone())
+                        .await?;
 
                     return match returned {
                         Either::Left(mut deferred) => {
@@ -461,7 +475,8 @@ impl DhtClientV4 {
                                 seen.insert(starting_node.clone());
                             }
 
-                            dht.recursive_get_peers_from_pool(deferred, finding.clone(), seen, slot).await
+                            dht.recursive_get_peers_from_pool(deferred, finding.clone(), seen, slot)
+                                .await
                         }
                         Either::Right(success) => {
                             trace!("got success response, {success:#?}");
@@ -471,8 +486,10 @@ impl DhtClientV4 {
                             match slot {
                                 Some(sender) => {
                                     // TODO: revisit this
-                                    let _ =
-                                        sender.send((token.expect("success response must have the token").as_bytes().into(), success));
+                                    let _ = sender.send((
+                                        token.expect("success response must have the token").as_bytes().into(),
+                                        success,
+                                    ));
                                     Ok(())
                                 }
                                 None => Err(RecursiveSearchError::Cancelled),

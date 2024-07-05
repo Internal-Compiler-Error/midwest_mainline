@@ -311,7 +311,11 @@ impl DhtV4 {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
         // TODO: clearly wrong
-        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), our_id.clone(), our_id.clone());
+        let query = Krpc::new_find_node_query(
+            hex::encode(transaction_id.to_be_bytes()),
+            our_id.clone(),
+            our_id.clone(),
+        );
 
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
@@ -331,7 +335,10 @@ impl DhtV4 {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
                 // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
-                table.add_new_node(BetterCompactNodeInfo::new(response.target_id().clone(), BetterCompactPeerContact(contact)))
+                table.add_new_node(BetterCompactNodeInfo::new(
+                    response.target_id().clone(),
+                    BetterCompactPeerContact(contact),
+                ))
             }
 
             nodes.dedup();
@@ -343,7 +350,11 @@ impl DhtV4 {
                 let contact: SocketAddrV4 = node.contact().0;
                 let our_id = dht.our_id.clone();
                 let transaction_id = dht.transaction_id_pool.next();
-                let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), our_id.clone(), node.node_id().clone());
+                let query = Krpc::new_find_node_query(
+                    hex::encode(transaction_id.to_be_bytes()),
+                    our_id.clone(),
+                    node.node_id().clone(),
+                );
                 Builder::new()
                     .name(&*format!("leave level bootstrap to {}", contact))
                     .spawn(async move {
@@ -360,7 +371,10 @@ impl DhtV4 {
                             for node in nodes {
                                 // add the leave level responses to our routing table
                                 let mut table = dht.routing_table.write().await;
-                                let peer = BetterCompactNodeInfo::new(node.node_id().clone(), BetterCompactPeerContact(contact));
+                                let peer = BetterCompactNodeInfo::new(
+                                    node.node_id().clone(),
+                                    BetterCompactPeerContact(contact),
+                                );
                                 table.add_new_node(peer);
                             }
                         }

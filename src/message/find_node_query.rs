@@ -46,7 +46,10 @@ impl ToRawKrpc for BetterFindNodeQuery {
             })
         });
 
-        encoder.get_output().expect("we know the fields up front, this should never error").into_boxed_slice()
+        encoder
+            .get_output()
+            .expect("we know the fields up front, this should never error")
+            .into_boxed_slice()
     }
 }
 

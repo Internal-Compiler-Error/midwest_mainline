@@ -1,32 +1,31 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use crate::domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact};
 use bendy::decoding::{Decoder, Object};
-use crate::domain_knowledge::{BetterCompactPeerContact, BetterCompactNodeInfo};
 
-use find_node_get_peers_non_compliant_response::
-    BetterFindNodeNonComGetPeersResponse
-;
+use find_node_get_peers_non_compliant_response::BetterFindNodeNonComGetPeersResponse;
 use get_peers_deferred_response::BetterGetPeersDeferredResponse;
 use get_peers_success_response::BetterGetPeersSuccessResponse;
 use ping_announce_peer_response::BetterPingAnnouncePeerResponse;
 
-use juicy_bencode;
-use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 use crate::domain_knowledge::{BetterInfoHash, BetterNodeId};
 use crate::message::announce_peer_query::BetterAnnouncePeerQuery;
 use crate::message::error::KrpcError;
 use crate::message::find_node_query::BetterFindNodeQuery;
 use crate::message::get_peers_query::BetterGetPeersQuery;
 use crate::message::ping_query::BetterPingQuery;
+use juicy_bencode;
+use juicy_bencode::{parse_bencode_dict, BencodeItemView};
 
 pub mod announce_peer_query;
+pub mod error;
 pub mod find_node_get_peers_non_compliant_response;
 pub mod find_node_query;
-pub mod get_peers_deferred_response; pub mod get_peers_query;
+pub mod get_peers_deferred_response;
+pub mod get_peers_query;
 pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
-pub mod error;
 
 pub type InfoHash = [u8; 20];
 pub type TransactionId = Box<[u8]>;
@@ -45,10 +44,7 @@ impl ParseKrpc for &[u8] {
         use std::str;
 
         let mut decoder = Decoder::new(self);
-        let message = decoder
-            .next_object()
-            .map_err(|_| ())?
-            .ok_or(())?;
+        let message = decoder.next_object().map_err(|_| ())?.ok_or(())?;
 
         let Object::Dict(mut dict) = message else {
             // invalid message
@@ -73,7 +69,8 @@ impl ParseKrpc for &[u8] {
         // TODO: are all transaction ids strings?
         let transaction_id = str::from_utf8(transaction_id).map_err(|_| ())?.to_string();
 
-        if message_type == b"e" { // Error message
+        if message_type == b"e" {
+            // Error message
             let code_and_message = parsed.get(b"e".as_slice()).ok_or(())?;
             let BencodeItemView::List(code_and_message) = code_and_message else {
                 return Err(());
@@ -91,13 +88,9 @@ impl ParseKrpc for &[u8] {
             let message = str::from_utf8(message).map_err(|_| ())?.to_string();
             // todo: cast safely
             let code: u32 = *code as u32;
-            return Ok(Krpc::ErrorResponse(KrpcError::new(
-                transaction_id,
-                code,
-                message,
-            )));
-
-        } else if message_type == &b"q" { // queries
+            return Ok(Krpc::ErrorResponse(KrpcError::new(transaction_id, code, message)));
+        } else if message_type == &b"q" {
+            // queries
             // pull out common fields
             let query_type = parsed.get(&b"q".as_slice()).ok_or(())?;
             let BencodeItemView::ByteString(query_type) = query_type else {
@@ -116,8 +109,7 @@ impl ParseKrpc for &[u8] {
             let querier = str::from_utf8(querier).map_err(|_| ())?.to_string();
 
             if query_type == &b"ping" {
-                let ping = BetterPingQuery::new(transaction_id,
-                                                BetterNodeId::new(querier).map_err(|_| ())?);
+                let ping = BetterPingQuery::new(transaction_id, BetterNodeId::new(querier).map_err(|_| ())?);
                 return Ok(Krpc::PingQuery(ping));
             } else if query_type == &b"find_node" {
                 let target = arguments.get(&b"target".as_slice()).ok_or(())?;
@@ -126,9 +118,10 @@ impl ParseKrpc for &[u8] {
                 };
                 let target = str::from_utf8(target).map_err(|_| ())?.to_string();
 
-                let find_node_request = BetterFindNodeQuery::new(transaction_id,
-                                                                 BetterNodeId::new(querier).map_err(|_| ())?,
-                                                                 BetterNodeId::new(target).map_err(|_| ())?,
+                let find_node_request = BetterFindNodeQuery::new(
+                    transaction_id,
+                    BetterNodeId::new(querier).map_err(|_| ())?,
+                    BetterNodeId::new(target).map_err(|_| ())?,
                 );
                 return Ok(Krpc::FindNodeQuery(find_node_request));
             } else if query_type == &b"get_peers" {
@@ -137,9 +130,10 @@ impl ParseKrpc for &[u8] {
                     return Err(());
                 };
                 let info_hash = str::from_utf8(info_hash).map_err(|_| ())?.to_string();
-                let get_peers = BetterGetPeersQuery::new(transaction_id,
-                                                         BetterNodeId::new(querier).map_err(|_| ())?,
-                                                         BetterInfoHash::new(info_hash).map_err(|_| ())?,
+                let get_peers = BetterGetPeersQuery::new(
+                    transaction_id,
+                    BetterNodeId::new(querier).map_err(|_| ())?,
+                    BetterInfoHash::new(info_hash).map_err(|_| ())?,
                 );
 
                 return Ok(Krpc::GetPeersQuery(get_peers));
@@ -148,7 +142,7 @@ impl ParseKrpc for &[u8] {
                 let implied_port = parsed.get(&b"implied_port".as_slice()).ok_or(())?;
                 let implied_port = match implied_port {
                     BencodeItemView::Integer(i) => Some(i),
-                    _ => None
+                    _ => None,
                 };
 
                 // TODO: revisit this, the semantics seems wrong
@@ -163,13 +157,11 @@ impl ParseKrpc for &[u8] {
                     None
                 };
 
-
                 let token = parsed.get(&b"token".as_slice()).ok_or(())?;
                 let BencodeItemView::ByteString(token) = token else {
                     return Err(());
                 };
                 let token = str::from_utf8(token).map_err(|_| ())?.to_string();
-
 
                 // todo: look at the non compliant ones
                 let info_hash = parsed.get(&b"info_hash".as_slice()).ok_or(())?;
@@ -190,7 +182,8 @@ impl ParseKrpc for &[u8] {
             } else {
                 return Err(());
             }
-        } else if message_type == &b"r" { // responses
+        } else if message_type == &b"r" {
+            // responses
             let body = parsed.get(b"r".as_slice()).ok_or(())?;
             let BencodeItemView::Dictionary(response) = body else {
                 return Err(());
@@ -201,7 +194,6 @@ impl ParseKrpc for &[u8] {
                 return Err(());
             };
             let target_id = BetterNodeId::new(String::from_utf8(target_id.to_vec()).unwrap()).unwrap();
-
 
             if response.contains_key(b"nodes".as_slice()) {
                 let nodes = response.get(b"nodes".as_slice()).unwrap();
@@ -221,10 +213,7 @@ impl ParseKrpc for &[u8] {
                         let port = u16::from_be_bytes([contact[4], contact[5]]);
                         let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
 
-                        BetterCompactNodeInfo {
-                            id: node_id,
-                            contact
-                        }
+                        BetterCompactNodeInfo { id: node_id, contact }
                     })
                     .collect();
 
@@ -233,7 +222,7 @@ impl ParseKrpc for &[u8] {
                     target_id,
                     nodes: contacts,
                 };
-                let msg = Krpc::FindNodeGetPeersNonCompliantResponse(res) ;
+                let msg = Krpc::FindNodeGetPeersNonCompliantResponse(res);
                 return Ok(msg);
                 // find nodes response
             } else if response.contains_key(b"token".as_slice()) {
@@ -249,11 +238,9 @@ impl ParseKrpc for &[u8] {
 
                     let contacts: Vec<_> = values
                         .iter()
-                        .filter_map(|x| {
-                            match x {
-                                BencodeItemView::ByteString(s) => Some(s),
-                                _ => None,
-                            }
+                        .filter_map(|x| match x {
+                            BencodeItemView::ByteString(s) => Some(s),
+                            _ => None,
                         })
                         .map(|sock_addr| {
                             // TODO: worry about segfault later
@@ -261,12 +248,13 @@ impl ParseKrpc for &[u8] {
                             let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
 
                             BetterCompactPeerContact(SocketAddrV4::new(ip, port))
-                        }).collect();
+                        })
+                        .collect();
 
                     let res = BetterGetPeersSuccessResponse::new(transaction_id, target_id, token, contacts);
                     let msg = Krpc::GetPeersSuccessResponse(res);
                     return Ok(msg);
-                } else if let Some(BencodeItemView::ByteString(nodes)) =  response.get(b"nodes".as_slice()) {
+                } else if let Some(BencodeItemView::ByteString(nodes)) = response.get(b"nodes".as_slice()) {
                     // deferred, nearest nodes returned
                     let contacts: Vec<_> = nodes
                         .chunks(26)
@@ -280,10 +268,7 @@ impl ParseKrpc for &[u8] {
                             let port = u16::from_be_bytes([contact[4], contact[5]]);
                             let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
 
-                            BetterCompactNodeInfo {
-                                id: node_id,
-                                contact
-                            }
+                            BetterCompactNodeInfo { id: node_id, contact }
                         })
                         .collect();
 
@@ -305,12 +290,12 @@ impl ParseKrpc for &[u8] {
                 // non-comliant response
                 return Err(());
             }
-        } else { // invalid message
+        } else {
+            // invalid message
             return Err(());
         }
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Krpc {
@@ -469,7 +454,7 @@ impl Krpc {
         // };
         //
         // Krpc::AnnouncePeerQuery(announce_peer_query)
-        let port = if implied_port {Some(port)} else {None};
+        let port = if implied_port { Some(port) } else { None };
         let announce_peer = BetterAnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
         Krpc::AnnouncePeerQuery(announce_peer)
     }
@@ -485,7 +470,11 @@ impl Krpc {
     }
 
     // construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: String, responding_id: BetterNodeId, nodes: Vec<BetterCompactNodeInfo>) -> Krpc {
+    pub fn new_find_node_response(
+        transaction_id: String,
+        responding_id: BetterNodeId,
+        nodes: Vec<BetterCompactNodeInfo>,
+    ) -> Krpc {
         // let find_node_response = FindNodeGetPeersNonCompliantResponse {
         //     transaction_id,
         //     message_type: Box::new(b"r".clone()),
@@ -521,7 +510,8 @@ impl Krpc {
         //     },
         // };
 
-        let get_peers_success_response = BetterGetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
+        let get_peers_success_response =
+            BetterGetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
         Krpc::GetPeersSuccessResponse(get_peers_success_response)
     }
 
@@ -531,7 +521,7 @@ impl Krpc {
         transaction_id: String,
         responding_id: BetterNodeId,
         response_token: String,
-        closest_nodes: Vec<BetterCompactNodeInfo>
+        closest_nodes: Vec<BetterCompactNodeInfo>,
     ) -> Krpc {
         // let get_peers_deferred_response = GetPeersDeferredResponse {
         //     transaction_id,
@@ -543,7 +533,8 @@ impl Krpc {
         //     },
         // };
 
-        let get_peers_deferred_response = BetterGetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
+        let get_peers_deferred_response =
+            BetterGetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
         Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
     }
 
@@ -617,7 +608,11 @@ impl Krpc {
         //     message_type: Box::new(b"e".clone()),
         //     error: (204 as u32, "A Unsupported Method Error Occurred".to_string()),
         // };
-        let error_response = KrpcError::new(transaction_id, 204 as u32, "A Unsupported Method Error Occurred".to_string());
+        let error_response = KrpcError::new(
+            transaction_id,
+            204 as u32,
+            "A Unsupported Method Error Occurred".to_string(),
+        );
         Krpc::ErrorResponse(error_response)
     }
 

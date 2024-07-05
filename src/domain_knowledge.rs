@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 use std::{
     fmt::{Debug, Formatter},
-    net::{Ipv4Addr, SocketAddrV4}, ops::Deref,
+    net::{Ipv4Addr, SocketAddrV4},
+    ops::Deref,
 };
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -35,7 +36,6 @@ impl ToBencode for BetterNodeId {
         encoder.emit_str(&self.0)
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterInfoHash(pub String);
@@ -133,10 +133,7 @@ pub struct BetterCompactNodeInfo {
 
 impl BetterCompactNodeInfo {
     pub fn new(id: BetterNodeId, contact: BetterCompactPeerContact) -> BetterCompactNodeInfo {
-        BetterCompactNodeInfo {
-            id,
-            contact
-        }
+        BetterCompactNodeInfo { id, contact }
     }
 
     pub fn node_id(&self) -> &BetterNodeId {
