@@ -1,8 +1,10 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact};
+use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
+use color_eyre::eyre::eyre;
 use find_node_get_peers_non_compliant_response::BetterFindNodeNonComGetPeersResponse;
 use get_peers_deferred_response::BetterGetPeersDeferredResponse;
 use get_peers_success_response::BetterGetPeersSuccessResponse;
@@ -35,111 +37,154 @@ pub trait ToRawKrpc {
 }
 
 pub trait ParseKrpc {
-    fn parse(&self) -> Result<Krpc, ()>;
+    fn parse(&self) -> Result<Krpc, OurError>;
 }
 
 impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
-    fn parse(&self) -> Result<Krpc, ()> {
+    fn parse(&self) -> Result<Krpc, OurError> {
         use std::str;
 
         let mut decoder = Decoder::new(self);
-        let message = decoder.next_object().map_err(|_| ())?.ok_or(())?;
+        let message = decoder
+            .next_object()
+            .map_err(|e| OurError::BendyDecodeError(e))?
+            .ok_or(OurError::DecodeError(eyre!("Error in decoding but different???")))?;
 
         let Object::Dict(mut dict) = message else {
+            // TODO: include the message in error reporting
+            //
             // invalid message
-            return Err(());
+            return Err(OurError::DecodeError(eyre!("Message is not a dict")));
         };
 
         // we're only using it to validate the message structure
-        dict.consume_all().map_err(|_| ())?;
+        dict.consume_all()
+            .map_err(|e| OurError::DecodeError(eyre!("Message strucutre is invalid")))?;
 
-        let (_remaining, parsed) = parse_bencode_dict(self).map_err(|_| ())?;
+        let (_remaining, parsed) =
+            parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained")))?;
 
-        let message_type_indicator = parsed.get(b"y".as_slice()).ok_or(())?;
+        let message_type_indicator = parsed
+            .get(b"y".as_slice())
+            .ok_or(OurError::DecodeError(eyre!("Message as no 'y' key")))?;
         let BencodeItemView::ByteString(ref message_type) = message_type_indicator else {
             // invalid message
-            return Err(());
+            return Err(OurError::DecodeError(eyre!("Message 'y' key is not a binary string")));
         };
 
-        let transaction_id = parsed.get(&b"t".as_slice()).ok_or(())?;
+        let transaction_id = parsed
+            .get(&b"t".as_slice())
+            .ok_or(OurError::DecodeError(eyre!("Message has no 't' key")))?;
         let BencodeItemView::ByteString(ref transaction_id) = transaction_id else {
-            return Err(());
+            return Err(OurError::DecodeError(eyre!("Message 't' key is not a binary string")));
         };
         // TODO: are all transaction ids strings?
-        let transaction_id = str::from_utf8(transaction_id).map_err(|_| ())?.to_string();
+        let transaction_id = str::from_utf8(transaction_id)
+            .map_err(|e| OurError::DecodeError(eyre!("Message txn id is not an utf8 string")))?
+            .to_string();
 
         if message_type == b"e" {
             // Error message
-            let code_and_message = parsed.get(b"e".as_slice()).ok_or(())?;
+            let code_and_message = parsed
+                .get(b"e".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Error message has no 'e' key")))?;
             let BencodeItemView::List(code_and_message) = code_and_message else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'e' key is not a list")));
             };
-            let code = code_and_message.get(0).ok_or(())?;
-            let message = code_and_message.get(1).ok_or(())?;
+            let code = code_and_message
+                .get(0)
+                .ok_or(OurError::DecodeError(eyre!("Error message has no first elem")))?;
+            let message = code_and_message
+                .get(1)
+                .ok_or(OurError::DecodeError(eyre!("Error message has no second elem")))?;
 
             let BencodeItemView::Integer(code) = code else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("First element is not an int")));
             };
 
             let BencodeItemView::ByteString(ref message) = message else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
             };
-            let message = str::from_utf8(message).map_err(|_| ())?.to_string();
+            let message = str::from_utf8(message)
+                .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                .to_string();
             // todo: cast safely
             let code: u32 = *code as u32;
             return Ok(Krpc::ErrorResponse(KrpcError::new(transaction_id, code, message)));
         } else if message_type == &b"q" {
             // queries
             // pull out common fields
-            let query_type = parsed.get(&b"q".as_slice()).ok_or(())?;
+            let query_type = parsed
+                .get(&b"q".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'q' key")))?;
             let BencodeItemView::ByteString(query_type) = query_type else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'q' key is not a binary string")));
             };
 
-            let arguments = parsed.get(&b"a".as_slice()).ok_or(())?;
+            let arguments = parsed
+                .get(&b"a".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'a' key")))?;
             let BencodeItemView::Dictionary(arguments) = arguments else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'a' key is not a dict")));
             };
 
-            let querier = arguments.get(&b"id".as_slice()).ok_or(())?;
+            let querier = arguments
+                .get(&b"id".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'id' key")))?;
             let BencodeItemView::ByteString(querier) = querier else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
-            let querier = str::from_utf8(querier).map_err(|_| ())?.to_string();
+            let querier = str::from_utf8(querier)
+                .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                .to_string();
 
             if query_type == &b"ping" {
-                let ping = BetterPingQuery::new(transaction_id, BetterNodeId::new(querier).map_err(|_| ())?);
+                let ping = BetterPingQuery::new(
+                    transaction_id,
+                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                );
                 return Ok(Krpc::PingQuery(ping));
             } else if query_type == &b"find_node" {
-                let target = arguments.get(&b"target".as_slice()).ok_or(())?;
+                let target = arguments
+                    .get(&b"target".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'target' key")))?;
                 let BencodeItemView::ByteString(target) = target else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
                 };
-                let target = str::from_utf8(target).map_err(|_| ())?.to_string();
+                let target = str::from_utf8(target)
+                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                    .to_string();
 
                 let find_node_request = BetterFindNodeQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|_| ())?,
-                    BetterNodeId::new(target).map_err(|_| ())?,
+                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterNodeId::new(target).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
                 );
                 return Ok(Krpc::FindNodeQuery(find_node_request));
             } else if query_type == &b"get_peers" {
-                let info_hash = parsed.get(&b"info_hash".as_slice()).ok_or(())?;
+                let info_hash = parsed
+                    .get(&b"info_hash".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
                 let BencodeItemView::ByteString(info_hash) = info_hash else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
                 };
-                let info_hash = str::from_utf8(info_hash).map_err(|_| ())?.to_string();
+                let info_hash = str::from_utf8(info_hash)
+                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                    .to_string();
                 let get_peers = BetterGetPeersQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|_| ())?,
-                    BetterInfoHash::new(info_hash).map_err(|_| ())?,
+                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterInfoHash::new(info_hash)
+                        .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
                 );
 
                 return Ok(Krpc::GetPeersQuery(get_peers));
             } else if query_type == &b"announce_peer" {
                 // todo: some stupid clients might not send this
-                let implied_port = parsed.get(&b"implied_port".as_slice()).ok_or(())?;
+                let implied_port = parsed
+                    .get(&b"implied_port".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'implied_port' key")))?;
                 let implied_port = match implied_port {
                     BencodeItemView::Integer(i) => Some(i),
                     _ => None,
@@ -147,9 +192,11 @@ impl ParseKrpc for &[u8] {
 
                 // TODO: revisit this, the semantics seems wrong
                 let port = if implied_port.is_some() {
-                    let port = parsed.get(&b"port".as_slice()).ok_or(())?;
+                    let port = parsed
+                        .get(&b"port".as_slice())
+                        .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'port' key")))?;
                     let BencodeItemView::Integer(port) = port else {
-                        return Err(());
+                        return Err(OurError::DecodeError(eyre!("'port' key is not a binary string")));
                     };
                     // todo: cast safely
                     Some(*port as u16)
@@ -157,48 +204,61 @@ impl ParseKrpc for &[u8] {
                     None
                 };
 
-                let token = parsed.get(&b"token".as_slice()).ok_or(())?;
+                let token = parsed
+                    .get(&b"token".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'token' key")))?;
                 let BencodeItemView::ByteString(token) = token else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
                 };
-                let token = str::from_utf8(token).map_err(|_| ())?.to_string();
+                let token = str::from_utf8(token)
+                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                    .to_string();
 
                 // todo: look at the non compliant ones
-                let info_hash = parsed.get(&b"info_hash".as_slice()).ok_or(())?;
+                let info_hash = parsed
+                    .get(&b"info_hash".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
                 let BencodeItemView::ByteString(info_hash) = info_hash else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
                 };
-                let info_hash = str::from_utf8(info_hash).map_err(|_| ())?.to_string();
+                let info_hash = str::from_utf8(info_hash)
+                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                    .to_string();
 
                 let announce_peer = BetterAnnouncePeerQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|_| ())?,
+                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
                     port,
-                    BetterInfoHash::new(info_hash).map_err(|_| ())?,
+                    BetterInfoHash::new(info_hash)
+                        .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
                     token,
                 );
 
                 return Ok(Krpc::AnnouncePeerQuery(announce_peer));
             } else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("Invalid message")));
             }
         } else if message_type == &b"r" {
             // responses
-            let body = parsed.get(b"r".as_slice()).ok_or(())?;
+            let body = parsed
+                .get(b"r".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Response message has no 'r' key")))?;
             let BencodeItemView::Dictionary(response) = body else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'r' key is not a dict")));
             };
 
-            let id = response.get(b"id".as_slice()).ok_or(())?;
+            let id = response
+                .get(b"id".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Response message has no 'id' key")))?;
             let BencodeItemView::ByteString(ref target_id) = id else {
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
             let target_id = BetterNodeId::new(String::from_utf8(target_id.to_vec()).unwrap()).unwrap();
 
             if response.contains_key(b"nodes".as_slice()) {
                 let nodes = response.get(b"nodes".as_slice()).unwrap();
                 let BencodeItemView::ByteString(ref nodes) = nodes else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
                 };
 
                 let contacts: Vec<_> = nodes
@@ -229,7 +289,7 @@ impl ParseKrpc for &[u8] {
                 // get_peers response
                 let token = response.get(b"token".as_slice()).unwrap();
                 let BencodeItemView::ByteString(token) = token else {
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
                 };
                 let token = String::from_utf8(token.to_vec()).unwrap();
 
@@ -277,7 +337,7 @@ impl ParseKrpc for &[u8] {
                     return Ok(msg);
                 } else {
                     // invalid message
-                    return Err(());
+                    return Err(OurError::DecodeError(eyre!("Invalid message")));
                 }
             } else if response.len() == 1 {
                 // only has id in the response
@@ -288,11 +348,11 @@ impl ParseKrpc for &[u8] {
                 return Ok(msg);
             } else {
                 // non-comliant response
-                return Err(());
+                return Err(OurError::DecodeError(eyre!("Invalid message")));
             }
         } else {
             // invalid message
-            return Err(());
+            return Err(OurError::DecodeError(eyre!("Invalid message")));
         }
     }
 }
