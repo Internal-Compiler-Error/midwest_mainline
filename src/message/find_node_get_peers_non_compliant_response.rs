@@ -84,5 +84,17 @@ impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
 
 #[cfg(test)]
 mod tests {
-    // TODO:
+    use crate::{domain_knowledge::BetterNodeId, message::{find_node_query::BetterFindNodeQuery, ToRawKrpc}};
+
+        #[test]
+        fn can_encode_example() {
+            let message = BetterFindNodeQuery::new("aa".to_string(), BetterNodeId("abcdefghij0123456789".to_string()), BetterNodeId("mnopqrstuvwxyz123456".to_string()));
+            let bytes = message.to_raw_krpc();
+
+            // taken directly from the spec
+            assert_eq!(
+                &*bytes,
+                b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q9:find_node1:t2:aa1:y1:qe" as &[u8]
+            );
+    }
 }
