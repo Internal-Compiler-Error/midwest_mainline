@@ -163,12 +163,14 @@ impl ParseKrpc for &[u8] {
                 );
                 return Ok(Krpc::FindNodeQuery(find_node_request));
             } else if query_type == &b"get_peers" {
-                let info_hash = parsed
+                let info_hash = arguments
                     .get(&b"info_hash".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
+
                 let BencodeItemView::ByteString(info_hash) = info_hash else {
                     return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
                 };
+
                 let info_hash = str::from_utf8(info_hash)
                     .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
                     .to_string();
@@ -182,7 +184,7 @@ impl ParseKrpc for &[u8] {
                 return Ok(Krpc::GetPeersQuery(get_peers));
             } else if query_type == &b"announce_peer" {
                 // todo: some stupid clients might not send this
-                let implied_port = parsed
+                let implied_port = arguments
                     .get(&b"implied_port".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'implied_port' key")))?;
                 let implied_port = match implied_port {
@@ -192,7 +194,7 @@ impl ParseKrpc for &[u8] {
 
                 // TODO: revisit this, the semantics seems wrong
                 let port = if implied_port.is_some() {
-                    let port = parsed
+                    let port = arguments
                         .get(&b"port".as_slice())
                         .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'port' key")))?;
                     let BencodeItemView::Integer(port) = port else {
@@ -204,7 +206,7 @@ impl ParseKrpc for &[u8] {
                     None
                 };
 
-                let token = parsed
+                let token = arguments
                     .get(&b"token".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'token' key")))?;
                 let BencodeItemView::ByteString(token) = token else {
@@ -215,7 +217,7 @@ impl ParseKrpc for &[u8] {
                     .to_string();
 
                 // todo: look at the non compliant ones
-                let info_hash = parsed
+                let info_hash = arguments
                     .get(&b"info_hash".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
                 let BencodeItemView::ByteString(info_hash) = info_hash else {
