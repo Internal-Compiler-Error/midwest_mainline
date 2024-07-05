@@ -12,12 +12,7 @@ pub struct BetterGetPeersDeferredResponse {
 }
 
 impl BetterGetPeersDeferredResponse {
-    pub fn new(
-        transaction_id: String,
-        querier: BetterNodeId,
-        token: String,
-        nodes: Vec<BetterCompactNodeInfo>,
-    ) -> Self {
+    pub fn new(transaction_id: String, querier: BetterNodeId, token: String, nodes: Vec<BetterCompactNodeInfo>) -> Self {
         Self {
             transaction_id,
             querier,
@@ -32,6 +27,7 @@ impl BetterGetPeersDeferredResponse {
 }
 
 impl ToRawKrpc for BetterGetPeersDeferredResponse {
+
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -55,7 +51,7 @@ impl ToRawKrpc for BetterGetPeersDeferredResponse {
 
                         let combined = self.nodes.iter().map(|peer| {
                             let node_id = &peer.id;
-                            let id_as_ascii = node_id.0.as_bytes();
+                            let _id_as_ascii = node_id.0.as_bytes();
 
                             let octets = peer.contact.0.ip().octets();
                             let port_in_ne = peer.contact.0.port().to_be_bytes();
@@ -78,4 +74,9 @@ impl ToRawKrpc for BetterGetPeersDeferredResponse {
             .expect("we know all the fields upfront, this should never error")
             .into_boxed_slice()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO:
 }
