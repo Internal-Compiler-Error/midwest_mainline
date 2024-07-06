@@ -5,9 +5,7 @@ use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
 use color_eyre::eyre::eyre;
-use find_node_get_peers_non_compliant_response::FindNodeNonComGetPeersResponse;
-use get_peers_deferred_response::GetPeersDeferredResponse;
-use get_peers_success_response::GetPeersSuccessResponse;
+use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
 
 use crate::domain_knowledge::{InfoHash, NodeId};
@@ -20,11 +18,9 @@ use juicy_bencode::{parse_bencode_dict, BencodeItemView};
 
 pub mod announce_peer_query;
 pub mod error;
-pub mod find_node_get_peers_non_compliant_response;
+pub mod find_node_get_peers_response;
 pub mod find_node_query;
-pub mod get_peers_deferred_response;
 pub mod get_peers_query;
-pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
 
@@ -269,12 +265,9 @@ impl ParseKrpc for &[u8] {
                     })
                     .collect();
 
-                let res = FindNodeNonComGetPeersResponse {
-                    transaction_id,
-                    target_id,
-                    nodes: contacts,
-                };
-                let msg = Krpc::FindNodeGetPeersNonCompliantResponse(res);
+                let res = Builder::new(transaction_id, target_id).with_nodes(&contacts).build();
+
+                let msg = Krpc::FindNodeGetPeersResponse(res);
                 return Ok(msg);
                 // find nodes response
             } else if response.contains_key(b"token".as_slice()) {
@@ -303,8 +296,11 @@ impl ParseKrpc for &[u8] {
                         })
                         .collect();
 
-                    let res = GetPeersSuccessResponse::new(transaction_id, target_id, token, contacts);
-                    let msg = Krpc::GetPeersSuccessResponse(res);
+                    let res = Builder::new(transaction_id, target_id)
+                        .with_token(token)
+                        .with_values(&contacts)
+                        .build();
+                    let msg = Krpc::FindNodeGetPeersResponse(res);
                     return Ok(msg);
                 } else if let Some(BencodeItemView::ByteString(nodes)) = response.get(b"nodes".as_slice()) {
                     // deferred, nearest nodes returned
@@ -324,8 +320,11 @@ impl ParseKrpc for &[u8] {
                         })
                         .collect();
 
-                    let res = GetPeersDeferredResponse::new(transaction_id, target_id, token, contacts);
-                    let msg = Krpc::GetPeersDeferredResponse(res);
+                    let res = Builder::new(transaction_id, target_id)
+                        .with_token(token)
+                        .with_nodes(&contacts)
+                        .build();
+                    let msg = Krpc::FindNodeGetPeersResponse(res);
                     return Ok(msg);
                 } else {
                     // invalid message
@@ -356,10 +355,8 @@ pub enum Krpc {
     GetPeersQuery(GetPeersQuery),
     PingQuery(PingQuery),
 
-    GetPeersSuccessResponse(GetPeersSuccessResponse),
-    GetPeersDeferredResponse(GetPeersDeferredResponse),
-    FindNodeGetPeersNonCompliantResponse(FindNodeNonComGetPeersResponse),
     PingAnnouncePeerResponse(PingAnnouncePeerResponse),
+    FindNodeGetPeersResponse(FindNodeGetPeersResponse),
 
     ErrorResponse(KrpcError),
 }
@@ -371,9 +368,10 @@ impl ToRawKrpc for Krpc {
             Krpc::FindNodeQuery(a) => a.to_raw_krpc(),
             Krpc::GetPeersQuery(a) => a.to_raw_krpc(),
             Krpc::PingQuery(a) => a.to_raw_krpc(),
-            Krpc::GetPeersSuccessResponse(a) => a.to_raw_krpc(),
-            Krpc::GetPeersDeferredResponse(a) => a.to_raw_krpc(),
-            Krpc::FindNodeGetPeersNonCompliantResponse(a) => a.to_raw_krpc(),
+            // Krpc::GetPeersSuccessResponse(a) => a.to_raw_krpc(),
+            // Krpc::GetPeersDeferredResponse(a) => a.to_raw_krpc(),
+            // Krpc::FindNodeGetPeersNonCompliantResponse(a) => a.to_raw_krpc(),
+            Krpc::FindNodeGetPeersResponse(a) => a.to_raw_krpc(),
             Krpc::PingAnnouncePeerResponse(a) => a.to_raw_krpc(),
             Krpc::ErrorResponse(a) => a.to_raw_krpc(),
         }
@@ -384,9 +382,7 @@ impl Krpc {
     pub fn is_response(&self) -> bool {
         match self {
             Krpc::PingAnnouncePeerResponse(_) => true,
-            Krpc::FindNodeGetPeersNonCompliantResponse(_) => true,
-            Krpc::GetPeersSuccessResponse(_) => true,
-            Krpc::GetPeersDeferredResponse(_) => true,
+            Krpc::FindNodeGetPeersResponse(_) => true,
             _ => false,
         }
     }
@@ -394,9 +390,7 @@ impl Krpc {
     pub fn transaction_id(&self) -> &TransactionId {
         match self {
             Krpc::PingAnnouncePeerResponse(msg) => msg.txn_id(),
-            Krpc::FindNodeGetPeersNonCompliantResponse(msg) => &msg.transaction_id,
-            Krpc::GetPeersSuccessResponse(msg) => msg.txn_id(),
-            Krpc::GetPeersDeferredResponse(msg) => msg.txn_id(),
+            Krpc::FindNodeGetPeersResponse(msg) => msg.txn_id(),
             Krpc::FindNodeQuery(msg) => msg.txn_id(),
             Krpc::GetPeersQuery(msg) => msg.txn_id(),
             Krpc::AnnouncePeerQuery(msg) => msg.txn_id(),
@@ -455,41 +449,6 @@ impl Krpc {
         Krpc::PingAnnouncePeerResponse(ping_res)
     }
 
-    // construct a response to a find_node query
-    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Vec<NodeInfo>) -> Krpc {
-        let find_node_res = FindNodeNonComGetPeersResponse {
-            transaction_id,
-            target_id: responding_id,
-            nodes,
-        };
-        Krpc::FindNodeGetPeersNonCompliantResponse(find_node_res)
-    }
-
-    // construct a response to a get_peers query when the peer is directly found
-    pub fn new_get_peers_success_response(
-        transaction_id: TransactionId,
-        responding_id: NodeId,
-        response_token: Token,
-        peers: Vec<PeerContact>,
-    ) -> Krpc {
-        let get_peers_success_response =
-            GetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
-        Krpc::GetPeersSuccessResponse(get_peers_success_response)
-    }
-
-    // construct a response to a get_peers query when the peer is not directly found and the closest
-    // nodes are returned
-    pub fn new_get_peers_deferred_response(
-        transaction_id: TransactionId,
-        responding_id: NodeId,
-        response_token: Token,
-        closest_nodes: Vec<NodeInfo>,
-    ) -> Krpc {
-        let get_peers_deferred_response =
-            GetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
-        Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
-    }
-
     // construct a response to a get_peers query when the peer is not directly found and the closest
     // nodes are returned
     #[allow(unused)]
@@ -529,20 +488,6 @@ impl Krpc {
         );
         Krpc::ErrorResponse(error_response)
     }
-
-    // pub fn id_as_u16(&self) -> u16 {
-    //     match self {
-    //         Krpc::ErrorResponse(error) => u16::from_be_bytes(error.transaction_id),
-    //         Krpc::PingAnnouncePeerResponse(ping) => u16::from_be_bytes(ping.transaction_id),
-    //         Krpc::GetPeersDeferredResponse(peers) => u16::from_be_bytes(peers.transaction_id),
-    //         Krpc::GetPeersSuccessResponse(peers) => u16::from_be_bytes(peers.transaction_id),
-    //         Krpc::FindNodeGetPeersNonCompliantResponse(node) => u16::from_be_bytes(node.transaction_id),
-    //         Krpc::PingQuery(ping) => u16::from_be_bytes(ping.transaction_id),
-    //         Krpc::FindNodeQuery(node) => u16::from_be_bytes(node.transaction_id),
-    //         Krpc::GetPeersQuery(peers) => u16::from_be_bytes(peers.transaction_id),
-    //         Krpc::AnnouncePeerQuery(peers) => u16::from_be_bytes(peers.transaction_id),
-    //     }
-    // }
 }
 
 #[cfg(test)]
@@ -637,16 +582,14 @@ mod test {
         let res_token = hex::decode("3704f7737408c5fef0f96bca389e4100f972859d").unwrap();
         let res_token = Token::from_bytes(&res_token);
 
-        let expected = Krpc::new_get_peers_success_response(
-            txn_id,
-            responding,
-            res_token,
-            vec![
-                PeerContact(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385)),
-                PeerContact(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878)),
-                PeerContact(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070)),
-            ],
-        );
+        use find_node_get_peers_response::Builder;
+        let expected = Builder::new(txn_id, responding)
+            .with_token(res_token)
+            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385)))
+            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878)))
+            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070)))
+            .build();
+        let expected = Krpc::FindNodeGetPeersResponse(expected);
 
         assert_eq!(decoded, expected);
     }
@@ -656,15 +599,19 @@ mod test {
         let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re" as &[u8];
         let decoded = message.parse().unwrap();
 
-        let expected = Krpc::new_find_node_response(
+        use find_node_get_peers_response::Builder;
+        let expected = Builder::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"0123456789abcdefghij"),
-            vec![NodeInfo::new(
-                NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
-                // TODO: place holder values
-                PeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
-            )],
-        );
+        )
+        .with_node(NodeInfo::new(
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            // TODO: place holder values
+            PeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
+        ))
+        .build();
+        let expected = Krpc::FindNodeGetPeersResponse(expected);
+
         assert_eq!(expected, decoded);
     }
 

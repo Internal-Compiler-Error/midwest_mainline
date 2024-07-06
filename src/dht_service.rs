@@ -314,73 +314,74 @@ impl DhtV4 {
     /// This is subject to change in the future.
     #[instrument(skip_all)]
     async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
-        let our_id = dht.our_id.clone();
-        let transaction_id = dht.transaction_id_pool.next();
-        // TODO: clearly wrong
-        let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), our_id.clone(), our_id.clone());
-
-        info!("bootstrapping with {contact}");
-        let response = timeout(Duration::from_secs(5), async {
-            dht.send_message(&query, &contact)
-                .await
-                .expect("failure to send message")
-        })
-        .await?;
-
-        if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-            let mut nodes = response.nodes().clone();
-            // let mut nodes: Vec<_> = nodes
-            //     .chunks_exact(26)
-            //     .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
-            //     .collect();
-            {
-                // add the bootstrapping node to our routing table
-                let mut table = dht.routing_table.write().await;
-                // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
-                table.add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(contact)))
-            }
-
-            nodes.dedup();
-
-            for node in &nodes {
-                dht.routing_table.write().await.add_new_node(node.clone());
-
-                let dht = dht.clone();
-                let contact: SocketAddrV4 = node.contact().0;
-                let our_id = dht.our_id.clone();
-                let transaction_id = dht.transaction_id_pool.next();
-                let query = Krpc::new_find_node_query(
-                    TransactionId::from(transaction_id),
-                    our_id.clone(),
-                    node.node_id().clone(),
-                );
-                Builder::new()
-                    .name(&*format!("leave level bootstrap to {}", contact))
-                    .spawn(async move {
-                        let response = timeout(Duration::from_secs(5), async {
-                            dht.send_message(&query, &contact)
-                                .await
-                                .expect("failure to send message")
-                        })
-                        .await?;
-
-                        if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
-                            let nodes: Vec<_> = response.nodes;
-
-                            for node in nodes {
-                                // add the leave level responses to our routing table
-                                let mut table = dht.routing_table.write().await;
-                                let peer = NodeInfo::new(node.node_id().clone(), PeerContact(contact));
-                                table.add_new_node(peer);
-                            }
-                        }
-                        Ok::<_, color_eyre::Report>(())
-                    })
-                    .unwrap();
-            }
-            info!("bootstrapping with {contact} succeeded");
-        }
-        Ok(())
+        todo!()
+        // let our_id = dht.our_id.clone();
+        // let transaction_id = dht.transaction_id_pool.next();
+        // // TODO: clearly wrong
+        // let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), our_id.clone(), our_id.clone());
+        //
+        // info!("bootstrapping with {contact}");
+        // let response = timeout(Duration::from_secs(5), async {
+        //     dht.send_message(&query, &contact)
+        //         .await
+        //         .expect("failure to send message")
+        // })
+        // .await?;
+        //
+        // if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
+        //     let mut nodes = response.nodes().clone();
+        //     // let mut nodes: Vec<_> = nodes
+        //     //     .chunks_exact(26)
+        //     //     .map(|x| CompactNodeContact::new(x.try_into().unwrap()))
+        //     //     .collect();
+        //     {
+        //         // add the bootstrapping node to our routing table
+        //         let mut table = dht.routing_table.write().await;
+        //         // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
+        //         table.add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(contact)))
+        //     }
+        //
+        //     nodes.dedup();
+        //
+        //     for node in &nodes {
+        //         dht.routing_table.write().await.add_new_node(node.clone());
+        //
+        //         let dht = dht.clone();
+        //         let contact: SocketAddrV4 = node.contact().0;
+        //         let our_id = dht.our_id.clone();
+        //         let transaction_id = dht.transaction_id_pool.next();
+        //         let query = Krpc::new_find_node_query(
+        //             TransactionId::from(transaction_id),
+        //             our_id.clone(),
+        //             node.node_id().clone(),
+        //         );
+        //         Builder::new()
+        //             .name(&*format!("leave level bootstrap to {}", contact))
+        //             .spawn(async move {
+        //                 let response = timeout(Duration::from_secs(5), async {
+        //                     dht.send_message(&query, &contact)
+        //                         .await
+        //                         .expect("failure to send message")
+        //                 })
+        //                 .await?;
+        //
+        //                 if let Krpc::FindNodeGetPeersNonCompliantResponse(response) = response {
+        //                     let nodes: Vec<_> = response.nodes;
+        //
+        //                     for node in nodes {
+        //                         // add the leave level responses to our routing table
+        //                         let mut table = dht.routing_table.write().await;
+        //                         let peer = NodeInfo::new(node.node_id().clone(), PeerContact(contact));
+        //                         table.add_new_node(peer);
+        //                     }
+        //                 }
+        //                 Ok::<_, color_eyre::Report>(())
+        //             })
+        //             .unwrap();
+        //     }
+        //     info!("bootstrapping with {contact} succeeded");
+        // }
+        // Ok(())
     }
 
     /// Returns a handle to the client so you can perform queries

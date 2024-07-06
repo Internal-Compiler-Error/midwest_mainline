@@ -124,38 +124,40 @@ impl DhtClientV4 {
     // peers means something special here so you can't use it
     // ask_node_for_nodes just sounds stupid so fuck it, it's her then.
     // Why her and not them? Because I want to piss people off
+    #[allow(unused_variables)]
     async fn ask_her_for_nodes(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: NodeId,
     ) -> Result<Vec<NodeInfo>, DhtServiceFailure> {
+        todo!()
         // construct the message to query our friends
-        let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), self.our_id.clone(), target);
-
-        // send the message and await for a response
-        let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
-
-        if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
-            // the nodes come back as one giant byte string, each 26 bytes is a node
-            // we split them up and create a vector of them
-            let mut nodes: Vec<_> = find_node_response.nodes;
-
-            // TODO: fix this
-            // some clients will return duplicate nodes, so we remove them
-            // nodes.sort_unstable_by_key(|node| {
-            //     let ip: SocketAddrV4 = node.into();
-            //     ip
-            // });
-            nodes.dedup();
-
-            Ok(nodes)
-        } else {
-            Err(DhtServiceFailure {
-                message: "Did not get an find node response".to_string(),
-            })
-        }
+        // let transaction_id = self.transaction_id_pool.next();
+        // let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), self.our_id.clone(), target);
+        //
+        // // send the message and await for a response
+        // let time_out = Duration::from_secs(15);
+        // let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        //
+        // if let Krpc::FindNodeGetPeersNonCompliantResponse(find_node_response) = response {
+        //     // the nodes come back as one giant byte string, each 26 bytes is a node
+        //     // we split them up and create a vector of them
+        //     let mut nodes: Vec<_> = find_node_response.nodes;
+        //
+        //     // TODO: fix this
+        //     // some clients will return duplicate nodes, so we remove them
+        //     // nodes.sort_unstable_by_key(|node| {
+        //     //     let ip: SocketAddrV4 = node.into();
+        //     //     ip
+        //     // });
+        //     nodes.dedup();
+        //
+        //     Ok(nodes)
+        // } else {
+        //     Err(DhtServiceFailure {
+        //         message: "Did not get an find node response".to_string(),
+        //     })
+        // }
     }
 
     #[instrument(skip(self))]
@@ -166,70 +168,71 @@ impl DhtClientV4 {
     ) -> Result<(Option<Token>, Either<Vec<NodeInfo>, Vec<PeerContact>>), DhtServiceFailure> {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
-        let transaction_id = self.transaction_id_pool.next();
-        // TODO: wtf, it expects a token?
-        let query = Krpc::new_get_peers_query(
-            TransactionId::from(transaction_id),
-            self.our_id.clone(),
-            InfoHash::from_bytes_unchecked(*&b"borken!"),
-        );
-
+        todo!()
+        // let transaction_id = self.transaction_id_pool.next();
+        // // TODO: wtf, it expects a token?
+        // let query = Krpc::new_get_peers_query(
+        //     TransactionId::from(transaction_id),
+        //     self.our_id.clone(),
+        //     InfoHash::from_bytes_unchecked(*&b"borken!"),
+        // );
+        //
         // send the message and await for a response
-        let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
-        return match response {
-            Krpc::GetPeersDeferredResponse(response) => {
-                // make sure we don't get duplicate nodes
-                let mut nodes = response.nodes;
-
-                // TODO: define an order for nodes??
-                // nodes.sort_unstable_by_key(|node| *node.);
-                nodes.dedup();
-
-                trace!(
-                    "got a deferred response from {}, returned nodes: {:#?}",
-                    interlocutor,
-                    &nodes
-                );
-                Ok((Some(response.token), Either::Left(nodes)))
-            }
-            Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
-                // make sure we don't get duplicate nodes
-                let mut nodes = response.nodes;
-
-                // TODO: define an order for nodes??
-                // nodes.sort_unstable_by_key(|node| node.into());
-                nodes.dedup();
-                trace!(
-                    "got a deferred response from {} (token missing), returned nodes {:#?}",
-                    interlocutor,
-                    &nodes
-                );
-
-                Ok((None, Either::Left(nodes)))
-            }
-            Krpc::GetPeersSuccessResponse(response) => {
-                let mut values = response.values;
-                // TODO: define an order for nodes??
-                // values.sort_unstable_by_key(|value| value.into());
-                values.dedup();
-
-                trace!("got a success response from {}, values {:#?}", interlocutor, &values);
-                Ok((Some(response.token), Either::Right(values)))
-            }
-            Krpc::ErrorResponse(response) => {
-                warn!("Got an error response to get peers: {:?}", response);
-                Err(DhtServiceFailure {
-                    message: "Got an error response to get peers".to_string(),
-                })
-            }
-            other => {
-                warn!("Unexpected response to get peers: {:?}", other);
-                Err(DhtServiceFailure {
-                    message: "Unexpected response to get peers".to_string(),
-                })
-            }
-        };
+        // let time_out = Duration::from_secs(15);
+        // let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        // return match response {
+        //     Krpc::GetPeersDeferredResponse(response) => {
+        //         // make sure we don't get duplicate nodes
+        //         let mut nodes = response.nodes;
+        //
+        //         // TODO: define an order for nodes??
+        //         // nodes.sort_unstable_by_key(|node| *node.);
+        //         nodes.dedup();
+        //
+        //         trace!(
+        //             "got a deferred response from {}, returned nodes: {:#?}",
+        //             interlocutor,
+        //             &nodes
+        //         );
+        //         Ok((Some(response.token), Either::Left(nodes)))
+        //     }
+        //     Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
+        //         // make sure we don't get duplicate nodes
+        //         let mut nodes = response.nodes;
+        //
+        //         // TODO: define an order for nodes??
+        //         // nodes.sort_unstable_by_key(|node| node.into());
+        //         nodes.dedup();
+        //         trace!(
+        //             "got a deferred response from {} (token missing), returned nodes {:#?}",
+        //             interlocutor,
+        //             &nodes
+        //         );
+        //
+        //         Ok((None, Either::Left(nodes)))
+        //     }
+        //     Krpc::GetPeersSuccessResponse(response) => {
+        //         let mut values = response.values;
+        //         // TODO: define an order for nodes??
+        //         // values.sort_unstable_by_key(|value| value.into());
+        //         values.dedup();
+        //
+        //         trace!("got a success response from {}, values {:#?}", interlocutor, &values);
+        //         Ok((Some(response.token), Either::Right(values)))
+        //     }
+        //     Krpc::ErrorResponse(response) => {
+        //         warn!("Got an error response to get peers: {:?}", response);
+        //         Err(DhtServiceFailure {
+        //             message: "Got an error response to get peers".to_string(),
+        //         })
+        //     }
+        //     other => {
+        //         warn!("Unexpected response to get peers: {:?}", other);
+        //         Err(DhtServiceFailure {
+        //             message: "Unexpected response to get peers".to_string(),
+        //         })
+        //     }
+        // };
     }
 
     /// starting point of trying to find any nodes on the network

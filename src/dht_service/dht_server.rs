@@ -227,20 +227,19 @@ impl DhtServer {
         let table = self.routing_table.read().await;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
+        use crate::message::find_node_get_peers_response::Builder;
         // if we have an exact match, it will be the first element in the vector
         return if &closest_eight[0].id == query.target_id() {
-            Krpc::new_find_node_response(
-                query.txn_id().clone(),
-                self.our_id.clone(),
-                vec![closest_eight[0].clone()],
-            )
+            let res = Builder::new(query.txn_id().clone(), self.our_id)
+                .with_node(closest_eight[0].clone())
+                .build();
+            Krpc::FindNodeGetPeersResponse(res)
         } else {
-            // let bytes = closest_eight.to_concated_node_contact();
-            Krpc::new_find_node_response(
-                query.txn_id().clone(),
-                self.our_id.clone(),
-                closest_eight.into_iter().cloned().collect(),
-            )
+            let stupid: Vec<_> = closest_eight.into_iter().cloned().collect();
+            let res = Builder::new(query.txn_id().clone(), self.our_id)
+                .with_nodes(&stupid)
+                .build();
+            Krpc::FindNodeGetPeersResponse(res)
         };
     }
 
@@ -264,7 +263,14 @@ impl DhtServer {
             let peers: Vec<_> = peers.iter().cloned().collect();
 
             let token = token_pool.token_for_addr(origin.ip()).await;
-            Krpc::new_get_peers_success_response(query.txn_id().clone(), self.our_id.clone(), token, peers)
+
+            use crate::message::find_node_get_peers_response::Builder;
+
+            let res = Builder::new(query.txn_id().clone(), self.our_id.clone())
+                .with_token(token)
+                .with_values(&peers)
+                .build();
+            Krpc::FindNodeGetPeersResponse(res)
         } else {
             let closest_eight: Vec<_> = self
                 .routing_table
@@ -278,7 +284,14 @@ impl DhtServer {
 
             let token = token_pool.token_for_addr(&origin.ip()).await;
 
-            Krpc::new_get_peers_deferred_response(query.txn_id().clone(), self.our_id.clone(), token, closest_eight)
+            // defferred
+
+            use crate::message::find_node_get_peers_response::Builder;
+            let res = Builder::new(query.txn_id().clone(), self.our_id.clone())
+                .with_token(token)
+                .with_nodes(&closest_eight)
+                .build();
+            Krpc::FindNodeGetPeersResponse(res)
         };
     }
 
