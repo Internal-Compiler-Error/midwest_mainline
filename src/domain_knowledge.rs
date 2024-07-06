@@ -107,10 +107,10 @@ impl ToBencode for Token {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct PeerContact(pub SocketAddrV4);
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct NodeInfo {
     pub id: NodeId,
     pub contact: PeerContact,
