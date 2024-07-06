@@ -25,7 +25,6 @@ use tracing::{error, info, info_span, trace, Instrument};
 
 #[derive(Debug)]
 struct TokenPool {
-    // TODO: define a type for token
     assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
     salt: Arc<RwLock<[u8; 128]>>,
 }
@@ -57,7 +56,7 @@ impl TokenPool {
             }
         };
 
-        // huh?
+        // TODO: huh?
         let task = Builder::new()
             .name("five minute salt")
             .spawn(new_salt_every_five_minutes);
@@ -144,7 +143,10 @@ impl DhtServer {
 
     #[tracing::instrument]
     pub(crate) async fn run(self: Arc<Self>) {
-        Builder::new().name("token pool").spawn(self.token_pool.clone().run());
+        Builder::new()
+            .name("token pool")
+            .spawn(self.token_pool.clone().run())
+            .unwrap();
 
         let mut requests = (&self).requests.lock().await;
         while let Some((request, socket_addr)) = requests.recv().await {
@@ -152,23 +154,26 @@ impl DhtServer {
 
             let server = self.clone();
 
-            Builder::new().name(&*format!("responding to {socket_addr}")).spawn(
-                async move {
-                    let server = &*server;
-                    let response = server.generate_response(request, socket_addr).await;
-                    trace!("Handling request from {socket_addr}");
+            Builder::new()
+                .name(&*format!("responding to {socket_addr}"))
+                .spawn(
+                    async move {
+                        let server = &*server;
+                        let response = server.generate_response(request, socket_addr).await;
+                        trace!("Handling request from {socket_addr}");
 
-                    if let Some(response) = response {
-                        let serialized = response.to_raw_krpc();
-                        server.socket.send_to(&serialized, socket_addr).await?;
-                        trace!("response sent for {socket_addr}");
+                        if let Some(response) = response {
+                            let serialized = response.to_raw_krpc();
+                            server.socket.send_to(&serialized, socket_addr).await?;
+                            trace!("response sent for {socket_addr}");
+                        }
+
+                        info!("table = {:#?}", server.hash_table.read().await.len());
+                        Ok::<_, color_eyre::Report>(())
                     }
-
-                    info!("table = {:#?}", server.hash_table.read().await.len());
-                    Ok::<_, color_eyre::Report>(())
-                }
-                .instrument(info_span!("handle_requests")),
-            );
+                    .instrument(info_span!("handle_requests")),
+                )
+                .unwrap();
         }
     }
 

@@ -234,7 +234,8 @@ impl DhtV4 {
         join_set
             .build_task()
             .name(&*format!("socket reader for {bind_addr}"))
-            .spawn(socket_reader.instrument(info_span!("socket reader")));
+            .spawn(socket_reader.instrument(info_span!("socket reader")))
+            .unwrap();
 
         let demultiplexer = MessageDemultiplexer::new(incoming_packets_rx, queries_tx);
         let demultiplexer = Arc::new(demultiplexer);
@@ -245,7 +246,8 @@ impl DhtV4 {
             .name(&*format!("message demultiplexer for {bind_addr}"))
             .spawn(async move {
                 demultiplexer_clone.run().await;
-            });
+            })
+            .unwrap();
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(&our_id)));
 
@@ -265,7 +267,8 @@ impl DhtV4 {
             bootstrap_join_set
                 .build_task()
                 .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(client.clone(), contact));
+                .spawn(Self::bootstrap_from(client.clone(), contact))
+                .unwrap();
         }
 
         while let Some(_) = bootstrap_join_set.join_next().await {}
@@ -283,7 +286,8 @@ impl DhtV4 {
         join_set
             .build_task()
             .name(&*format!("DHT server for {bind_addr}"))
-            .spawn(server.clone().run());
+            .spawn(server.clone().run())
+            .unwrap();
 
         let dht = DhtV4 {
             client: client.clone(),
@@ -371,7 +375,8 @@ impl DhtV4 {
                             }
                         }
                         Ok::<_, color_eyre::Report>(())
-                    });
+                    })
+                    .unwrap();
             }
             info!("bootstrapping with {contact} succeeded");
         }
@@ -393,13 +398,13 @@ impl DhtV4 {
 #[cfg(test)]
 mod tests {
     use crate::dht_service::DhtV4;
-    use num::{BigUint, Num};
-    use opentelemetry::global;
-    use rand::RngCore;
+    // use num::{BigUint, Num};
+    // use opentelemetry::global;
+    // use rand::RngCore;
     use std::{net::SocketAddrV4, str::FromStr, sync::Once};
-    use tokio::time::{self, timeout};
-    use tracing::info;
-    use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+    // use tokio::time::{self, timeout};
+    // use tracing::info;
+    // use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
     static TEST_INIT: Once = Once::new();
 

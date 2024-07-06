@@ -492,6 +492,7 @@ impl Krpc {
 
     // construct a response to a get_peers query when the peer is not directly found and the closest
     // nodes are returned
+    #[allow(unused)]
     pub fn new_get_peers_deferred_response_con_compliant(
         transaction_id: TransactionId,
         responding_id: NodeId,
