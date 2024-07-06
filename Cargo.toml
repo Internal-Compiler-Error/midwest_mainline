@@ -21,14 +21,11 @@ path = "src/parser_tester.rs"
 
 [dependencies]
 num = { version = "^0.4", features = ["alloc"] }
-bendy = { version = "^0.3", features = ["serde", "serde_bytes"] }
-serde = { version = "^1.0", features = ["derive"] }
-serde_with = "3.8.1"
+bendy = { version = "^0.3" }
 juicy_bencode = "^0.1"
-derive_more = "^0.99"
+# derive_more = "^0.99"
 rand = { version = "^0.8", features = ["small_rng"] }
 tokio = { version = "^1.38", features = ["full", "tracing"] }
-either = "^1.7"
 async-recursion = "1.1.0"
 futures = "0.3.30"
 color-eyre = "^0.6"
@@ -38,7 +35,6 @@ crc32c = "^0.6"
 hex = "^0.4"
 sha3 = "^0.10"
 pretty-hex = "0.4.1"
-serde_unit_struct = "^0.1"
 thiserror = "1.0.61"
 smallvec = "1.13.2"
 base64 = "0.22.1"
