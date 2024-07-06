@@ -4,6 +4,7 @@ use crate::domain_knowledge::{NodeInfo, PeerContact, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
+use bendy::value;
 use color_eyre::eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
@@ -172,7 +173,7 @@ impl ParseKrpc for &[u8] {
 
                 return Ok(Krpc::GetPeersQuery(get_peers));
             } else if query_type == &b"announce_peer" {
-                // todo: some stupid clients might not send this
+                // TODO: some stupid clients might not send this
                 let implied_port = arguments
                     .get(&b"implied_port".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'implied_port' key")))?;
@@ -242,45 +243,39 @@ impl ParseKrpc for &[u8] {
             let target_id = assert_len(&target_id, 20)?;
             let target_id = NodeId::from_bytes_unchecked(target_id);
 
-            if response.contains_key(b"nodes".as_slice()) {
-                let nodes = response.get(b"nodes".as_slice()).unwrap();
-                let BencodeItemView::ByteString(ref nodes) = nodes else {
-                    return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
-                };
+            // if the message contains a "nodes", then try to parse it out
+            let nodes = match response.contains_key(b"nodes".as_slice()) {
+                true => {
+                    let nodes = response.get(b"nodes".as_slice()).unwrap();
+                    let BencodeItemView::ByteString(ref nodes) = nodes else {
+                        return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
+                    };
 
-                // TODO: worry about when the length is a multiple of 26
-                let contacts: Vec<_> = nodes
-                    .chunks(26)
-                    .map(|info| {
-                        let node_id = &info[0..20];
-                        let contact = &info[20..26];
+                    // TODO: worry about when the length is a multiple of 26
+                    let contacts: Vec<_> = nodes
+                        .chunks(26)
+                        .map(|info| {
+                            let node_id = &info[0..20];
+                            let contact = &info[20..26];
 
-                        let node_id = NodeId::from_bytes_unchecked(node_id);
+                            let node_id = NodeId::from_bytes_unchecked(node_id);
 
-                        let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
-                        let port = u16::from_be_bytes([contact[4], contact[5]]);
-                        let contact = PeerContact(SocketAddrV4::new(ip, port));
+                            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
+                            let port = u16::from_be_bytes([contact[4], contact[5]]);
+                            let contact = PeerContact(SocketAddrV4::new(ip, port));
 
-                        NodeInfo { id: node_id, contact }
-                    })
-                    .collect();
+                            NodeInfo::new(node_id, contact)
+                        })
+                        .collect();
 
-                let res = Builder::new(transaction_id, target_id).with_nodes(&contacts).build();
+                    Some(contacts)
+                }
+                false => None,
+            };
 
-                let msg = Krpc::FindNodeGetPeersResponse(res);
-                return Ok(msg);
-                // find nodes response
-            } else if response.contains_key(b"token".as_slice()) {
-                // get_peers response
-                let token = response.get(b"token".as_slice()).unwrap();
-                let BencodeItemView::ByteString(token) = token else {
-                    return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
-                };
-                let token = Token::from_bytes(token);
-
-                if let Some(BencodeItemView::List(values)) = response.get(b"values".as_slice()) {
-                    // success, the peers can be contacted immediately
-
+            // if the message contains a "values" key, then try to parse it out
+            let values = match response.get(b"values".as_slice()) {
+                Some(BencodeItemView::List(values)) => {
                     let contacts: Vec<_> = values
                         .iter()
                         .filter_map(|x| match x {
@@ -296,54 +291,57 @@ impl ParseKrpc for &[u8] {
                         })
                         .collect();
 
-                    let res = Builder::new(transaction_id, target_id)
-                        .with_token(token)
-                        .with_values(&contacts)
-                        .build();
-                    let msg = Krpc::FindNodeGetPeersResponse(res);
-                    return Ok(msg);
-                } else if let Some(BencodeItemView::ByteString(nodes)) = response.get(b"nodes".as_slice()) {
-                    // deferred, nearest nodes returned
-                    let contacts: Vec<_> = nodes
-                        .chunks(26)
-                        .map(|info| {
-                            let node_id = &info[0..20];
-                            let contact = &info[20..26];
-
-                            let node_id = NodeId::from_bytes_unchecked(node_id);
-
-                            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
-                            let port = u16::from_be_bytes([contact[4], contact[5]]);
-                            let contact = PeerContact(SocketAddrV4::new(ip, port));
-
-                            NodeInfo { id: node_id, contact }
-                        })
-                        .collect();
-
-                    let res = Builder::new(transaction_id, target_id)
-                        .with_token(token)
-                        .with_nodes(&contacts)
-                        .build();
-                    let msg = Krpc::FindNodeGetPeersResponse(res);
-                    return Ok(msg);
-                } else {
-                    // invalid message
-                    return Err(OurError::DecodeError(eyre!("Invalid message")));
+                    Some(contacts)
                 }
-            } else if response.len() == 1 {
-                // only has id in the response
-                //
-                // could be a ping, or, announce peer, due to the horrible protocol design of KRPC
-                let res = PingAnnouncePeerResponse::new(transaction_id, target_id);
-                let msg = Krpc::PingAnnouncePeerResponse(res);
+                _ => None,
+            };
+
+            // if the message contains a "token" key, then try to parse it out
+            let token = match response.contains_key(b"token".as_slice()) {
+                true => {
+                    // get_peers response
+                    let token = response.get(b"token".as_slice()).unwrap();
+                    let BencodeItemView::ByteString(token) = token else {
+                        return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
+                    };
+                    let token = Token::from_bytes(token);
+                    Some(token)
+                }
+                false => None,
+            };
+
+            if nodes.is_none() && values.is_none() && token.is_none() {
+                // when they have none of these, then it's just a response to ping to announce query
+
+                let msg = PingAnnouncePeerResponse::new(transaction_id, target_id);
+                let msg = Krpc::PingAnnouncePeerResponse(msg);
                 return Ok(msg);
             } else {
-                // non-comliant response
-                return Err(OurError::DecodeError(eyre!("Invalid message")));
+                // otherwise it's response to get_peers or find_node
+                let builder = Builder::new(transaction_id, target_id);
+
+                let builder = match token {
+                    Some(token) => builder.with_token(token),
+                    None => builder,
+                };
+
+                let builder = match nodes {
+                    Some(nodes) => builder.with_nodes(&nodes),
+                    None => builder,
+                };
+
+                let builder = match values {
+                    Some(values) => builder.with_values(&values),
+                    None => builder,
+                };
+
+                let msg = builder.build();
+                let msg = Krpc::FindNodeGetPeersResponse(msg);
+                return Ok(msg);
             }
         } else {
             // invalid message
-            return Err(OurError::DecodeError(eyre!("Invalid message")));
+            return Err(OurError::DecodeError(eyre!("Unkown message type")));
         }
     }
 }
@@ -368,9 +366,6 @@ impl ToRawKrpc for Krpc {
             Krpc::FindNodeQuery(a) => a.to_raw_krpc(),
             Krpc::GetPeersQuery(a) => a.to_raw_krpc(),
             Krpc::PingQuery(a) => a.to_raw_krpc(),
-            // Krpc::GetPeersSuccessResponse(a) => a.to_raw_krpc(),
-            // Krpc::GetPeersDeferredResponse(a) => a.to_raw_krpc(),
-            // Krpc::FindNodeGetPeersNonCompliantResponse(a) => a.to_raw_krpc(),
             Krpc::FindNodeGetPeersResponse(a) => a.to_raw_krpc(),
             Krpc::PingAnnouncePeerResponse(a) => a.to_raw_krpc(),
             Krpc::ErrorResponse(a) => a.to_raw_krpc(),

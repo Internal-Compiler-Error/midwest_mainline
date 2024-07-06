@@ -40,7 +40,7 @@ impl ToBencode for NodeId {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct InfoHash(pub [u8; 20]);
 
 impl InfoHash {
@@ -56,6 +56,15 @@ impl InfoHash {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl Debug for InfoHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use base64::prelude::*;
+        // let hex = hex::encode(self.0);
+        let str = BASE64_STANDARD.encode(self.0);
+        write!(f, "{}", str)
     }
 }
 
