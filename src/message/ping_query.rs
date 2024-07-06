@@ -56,7 +56,7 @@ mod tests {
 
         let ping_query = BetterPingQuery::new(
             "aa".into(),
-            BetterNodeId::new("abcdefghij0123456789".to_string()).unwrap(),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );
 
         let serailzied = ping_query.to_raw_krpc();

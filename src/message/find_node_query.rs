@@ -63,8 +63,8 @@ mod tests {
 
         let query = BetterFindNodeQuery::new(
             "aa".to_string(),
-            BetterNodeId::new("abcdefghij0123456789".to_string()).unwrap(),
-            BetterNodeId::new("mnopqrstuvwxyz123456".to_string()).unwrap(),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         let encoded = query.to_raw_krpc();

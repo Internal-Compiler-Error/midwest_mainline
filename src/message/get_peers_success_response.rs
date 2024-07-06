@@ -91,7 +91,7 @@ mod tests {
 
         let response = super::BetterGetPeersSuccessResponse::new(
             "aa".to_string(),
-            BetterNodeId::new("abcdefghij0123456789".to_string()).unwrap(),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             "aoeusnth".to_string(),
             vec![
                 BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),

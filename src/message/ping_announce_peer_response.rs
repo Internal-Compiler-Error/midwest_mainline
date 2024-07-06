@@ -52,8 +52,10 @@ mod tests {
     fn can_encode_example() {
         use std::str;
 
-        let ping_response =
-            BetterPingAnnouncePeerResponse::new("aa".into(), BetterNodeId::new("mnopqrstuvwxyz123456".into()).unwrap());
+        let ping_response = BetterPingAnnouncePeerResponse::new(
+            "aa".into(),
+            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+        );
 
         let expected = "d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
         let encoded = ping_response.to_raw_krpc();

@@ -29,9 +29,6 @@ pub mod get_peers_success_response;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
 
-pub type InfoHash = [u8; 20];
-pub type TransactionId = Box<[u8]>;
-
 pub trait ToRawKrpc {
     fn to_raw_krpc(&self) -> Box<[u8]>;
 }
@@ -44,6 +41,14 @@ impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
     fn parse(&self) -> Result<Krpc, OurError> {
         use std::str;
+
+        fn assert_len(bytes: &[u8], len: usize) -> Result<&[u8], OurError> {
+            if bytes.len() == len {
+                Ok(bytes)
+            } else {
+                Err(OurError::DecodeError(eyre!("Should be {len} long")))
+            }
+        }
 
         let mut decoder = Decoder::new(self);
         let message = decoder
@@ -135,15 +140,11 @@ impl ParseKrpc for &[u8] {
             let BencodeItemView::ByteString(querier) = querier else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
-            let querier = str::from_utf8(querier)
-                .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                .to_string();
+
+            let querier = assert_len(querier, 20)?;
 
             if query_type == &b"ping" {
-                let ping = BetterPingQuery::new(
-                    transaction_id,
-                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
-                );
+                let ping = BetterPingQuery::new(transaction_id, BetterNodeId::from_bytes_unchecked(querier));
                 return Ok(Krpc::PingQuery(ping));
             } else if query_type == &b"find_node" {
                 let target = arguments
@@ -152,14 +153,12 @@ impl ParseKrpc for &[u8] {
                 let BencodeItemView::ByteString(target) = target else {
                     return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
                 };
-                let target = str::from_utf8(target)
-                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                    .to_string();
+                let target = assert_len(target, 20)?;
 
                 let find_node_request = BetterFindNodeQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
-                    BetterNodeId::new(target).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterNodeId::from_bytes_unchecked(querier),
+                    BetterNodeId::from_bytes_unchecked(target),
                 );
                 return Ok(Krpc::FindNodeQuery(find_node_request));
             } else if query_type == &b"get_peers" {
@@ -171,14 +170,12 @@ impl ParseKrpc for &[u8] {
                     return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
                 };
 
-                let info_hash = str::from_utf8(info_hash)
-                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                    .to_string();
+                let info_hash = assert_len(info_hash, 20)?;
+
                 let get_peers = BetterGetPeersQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
-                    BetterInfoHash::new(info_hash)
-                        .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterNodeId::from_bytes_unchecked(querier),
+                    BetterInfoHash::from_bytes_unchecked(info_hash),
                 );
 
                 return Ok(Krpc::GetPeersQuery(get_peers));
@@ -223,16 +220,13 @@ impl ParseKrpc for &[u8] {
                 let BencodeItemView::ByteString(info_hash) = info_hash else {
                     return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
                 };
-                let info_hash = str::from_utf8(info_hash)
-                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                    .to_string();
+                let info_hash = assert_len(info_hash, 20)?;
 
                 let announce_peer = BetterAnnouncePeerQuery::new(
                     transaction_id,
-                    BetterNodeId::new(querier).map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterNodeId::from_bytes_unchecked(querier),
                     port,
-                    BetterInfoHash::new(info_hash)
-                        .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?,
+                    BetterInfoHash::from_bytes_unchecked(info_hash),
                     token,
                 );
 
@@ -255,7 +249,8 @@ impl ParseKrpc for &[u8] {
             let BencodeItemView::ByteString(ref target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
-            let target_id = BetterNodeId::new(String::from_utf8(target_id.to_vec()).unwrap()).unwrap();
+            let target_id = assert_len(&target_id, 20)?;
+            let target_id = BetterNodeId::from_bytes_unchecked(target_id);
 
             if response.contains_key(b"nodes".as_slice()) {
                 let nodes = response.get(b"nodes".as_slice()).unwrap();
@@ -263,13 +258,14 @@ impl ParseKrpc for &[u8] {
                     return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
                 };
 
+                // TODO: worry about when the length is a multiple of 26
                 let contacts: Vec<_> = nodes
                     .chunks(26)
                     .map(|info| {
                         let node_id = &info[0..20];
                         let contact = &info[20..26];
 
-                        let node_id = BetterNodeId::new(String::from_utf8(node_id.to_vec()).unwrap()).unwrap();
+                        let node_id = BetterNodeId::from_bytes_unchecked(node_id);
 
                         let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
                         let port = u16::from_be_bytes([contact[4], contact[5]]);
@@ -324,7 +320,7 @@ impl ParseKrpc for &[u8] {
                             let node_id = &info[0..20];
                             let contact = &info[20..26];
 
-                            let node_id = BetterNodeId::new(String::from_utf8(node_id.to_vec()).unwrap()).unwrap();
+                            let node_id = BetterNodeId::from_bytes_unchecked(node_id);
 
                             let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
                             let port = u16::from_be_bytes([contact[4], contact[5]]);
@@ -584,7 +580,10 @@ mod test {
     fn can_parse_example_ping_query() {
         let message = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe" as &[u8];
         let deserialized = message.parse().unwrap();
-        let expected = Krpc::new_ping_query("aa".to_string(), BetterNodeId("abcdefghij0123456789".to_string()));
+        let expected = Krpc::new_ping_query(
+            "aa".to_string(),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+        );
         //println!("{:?}", String::from_utf8_lossy(&to_bytes(&expected)?));
         assert_eq!(deserialized, expected);
     }
@@ -597,8 +596,8 @@ mod test {
 
         let expected = Krpc::new_find_node_query(
             "aa".to_string(),
-            BetterNodeId("abcdefghij0123456789".to_string()),
-            BetterNodeId("mnopqrstuvwxyz123456".to_string()),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         assert_eq!(deserialized, expected);
@@ -612,8 +611,8 @@ mod test {
 
         let expected = Krpc::new_get_peers_query(
             "aa".to_string(),
-            BetterNodeId("abcdefghij0123456789".to_string()),
-            BetterInfoHash("mnopqrstuvwxyz123456".to_string()),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         // taken directly from the spec
@@ -628,8 +627,8 @@ mod test {
 
         let expected = Krpc::new_announce_peer_query(
             "aa".to_string(),
-            BetterInfoHash("mnopqrstuvwxyz123456".to_string()),
-            BetterNodeId("abcdefghij0123456789".to_string()),
+            BetterInfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
+            BetterNodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
             6881,
             true,
             "aoeusnth".to_string(),
@@ -644,7 +643,10 @@ mod test {
         let message = b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re" as &[u8];
         let decoded = message.parse().unwrap();
 
-        let expected = Krpc::new_ping_response("aa".to_string(), BetterNodeId("mnopqrstuvwxyz123456".to_string()));
+        let expected = Krpc::new_ping_response(
+            "aa".to_string(),
+            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+        );
         assert_eq!(decoded, expected);
     }
 
@@ -657,8 +659,8 @@ mod test {
         let txn_id = String::from_utf8(txn_id).unwrap();
 
         let responding = hex::decode("23307bc01f5e7cc56ba66314b36e69246304f870").unwrap();
-        let responding = String::from_utf8(responding).unwrap();
-        let responding = BetterNodeId(responding);
+        // let responding = String::from_utf8(responding).unwrap();
+        let responding = BetterNodeId::from_bytes_unchecked(&responding);
 
         let res_token = hex::decode("3704f7737408c5fef0f96bca389e4100f972859d").unwrap();
         let res_token = String::from_utf8(res_token).unwrap();

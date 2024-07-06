@@ -159,7 +159,6 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> BetterNodeId {
 
     id[19] = rand;
 
-    let id = String::from_utf8(id.to_vec()).unwrap();
     BetterNodeId(id)
 }
 

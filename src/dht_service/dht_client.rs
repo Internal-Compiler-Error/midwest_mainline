@@ -182,7 +182,7 @@ impl DhtClientV4 {
         let query = Krpc::new_get_peers_query(
             hex::encode(transaction_id.to_be_bytes()),
             self.our_id.clone(),
-            BetterInfoHash("borken!".to_string()),
+            BetterInfoHash::from_bytes_unchecked(*&b"borken!"),
         );
 
         // send the message and await for a response
@@ -295,8 +295,8 @@ impl DhtClientV4 {
             .into_iter()
             .flatten()
             .map(|node| {
-                let node_id = BigUint::from_bytes_be(node.node_id().0.as_bytes());
-                let our_id = BigUint::from_bytes_be(self.our_id.0.as_bytes());
+                let node_id = BigUint::from_bytes_be(node.node_id().as_bytes());
+                let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
                 let distance = our_id.bitxor(node_id);
 
                 (node, distance)

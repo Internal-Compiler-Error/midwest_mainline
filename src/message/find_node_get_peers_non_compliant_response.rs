@@ -53,21 +53,24 @@ impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
                     // number. Unfortunately, the bittorrent people are insane and decided to encode this as a string
                     // using ascii in network/big endian.
                     e.emit_pair_with(b"values", |e| {
-                        use std::str;
-
                         let combined = self.nodes.iter().map(|peer| {
                             let node_id = &peer.id;
-                            let _id_as_ascii = node_id.0.as_bytes();
 
                             let octets = peer.contact.0.ip().octets();
                             let port_in_ne = peer.contact.0.port().to_be_bytes();
 
-                            let ip_as_ascii = str::from_utf8(octets.as_slice()).expect("we know the ip is ascii");
-                            let port_as_ascii =
-                                str::from_utf8(port_in_ne.as_slice()).expect("we know the port is ascii");
+                            let mut arr = [0u8; 26];
+                            let id = &mut arr[0..20];
+                            id.copy_from_slice(&node_id.0);
 
-                            // TODO: shouldn't they be transmitted raw instead?
-                            format!("{}{}{}", node_id.0, ip_as_ascii, port_as_ascii)
+                            let ip = &mut arr[20..24];
+                            ip.copy_from_slice(&octets);
+
+                            let port = &mut arr[24..26];
+                            port.copy_from_slice(&port_in_ne);
+
+                            // because bendy is stupid
+                            Vec::from_iter(arr)
                         });
                         e.emit_unchecked_list(combined)
                     })
@@ -84,17 +87,24 @@ impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{domain_knowledge::BetterNodeId, message::{find_node_query::BetterFindNodeQuery, ToRawKrpc}};
+    use crate::{
+        domain_knowledge::BetterNodeId,
+        message::{find_node_query::BetterFindNodeQuery, ToRawKrpc},
+    };
 
-        #[test]
-        fn can_encode_example() {
-            let message = BetterFindNodeQuery::new("aa".to_string(), BetterNodeId("abcdefghij0123456789".to_string()), BetterNodeId("mnopqrstuvwxyz123456".to_string()));
-            let bytes = message.to_raw_krpc();
+    #[test]
+    fn can_encode_example() {
+        let message = BetterFindNodeQuery::new(
+            "aa".to_string(),
+            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+        );
+        let bytes = message.to_raw_krpc();
 
-            // taken directly from the spec
-            assert_eq!(
-                &*bytes,
-                b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q9:find_node1:t2:aa1:y1:qe" as &[u8]
-            );
+        // taken directly from the spec
+        assert_eq!(
+            &*bytes,
+            b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q9:find_node1:t2:aa1:y1:qe" as &[u8]
+        );
     }
 }
