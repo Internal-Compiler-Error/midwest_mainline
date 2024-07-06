@@ -40,9 +40,9 @@ impl ToBencode for NodeId {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct BetterInfoHash(pub [u8; 20]);
+pub struct InfoHash(pub [u8; 20]);
 
-impl BetterInfoHash {
+impl InfoHash {
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
         if bytes.len() != 20 {
             panic!("Info hash must be exactly 20 bytes");
@@ -50,7 +50,7 @@ impl BetterInfoHash {
 
         let mut arr = [0u8; 20];
         arr.copy_from_slice(bytes);
-        BetterInfoHash(arr)
+        InfoHash(arr)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -58,7 +58,7 @@ impl BetterInfoHash {
     }
 }
 
-impl ToBencode for BetterInfoHash {
+impl ToBencode for InfoHash {
     const MAX_DEPTH: usize = 0 as usize;
 
     fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {

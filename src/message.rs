@@ -5,18 +5,17 @@ use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
 use color_eyre::eyre::eyre;
-use find_node_get_peers_non_compliant_response::BetterFindNodeNonComGetPeersResponse;
-use get_peers_deferred_response::BetterGetPeersDeferredResponse;
-use get_peers_success_response::BetterGetPeersSuccessResponse;
-use ping_announce_peer_response::BetterPingAnnouncePeerResponse;
+use find_node_get_peers_non_compliant_response::FindNodeNonComGetPeersResponse;
+use get_peers_deferred_response::GetPeersDeferredResponse;
+use get_peers_success_response::GetPeersSuccessResponse;
+use ping_announce_peer_response::PingAnnouncePeerResponse;
 
-use crate::domain_knowledge::{BetterInfoHash, NodeId};
-use crate::message::announce_peer_query::BetterAnnouncePeerQuery;
+use crate::domain_knowledge::{InfoHash, NodeId};
+use crate::message::announce_peer_query::AnnouncePeerQuery;
 use crate::message::error::KrpcError;
-use crate::message::find_node_query::BetterFindNodeQuery;
-use crate::message::get_peers_query::BetterGetPeersQuery;
-use crate::message::ping_query::BetterPingQuery;
-use juicy_bencode;
+use crate::message::find_node_query::FindNodeQuery;
+use crate::message::get_peers_query::GetPeersQuery;
+use crate::message::ping_query::PingQuery;
 use juicy_bencode::{parse_bencode_dict, BencodeItemView};
 
 pub mod announce_peer_query;
@@ -141,7 +140,7 @@ impl ParseKrpc for &[u8] {
             let querier = assert_len(querier, 20)?;
 
             if query_type == &b"ping" {
-                let ping = BetterPingQuery::new(transaction_id, NodeId::from_bytes_unchecked(querier));
+                let ping = PingQuery::new(transaction_id, NodeId::from_bytes_unchecked(querier));
                 return Ok(Krpc::PingQuery(ping));
             } else if query_type == &b"find_node" {
                 let target = arguments
@@ -152,7 +151,7 @@ impl ParseKrpc for &[u8] {
                 };
                 let target = assert_len(target, 20)?;
 
-                let find_node_request = BetterFindNodeQuery::new(
+                let find_node_request = FindNodeQuery::new(
                     transaction_id,
                     NodeId::from_bytes_unchecked(querier),
                     NodeId::from_bytes_unchecked(target),
@@ -169,10 +168,10 @@ impl ParseKrpc for &[u8] {
 
                 let info_hash = assert_len(info_hash, 20)?;
 
-                let get_peers = BetterGetPeersQuery::new(
+                let get_peers = GetPeersQuery::new(
                     transaction_id,
                     NodeId::from_bytes_unchecked(querier),
-                    BetterInfoHash::from_bytes_unchecked(info_hash),
+                    InfoHash::from_bytes_unchecked(info_hash),
                 );
 
                 return Ok(Krpc::GetPeersQuery(get_peers));
@@ -217,11 +216,11 @@ impl ParseKrpc for &[u8] {
                 };
                 let info_hash = assert_len(info_hash, 20)?;
 
-                let announce_peer = BetterAnnouncePeerQuery::new(
+                let announce_peer = AnnouncePeerQuery::new(
                     transaction_id,
                     NodeId::from_bytes_unchecked(querier),
                     port,
-                    BetterInfoHash::from_bytes_unchecked(info_hash),
+                    InfoHash::from_bytes_unchecked(info_hash),
                     token,
                 );
 
@@ -270,7 +269,7 @@ impl ParseKrpc for &[u8] {
                     })
                     .collect();
 
-                let res = BetterFindNodeNonComGetPeersResponse {
+                let res = FindNodeNonComGetPeersResponse {
                     transaction_id,
                     target_id,
                     nodes: contacts,
@@ -304,7 +303,7 @@ impl ParseKrpc for &[u8] {
                         })
                         .collect();
 
-                    let res = BetterGetPeersSuccessResponse::new(transaction_id, target_id, token, contacts);
+                    let res = GetPeersSuccessResponse::new(transaction_id, target_id, token, contacts);
                     let msg = Krpc::GetPeersSuccessResponse(res);
                     return Ok(msg);
                 } else if let Some(BencodeItemView::ByteString(nodes)) = response.get(b"nodes".as_slice()) {
@@ -325,7 +324,7 @@ impl ParseKrpc for &[u8] {
                         })
                         .collect();
 
-                    let res = BetterGetPeersDeferredResponse::new(transaction_id, target_id, token, contacts);
+                    let res = GetPeersDeferredResponse::new(transaction_id, target_id, token, contacts);
                     let msg = Krpc::GetPeersDeferredResponse(res);
                     return Ok(msg);
                 } else {
@@ -336,7 +335,7 @@ impl ParseKrpc for &[u8] {
                 // only has id in the response
                 //
                 // could be a ping, or, announce peer, due to the horrible protocol design of KRPC
-                let res = BetterPingAnnouncePeerResponse::new(transaction_id, target_id);
+                let res = PingAnnouncePeerResponse::new(transaction_id, target_id);
                 let msg = Krpc::PingAnnouncePeerResponse(res);
                 return Ok(msg);
             } else {
@@ -352,15 +351,15 @@ impl ParseKrpc for &[u8] {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Krpc {
-    AnnouncePeerQuery(BetterAnnouncePeerQuery),
-    FindNodeQuery(BetterFindNodeQuery),
-    GetPeersQuery(BetterGetPeersQuery),
-    PingQuery(BetterPingQuery),
+    AnnouncePeerQuery(AnnouncePeerQuery),
+    FindNodeQuery(FindNodeQuery),
+    GetPeersQuery(GetPeersQuery),
+    PingQuery(PingQuery),
 
-    GetPeersSuccessResponse(BetterGetPeersSuccessResponse),
-    GetPeersDeferredResponse(BetterGetPeersDeferredResponse),
-    FindNodeGetPeersNonCompliantResponse(BetterFindNodeNonComGetPeersResponse),
-    PingAnnouncePeerResponse(BetterPingAnnouncePeerResponse),
+    GetPeersSuccessResponse(GetPeersSuccessResponse),
+    GetPeersDeferredResponse(GetPeersDeferredResponse),
+    FindNodeGetPeersNonCompliantResponse(FindNodeNonComGetPeersResponse),
+    PingAnnouncePeerResponse(PingAnnouncePeerResponse),
 
     ErrorResponse(KrpcError),
 }
@@ -379,23 +378,6 @@ impl ToRawKrpc for Krpc {
             Krpc::ErrorResponse(a) => a.to_raw_krpc(),
         }
     }
-}
-
-#[allow(non_camel_case_types)]
-pub(crate) mod query_methods {
-    use serde_unit_struct::{Deserialize_unit_struct, Serialize_unit_struct};
-
-    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-    pub(crate) struct find_node;
-
-    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-    pub(crate) struct ping;
-
-    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-    pub(crate) struct announce_peer;
-
-    #[derive(Debug, PartialEq, Eq, Deserialize_unit_struct, Serialize_unit_struct)]
-    pub(crate) struct get_peers;
 }
 
 impl Krpc {
@@ -441,41 +423,41 @@ impl Krpc {
     }
 
     pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
-        let ping = BetterPingQuery::new(transaction_id, querying_id);
+        let ping = PingQuery::new(transaction_id, querying_id);
         Krpc::PingQuery(ping)
     }
 
     pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
-        let find_node = BetterFindNodeQuery::new(transaction_id, querying_id, target_id);
+        let find_node = FindNodeQuery::new(transaction_id, querying_id, target_id);
         Krpc::FindNodeQuery(find_node)
     }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: BetterInfoHash) -> Krpc {
-        let get_peers = BetterGetPeersQuery::new(transaction_id, querying_id, info_hash);
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
+        let get_peers = GetPeersQuery::new(transaction_id, querying_id, info_hash);
         Krpc::GetPeersQuery(get_peers)
     }
 
     pub fn new_announce_peer_query(
         transaction_id: TransactionId,
-        info_hash: BetterInfoHash,
+        info_hash: InfoHash,
         querying_id: NodeId,
         port: u16,
         implied_port: bool,
         token: Token,
     ) -> Krpc {
         let port = if implied_port { Some(port) } else { None };
-        let announce_peer = BetterAnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
+        let announce_peer = AnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
         Krpc::AnnouncePeerQuery(announce_peer)
     }
 
     pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let ping_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
+        let ping_res = PingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(ping_res)
     }
 
     // construct a response to a find_node query
     pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Vec<NodeInfo>) -> Krpc {
-        let find_node_res = BetterFindNodeNonComGetPeersResponse {
+        let find_node_res = FindNodeNonComGetPeersResponse {
             transaction_id,
             target_id: responding_id,
             nodes,
@@ -491,7 +473,7 @@ impl Krpc {
         peers: Vec<PeerContact>,
     ) -> Krpc {
         let get_peers_success_response =
-            BetterGetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
+            GetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
         Krpc::GetPeersSuccessResponse(get_peers_success_response)
     }
 
@@ -504,7 +486,7 @@ impl Krpc {
         closest_nodes: Vec<NodeInfo>,
     ) -> Krpc {
         let get_peers_deferred_response =
-            BetterGetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
+            GetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
         Krpc::GetPeersDeferredResponse(get_peers_deferred_response)
     }
 
@@ -519,7 +501,7 @@ impl Krpc {
     }
 
     pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let announce_peer_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
+        let announce_peer_res = PingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(announce_peer_res)
     }
 
@@ -575,7 +557,6 @@ mod test {
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );
-        //println!("{:?}", String::from_utf8_lossy(&to_bytes(&expected)?));
         assert_eq!(deserialized, expected);
     }
 
@@ -603,7 +584,7 @@ mod test {
         let expected = Krpc::new_get_peers_query(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            InfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         // taken directly from the spec
@@ -618,7 +599,7 @@ mod test {
 
         let expected = Krpc::new_announce_peer_query(
             TransactionId::from_bytes(*&b"aa"),
-            BetterInfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
+            InfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
             NodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
             6881,
             true,

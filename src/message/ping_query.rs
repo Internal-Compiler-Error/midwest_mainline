@@ -3,12 +3,12 @@ use crate::domain_knowledge::{NodeId, TransactionId};
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterPingQuery {
+pub struct PingQuery {
     transaction_id: TransactionId,
     target_id: NodeId,
 }
 
-impl BetterPingQuery {
+impl PingQuery {
     pub fn new(transaction_id: TransactionId, target_id: NodeId) -> Self {
         Self {
             transaction_id,
@@ -25,7 +25,7 @@ impl BetterPingQuery {
     }
 }
 
-impl ToRawKrpc for BetterPingQuery {
+impl ToRawKrpc for PingQuery {
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -53,7 +53,7 @@ mod tests {
     fn can_encode_from_example() {
         use std::str;
 
-        let ping_query = BetterPingQuery::new(
+        let ping_query = PingQuery::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );

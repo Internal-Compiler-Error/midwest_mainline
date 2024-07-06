@@ -3,13 +3,13 @@ use crate::domain_knowledge::{NodeId, TransactionId};
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterFindNodeQuery {
+pub struct FindNodeQuery {
     transaction_id: TransactionId,
     ourself: NodeId,
     target: NodeId,
 }
 
-impl BetterFindNodeQuery {
+impl FindNodeQuery {
     pub fn new(transaction_id: TransactionId, ourself: NodeId, target: NodeId) -> Self {
         Self {
             transaction_id,
@@ -27,7 +27,7 @@ impl BetterFindNodeQuery {
     }
 }
 
-impl ToRawKrpc for BetterFindNodeQuery {
+impl ToRawKrpc for FindNodeQuery {
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -61,7 +61,7 @@ mod tests {
     fn can_encode_example() {
         use std::str;
 
-        let query = BetterFindNodeQuery::new(
+        let query = FindNodeQuery::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),

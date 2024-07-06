@@ -1,6 +1,6 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{BetterInfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
+    domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
     message::{Krpc, ToRawKrpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -171,7 +171,7 @@ impl DhtClientV4 {
         let query = Krpc::new_get_peers_query(
             TransactionId::from(transaction_id),
             self.our_id.clone(),
-            BetterInfoHash::from_bytes_unchecked(*&b"borken!"),
+            InfoHash::from_bytes_unchecked(*&b"borken!"),
         );
 
         // send the message and await for a response
@@ -496,7 +496,7 @@ impl DhtClientV4 {
 
     pub async fn get_peers(
         self: Arc<Self>,
-        info_hash: BetterInfoHash,
+        info_hash: InfoHash,
     ) -> Result<(Box<[u8]>, Vec<PeerContact>), DhtServiceFailure> {
         // TODO: verify this
 
@@ -545,7 +545,7 @@ impl DhtClientV4 {
     pub async fn announce_peers(
         self: Arc<Self>,
         recipient: SocketAddrV4,
-        info_hash: BetterInfoHash,
+        info_hash: InfoHash,
         port: Option<u16>,
         token: Token,
     ) -> Result<(), DhtServiceFailure> {

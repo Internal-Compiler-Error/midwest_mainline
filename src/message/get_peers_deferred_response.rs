@@ -3,7 +3,7 @@ use crate::domain_knowledge::{NodeId, NodeInfo, Token, TransactionId};
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterGetPeersDeferredResponse {
+pub struct GetPeersDeferredResponse {
     // TODO: make them private
     transaction_id: TransactionId,
     pub querier: NodeId,
@@ -11,7 +11,7 @@ pub struct BetterGetPeersDeferredResponse {
     pub nodes: Vec<NodeInfo>,
 }
 
-impl BetterGetPeersDeferredResponse {
+impl GetPeersDeferredResponse {
     pub fn new(transaction_id: TransactionId, querier: NodeId, token: Token, nodes: Vec<NodeInfo>) -> Self {
         Self {
             transaction_id,
@@ -26,7 +26,7 @@ impl BetterGetPeersDeferredResponse {
     }
 }
 
-impl ToRawKrpc for BetterGetPeersDeferredResponse {
+impl ToRawKrpc for GetPeersDeferredResponse {
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;

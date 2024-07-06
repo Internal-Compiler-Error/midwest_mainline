@@ -3,7 +3,7 @@ use crate::domain_knowledge::{NodeId, PeerContact, Token, TransactionId};
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterGetPeersSuccessResponse {
+pub struct GetPeersSuccessResponse {
     // TODO: make them private
     transaction_id: TransactionId,
     target_id: NodeId,
@@ -11,7 +11,7 @@ pub struct BetterGetPeersSuccessResponse {
     pub values: Vec<PeerContact>,
 }
 
-impl BetterGetPeersSuccessResponse {
+impl GetPeersSuccessResponse {
     pub fn new(transaction_id: TransactionId, target_id: NodeId, token: Token, values: Vec<PeerContact>) -> Self {
         Self {
             transaction_id,
@@ -30,7 +30,7 @@ impl BetterGetPeersSuccessResponse {
     }
 }
 
-impl ToRawKrpc for BetterGetPeersSuccessResponse {
+impl ToRawKrpc for GetPeersSuccessResponse {
     #[allow(unused_must_use)]
     // If you are the poor soul who has to read this, I offer my condolences.
     fn to_raw_krpc(&self) -> Box<[u8]> {
@@ -84,7 +84,7 @@ mod tests {
     fn can_encode_example() {
         use std::str;
 
-        let response = super::BetterGetPeersSuccessResponse::new(
+        let response = super::GetPeersSuccessResponse::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             Token::from_bytes(*&b"aoeusnth"),

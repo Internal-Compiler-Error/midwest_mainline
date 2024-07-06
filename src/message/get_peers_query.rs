@@ -1,16 +1,16 @@
-use crate::domain_knowledge::{BetterInfoHash, NodeId, TransactionId};
+use crate::domain_knowledge::{InfoHash, NodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterGetPeersQuery {
+pub struct GetPeersQuery {
     transaction_id: TransactionId,
     ourself: NodeId,
-    info_hash: BetterInfoHash,
+    info_hash: InfoHash,
 }
 
-impl BetterGetPeersQuery {
-    pub fn new(transaction_id: TransactionId, ourself: NodeId, info_hash: BetterInfoHash) -> Self {
+impl GetPeersQuery {
+    pub fn new(transaction_id: TransactionId, ourself: NodeId, info_hash: InfoHash) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -27,12 +27,12 @@ impl BetterGetPeersQuery {
         &self.ourself
     }
 
-    pub fn info_hash(&self) -> &BetterInfoHash {
+    pub fn info_hash(&self) -> &InfoHash {
         &self.info_hash
     }
 }
 
-impl ToRawKrpc for BetterGetPeersQuery {
+impl ToRawKrpc for GetPeersQuery {
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -67,10 +67,10 @@ mod tests {
     fn can_encode_exmaple() {
         use std::str;
 
-        let query = super::BetterGetPeersQuery::new(
+        let query = super::GetPeersQuery::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            InfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         let encoded = query.to_raw_krpc();

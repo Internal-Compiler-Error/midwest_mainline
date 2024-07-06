@@ -1,8 +1,8 @@
 use crate::{
-    domain_knowledge::{NodeInfo, PeerContact, BetterInfoHash, NodeId, Token},
+    domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token},
     message::{
-        announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery,
-        get_peers_query::BetterGetPeersQuery, ping_query::BetterPingQuery, Krpc, ToRawKrpc,
+        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
+        ping_query::PingQuery, Krpc, ToRawKrpc,
     },
     routing::RoutingTable,
 };
@@ -120,7 +120,7 @@ pub struct DhtServer {
     routing_table: Arc<RwLock<RoutingTable>>,
     our_id: NodeId,
     requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
-    hash_table: Arc<RwLock<HashMap<BetterInfoHash, Vec<PeerContact>>>>,
+    hash_table: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
     socket: Arc<UdpSocket>,
 }
@@ -191,7 +191,7 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_ping_response(&self, ping: BetterPingQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
@@ -208,7 +208,7 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_find_node_response(&self, query: BetterFindNodeQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
@@ -240,7 +240,7 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_get_peers_response(&self, query: BetterGetPeersQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
@@ -278,7 +278,7 @@ impl DhtServer {
     }
 
     #[tracing::instrument]
-    async fn generate_announce_peer_response(&self, announce: BetterAnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
+    async fn generate_announce_peer_response(&self, announce: AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
         if !self.token_pool.is_valid_token(&origin.ip(), announce.token()).await {
             return Krpc::new_standard_protocol_error(announce.txn_id().clone());

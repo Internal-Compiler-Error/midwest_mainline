@@ -3,15 +3,15 @@ use crate::domain_knowledge::{NodeId, NodeInfo, TransactionId};
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterFindNodeNonComGetPeersResponse {
+pub struct FindNodeNonComGetPeersResponse {
     pub transaction_id: TransactionId,
     pub target_id: NodeId,
     pub nodes: Vec<NodeInfo>,
 }
 
-impl BetterFindNodeNonComGetPeersResponse {
-    pub fn new(txn_id: TransactionId, target: NodeId, nodes: Vec<NodeInfo>) -> BetterFindNodeNonComGetPeersResponse {
-        BetterFindNodeNonComGetPeersResponse {
+impl FindNodeNonComGetPeersResponse {
+    pub fn new(txn_id: TransactionId, target: NodeId, nodes: Vec<NodeInfo>) -> FindNodeNonComGetPeersResponse {
+        FindNodeNonComGetPeersResponse {
             transaction_id: txn_id,
             target_id: target,
             nodes,
@@ -31,7 +31,7 @@ impl BetterFindNodeNonComGetPeersResponse {
     }
 }
 
-impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
+impl ToRawKrpc for FindNodeNonComGetPeersResponse {
     #[allow(unused_must_use)]
     fn to_raw_krpc(&self) -> Box<[u8]> {
         use bendy::encoding::Encoder;
@@ -85,12 +85,12 @@ impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
 mod tests {
     use crate::{
         domain_knowledge::{NodeId, TransactionId},
-        message::{find_node_query::BetterFindNodeQuery, ToRawKrpc},
+        message::{find_node_query::FindNodeQuery, ToRawKrpc},
     };
 
     #[test]
     fn can_encode_example() {
-        let message = BetterFindNodeQuery::new(
+        let message = FindNodeQuery::new(
             TransactionId::from_bytes(*&b"aa"),
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
