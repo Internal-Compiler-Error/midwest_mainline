@@ -165,170 +165,199 @@ impl DhtClientV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: NodeId,
+        // TODO: the assumption that success has no nodes is fundamentally wrong, sometimes, they
+        // do
     ) -> Result<(Option<Token>, Either<Vec<NodeInfo>, Vec<PeerContact>>), DhtServiceFailure> {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         todo!()
-        // let transaction_id = self.transaction_id_pool.next();
-        // // TODO: wtf, it expects a token?
-        // let query = Krpc::new_get_peers_query(
-        //     TransactionId::from(transaction_id),
-        //     self.our_id.clone(),
-        //     InfoHash::from_bytes_unchecked(*&b"borken!"),
-        // );
+        //     let transaction_id = self.transaction_id_pool.next();
+        //     // TODO: wtf, it expects a token?
+        //     let query = Krpc::new_get_peers_query(
+        //         TransactionId::from(transaction_id),
+        //         self.our_id.clone(),
+        //         InfoHash::from_bytes_unchecked(*&b"borken!"),
+        //     );
         //
-        // send the message and await for a response
-        // let time_out = Duration::from_secs(15);
-        // let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
-        // return match response {
-        //     Krpc::GetPeersDeferredResponse(response) => {
-        //         // make sure we don't get duplicate nodes
-        //         let mut nodes = response.nodes;
+        //     // send the message and await for a response
+        //     let time_out = Duration::from_secs(15);
+        //     let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
         //
-        //         // TODO: define an order for nodes??
-        //         // nodes.sort_unstable_by_key(|node| *node.);
-        //         nodes.dedup();
+        //     return match response {
+        //         Krpc::ErrorResponse(response) => {
+        //             warn!("Got an error response to get peers: {:?}", response);
+        //             Err(DhtServiceFailure {
+        //                 message: "Got an error response to get peers".to_string(),
+        //             })
+        //         },
+        //         Krpc::FindNodeGetPeersResponse(response) => {
+        //             let token = response.token().cloned();
         //
-        //         trace!(
-        //             "got a deferred response from {}, returned nodes: {:#?}",
-        //             interlocutor,
-        //             &nodes
-        //         );
-        //         Ok((Some(response.token), Either::Left(nodes)))
+        //             if let Some(ref nodes) = response.nodes() {
+        //                 let mut nodes = nodes.clone();
+        //                 // TODO: need sorting
+        //                 nodes.dedup();
+        //             }
+        //
+        //
+        //         },
+        //         other => {
+        //             warn!("Unexpected response to get peers: {:?}", other);
+        //             Err(DhtServiceFailure {
+        //                 message: "Unexpected response to get peers".to_string(),
+        //             })
+        //         }
         //     }
-        //     Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
-        //         // make sure we don't get duplicate nodes
-        //         let mut nodes = response.nodes;
         //
-        //         // TODO: define an order for nodes??
-        //         // nodes.sort_unstable_by_key(|node| node.into());
-        //         nodes.dedup();
-        //         trace!(
-        //             "got a deferred response from {} (token missing), returned nodes {:#?}",
-        //             interlocutor,
-        //             &nodes
-        //         );
+        //     return match response {
+        //         Krpc::GetPeersDeferredResponse(response) => {
+        //             // make sure we don't get duplicate nodes
+        //             let mut nodes = response.nodes;
         //
-        //         Ok((None, Either::Left(nodes)))
+        //             // TODO: define an order for nodes??
+        //             // nodes.sort_unstable_by_key(|node| *node.);
+        //             nodes.dedup();
+        //
+        //             trace!(
+        //                 "got a deferred response from {}, returned nodes: {:#?}",
+        //                 interlocutor,
+        //                 &nodes
+        //             );
+        //             Ok((Some(response.token), Either::Left(nodes)))
+        //         }
+        //         Krpc::FindNodeGetPeersNonCompliantResponse(response) => {
+        //             // make sure we don't get duplicate nodes
+        //             let mut nodes = response.nodes;
+        //
+        //             // TODO: define an order for nodes??
+        //             // nodes.sort_unstable_by_key(|node| node.into());
+        //             nodes.dedup();
+        //             trace!(
+        //                 "got a deferred response from {} (token missing), returned nodes {:#?}",
+        //                 interlocutor,
+        //                 &nodes
+        //             );
+        //
+        //             Ok((None, Either::Left(nodes)))
+        //         }
+        //         Krpc::GetPeersSuccessResponse(response) => {
+        //             let mut values = response.values;
+        //             // TODO: define an order for nodes??
+        //             // values.sort_unstable_by_key(|value| value.into());
+        //             values.dedup();
+        //
+        //             trace!("got a success response from {}, values {:#?}", interlocutor, &values);
+        //             Ok((Some(response.token), Either::Right(values)))
+        //         }
+        //         Krpc::ErrorResponse(response) => {
+        //             warn!("Got an error response to get peers: {:?}", response);
+        //             Err(DhtServiceFailure {
+        //                 message: "Got an error response to get peers".to_string(),
+        //             })
+        //         }
+        //         other => {
+        //             warn!("Unexpected response to get peers: {:?}", other);
+        //             Err(DhtServiceFailure {
+        //                 message: "Unexpected response to get peers".to_string(),
+        //             })
+        //         }
+        //     };
+        // }
+        //
+        // /// starting point of trying to find any nodes on the network
+        // pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<NodeInfo, DhtServiceFailure> {
+        //     // if we already know the node, then no need for any network requests
+        //     if let Some(node) = (&self).routing_table.read().await.find(target) {
+        //         return Ok(node.contact.clone());
         //     }
-        //     Krpc::GetPeersSuccessResponse(response) => {
-        //         let mut values = response.values;
-        //         // TODO: define an order for nodes??
-        //         // values.sort_unstable_by_key(|value| value.into());
-        //         values.dedup();
         //
-        //         trace!("got a success response from {}, values {:#?}", interlocutor, &values);
-        //         Ok((Some(response.token), Either::Right(values)))
+        //     // find the closest nodes that we know
+        //     let closest;
+        //     {
+        //         let table = (&self).routing_table.read().await;
+        //         closest = table.find_closest(target).into_iter().cloned().collect::<Vec<_>>();
         //     }
-        //     Krpc::ErrorResponse(response) => {
-        //         warn!("Got an error response to get peers: {:?}", response);
-        //         Err(DhtServiceFailure {
-        //             message: "Got an error response to get peers".to_string(),
+        //
+        //     let returned_nodes = closest
+        //         .into_iter()
+        //         .map(|node| {
+        //             // TODO: smelly
+        //             let ip: SocketAddrV4 = node.contact.0;
+        //             ip
         //         })
+        //         .map(|ip| self.clone().ask_her_for_nodes(ip, target.clone()))
+        //         .collect::<Vec<_>>();
+        //
+        //     let returned_nodes = returned_nodes.par_spawn_and_await().await?;
+        //
+        //     let returned_nodes: Vec<_> = returned_nodes
+        //         .into_iter()
+        //         .filter(|node| node.is_ok())
+        //         .map(|node| node.unwrap())
+        //         .collect();
+        //
+        //     // if they all ended in failure, then we can't find the node
+        //     if returned_nodes.len() == 0 {
+        //         return Err(DhtServiceFailure {
+        //             message: "Could not find node, all nodes requests ended in failure".to_string(),
+        //         });
         //     }
-        //     other => {
-        //         warn!("Unexpected response to get peers: {:?}", other);
-        //         Err(DhtServiceFailure {
-        //             message: "Unexpected response to get peers".to_string(),
+        //
+        //     // it's possible that some of the nodes returned are actually the node we're looking for
+        //     // so we check for that and return it if it's the case
+        //     let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
+        //
+        //     if target_node.is_some() {
+        //         return Ok(target_node.unwrap().clone());
+        //     }
+        //
+        //     // if we don't have the node, then we find the alpha closest nodes and ask them in turn
+        //     let mut sorted_by_distance: Vec<_> = returned_nodes
+        //         .into_iter()
+        //         .flatten()
+        //         .map(|node| {
+        //             let node_id = BigUint::from_bytes_be(node.node_id().as_bytes());
+        //             let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
+        //             let distance = our_id.bitxor(node_id);
+        //
+        //             (node, distance)
         //         })
+        //         .collect();
+        //     sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
+        //
+        //     // add all the nodes we have visited so far
+        //     let seen_node: Arc<Mutex<HashSet<NodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+        //     {
+        //         let mut seen = seen_node.lock().await;
+        //         sorted_by_distance.iter().for_each(|(node, _)| {
+        //             seen.insert(node.clone());
+        //         });
         //     }
-        // };
-    }
-
-    /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<NodeInfo, DhtServiceFailure> {
-        // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).routing_table.read().await.find(target) {
-            return Ok(node.contact.clone());
-        }
-
-        // find the closest nodes that we know
-        let closest;
-        {
-            let table = (&self).routing_table.read().await;
-            closest = table.find_closest(target).into_iter().cloned().collect::<Vec<_>>();
-        }
-
-        let returned_nodes = closest
-            .into_iter()
-            .map(|node| {
-                // TODO: smelly
-                let ip: SocketAddrV4 = node.contact.0;
-                ip
-            })
-            .map(|ip| self.clone().ask_her_for_nodes(ip, target.clone()))
-            .collect::<Vec<_>>();
-
-        let returned_nodes = returned_nodes.par_spawn_and_await().await?;
-
-        let returned_nodes: Vec<_> = returned_nodes
-            .into_iter()
-            .filter(|node| node.is_ok())
-            .map(|node| node.unwrap())
-            .collect();
-
-        // if they all ended in failure, then we can't find the node
-        if returned_nodes.len() == 0 {
-            return Err(DhtServiceFailure {
-                message: "Could not find node, all nodes requests ended in failure".to_string(),
-            });
-        }
-
-        // it's possible that some of the nodes returned are actually the node we're looking for
-        // so we check for that and return it if it's the case
-        let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
-
-        if target_node.is_some() {
-            return Ok(target_node.unwrap().clone());
-        }
-
-        // if we don't have the node, then we find the alpha closest nodes and ask them in turn
-        let mut sorted_by_distance: Vec<_> = returned_nodes
-            .into_iter()
-            .flatten()
-            .map(|node| {
-                let node_id = BigUint::from_bytes_be(node.node_id().as_bytes());
-                let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
-                let distance = our_id.bitxor(node_id);
-
-                (node, distance)
-            })
-            .collect();
-        sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
-
-        // add all the nodes we have visited so far
-        let seen_node: Arc<Mutex<HashSet<NodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
-        {
-            let mut seen = seen_node.lock().await;
-            sorted_by_distance.iter().for_each(|(node, _)| {
-                seen.insert(node.clone());
-            });
-        }
-
-        let (tx, rx) = oneshot::channel();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-
-        let starting_pool: Vec<NodeInfo> = sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
-
-        let dht = self.clone();
-        let target = target.clone();
-        let mut parallel_find = tokio::spawn(async move {
-            let _ = dht
-                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, tx)
-                .await;
-        });
-
-        tokio::select! {
-             _ = &mut parallel_find => {
-                Err(DhtServiceFailure {
-                    message: "Could not find node, all nodes requests ended in failure".to_string(),
-                })
-            },
-            Ok(target) = rx => {
-                parallel_find.abort();
-                Ok(target)
-            },
-        }
+        //
+        //     let (tx, rx) = oneshot::channel();
+        //     let tx = Arc::new(Mutex::new(Some(tx)));
+        //
+        //     let starting_pool: Vec<NodeInfo> = sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
+        //
+        //     let dht = self.clone();
+        //     let target = target.clone();
+        //     let mut parallel_find = tokio::spawn(async move {
+        //         let _ = dht
+        //             .recursive_find_from_pool(starting_pool, target.clone(), seen_node, tx)
+        //             .await;
+        //     });
+        //
+        //     tokio::select! {
+        //          _ = &mut parallel_find => {
+        //             Err(DhtServiceFailure {
+        //                 message: "Could not find node, all nodes requests ended in failure".to_string(),
+        //             })
+        //         },
+        //         Ok(target) = rx => {
+        //             parallel_find.abort();
+        //             Ok(target)
+        //         },
+        //     }
     }
 
     #[async_recursion]

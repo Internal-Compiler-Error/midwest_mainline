@@ -1,4 +1,5 @@
 #![allow(unused_variables, dead_code)]
+
 use crate::domain_knowledge::{NodeId, NodeInfo, PeerContact, Token, TransactionId};
 
 use super::ToRawKrpc;
@@ -75,6 +76,35 @@ impl Builder {
 impl FindNodeGetPeersResponse {
     pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
+    }
+
+    pub fn is_get_peer_success(&self) -> bool {
+        // TODO: do we need to care if the token exists?
+        !self.values.is_empty()
+    }
+
+    pub fn is_get_peer_defferred(&self) -> bool {
+        !self.is_get_peer_success()
+    }
+
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    pub fn peer_id(&self) -> &NodeId {
+        &self.peer_id
+    }
+
+    pub fn token(&self) -> Option<&Token> {
+        self.token.as_ref()
+    }
+
+    pub fn values(&self) -> &Vec<PeerContact> {
+        &self.values
+    }
+
+    pub fn nodes(&self) -> &Vec<NodeInfo> {
+        &self.nodes
     }
 }
 

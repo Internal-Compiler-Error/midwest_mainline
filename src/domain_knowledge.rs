@@ -1,4 +1,5 @@
 use bendy::encoding::ToBencode;
+use num::traits::ops::bytes;
 use smallvec::SmallVec;
 use std::{fmt::Debug, net::SocketAddrV4};
 
@@ -143,10 +144,11 @@ impl TransactionId {
     }
 }
 
-impl From<u16> for TransactionId {
-    fn from(value: u16) -> Self {
-        let bytes = value.to_be_bytes();
-        let bytes = SmallVec::from_buf(bytes);
-        TransactionId(bytes)
+impl<T, const N: usize> From<T> for TransactionId
+where
+    T: num::Integer + bytes::ToBytes<Bytes = [u8; N]>,
+{
+    fn from(value: T) -> Self {
+        TransactionId::from_bytes(&value.to_be_bytes())
     }
 }
