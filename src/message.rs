@@ -4,7 +4,6 @@ use crate::domain_knowledge::{NodeInfo, PeerContact, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
-use bendy::value;
 use color_eyre::eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
