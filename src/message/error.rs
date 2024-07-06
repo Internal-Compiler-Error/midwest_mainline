@@ -1,14 +1,14 @@
-use crate::message::ToRawKrpc;
+use crate::{domain_knowledge::TransactionId, message::ToRawKrpc};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct KrpcError {
-    transaction_id: String,
+    transaction_id: TransactionId,
     code: u32,
     message: String,
 }
 
 impl KrpcError {
-    pub fn new(transaction_id: String, code: u32, message: String) -> Self {
+    pub fn new(transaction_id: TransactionId, code: u32, message: String) -> Self {
         Self {
             transaction_id,
             code,
@@ -16,7 +16,7 @@ impl KrpcError {
         }
     }
 
-    pub fn new_generic(transaction_id: String) -> Self {
+    pub fn new_generic(transaction_id: TransactionId) -> Self {
         Self {
             transaction_id,
             code: 201,
@@ -24,7 +24,7 @@ impl KrpcError {
         }
     }
 
-    pub fn new_server(transaction_id: String) -> Self {
+    pub fn new_server(transaction_id: TransactionId) -> Self {
         Self {
             transaction_id,
             code: 202,
@@ -32,7 +32,7 @@ impl KrpcError {
         }
     }
 
-    pub fn new_protocol(transaction_id: String) -> Self {
+    pub fn new_protocol(transaction_id: TransactionId) -> Self {
         Self {
             transaction_id,
             code: 203,
@@ -40,7 +40,7 @@ impl KrpcError {
         }
     }
 
-    pub fn new_method_unknown(transaction_id: String) -> Self {
+    pub fn new_method_unknown(transaction_id: TransactionId) -> Self {
         Self {
             transaction_id,
             code: 204,
@@ -48,7 +48,7 @@ impl KrpcError {
         }
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 }
@@ -60,7 +60,7 @@ impl ToRawKrpc for KrpcError {
 
         let mut encoder = Encoder::new();
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair(b"t", self.transaction_id.as_bytes());
             e.emit_pair(b"y", &"e");
             e.emit_pair_with(b"e", |e| {
                 e.emit_list(|e| {

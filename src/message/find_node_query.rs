@@ -1,16 +1,16 @@
-use crate::domain_knowledge::BetterNodeId;
+use crate::domain_knowledge::{BetterNodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterFindNodeQuery {
-    transaction_id: String,
+    transaction_id: TransactionId,
     ourself: BetterNodeId,
     target: BetterNodeId,
 }
 
 impl BetterFindNodeQuery {
-    pub fn new(transaction_id: String, ourself: BetterNodeId, target: BetterNodeId) -> Self {
+    pub fn new(transaction_id: TransactionId, ourself: BetterNodeId, target: BetterNodeId) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -18,7 +18,7 @@ impl BetterFindNodeQuery {
         }
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 
@@ -34,7 +34,7 @@ impl ToRawKrpc for BetterFindNodeQuery {
 
         let mut encoder = Encoder::new();
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", &"q");
             e.emit_pair(b"q", &"find_node");
 
@@ -62,7 +62,7 @@ mod tests {
         use std::str;
 
         let query = BetterFindNodeQuery::new(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );

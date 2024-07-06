@@ -1,5 +1,5 @@
 use crate::{
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId},
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, Token},
     message::{
         announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery,
         get_peers_query::BetterGetPeersQuery, ping_query::BetterPingQuery, Krpc, ToRawKrpc,
@@ -26,7 +26,7 @@ use tracing::{error, info, info_span, trace, Instrument};
 #[derive(Debug)]
 struct TokenPool {
     // TODO: define a type for token
-    assigned: Arc<Mutex<HashMap<Ipv4Addr, (String, Instant)>>>,
+    assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
     salt: Arc<RwLock<[u8; 128]>>,
 }
 
@@ -66,7 +66,7 @@ impl TokenPool {
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
     /// existing token.
-    pub(crate) async fn token_for_addr(&self, addr: &Ipv4Addr) -> String {
+    pub(crate) async fn token_for_addr(&self, addr: &Ipv4Addr) -> Token {
         let mut assigned = self.assigned.lock().await;
         let entry = assigned.entry(*addr);
 
@@ -96,21 +96,22 @@ impl TokenPool {
     }
 
     /// See as the moment of calling, is the token correct?
-    pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &str) -> bool {
+    pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &Token) -> bool {
         let expected_token = self.generate_token(addr).await;
-        &*expected_token == token
+        expected_token == *token
     }
 
     /// generate what the token for the address should be as this current moment
-    async fn generate_token(&self, addr: &Ipv4Addr) -> String {
+    async fn generate_token(&self, addr: &Ipv4Addr) -> Token {
         let mut hasher = Sha3_256::new();
         let salt = self.salt.read().await;
         hasher.update(&*salt);
         hasher.update(addr.octets());
 
         let digest = hasher.finalize();
-        String::from_utf8(digest.as_slice().to_vec()).unwrap()
+        // String::from_utf8(digest.as_slice().to_vec()).unwrap()
         // Box::from(digest.as_slice())
+        Token::from_bytes(digest.as_slice())
     }
 }
 
@@ -203,7 +204,7 @@ impl DhtServer {
             routing_table.add_new_node(peer);
         }
 
-        Krpc::new_ping_response(ping.txn_id().to_string(), self.our_id.clone())
+        Krpc::new_ping_response(ping.txn_id().clone(), self.our_id.clone())
     }
 
     #[tracing::instrument]
@@ -224,14 +225,14 @@ impl DhtServer {
         // if we have an exact match, it will be the first element in the vector
         return if &closest_eight[0].id == query.target_id() {
             Krpc::new_find_node_response(
-                query.txn_id().to_string(),
+                query.txn_id().clone(),
                 self.our_id.clone(),
                 vec![closest_eight[0].clone()],
             )
         } else {
             // let bytes = closest_eight.to_concated_node_contact();
             Krpc::new_find_node_response(
-                query.txn_id().to_string(),
+                query.txn_id().clone(),
                 self.our_id.clone(),
                 closest_eight.into_iter().cloned().collect(),
             )
@@ -258,7 +259,7 @@ impl DhtServer {
             let peers: Vec<_> = peers.iter().cloned().collect();
 
             let token = token_pool.token_for_addr(origin.ip()).await;
-            Krpc::new_get_peers_success_response(query.txn_id().to_string(), self.our_id.clone(), token, peers)
+            Krpc::new_get_peers_success_response(query.txn_id().clone(), self.our_id.clone(), token, peers)
         } else {
             let closest_eight: Vec<_> = self
                 .routing_table
@@ -272,7 +273,7 @@ impl DhtServer {
 
             let token = token_pool.token_for_addr(&origin.ip()).await;
 
-            Krpc::new_get_peers_deferred_response(query.txn_id().to_string(), self.our_id.clone(), token, closest_eight)
+            Krpc::new_get_peers_deferred_response(query.txn_id().clone(), self.our_id.clone(), token, closest_eight)
         };
     }
 
@@ -280,7 +281,7 @@ impl DhtServer {
     async fn generate_announce_peer_response(&self, announce: BetterAnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
         if !self.token_pool.is_valid_token(&origin.ip(), announce.token()).await {
-            return Krpc::new_standard_protocol_error(announce.txn_id().to_string());
+            return Krpc::new_standard_protocol_error(announce.txn_id().clone());
         }
 
         // add the node into our routing table
@@ -312,6 +313,6 @@ impl DhtServer {
             .or_insert_with(Vec::new)
             .push(peer_contact);
 
-        Krpc::new_announce_peer_response(announce.txn_id().to_string(), self.our_id.clone())
+        Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
     }
 }

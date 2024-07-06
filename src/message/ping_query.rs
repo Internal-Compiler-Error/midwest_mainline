@@ -1,23 +1,22 @@
-use crate::domain_knowledge::BetterNodeId;
+use crate::domain_knowledge::{BetterNodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterPingQuery {
-    transaction_id: String,
+    transaction_id: TransactionId,
     target_id: BetterNodeId,
 }
 
 impl BetterPingQuery {
-    // TODO: think about a better error type
-    pub fn new(transaction_id: String, target_id: BetterNodeId) -> Self {
+    pub fn new(transaction_id: TransactionId, target_id: BetterNodeId) -> Self {
         Self {
             transaction_id,
             target_id,
         }
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 
@@ -33,7 +32,7 @@ impl ToRawKrpc for BetterPingQuery {
 
         let mut encoder = Encoder::new();
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", "q");
             e.emit_pair(b"q", "ping");
             e.emit_pair_with(b"a", |e| e.emit_dict(|mut e| e.emit_pair(b"id", &self.target_id)))
@@ -55,7 +54,7 @@ mod tests {
         use std::str;
 
         let ping_query = BetterPingQuery::new(
-            "aa".into(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );
 

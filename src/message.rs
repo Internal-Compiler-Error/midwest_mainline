@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact};
+use crate::domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
@@ -65,10 +65,10 @@ impl ParseKrpc for &[u8] {
 
         // we're only using it to validate the message structure
         dict.consume_all()
-            .map_err(|e| OurError::DecodeError(eyre!("Message strucutre is invalid")))?;
+            .map_err(|_e| OurError::DecodeError(eyre!("Message strucutre is invalid")))?;
 
         let (_remaining, parsed) =
-            parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained")))?;
+            parse_bencode_dict(self).map_err(|_e| OurError::DecodeError(eyre!("nom complained")))?;
 
         let message_type_indicator = parsed
             .get(b"y".as_slice())
@@ -84,10 +84,7 @@ impl ParseKrpc for &[u8] {
         let BencodeItemView::ByteString(ref transaction_id) = transaction_id else {
             return Err(OurError::DecodeError(eyre!("Message 't' key is not a binary string")));
         };
-        // TODO: are all transaction ids strings?
-        let transaction_id = str::from_utf8(transaction_id)
-            .map_err(|e| OurError::DecodeError(eyre!("Message txn id is not an utf8 string")))?
-            .to_string();
+        let transaction_id = TransactionId::from_bytes(transaction_id);
 
         if message_type == b"e" {
             // Error message
@@ -112,7 +109,7 @@ impl ParseKrpc for &[u8] {
                 return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
             };
             let message = str::from_utf8(message)
-                .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+                .map_err(|_e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
                 .to_string();
             // todo: cast safely
             let code: u32 = *code as u32;
@@ -209,9 +206,7 @@ impl ParseKrpc for &[u8] {
                 let BencodeItemView::ByteString(token) = token else {
                     return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
                 };
-                let token = str::from_utf8(token)
-                    .map_err(|e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                    .to_string();
+                let token = Token::from_bytes(token);
 
                 // todo: look at the non compliant ones
                 let info_hash = arguments
@@ -289,7 +284,7 @@ impl ParseKrpc for &[u8] {
                 let BencodeItemView::ByteString(token) = token else {
                     return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
                 };
-                let token = String::from_utf8(token.to_vec()).unwrap();
+                let token = Token::from_bytes(token);
 
                 if let Some(BencodeItemView::List(values)) = response.get(b"values".as_slice()) {
                     // success, the peers can be contacted immediately
@@ -414,7 +409,7 @@ impl Krpc {
         }
     }
 
-    pub fn transaction_id(&self) -> &str {
+    pub fn transaction_id(&self) -> &TransactionId {
         match self {
             Krpc::PingAnnouncePeerResponse(msg) => msg.txn_id(),
             Krpc::FindNodeGetPeersNonCompliantResponse(msg) => &msg.transaction_id,
@@ -445,42 +440,50 @@ impl Krpc {
         }
     }
 
-    pub fn new_ping_query(transaction_id: String, querying_id: BetterNodeId) -> Krpc {
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: BetterNodeId) -> Krpc {
         let ping = BetterPingQuery::new(transaction_id, querying_id);
         Krpc::PingQuery(ping)
     }
 
-    pub fn new_find_node_query(transaction_id: String, querying_id: BetterNodeId, target_id: BetterNodeId) -> Krpc {
+    pub fn new_find_node_query(
+        transaction_id: TransactionId,
+        querying_id: BetterNodeId,
+        target_id: BetterNodeId,
+    ) -> Krpc {
         let find_node = BetterFindNodeQuery::new(transaction_id, querying_id, target_id);
         Krpc::FindNodeQuery(find_node)
     }
 
-    pub fn new_get_peers_query(transaction_id: String, querying_id: BetterNodeId, info_hash: BetterInfoHash) -> Krpc {
+    pub fn new_get_peers_query(
+        transaction_id: TransactionId,
+        querying_id: BetterNodeId,
+        info_hash: BetterInfoHash,
+    ) -> Krpc {
         let get_peers = BetterGetPeersQuery::new(transaction_id, querying_id, info_hash);
         Krpc::GetPeersQuery(get_peers)
     }
 
     pub fn new_announce_peer_query(
-        transaction_id: String,
+        transaction_id: TransactionId,
         info_hash: BetterInfoHash,
         querying_id: BetterNodeId,
         port: u16,
         implied_port: bool,
-        token: String,
+        token: Token,
     ) -> Krpc {
         let port = if implied_port { Some(port) } else { None };
         let announce_peer = BetterAnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
         Krpc::AnnouncePeerQuery(announce_peer)
     }
 
-    pub fn new_ping_response(transaction_id: String, responding_id: BetterNodeId) -> Krpc {
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: BetterNodeId) -> Krpc {
         let ping_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(ping_res)
     }
 
     // construct a response to a find_node query
     pub fn new_find_node_response(
-        transaction_id: String,
+        transaction_id: TransactionId,
         responding_id: BetterNodeId,
         nodes: Vec<BetterCompactNodeInfo>,
     ) -> Krpc {
@@ -494,9 +497,9 @@ impl Krpc {
 
     // construct a response to a get_peers query when the peer is directly found
     pub fn new_get_peers_success_response(
-        transaction_id: String,
+        transaction_id: TransactionId,
         responding_id: BetterNodeId,
-        response_token: String,
+        response_token: Token,
         peers: Vec<BetterCompactPeerContact>,
     ) -> Krpc {
         let get_peers_success_response =
@@ -507,9 +510,9 @@ impl Krpc {
     // construct a response to a get_peers query when the peer is not directly found and the closest
     // nodes are returned
     pub fn new_get_peers_deferred_response(
-        transaction_id: String,
+        transaction_id: TransactionId,
         responding_id: BetterNodeId,
-        response_token: String,
+        response_token: Token,
         closest_nodes: Vec<BetterCompactNodeInfo>,
     ) -> Krpc {
         let get_peers_deferred_response =
@@ -520,34 +523,34 @@ impl Krpc {
     // construct a response to a get_peers query when the peer is not directly found and the closest
     // nodes are returned
     pub fn new_get_peers_deferred_response_con_compliant(
-        transaction_id: String,
+        transaction_id: TransactionId,
         responding_id: BetterNodeId,
         closest_nodes: Vec<BetterCompactNodeInfo>,
     ) -> Krpc {
         todo!()
     }
 
-    pub fn new_announce_peer_response(transaction_id: String, responding_id: BetterNodeId) -> Krpc {
+    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: BetterNodeId) -> Krpc {
         let announce_peer_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(announce_peer_res)
     }
 
-    pub fn new_standard_generic_error_response(transaction_id: String) -> Krpc {
+    pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Krpc {
         let error_response = KrpcError::new(transaction_id, 201 as u32, "A Generic Error Occurred".to_string());
         Krpc::ErrorResponse(error_response)
     }
 
-    pub fn new_standard_server_error(transaction_id: String) -> Krpc {
+    pub fn new_standard_server_error(transaction_id: TransactionId) -> Krpc {
         let error_response = KrpcError::new(transaction_id, 202 as u32, "A Server Error Occurred".to_string());
         Krpc::ErrorResponse(error_response)
     }
 
-    pub fn new_standard_protocol_error(transaction_id: String) -> Krpc {
+    pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Krpc {
         let error_response = KrpcError::new(transaction_id, 203 as u32, "A Protocol Error Occurred".to_string());
         Krpc::ErrorResponse(error_response)
     }
 
-    pub fn new_unsupported_error(transaction_id: String) -> Krpc {
+    pub fn new_unsupported_error(transaction_id: TransactionId) -> Krpc {
         let error_response = KrpcError::new(
             transaction_id,
             204 as u32,
@@ -581,7 +584,7 @@ mod test {
         let message = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe" as &[u8];
         let deserialized = message.parse().unwrap();
         let expected = Krpc::new_ping_query(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );
         //println!("{:?}", String::from_utf8_lossy(&to_bytes(&expected)?));
@@ -595,7 +598,7 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_find_node_query(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
@@ -610,7 +613,7 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_get_peers_query(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
@@ -626,12 +629,12 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_announce_peer_query(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterInfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
             BetterNodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
             6881,
             true,
-            "aoeusnth".to_string(),
+            Token::from_bytes(*&b"aoeusnth"),
         );
 
         // taken directly from the spec
@@ -644,7 +647,7 @@ mod test {
         let decoded = message.parse().unwrap();
 
         let expected = Krpc::new_ping_response(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
         assert_eq!(decoded, expected);
@@ -656,14 +659,13 @@ mod test {
         let decoded = bencoded.as_slice().parse().unwrap();
 
         let txn_id = hex::decode("11ec").unwrap();
-        let txn_id = String::from_utf8(txn_id).unwrap();
+        let txn_id = TransactionId::from_bytes(&txn_id);
 
         let responding = hex::decode("23307bc01f5e7cc56ba66314b36e69246304f870").unwrap();
-        // let responding = String::from_utf8(responding).unwrap();
         let responding = BetterNodeId::from_bytes_unchecked(&responding);
 
         let res_token = hex::decode("3704f7737408c5fef0f96bca389e4100f972859d").unwrap();
-        let res_token = String::from_utf8(res_token).unwrap();
+        let res_token = Token::from_bytes(&res_token);
 
         let expected = Krpc::new_get_peers_success_response(
             txn_id,
@@ -679,20 +681,22 @@ mod test {
         assert_eq!(decoded, expected);
     }
 
-    // TODO: make this work
-    //
-    // #[test]
-    // fn can_parse_example_find_node_response() {
-    //     let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re" as &[u8];
-    //     let decoded = message.parse().unwrap();
-    //
-    //     let expected = Krpc::new_find_node_response(
-    //         "aa".to_string(),
-    //         BetterNodeId("0123456789abcdefghij".to_string()),
-    //         Box::new(b"mnopqrstuvwxyz123456".clone()),
-    //     );
-    //     assert_eq!(expected, decoded);
-    // }
+    #[test]
+    fn can_parse_example_find_node_response() {
+        let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re" as &[u8];
+        let decoded = message.parse().unwrap();
+
+        let expected = Krpc::new_find_node_response(
+            TransactionId::from_bytes(*&b"aa"),
+            BetterNodeId::from_bytes_unchecked(*&b"0123456789abcdefghij"),
+            vec![BetterCompactNodeInfo::new(
+                BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+                // TODO: place holder values
+                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
+            )],
+        );
+        assert_eq!(expected, decoded);
+    }
 
     #[test]
     // no, I can't remember why it's called that either now
@@ -707,7 +711,7 @@ mod test {
         let message = b"d1:eli201e24:A Generic Error Occurrede1:t2:aa1:y1:ee" as &[u8];
         let decoded: Krpc = message.parse().unwrap();
 
-        let expected = Krpc::new_standard_generic_error_response("aa".to_string());
+        let expected = Krpc::new_standard_generic_error_response(TransactionId::from_bytes(*&b"aa"));
         assert_eq!(expected, decoded);
     }
 

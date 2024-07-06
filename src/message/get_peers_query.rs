@@ -1,16 +1,16 @@
-use crate::domain_knowledge::{BetterInfoHash, BetterNodeId};
+use crate::domain_knowledge::{BetterInfoHash, BetterNodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersQuery {
-    transaction_id: String,
+    transaction_id: TransactionId,
     ourself: BetterNodeId,
     info_hash: BetterInfoHash,
 }
 
 impl BetterGetPeersQuery {
-    pub fn new(transaction_id: String, ourself: BetterNodeId, info_hash: BetterInfoHash) -> Self {
+    pub fn new(transaction_id: TransactionId, ourself: BetterNodeId, info_hash: BetterInfoHash) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -18,7 +18,7 @@ impl BetterGetPeersQuery {
         }
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 
@@ -40,7 +40,7 @@ impl ToRawKrpc for BetterGetPeersQuery {
         let mut encoder = Encoder::new();
 
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", &"q");
             e.emit_pair(b"q", &"get_peers");
 
@@ -68,7 +68,7 @@ mod tests {
         use std::str;
 
         let query = super::BetterGetPeersQuery::new(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );

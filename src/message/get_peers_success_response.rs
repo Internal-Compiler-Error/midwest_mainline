@@ -1,21 +1,21 @@
-use crate::domain_knowledge::{BetterCompactPeerContact, BetterNodeId};
+use crate::domain_knowledge::{BetterCompactPeerContact, BetterNodeId, Token, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersSuccessResponse {
     // TODO: make them private
-    transaction_id: String,
+    transaction_id: TransactionId,
     target_id: BetterNodeId,
-    pub token: String,
+    pub token: Token,
     pub values: Vec<BetterCompactPeerContact>,
 }
 
 impl BetterGetPeersSuccessResponse {
     pub fn new(
-        transaction_id: String,
+        transaction_id: TransactionId,
         target_id: BetterNodeId,
-        token: String,
+        token: Token,
         values: Vec<BetterCompactPeerContact>,
     ) -> Self {
         Self {
@@ -30,7 +30,7 @@ impl BetterGetPeersSuccessResponse {
         self.values.push(peer);
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 }
@@ -43,7 +43,7 @@ impl ToRawKrpc for BetterGetPeersSuccessResponse {
 
         let mut encoder = Encoder::new();
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", "r");
             e.emit_pair_with(b"r", |e| {
                 e.emit_unsorted_dict(|e| {
@@ -90,9 +90,9 @@ mod tests {
         use std::str;
 
         let response = super::BetterGetPeersSuccessResponse::new(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            "aoeusnth".to_string(),
+            Token::from_bytes(*&b"aoeusnth"),
             vec![
                 BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),
                 BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)),

@@ -1,23 +1,23 @@
-use crate::domain_knowledge::{BetterInfoHash, BetterNodeId};
+use crate::domain_knowledge::{BetterInfoHash, BetterNodeId, Token, TransactionId};
 use crate::message::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterAnnouncePeerQuery {
-    transaction_id: String,
+    transaction_id: TransactionId,
     ourself: BetterNodeId,
     implied_port: bool,
     info_hash: BetterInfoHash,
     port: u16,
-    token: String,
+    token: Token,
 }
 
 impl BetterAnnouncePeerQuery {
     pub fn new(
-        transaction_id: String,
+        transaction_id: TransactionId,
         ourself: BetterNodeId,
         port: Option<u16>,
         info_hash: BetterInfoHash,
-        token: String,
+        token: Token,
     ) -> Self {
         Self {
             transaction_id,
@@ -30,11 +30,11 @@ impl BetterAnnouncePeerQuery {
     }
 
     /// Transaction id
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 
-    pub fn token(&self) -> &str {
+    pub fn token(&self) -> &Token {
         &self.token
     }
 
@@ -62,7 +62,7 @@ impl ToRawKrpc for BetterAnnouncePeerQuery {
 
         let mut encoder = Encoder::new();
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", &"q");
             e.emit_pair(b"q", &"announce_peer");
 
@@ -93,11 +93,11 @@ mod tests {
         use std::str;
 
         let announce = BetterAnnouncePeerQuery::new(
-            "aa".to_string(),
+            TransactionId::from_bytes(*&b"aa"),
             BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             None,
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
-            "aoeusnth".to_string(),
+            Token::from_bytes(*&b"aoeusnth"),
         );
 
         let encoded = announce.to_raw_krpc();

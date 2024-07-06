@@ -1414,6 +1414,7 @@ version = "0.1.1-beta"
 dependencies = [
  "async-recursion",
  "async-trait",
+ "base64 0.22.1",
  "bendy",
  "color-eyre",
  "console-subscriber",

@@ -1,6 +1,6 @@
 use crate::{
     dht_service::dht_server::DhtServer,
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterNodeId},
+    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterNodeId, TransactionId},
     message::{Krpc, ParseKrpc},
     routing::RoutingTable,
 };
@@ -60,7 +60,7 @@ impl Error for DhtServiceFailure {}
 #[derive(Debug)]
 pub(crate) struct MessageDemultiplexer {
     /// a map to keep track of the responses we await from the client
-    pending_responses: Mutex<HashMap<String, Sender<Krpc>>>,
+    pending_responses: Mutex<HashMap<TransactionId, Sender<Krpc>>>,
 
     /// all messages belong to the server are put into this queue.
     query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
@@ -86,7 +86,10 @@ impl MessageDemultiplexer {
         let mut incoming_messages = self.incoming_messages.lock().await;
         while let Some((msg, socket_addr)) = incoming_messages.recv().await {
             let id = msg.transaction_id();
-            trace!("received message for transaction id {:?}", hex::encode_upper(&*id));
+            trace!(
+                "received message for transaction id {:?}",
+                hex::encode_upper(id.as_bytes())
+            );
 
             // see if we have a slot for this transaction id, if we do, that means one of the
             // messages that we expect, otherwise the message is a query we need to handle
@@ -105,7 +108,7 @@ impl MessageDemultiplexer {
     }
 
     /// Tell the placer we should expect some messages
-    pub async fn register(&self, transaction_id: String, sending_half: oneshot::Sender<Krpc>) {
+    pub async fn register(&self, transaction_id: TransactionId, sending_half: oneshot::Sender<Krpc>) {
         let mut guard = self.pending_responses.lock().await;
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
@@ -310,11 +313,7 @@ impl DhtV4 {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
         // TODO: clearly wrong
-        let query = Krpc::new_find_node_query(
-            hex::encode(transaction_id.to_be_bytes()),
-            our_id.clone(),
-            our_id.clone(),
-        );
+        let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), our_id.clone(), our_id.clone());
 
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
@@ -350,7 +349,7 @@ impl DhtV4 {
                 let our_id = dht.our_id.clone();
                 let transaction_id = dht.transaction_id_pool.next();
                 let query = Krpc::new_find_node_query(
-                    hex::encode(transaction_id.to_be_bytes()),
+                    TransactionId::from(transaction_id),
                     our_id.clone(),
                     node.node_id().clone(),
                 );

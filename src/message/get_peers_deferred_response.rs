@@ -1,21 +1,21 @@
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId};
+use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId, Token, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersDeferredResponse {
     // TODO: make them private
-    transaction_id: String,
+    transaction_id: TransactionId,
     pub querier: BetterNodeId,
-    pub token: String,
+    pub token: Token,
     pub nodes: Vec<BetterCompactNodeInfo>,
 }
 
 impl BetterGetPeersDeferredResponse {
     pub fn new(
-        transaction_id: String,
+        transaction_id: TransactionId,
         querier: BetterNodeId,
-        token: String,
+        token: Token,
         nodes: Vec<BetterCompactNodeInfo>,
     ) -> Self {
         Self {
@@ -26,7 +26,7 @@ impl BetterGetPeersDeferredResponse {
         }
     }
 
-    pub fn txn_id(&self) -> &str {
+    pub fn txn_id(&self) -> &TransactionId {
         &self.transaction_id
     }
 }
@@ -39,7 +39,7 @@ impl ToRawKrpc for BetterGetPeersDeferredResponse {
         let mut encoder = Encoder::new();
 
         encoder.emit_and_sort_dict(|e| {
-            e.emit_pair(b"t", &self.transaction_id);
+            e.emit_pair(b"t", self.transaction_id.as_bytes());
             e.emit_pair(b"y", &"r");
 
             e.emit_pair_with(b"r", |e| {

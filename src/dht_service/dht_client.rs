@@ -1,6 +1,8 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId},
+    domain_knowledge::{
+        BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, Token, TransactionId,
+    },
     message::{Krpc, ToRawKrpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -92,9 +94,7 @@ impl DhtClientV4 {
         // TODO: why was it assumed that serailization could fail?
         let bytes = message.to_raw_krpc();
         {
-            self.demultiplexer
-                .register(message.transaction_id().to_string(), tx)
-                .await;
+            self.demultiplexer.register(message.transaction_id().clone(), tx).await;
             self.socket.send_to(&bytes, recipient).await?;
         }
         let response = rx.await.unwrap();
@@ -104,7 +104,7 @@ impl DhtClientV4 {
     pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
         let this = &self;
         let transaction_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(hex::encode(transaction_id.to_be_bytes()), this.our_id.clone());
+        let ping_msg = Krpc::new_ping_query(TransactionId::from(transaction_id), this.our_id.clone());
 
         let response = self.send_message(&ping_msg, &recipient).await?;
 
@@ -136,7 +136,7 @@ impl DhtClientV4 {
     ) -> Result<Vec<BetterCompactNodeInfo>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(hex::encode(transaction_id.to_be_bytes()), self.our_id.clone(), target);
+        let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), self.our_id.clone(), target);
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
@@ -170,7 +170,7 @@ impl DhtClientV4 {
         target: BetterNodeId,
     ) -> Result<
         (
-            Option<String>,
+            Option<Token>,
             Either<Vec<BetterCompactNodeInfo>, Vec<BetterCompactPeerContact>>,
         ),
         DhtServiceFailure,
@@ -180,7 +180,7 @@ impl DhtClientV4 {
         let transaction_id = self.transaction_id_pool.next();
         // TODO: wtf, it expects a token?
         let query = Krpc::new_get_peers_query(
-            hex::encode(transaction_id.to_be_bytes()),
+            TransactionId::from(transaction_id),
             self.our_id.clone(),
             BetterInfoHash::from_bytes_unchecked(*&b"borken!"),
         );
@@ -559,12 +559,12 @@ impl DhtClientV4 {
         recipient: SocketAddrV4,
         info_hash: BetterInfoHash,
         port: Option<u16>,
-        token: String,
+        token: Token,
     ) -> Result<(), DhtServiceFailure> {
         let transaction_id = self.transaction_id_pool.next();
         let query = if let Some(port) = port {
             Krpc::new_announce_peer_query(
-                hex::encode(transaction_id.to_be_bytes()),
+                TransactionId::from(transaction_id),
                 info_hash,
                 self.our_id.clone(),
                 port,
@@ -573,7 +573,7 @@ impl DhtClientV4 {
             )
         } else {
             Krpc::new_announce_peer_query(
-                hex::encode(transaction_id.to_be_bytes()),
+                TransactionId::from(transaction_id),
                 info_hash,
                 self.our_id.clone(),
                 self.socket_address.port(),
