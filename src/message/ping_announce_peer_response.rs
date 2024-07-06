@@ -1,15 +1,15 @@
-use crate::domain_knowledge::{BetterNodeId, TransactionId};
+use crate::domain_knowledge::{NodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterPingAnnouncePeerResponse {
     transaction_id: TransactionId,
-    target_id: BetterNodeId,
+    target_id: NodeId,
 }
 
 impl BetterPingAnnouncePeerResponse {
-    pub fn new(transaction_id: TransactionId, target_id: BetterNodeId) -> Self {
+    pub fn new(transaction_id: TransactionId, target_id: NodeId) -> Self {
         Self {
             transaction_id,
             target_id,
@@ -20,7 +20,7 @@ impl BetterPingAnnouncePeerResponse {
         &self.transaction_id
     }
 
-    pub fn target_id(&self) -> &BetterNodeId {
+    pub fn target_id(&self) -> &NodeId {
         &self.target_id
     }
 }
@@ -54,7 +54,7 @@ mod tests {
 
         let ping_response = BetterPingAnnouncePeerResponse::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         let expected = "d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";

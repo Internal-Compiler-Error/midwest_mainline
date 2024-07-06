@@ -1,16 +1,16 @@
-use crate::domain_knowledge::{BetterNodeId, TransactionId};
+use crate::domain_knowledge::{NodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterFindNodeQuery {
     transaction_id: TransactionId,
-    ourself: BetterNodeId,
-    target: BetterNodeId,
+    ourself: NodeId,
+    target: NodeId,
 }
 
 impl BetterFindNodeQuery {
-    pub fn new(transaction_id: TransactionId, ourself: BetterNodeId, target: BetterNodeId) -> Self {
+    pub fn new(transaction_id: TransactionId, ourself: NodeId, target: NodeId) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -22,7 +22,7 @@ impl BetterFindNodeQuery {
         &self.transaction_id
     }
 
-    pub fn target_id(&self) -> &BetterNodeId {
+    pub fn target_id(&self) -> &NodeId {
         &self.target
     }
 }
@@ -63,8 +63,8 @@ mod tests {
 
         let query = BetterFindNodeQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         let encoded = query.to_raw_krpc();

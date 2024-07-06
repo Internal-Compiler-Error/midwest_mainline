@@ -1,16 +1,16 @@
-use crate::domain_knowledge::{BetterInfoHash, BetterNodeId, TransactionId};
+use crate::domain_knowledge::{BetterInfoHash, NodeId, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterGetPeersQuery {
     transaction_id: TransactionId,
-    ourself: BetterNodeId,
+    ourself: NodeId,
     info_hash: BetterInfoHash,
 }
 
 impl BetterGetPeersQuery {
-    pub fn new(transaction_id: TransactionId, ourself: BetterNodeId, info_hash: BetterInfoHash) -> Self {
+    pub fn new(transaction_id: TransactionId, ourself: NodeId, info_hash: BetterInfoHash) -> Self {
         Self {
             transaction_id,
             ourself,
@@ -23,7 +23,7 @@ impl BetterGetPeersQuery {
     }
 
     // TODO: horrible name, when we recive a request, it's clearly not from ourself
-    pub fn our_id(&self) -> &BetterNodeId {
+    pub fn our_id(&self) -> &NodeId {
         &self.ourself
     }
 
@@ -69,7 +69,7 @@ mod tests {
 
         let query = super::BetterGetPeersQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 

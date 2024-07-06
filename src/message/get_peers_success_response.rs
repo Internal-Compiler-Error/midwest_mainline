@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{BetterCompactPeerContact, BetterNodeId, Token, TransactionId};
+use crate::domain_knowledge::{NodeId, PeerContact, Token, TransactionId};
 
 use super::ToRawKrpc;
 
@@ -6,18 +6,13 @@ use super::ToRawKrpc;
 pub struct BetterGetPeersSuccessResponse {
     // TODO: make them private
     transaction_id: TransactionId,
-    target_id: BetterNodeId,
+    target_id: NodeId,
     pub token: Token,
-    pub values: Vec<BetterCompactPeerContact>,
+    pub values: Vec<PeerContact>,
 }
 
 impl BetterGetPeersSuccessResponse {
-    pub fn new(
-        transaction_id: TransactionId,
-        target_id: BetterNodeId,
-        token: Token,
-        values: Vec<BetterCompactPeerContact>,
-    ) -> Self {
+    pub fn new(transaction_id: TransactionId, target_id: NodeId, token: Token, values: Vec<PeerContact>) -> Self {
         Self {
             transaction_id,
             target_id,
@@ -26,7 +21,7 @@ impl BetterGetPeersSuccessResponse {
         }
     }
 
-    pub fn add_peer(&mut self, peer: BetterCompactPeerContact) {
+    pub fn add_peer(&mut self, peer: PeerContact) {
         self.values.push(peer);
     }
 
@@ -91,11 +86,11 @@ mod tests {
 
         let response = super::BetterGetPeersSuccessResponse::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             Token::from_bytes(*&b"aoeusnth"),
             vec![
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)),
             ],
         );
 

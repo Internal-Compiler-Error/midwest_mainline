@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId};
+use crate::domain_knowledge::{NodeId, NodeInfo};
 use num::BigUint;
 use std::{ops::BitXor, str::FromStr, time::Instant};
 use tracing::{info, trace};
@@ -33,12 +33,12 @@ impl Bucket {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub(crate) contact: BetterCompactNodeInfo,
+    pub(crate) contact: NodeInfo,
     pub(crate) last_checked: Instant,
 }
 
 impl RoutingTable {
-    pub fn new(id: &BetterNodeId) -> Self {
+    pub fn new(id: &NodeId) -> Self {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
@@ -57,7 +57,7 @@ impl RoutingTable {
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
-    pub fn add_new_node(&mut self, contact: BetterCompactNodeInfo) {
+    pub fn add_new_node(&mut self, contact: NodeInfo) {
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
         if let Some(node) = self
@@ -129,7 +129,7 @@ impl RoutingTable {
         info!("node processed, node count: {}", self.node_count());
     }
 
-    pub fn find_closest(&self, target: &BetterNodeId) -> Vec<&BetterCompactNodeInfo> {
+    pub fn find_closest(&self, target: &NodeId) -> Vec<&NodeInfo> {
         let mut closest_nodes: Vec<_> = self
             .buckets
             .iter()
@@ -162,7 +162,7 @@ impl RoutingTable {
             .collect()
     }
 
-    pub fn find(&self, target: &BetterNodeId) -> Option<&Node> {
+    pub fn find(&self, target: &NodeId) -> Option<&Node> {
         self.buckets
             .iter()
             .map(|bucket| bucket.nodes.iter())

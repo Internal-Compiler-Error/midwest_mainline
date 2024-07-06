@@ -1,8 +1,6 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
-    domain_knowledge::{
-        BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, Token, TransactionId,
-    },
+    domain_knowledge::{BetterInfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
     message::{Krpc, ToRawKrpc},
     routing::RoutingTable,
     utils::ParSpawnAndAwait,
@@ -30,7 +28,7 @@ use tracing::{debug, info, instrument, trace, warn};
 #[derive(Debug)]
 pub struct DhtClientV4 {
     pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) our_id: BetterNodeId,
+    pub(crate) our_id: NodeId,
     pub(crate) demultiplexer: Arc<MessageDemultiplexer>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
@@ -73,7 +71,7 @@ impl DhtClientV4 {
         socket: Arc<UdpSocket>,
         demultiplexer: Arc<MessageDemultiplexer>,
         routing_table: Arc<RwLock<RoutingTable>>,
-        our_id: BetterNodeId,
+        our_id: NodeId,
     ) -> Self {
         DhtClientV4 {
             socket,
@@ -112,10 +110,7 @@ impl DhtClientV4 {
             this.routing_table
                 .write()
                 .await
-                .add_new_node(BetterCompactNodeInfo::new(
-                    response.target_id().clone(),
-                    BetterCompactPeerContact(recipient),
-                ));
+                .add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(recipient)));
 
             Ok(())
         } else {
@@ -132,8 +127,8 @@ impl DhtClientV4 {
     async fn ask_her_for_nodes(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
-        target: BetterNodeId,
-    ) -> Result<Vec<BetterCompactNodeInfo>, DhtServiceFailure> {
+        target: NodeId,
+    ) -> Result<Vec<NodeInfo>, DhtServiceFailure> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
         let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), self.our_id.clone(), target);
@@ -167,14 +162,8 @@ impl DhtClientV4 {
     async fn ask_her_for_peers(
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
-        target: BetterNodeId,
-    ) -> Result<
-        (
-            Option<Token>,
-            Either<Vec<BetterCompactNodeInfo>, Vec<BetterCompactPeerContact>>,
-        ),
-        DhtServiceFailure,
-    > {
+        target: NodeId,
+    ) -> Result<(Option<Token>, Either<Vec<NodeInfo>, Vec<PeerContact>>), DhtServiceFailure> {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
@@ -244,7 +233,7 @@ impl DhtClientV4 {
     }
 
     /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: &BetterNodeId) -> Result<BetterCompactNodeInfo, DhtServiceFailure> {
+    pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<NodeInfo, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.read().await.find(target) {
             return Ok(node.contact.clone());
@@ -305,7 +294,7 @@ impl DhtClientV4 {
         sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
 
         // add all the nodes we have visited so far
-        let seen_node: Arc<Mutex<HashSet<BetterCompactNodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_node: Arc<Mutex<HashSet<NodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
         {
             let mut seen = seen_node.lock().await;
             sorted_by_distance.iter().for_each(|(node, _)| {
@@ -316,8 +305,7 @@ impl DhtClientV4 {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
 
-        let starting_pool: Vec<BetterCompactNodeInfo> =
-            sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
+        let starting_pool: Vec<NodeInfo> = sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
 
         let dht = self.clone();
         let target = target.clone();
@@ -347,10 +335,10 @@ impl DhtClientV4 {
     /// the caller should drop the future to cancel all remaining tasks
     async fn recursive_find_from_pool(
         self: Arc<Self>,
-        mut starting_pool: Vec<BetterCompactNodeInfo>,
-        finding: BetterNodeId,
-        seen: Arc<Mutex<HashSet<BetterCompactNodeInfo>>>,
-        slot: Arc<Mutex<Option<Sender<BetterCompactNodeInfo>>>>,
+        mut starting_pool: Vec<NodeInfo>,
+        finding: NodeId,
+        seen: Arc<Mutex<HashSet<NodeInfo>>>,
+        slot: Arc<Mutex<Option<Sender<NodeInfo>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -430,10 +418,10 @@ impl DhtClientV4 {
     #[instrument(skip_all)]
     async fn recursive_get_peers_from_pool(
         self: Arc<Self>,
-        mut starting_pool: Vec<BetterCompactNodeInfo>,
-        finding: BetterNodeId,
-        seen: Arc<Mutex<HashSet<BetterCompactNodeInfo>>>,
-        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<BetterCompactPeerContact>)>>>>,
+        mut starting_pool: Vec<NodeInfo>,
+        finding: NodeId,
+        seen: Arc<Mutex<HashSet<NodeInfo>>>,
+        slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<PeerContact>)>>>>,
     ) -> Result<(), RecursiveSearchError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
@@ -509,12 +497,12 @@ impl DhtClientV4 {
     pub async fn get_peers(
         self: Arc<Self>,
         info_hash: BetterInfoHash,
-    ) -> Result<(Box<[u8]>, Vec<BetterCompactPeerContact>), DhtServiceFailure> {
+    ) -> Result<(Box<[u8]>, Vec<PeerContact>), DhtServiceFailure> {
         // TODO: verify this
 
         // the info hash and node is occupy the same address space, nodes are supposed to store
         // info_hashes close to its id
-        let target = BetterNodeId(info_hash.0);
+        let target = NodeId(info_hash.0);
 
         // get all the closest nodes to the info_hash
         let closest_nodes: Vec<_> = self

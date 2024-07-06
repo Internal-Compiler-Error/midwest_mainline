@@ -1,5 +1,5 @@
 use crate::{
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterInfoHash, BetterNodeId, Token},
+    domain_knowledge::{NodeInfo, PeerContact, BetterInfoHash, NodeId, Token},
     message::{
         announce_peer_query::BetterAnnouncePeerQuery, find_node_query::BetterFindNodeQuery,
         get_peers_query::BetterGetPeersQuery, ping_query::BetterPingQuery, Krpc, ToRawKrpc,
@@ -118,9 +118,9 @@ impl TokenPool {
 #[derive(Debug)]
 pub struct DhtServer {
     routing_table: Arc<RwLock<RoutingTable>>,
-    our_id: BetterNodeId,
+    our_id: NodeId,
     requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
-    hash_table: Arc<RwLock<HashMap<BetterInfoHash, Vec<BetterCompactPeerContact>>>>,
+    hash_table: Arc<RwLock<HashMap<BetterInfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
     socket: Arc<UdpSocket>,
 }
@@ -129,7 +129,7 @@ impl DhtServer {
     pub(crate) fn new(
         requests: Receiver<(Krpc, SocketAddrV4)>,
         socket: Arc<UdpSocket>,
-        id: BetterNodeId,
+        id: NodeId,
         routing_table: Arc<RwLock<RoutingTable>>,
     ) -> Self {
         Self {
@@ -196,9 +196,9 @@ impl DhtServer {
         {
             let mut routing_table = self.routing_table.write().await;
             // TODO: use new
-            let peer = BetterCompactNodeInfo {
+            let peer = NodeInfo {
                 id: ping.target_id().clone(),
-                contact: BetterCompactPeerContact(origin),
+                contact: PeerContact(origin),
             };
 
             routing_table.add_new_node(peer);
@@ -212,9 +212,9 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = BetterCompactNodeInfo {
+            let peer = NodeInfo {
                 id: query.target_id().clone(),
-                contact: BetterCompactPeerContact(origin),
+                contact: PeerContact(origin),
             };
             routing_table.add_new_node(peer);
         }
@@ -244,9 +244,9 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = BetterCompactNodeInfo {
+            let peer = NodeInfo {
                 id: query.our_id().clone(),
-                contact: BetterCompactPeerContact(origin),
+                contact: PeerContact(origin),
             };
             routing_table.add_new_node(peer);
         }
@@ -287,9 +287,9 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = BetterCompactNodeInfo {
+            let peer = NodeInfo {
                 id: announce.querying().clone(),
-                contact: BetterCompactPeerContact(origin),
+                contact: PeerContact(origin),
             };
             routing_table.add_new_node(peer);
         }
@@ -298,10 +298,10 @@ impl DhtServer {
         // argument is ignored if the implied port is not 0 and we use the origin port instead
         let peer_contact = {
             if !announce.implied_port() {
-                BetterCompactPeerContact(SocketAddrV4::new(*origin.ip(), announce.port()))
+                PeerContact(SocketAddrV4::new(*origin.ip(), announce.port()))
                 // CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.port()))
             } else {
-                BetterCompactPeerContact(origin)
+                PeerContact(origin)
                 // CompactPeerContact::from(origin)
             }
         };

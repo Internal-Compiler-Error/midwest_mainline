@@ -1,10 +1,10 @@
-use crate::domain_knowledge::{BetterInfoHash, BetterNodeId, Token, TransactionId};
+use crate::domain_knowledge::{BetterInfoHash, NodeId, Token, TransactionId};
 use crate::message::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterAnnouncePeerQuery {
     transaction_id: TransactionId,
-    ourself: BetterNodeId,
+    ourself: NodeId,
     implied_port: bool,
     info_hash: BetterInfoHash,
     port: u16,
@@ -14,7 +14,7 @@ pub struct BetterAnnouncePeerQuery {
 impl BetterAnnouncePeerQuery {
     pub fn new(
         transaction_id: TransactionId,
-        ourself: BetterNodeId,
+        ourself: NodeId,
         port: Option<u16>,
         info_hash: BetterInfoHash,
         token: Token,
@@ -38,7 +38,7 @@ impl BetterAnnouncePeerQuery {
         &self.token
     }
 
-    pub fn querying(&self) -> &BetterNodeId {
+    pub fn querying(&self) -> &NodeId {
         &self.ourself
     }
 
@@ -94,7 +94,7 @@ mod tests {
 
         let announce = BetterAnnouncePeerQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             None,
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
             Token::from_bytes(*&b"aoeusnth"),

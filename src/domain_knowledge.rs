@@ -3,9 +3,9 @@ use smallvec::SmallVec;
 use std::{fmt::Debug, net::SocketAddrV4};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct BetterNodeId(pub [u8; 20]);
+pub struct NodeId(pub [u8; 20]);
 
-impl Debug for BetterNodeId {
+impl Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::prelude::*;
         // let hex = hex::encode(self.0);
@@ -14,7 +14,7 @@ impl Debug for BetterNodeId {
     }
 }
 
-impl BetterNodeId {
+impl NodeId {
     /// Panics if the lenght is not exactly 20
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
         if bytes.len() != 20 {
@@ -23,7 +23,7 @@ impl BetterNodeId {
 
         let mut arr = [0u8; 20];
         arr.copy_from_slice(bytes);
-        BetterNodeId(arr)
+        NodeId(arr)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -31,7 +31,7 @@ impl BetterNodeId {
     }
 }
 
-impl ToBencode for BetterNodeId {
+impl ToBencode for NodeId {
     const MAX_DEPTH: usize = 0 as usize;
 
     fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
@@ -98,24 +98,24 @@ impl ToBencode for Token {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterCompactPeerContact(pub SocketAddrV4);
+pub struct PeerContact(pub SocketAddrV4);
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct BetterCompactNodeInfo {
-    pub id: BetterNodeId,
-    pub contact: BetterCompactPeerContact,
+pub struct NodeInfo {
+    pub id: NodeId,
+    pub contact: PeerContact,
 }
 
-impl BetterCompactNodeInfo {
-    pub fn new(id: BetterNodeId, contact: BetterCompactPeerContact) -> BetterCompactNodeInfo {
-        BetterCompactNodeInfo { id, contact }
+impl NodeInfo {
+    pub fn new(id: NodeId, contact: PeerContact) -> NodeInfo {
+        NodeInfo { id, contact }
     }
 
-    pub fn node_id(&self) -> &BetterNodeId {
+    pub fn node_id(&self) -> &NodeId {
         &self.id
     }
 
-    pub fn contact(&self) -> &BetterCompactPeerContact {
+    pub fn contact(&self) -> &PeerContact {
         &self.contact
     }
 }

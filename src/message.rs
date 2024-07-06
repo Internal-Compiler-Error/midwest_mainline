@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, Token, TransactionId};
+use crate::domain_knowledge::{NodeInfo, PeerContact, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
@@ -10,7 +10,7 @@ use get_peers_deferred_response::BetterGetPeersDeferredResponse;
 use get_peers_success_response::BetterGetPeersSuccessResponse;
 use ping_announce_peer_response::BetterPingAnnouncePeerResponse;
 
-use crate::domain_knowledge::{BetterInfoHash, BetterNodeId};
+use crate::domain_knowledge::{BetterInfoHash, NodeId};
 use crate::message::announce_peer_query::BetterAnnouncePeerQuery;
 use crate::message::error::KrpcError;
 use crate::message::find_node_query::BetterFindNodeQuery;
@@ -141,7 +141,7 @@ impl ParseKrpc for &[u8] {
             let querier = assert_len(querier, 20)?;
 
             if query_type == &b"ping" {
-                let ping = BetterPingQuery::new(transaction_id, BetterNodeId::from_bytes_unchecked(querier));
+                let ping = BetterPingQuery::new(transaction_id, NodeId::from_bytes_unchecked(querier));
                 return Ok(Krpc::PingQuery(ping));
             } else if query_type == &b"find_node" {
                 let target = arguments
@@ -154,8 +154,8 @@ impl ParseKrpc for &[u8] {
 
                 let find_node_request = BetterFindNodeQuery::new(
                     transaction_id,
-                    BetterNodeId::from_bytes_unchecked(querier),
-                    BetterNodeId::from_bytes_unchecked(target),
+                    NodeId::from_bytes_unchecked(querier),
+                    NodeId::from_bytes_unchecked(target),
                 );
                 return Ok(Krpc::FindNodeQuery(find_node_request));
             } else if query_type == &b"get_peers" {
@@ -171,7 +171,7 @@ impl ParseKrpc for &[u8] {
 
                 let get_peers = BetterGetPeersQuery::new(
                     transaction_id,
-                    BetterNodeId::from_bytes_unchecked(querier),
+                    NodeId::from_bytes_unchecked(querier),
                     BetterInfoHash::from_bytes_unchecked(info_hash),
                 );
 
@@ -219,7 +219,7 @@ impl ParseKrpc for &[u8] {
 
                 let announce_peer = BetterAnnouncePeerQuery::new(
                     transaction_id,
-                    BetterNodeId::from_bytes_unchecked(querier),
+                    NodeId::from_bytes_unchecked(querier),
                     port,
                     BetterInfoHash::from_bytes_unchecked(info_hash),
                     token,
@@ -245,7 +245,7 @@ impl ParseKrpc for &[u8] {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
             let target_id = assert_len(&target_id, 20)?;
-            let target_id = BetterNodeId::from_bytes_unchecked(target_id);
+            let target_id = NodeId::from_bytes_unchecked(target_id);
 
             if response.contains_key(b"nodes".as_slice()) {
                 let nodes = response.get(b"nodes".as_slice()).unwrap();
@@ -260,13 +260,13 @@ impl ParseKrpc for &[u8] {
                         let node_id = &info[0..20];
                         let contact = &info[20..26];
 
-                        let node_id = BetterNodeId::from_bytes_unchecked(node_id);
+                        let node_id = NodeId::from_bytes_unchecked(node_id);
 
                         let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
                         let port = u16::from_be_bytes([contact[4], contact[5]]);
-                        let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
+                        let contact = PeerContact(SocketAddrV4::new(ip, port));
 
-                        BetterCompactNodeInfo { id: node_id, contact }
+                        NodeInfo { id: node_id, contact }
                     })
                     .collect();
 
@@ -300,7 +300,7 @@ impl ParseKrpc for &[u8] {
                             let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
                             let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
 
-                            BetterCompactPeerContact(SocketAddrV4::new(ip, port))
+                            PeerContact(SocketAddrV4::new(ip, port))
                         })
                         .collect();
 
@@ -315,13 +315,13 @@ impl ParseKrpc for &[u8] {
                             let node_id = &info[0..20];
                             let contact = &info[20..26];
 
-                            let node_id = BetterNodeId::from_bytes_unchecked(node_id);
+                            let node_id = NodeId::from_bytes_unchecked(node_id);
 
                             let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
                             let port = u16::from_be_bytes([contact[4], contact[5]]);
-                            let contact = BetterCompactPeerContact(SocketAddrV4::new(ip, port));
+                            let contact = PeerContact(SocketAddrV4::new(ip, port));
 
-                            BetterCompactNodeInfo { id: node_id, contact }
+                            NodeInfo { id: node_id, contact }
                         })
                         .collect();
 
@@ -440,25 +440,17 @@ impl Krpc {
         }
     }
 
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: BetterNodeId) -> Krpc {
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
         let ping = BetterPingQuery::new(transaction_id, querying_id);
         Krpc::PingQuery(ping)
     }
 
-    pub fn new_find_node_query(
-        transaction_id: TransactionId,
-        querying_id: BetterNodeId,
-        target_id: BetterNodeId,
-    ) -> Krpc {
+    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
         let find_node = BetterFindNodeQuery::new(transaction_id, querying_id, target_id);
         Krpc::FindNodeQuery(find_node)
     }
 
-    pub fn new_get_peers_query(
-        transaction_id: TransactionId,
-        querying_id: BetterNodeId,
-        info_hash: BetterInfoHash,
-    ) -> Krpc {
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: BetterInfoHash) -> Krpc {
         let get_peers = BetterGetPeersQuery::new(transaction_id, querying_id, info_hash);
         Krpc::GetPeersQuery(get_peers)
     }
@@ -466,7 +458,7 @@ impl Krpc {
     pub fn new_announce_peer_query(
         transaction_id: TransactionId,
         info_hash: BetterInfoHash,
-        querying_id: BetterNodeId,
+        querying_id: NodeId,
         port: u16,
         implied_port: bool,
         token: Token,
@@ -476,17 +468,13 @@ impl Krpc {
         Krpc::AnnouncePeerQuery(announce_peer)
     }
 
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: BetterNodeId) -> Krpc {
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
         let ping_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(ping_res)
     }
 
     // construct a response to a find_node query
-    pub fn new_find_node_response(
-        transaction_id: TransactionId,
-        responding_id: BetterNodeId,
-        nodes: Vec<BetterCompactNodeInfo>,
-    ) -> Krpc {
+    pub fn new_find_node_response(transaction_id: TransactionId, responding_id: NodeId, nodes: Vec<NodeInfo>) -> Krpc {
         let find_node_res = BetterFindNodeNonComGetPeersResponse {
             transaction_id,
             target_id: responding_id,
@@ -498,9 +486,9 @@ impl Krpc {
     // construct a response to a get_peers query when the peer is directly found
     pub fn new_get_peers_success_response(
         transaction_id: TransactionId,
-        responding_id: BetterNodeId,
+        responding_id: NodeId,
         response_token: Token,
-        peers: Vec<BetterCompactPeerContact>,
+        peers: Vec<PeerContact>,
     ) -> Krpc {
         let get_peers_success_response =
             BetterGetPeersSuccessResponse::new(transaction_id, responding_id, response_token, peers);
@@ -511,9 +499,9 @@ impl Krpc {
     // nodes are returned
     pub fn new_get_peers_deferred_response(
         transaction_id: TransactionId,
-        responding_id: BetterNodeId,
+        responding_id: NodeId,
         response_token: Token,
-        closest_nodes: Vec<BetterCompactNodeInfo>,
+        closest_nodes: Vec<NodeInfo>,
     ) -> Krpc {
         let get_peers_deferred_response =
             BetterGetPeersDeferredResponse::new(transaction_id, responding_id, response_token, closest_nodes);
@@ -524,13 +512,13 @@ impl Krpc {
     // nodes are returned
     pub fn new_get_peers_deferred_response_con_compliant(
         transaction_id: TransactionId,
-        responding_id: BetterNodeId,
-        closest_nodes: Vec<BetterCompactNodeInfo>,
+        responding_id: NodeId,
+        closest_nodes: Vec<NodeInfo>,
     ) -> Krpc {
         todo!()
     }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: BetterNodeId) -> Krpc {
+    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
         let announce_peer_res = BetterPingAnnouncePeerResponse::new(transaction_id, responding_id);
         Krpc::PingAnnouncePeerResponse(announce_peer_res)
     }
@@ -585,7 +573,7 @@ mod test {
         let deserialized = message.parse().unwrap();
         let expected = Krpc::new_ping_query(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         );
         //println!("{:?}", String::from_utf8_lossy(&to_bytes(&expected)?));
         assert_eq!(deserialized, expected);
@@ -599,8 +587,8 @@ mod test {
 
         let expected = Krpc::new_find_node_query(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
         assert_eq!(deserialized, expected);
@@ -614,7 +602,7 @@ mod test {
 
         let expected = Krpc::new_get_peers_query(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
             BetterInfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
 
@@ -631,7 +619,7 @@ mod test {
         let expected = Krpc::new_announce_peer_query(
             TransactionId::from_bytes(*&b"aa"),
             BetterInfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
-            BetterNodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
             6881,
             true,
             Token::from_bytes(*&b"aoeusnth"),
@@ -648,7 +636,7 @@ mod test {
 
         let expected = Krpc::new_ping_response(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
         assert_eq!(decoded, expected);
     }
@@ -662,7 +650,7 @@ mod test {
         let txn_id = TransactionId::from_bytes(&txn_id);
 
         let responding = hex::decode("23307bc01f5e7cc56ba66314b36e69246304f870").unwrap();
-        let responding = BetterNodeId::from_bytes_unchecked(&responding);
+        let responding = NodeId::from_bytes_unchecked(&responding);
 
         let res_token = hex::decode("3704f7737408c5fef0f96bca389e4100f972859d").unwrap();
         let res_token = Token::from_bytes(&res_token);
@@ -672,9 +660,9 @@ mod test {
             responding,
             res_token,
             vec![
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385)),
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878)),
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070)),
             ],
         );
 
@@ -688,11 +676,11 @@ mod test {
 
         let expected = Krpc::new_find_node_response(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"0123456789abcdefghij"),
-            vec![BetterCompactNodeInfo::new(
-                BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"0123456789abcdefghij"),
+            vec![NodeInfo::new(
+                NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
                 // TODO: place holder values
-                BetterCompactPeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
+                PeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
             )],
         );
         assert_eq!(expected, decoded);

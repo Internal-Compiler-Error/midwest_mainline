@@ -1,6 +1,6 @@
 use crate::{
     dht_service::dht_server::DhtServer,
-    domain_knowledge::{BetterCompactNodeInfo, BetterCompactPeerContact, BetterNodeId, TransactionId},
+    domain_knowledge::{NodeId, NodeInfo, PeerContact, TransactionId},
     message::{Krpc, ParseKrpc},
     routing::RoutingTable,
 };
@@ -140,7 +140,7 @@ impl From<JoinError> for DhtServiceFailure {
     }
 }
 
-fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> BetterNodeId {
+fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     let mut rng = rand::thread_rng();
     let r = rand & 0x07;
     let mut id = [0u8; 20];
@@ -162,7 +162,7 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> BetterNodeId {
 
     id[19] = rand;
 
-    BetterNodeId(id)
+    NodeId(id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,10 +333,7 @@ impl DhtV4 {
                 // add the bootstrapping node to our routing table
                 let mut table = dht.routing_table.write().await;
                 // table.add_new_node(CompactNodeContact::from_node_id_and_addr(&response.body.id, &contact));
-                table.add_new_node(BetterCompactNodeInfo::new(
-                    response.target_id().clone(),
-                    BetterCompactPeerContact(contact),
-                ))
+                table.add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(contact)))
             }
 
             nodes.dedup();
@@ -369,10 +366,7 @@ impl DhtV4 {
                             for node in nodes {
                                 // add the leave level responses to our routing table
                                 let mut table = dht.routing_table.write().await;
-                                let peer = BetterCompactNodeInfo::new(
-                                    node.node_id().clone(),
-                                    BetterCompactPeerContact(contact),
-                                );
+                                let peer = NodeInfo::new(node.node_id().clone(), PeerContact(contact));
                                 table.add_new_node(peer);
                             }
                         }

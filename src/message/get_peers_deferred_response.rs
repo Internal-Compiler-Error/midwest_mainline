@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId, Token, TransactionId};
+use crate::domain_knowledge::{NodeId, NodeInfo, Token, TransactionId};
 
 use super::ToRawKrpc;
 
@@ -6,18 +6,13 @@ use super::ToRawKrpc;
 pub struct BetterGetPeersDeferredResponse {
     // TODO: make them private
     transaction_id: TransactionId,
-    pub querier: BetterNodeId,
+    pub querier: NodeId,
     pub token: Token,
-    pub nodes: Vec<BetterCompactNodeInfo>,
+    pub nodes: Vec<NodeInfo>,
 }
 
 impl BetterGetPeersDeferredResponse {
-    pub fn new(
-        transaction_id: TransactionId,
-        querier: BetterNodeId,
-        token: Token,
-        nodes: Vec<BetterCompactNodeInfo>,
-    ) -> Self {
+    pub fn new(transaction_id: TransactionId, querier: NodeId, token: Token, nodes: Vec<NodeInfo>) -> Self {
         Self {
             transaction_id,
             querier,

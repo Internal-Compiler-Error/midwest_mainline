@@ -1,20 +1,16 @@
-use crate::domain_knowledge::{BetterCompactNodeInfo, BetterNodeId, TransactionId};
+use crate::domain_knowledge::{NodeId, NodeInfo, TransactionId};
 
 use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct BetterFindNodeNonComGetPeersResponse {
     pub transaction_id: TransactionId,
-    pub target_id: BetterNodeId,
-    pub nodes: Vec<BetterCompactNodeInfo>,
+    pub target_id: NodeId,
+    pub nodes: Vec<NodeInfo>,
 }
 
 impl BetterFindNodeNonComGetPeersResponse {
-    pub fn new(
-        txn_id: TransactionId,
-        target: BetterNodeId,
-        nodes: Vec<BetterCompactNodeInfo>,
-    ) -> BetterFindNodeNonComGetPeersResponse {
+    pub fn new(txn_id: TransactionId, target: NodeId, nodes: Vec<NodeInfo>) -> BetterFindNodeNonComGetPeersResponse {
         BetterFindNodeNonComGetPeersResponse {
             transaction_id: txn_id,
             target_id: target,
@@ -22,11 +18,11 @@ impl BetterFindNodeNonComGetPeersResponse {
         }
     }
 
-    pub fn nodes(&self) -> &Vec<BetterCompactNodeInfo> {
+    pub fn nodes(&self) -> &Vec<NodeInfo> {
         &self.nodes
     }
 
-    pub fn target_id(&self) -> &BetterNodeId {
+    pub fn target_id(&self) -> &NodeId {
         &self.target_id
     }
 
@@ -88,7 +84,7 @@ impl ToRawKrpc for BetterFindNodeNonComGetPeersResponse {
 #[cfg(test)]
 mod tests {
     use crate::{
-        domain_knowledge::{BetterNodeId, TransactionId},
+        domain_knowledge::{NodeId, TransactionId},
         message::{find_node_query::BetterFindNodeQuery, ToRawKrpc},
     };
 
@@ -96,8 +92,8 @@ mod tests {
     fn can_encode_example() {
         let message = BetterFindNodeQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            BetterNodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            BetterNodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
         );
         let bytes = message.to_raw_krpc();
 
