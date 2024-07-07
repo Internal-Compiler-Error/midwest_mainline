@@ -345,7 +345,7 @@ impl ParseKrpc for &[u8] {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Krpc {
     AnnouncePeerQuery(AnnouncePeerQuery),
     FindNodeQuery(FindNodeQuery),

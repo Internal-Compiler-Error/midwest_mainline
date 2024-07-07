@@ -23,6 +23,8 @@ use tokio::{
     time::Instant,
 };
 use tracing::{error, info, info_span, trace, Instrument};
+
+use super::{peer_guide::PeerGuide, MessageBroker};
 #[derive(Debug)]
 struct TokenPool {
     assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
@@ -116,28 +118,31 @@ impl TokenPool {
 
 #[derive(Debug)]
 pub struct DhtServer {
-    routing_table: Arc<RwLock<RoutingTable>>,
+    peer_guide: Arc<PeerGuide>,
     our_id: NodeId,
-    requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
+    // requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
     hash_table: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
-    socket: Arc<UdpSocket>,
+    // socket: Arc<UdpSocket>,
+    message_broker: Arc<MessageBroker>,
 }
 
 impl DhtServer {
     pub(crate) fn new(
-        requests: Receiver<(Krpc, SocketAddrV4)>,
-        socket: Arc<UdpSocket>,
+        // requests: Receiver<(Krpc, SocketAddrV4)>,
+        // socket: Arc<UdpSocket>,
         id: NodeId,
-        routing_table: Arc<RwLock<RoutingTable>>,
+        peer_guide: Arc<PeerGuide>,
+        message_broker: Arc<MessageBroker>,
     ) -> Self {
         Self {
-            requests: Mutex::new(requests),
+            // requests: Mutex::new(requests),
             hash_table: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
-            socket,
+            // socket,
             our_id: id,
-            routing_table,
+            peer_guide,
+            message_broker,
         }
     }
 
@@ -147,34 +152,58 @@ impl DhtServer {
             .name("token pool")
             .spawn(self.token_pool.clone().run())
             .unwrap();
+        let mut rx = self.message_broker.subscribe_inbound();
 
-        let mut requests = (&self).requests.lock().await;
-        while let Some((request, socket_addr)) = requests.recv().await {
-            trace!("Received request: {:?}", request);
-
+        while let Some((request, socket_addr)) = rx.recv().await {
             let server = self.clone();
+            TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
+                async move {
+                    let server = &*server;
 
-            TskBuilder::new()
-                .name(&*format!("responding to {socket_addr}"))
-                .spawn(
-                    async move {
-                        let server = &*server;
-                        let response = server.generate_response(request, socket_addr).await;
-                        trace!("Handling request from {socket_addr}");
+                    let response = match server.generate_response(request, socket_addr).await {
+                        Some(msg) => msg,
+                        None => return,
+                    };
 
-                        if let Some(response) = response {
-                            let serialized = response.to_raw_krpc();
-                            server.socket.send_to(&serialized, socket_addr).await?;
-                            trace!("response sent for {socket_addr}");
-                        }
+                    trace!("Handling request from {socket_addr}");
 
-                        info!("table = {:#?}", server.hash_table.read().await.len());
-                        Ok::<_, color_eyre::Report>(())
-                    }
-                    .instrument(info_span!("handle_requests")),
-                )
-                .unwrap();
+                    server.message_broker.send_msg(response, socket_addr);
+                    trace!("response sending for {socket_addr}");
+
+                    // info!("table = {:#?}", server.hash_table.read().await.len());
+                    // Ok::<_, color_eyre::Report>(())
+                }
+                .instrument(info_span!("handle_requests")),
+            );
         }
+
+        // let mut requests = (&self).requests.lock().await;
+        // while let Some((request, socket_addr)) = requests.recv().await {
+        //     trace!("Received request: {:?}", request);
+        //
+        //     let server = self.clone();
+        //
+        //     TskBuilder::new()
+        //         .name(&*format!("responding to {socket_addr}"))
+        //         .spawn(
+        //             async move {
+        //                 let server = &*server;
+        //                 let response = server.generate_response(request, socket_addr).await;
+        //                 trace!("Handling request from {socket_addr}");
+        //
+        //                 if let Some(response) = response {
+        //                     let serialized = response.to_raw_krpc();
+        //                     server.socket.send_to(&serialized, socket_addr).await?;
+        //                     trace!("response sent for {socket_addr}");
+        //                 }
+        //
+        //                 info!("table = {:#?}", server.hash_table.read().await.len());
+        //                 Ok::<_, color_eyre::Report>(())
+        //             }
+        //             .instrument(info_span!("handle_requests")),
+        //         )
+        //         .unwrap();
+        // }
     }
 
     #[tracing::instrument]
@@ -198,12 +227,12 @@ impl DhtServer {
     #[tracing::instrument]
     async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
-        {
-            let mut routing_table = self.routing_table.write().await;
-
-            let peer = NodeInfo::new(*ping.target_id(), PeerContact(origin));
-            routing_table.add_new_node(peer);
-        }
+        // {
+        //     let mut routing_table = self.peer_guide.write().await;
+        //
+        //     let peer = NodeInfo::new(*ping.target_id(), PeerContact(origin));
+        //     routing_table.add_new_node(peer);
+        // }
 
         Krpc::new_ping_response(ping.txn_id().clone(), self.our_id.clone())
     }
@@ -211,15 +240,15 @@ impl DhtServer {
     #[tracing::instrument]
     async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
-        {
-            let mut routing_table = self.routing_table.write().await;
+        // {
+        //     let mut routing_table = self.peer_guide.write().await;
+        //
+        //     let peer = NodeInfo::new(*query.target_id(), PeerContact(origin));
+        //     routing_table.add_new_node(peer);
+        // }
 
-            let peer = NodeInfo::new(*query.target_id(), PeerContact(origin));
-            routing_table.add_new_node(peer);
-        }
-
-        let table = self.routing_table.read().await;
-        let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
+        let table = &self.peer_guide;
+        let closest_eight: Vec<_> = table.find_closest(*query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
         return if closest_eight[0].node_id() == query.target_id() {
@@ -228,7 +257,7 @@ impl DhtServer {
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
         } else {
-            let stupid: Vec<_> = closest_eight.into_iter().cloned().collect();
+            let stupid: Vec<_> = closest_eight.into_iter().collect();
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id)
                 .with_nodes(&stupid)
                 .build();
@@ -239,12 +268,12 @@ impl DhtServer {
     #[tracing::instrument]
     async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         // add the node into our routing table
-        {
-            let mut routing_table = self.routing_table.write().await;
-
-            let peer = NodeInfo::new(*query.peer_id(), PeerContact(origin));
-            routing_table.add_new_node(peer);
-        }
+        // {
+        // let mut routing_table = self.peer_guide.write().await;
+        //
+        // let peer = NodeInfo::new(*query.peer_id(), PeerContact(origin));
+        // routing_table.add_new_node(peer);
+        // }
 
         // see if know about the info hash
         let table = self.hash_table.read().await;
@@ -262,13 +291,11 @@ impl DhtServer {
             Krpc::FindNodeGetPeersResponse(res)
         } else {
             let closest_eight: Vec<_> = self
-                .routing_table
-                .read()
-                .await
-                .find_closest(query.peer_id()) // TODO: wtf, why are we finding via info_hash
+                .peer_guide
+                .find_closest(*query.peer_id()) // TODO: wtf, why are we finding via info_hash
                 // before
                 .into_iter()
-                .cloned()
+                // .cloned()
                 .collect();
 
             let token = token_pool.token_for_addr(&origin.ip()).await;
@@ -290,13 +317,13 @@ impl DhtServer {
             return Krpc::new_standard_protocol_error(announce.txn_id().clone());
         }
 
-        // add the node into our routing table
-        {
-            let mut routing_table = self.routing_table.write().await;
-
-            let peer = NodeInfo::new(announce.querying().clone(), PeerContact(origin));
-            routing_table.add_new_node(peer);
-        }
+        // // add the node into our routing table
+        // {
+        //     let mut routing_table = self.peer_guide.write().await;
+        //
+        //     let peer = NodeInfo::new(announce.querying().clone(), PeerContact(origin));
+        //     routing_table.add_new_node(peer);
+        // }
 
         // generate the correct peer contact according to the implied port argument, the port
         // argument is ignored if the implied port is not 0 and we use the origin port instead

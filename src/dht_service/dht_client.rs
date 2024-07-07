@@ -1,8 +1,7 @@
 use crate::{
     dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageBroker},
     domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
-    message::{Krpc, ToRawKrpc},
-    routing::RoutingTable,
+    message::Krpc,
     utils::ParSpawnAndAwait,
 };
 use async_recursion::async_recursion;
@@ -24,13 +23,15 @@ use tokio::{
 };
 use tracing::{debug, info, instrument, trace, warn};
 
+use super::peer_guide::PeerGuide;
+
 #[derive(Debug)]
 pub struct DhtClientV4 {
-    pub(crate) socket: Arc<UdpSocket>,
+    // pub(crate) socket: Arc<UdpSocket>,
     pub(crate) our_id: NodeId,
-    pub(crate) demultiplexer: Arc<MessageBroker>,
-    pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
-    pub(crate) socket_address: SocketAddrV4,
+    pub(crate) message_broker: Arc<MessageBroker>,
+    pub(crate) routing_table: Arc<PeerGuide>,
+    // pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: TransactionIdPool,
 }
 
@@ -66,18 +67,16 @@ impl DhtClientV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     pub(crate) fn new(
-        bind_addr: SocketAddrV4,
-        socket: Arc<UdpSocket>,
-        demultiplexer: Arc<MessageBroker>,
-        routing_table: Arc<RwLock<RoutingTable>>,
+        // bind_addr: SocketAddrV4,
+        message_broker: Arc<MessageBroker>,
+        peer_guide: Arc<PeerGuide>,
         our_id: NodeId,
     ) -> Self {
         DhtClientV4 {
-            socket,
-            demultiplexer,
+            message_broker,
             our_id,
-            routing_table,
-            socket_address: bind_addr,
+            routing_table: peer_guide,
+            // socket_address: bind_addr,
             transaction_id_pool: TransactionIdPool::new(),
         }
     }
@@ -85,16 +84,16 @@ impl DhtClientV4 {
     /// Send a message out and await for a response.
     ///
     /// It does not alter the routing table, callers must decide what to do with the response.
-    pub async fn send_message(&self, message: &Krpc, recipient: &SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
-        let (tx, rx) = oneshot::channel();
-
-        // TODO: why was it assumed that serailization could fail?
-        let bytes = message.to_raw_krpc();
-        {
-            self.demultiplexer.register(message.transaction_id().clone(), tx).await;
-            self.socket.send_to(&bytes, recipient).await?;
-        }
-        let response = rx.await.unwrap();
+    pub async fn send_message(&self, message: &Krpc, recipient: SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
+        let rx = {
+            let rx = self
+                .message_broker
+                .subscribe_one(message.transaction_id().clone())
+                .await;
+            self.message_broker.send_msg(message.clone(), recipient);
+            rx
+        };
+        let (response, _addr) = rx.await.unwrap();
         Ok(response)
     }
 
@@ -103,13 +102,13 @@ impl DhtClientV4 {
         let transaction_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(transaction_id), this.our_id.clone());
 
-        let response = self.send_message(&ping_msg, &recipient).await?;
+        let response = self.send_message(&ping_msg, recipient).await?;
 
-        return if let Krpc::PingAnnouncePeerResponse(response) = response {
-            this.routing_table
-                .write()
-                .await
-                .add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(recipient)));
+        return if let Krpc::PingAnnouncePeerResponse(_response) = response {
+            // this.routing_table
+            //     .write()
+            //     .await
+            //     .add_new_node(NodeInfo::new(response.target_id().clone(), PeerContact(recipient)));
 
             Ok(())
         } else {
@@ -135,7 +134,7 @@ impl DhtClientV4 {
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        let response = timeout(time_out, self.send_message(&query, interlocutor)).await??;
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
             // the nodes come back as one giant byte string, each 26 bytes is a node
@@ -175,7 +174,7 @@ impl DhtClientV4 {
 
         // send the message and await for a response
         let time_out = Duration::from_secs(15);
-        let response = timeout(time_out, self.send_message(&query, &interlocutor)).await??;
+        let response = timeout(time_out, self.send_message(&query, interlocutor)).await??;
 
         return match response {
             Krpc::ErrorResponse(response) => {
@@ -207,17 +206,18 @@ impl DhtClientV4 {
     }
 
     /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: &NodeId) -> Result<NodeInfo, DhtServiceFailure> {
+    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, DhtServiceFailure> {
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).routing_table.read().await.find(target) {
+        if let Some(node) = (&self).routing_table.find(target) {
             return Ok(node.contact.clone());
         }
 
         // find the closest nodes that we know
         let closest;
         {
-            let table = (&self).routing_table.read().await;
-            closest = table.find_closest(target).into_iter().cloned().collect::<Vec<_>>();
+            // let table = (&self).routing_table.read().await;
+            let table = (&self).routing_table.clone();
+            closest = table.find_closest(target)
         }
 
         let returned_nodes = closest
@@ -243,7 +243,7 @@ impl DhtClientV4 {
 
         // it's possible that some of the nodes returned are actually the node we're looking for
         // so we check for that and return it if it's the case
-        let target_node = returned_nodes.iter().flatten().find(|node| node.node_id() == target);
+        let target_node = returned_nodes.iter().flatten().find(|node| *node.node_id() == target);
 
         if target_node.is_some() {
             return Ok(target_node.unwrap().clone());
@@ -344,12 +344,12 @@ impl DhtClientV4 {
                         .await?;
 
                     // add the nodes to our routing table
-                    {
-                        let mut table = dht.routing_table.write().await;
-                        returned_nodes.iter().for_each(|node| {
-                            table.add_new_node(node.clone());
-                        });
-                    }
+                    // {
+                    //     let mut table = dht.routing_table.write().await;
+                    //     returned_nodes.iter().for_each(|node| {
+                    //         table.add_new_node(node.clone());
+                    //     });
+                    // }
 
                     // see if we got the node we're looking for
                     return if let Some(node) = returned_nodes.iter().find(|node| node.node_id() == &finding) {
@@ -503,14 +503,7 @@ impl DhtClientV4 {
         let target = NodeId(info_hash.0);
 
         // get all the closest nodes to the info_hash
-        let closest_nodes: Vec<_> = self
-            .routing_table
-            .read()
-            .await
-            .find_closest(&target)
-            .into_iter()
-            .cloned()
-            .collect();
+        let closest_nodes: Vec<_> = self.routing_table.find_closest(target).into_iter().collect();
 
         let seen = Arc::new(Mutex::new(HashSet::new()));
         let (tx, mut rx) = oneshot::channel();
@@ -562,13 +555,15 @@ impl DhtClientV4 {
                 TransactionId::from(transaction_id),
                 info_hash,
                 self.our_id.clone(),
-                self.socket_address.port(),
+                // TODO: hmm, this interesting
+                // self.socket_address.port(),
+                0, // obviously replace this later
                 true,
                 token,
             )
         };
 
-        let response = self.send_message(&query, &recipient).await?;
+        let response = self.send_message(&query, recipient).await?;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),

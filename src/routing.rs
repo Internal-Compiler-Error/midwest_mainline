@@ -31,14 +31,15 @@ impl Bucket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+// TODO: this name is shit, think of a better one
 pub struct Node {
     pub(crate) contact: NodeInfo,
     pub(crate) last_checked: Instant,
 }
 
 impl RoutingTable {
-    pub fn new(id: &NodeId) -> Self {
+    pub fn new(id: NodeId) -> Self {
         let default_bucket = Bucket {
             lower_bound: BigUint::from(0u8),
             // 2^160
@@ -130,7 +131,7 @@ impl RoutingTable {
         info!("node processed, node count: {}", self.node_count());
     }
 
-    pub fn find_closest(&self, target: &NodeId) -> Vec<&NodeInfo> {
+    pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
         let mut closest_nodes: Vec<_> = self
             .buckets
             .iter()
@@ -157,17 +158,19 @@ impl RoutingTable {
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
         closest_nodes
             .iter()
-            .filter(|(_, node)| node.node_id() != target)
+            .filter(|(_, node)| *node.node_id() != target)
             .take(8)
             .map(|x| x.1)
+            .cloned()
             .collect()
     }
 
-    pub fn find(&self, target: &NodeId) -> Option<&Node> {
+    pub fn find(&self, target: NodeId) -> Option<Node> {
         self.buckets
             .iter()
             .map(|bucket| bucket.nodes.iter())
             .flatten()
-            .find(|node| node.contact.node_id() == target)
+            .find(|node| *node.contact.node_id() == target)
+            .cloned()
     }
 }
