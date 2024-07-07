@@ -1,10 +1,9 @@
 use crate::{
-    domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token},
+    domain_knowledge::{InfoHash, NodeId, PeerContact, Token},
     message::{
         announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-        ping_query::PingQuery, Krpc, ToRawKrpc,
+        ping_query::PingQuery, Krpc,
     },
-    routing::RoutingTable,
 };
 use rand::RngCore;
 
@@ -17,12 +16,11 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::UdpSocket,
-    sync::{mpsc::Receiver, Mutex, RwLock},
+    sync::{Mutex, RwLock},
     task::Builder as TskBuilder,
     time::Instant,
 };
-use tracing::{error, info, info_span, trace, Instrument};
+use tracing::{error, info_span, trace, Instrument};
 
 use super::{peer_guide::PeerGuide, MessageBroker};
 #[derive(Debug)]

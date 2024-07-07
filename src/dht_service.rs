@@ -7,7 +7,8 @@ mod transaction_id_pool;
 use crate::{
     dht_service::dht_server::DhtServer,
     domain_knowledge::{NodeId, TransactionId},
-    message::{Krpc, ParseKrpc, ToRawKrpc},
+    message::Krpc,
+    our_error::OurError,
 };
 
 use message_broker::MessageBroker;
@@ -16,24 +17,18 @@ use rand::{Rng, RngCore};
 use std::{
     error::Error,
     fmt::{Display, Formatter},
-    io,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{
-        mpsc,
-        oneshot::{self, Sender},
-        Mutex as AsyncMutex,
-    },
-    task::{Builder, JoinError, JoinHandle, JoinSet},
+    task::{Builder, JoinError, JoinSet},
     time::{error::Elapsed, timeout},
 };
 
 use dht_client::DhtClientV4;
-use tracing::{info, instrument, trace, warn};
+use tracing::{info, instrument};
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -45,44 +40,6 @@ pub struct DhtV4 {
     message_broker: Arc<MessageBroker>,
     peer_guide: Arc<PeerGuide>,
     helper_tasks: JoinSet<()>,
-}
-
-/// A very unhelpful error type. This will be replaced with a more helpful error type in the future.
-#[derive(Debug)]
-pub struct DhtServiceFailure {
-    message: String,
-}
-
-impl Display for DhtServiceFailure {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl Error for DhtServiceFailure {}
-
-impl From<std::io::Error> for DhtServiceFailure {
-    fn from(error: std::io::Error) -> Self {
-        DhtServiceFailure {
-            message: error.to_string(),
-        }
-    }
-}
-
-impl From<Elapsed> for DhtServiceFailure {
-    fn from(error: Elapsed) -> Self {
-        DhtServiceFailure {
-            message: error.to_string(),
-        }
-    }
-}
-
-impl From<JoinError> for DhtServiceFailure {
-    fn from(error: JoinError) -> Self {
-        DhtServiceFailure {
-            message: error.to_string(),
-        }
-    }
 }
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
@@ -110,17 +67,6 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     NodeId(id)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapError {
-    TimedOut,
-}
-
-impl From<Elapsed> for BootstrapError {
-    fn from(_: Elapsed) -> Self {
-        BootstrapError::TimedOut
-    }
-}
-
 impl DhtV4 {
     /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
     /// external IP address of the machine. Note there is no way to verify the external IP address
@@ -130,22 +76,14 @@ impl DhtV4 {
         bind_addr: SocketAddrV4,
         external_addr: Ipv4Addr,
         known_nodes: Vec<SocketAddrV4>,
-    ) -> Result<Self, DhtServiceFailure> {
+    ) -> Result<Self, OurError> {
         let socket = UdpSocket::bind(&bind_addr).await?;
-        // let socket = Arc::new(socket);
 
         // id is randomly generated according to BEP-42
         let our_id = random_idv4(&external_addr, rand::thread_rng().gen::<u8>());
 
         // the JoinSet keeps all the tasks required to make the DHT node functional
         let mut join_set = JoinSet::new();
-
-        // all udp packets are sent to the channel, and the demultiplexer will route them into either
-        // oneshot senders or a queue for severs to handle
-        // let (incoming_packets_tx, incoming_packets_rx) = mpsc::channel(1024);
-
-        // all queries that servers should handle are sent on this channel
-        // let (queries_tx, queries_rx) = mpsc::channel(1024);
 
         // TODO: wtf, why is bootstrapping so special
         //
@@ -192,19 +130,13 @@ impl DhtV4 {
             .build_task()
             .name(&*format!("message demultiplexer for {bind_addr}"))
             .spawn(async move {
-                message_broker_clone.run().await;
+                let _ = message_broker_clone.run().await;
             })
             .unwrap();
 
         let peer_guide = Arc::new(PeerGuide::new(our_id));
 
-        let client = DhtClientV4::new(
-            // bind_addr,
-            // socket.clone(),
-            message_broker.clone(),
-            peer_guide.clone(),
-            our_id.clone(),
-        );
+        let client = DhtClientV4::new(message_broker.clone(), peer_guide.clone(), our_id.clone());
         let client = Arc::new(client);
 
         // ask all the known nodes for ourselves
@@ -243,14 +175,13 @@ impl DhtV4 {
             server: server.clone(),
             message_broker,
             peer_guide: peer_guide.clone(),
-
             helper_tasks: join_set,
         };
 
         Ok(dht)
     }
 
-    /// Keep the DHT running so you can't use the clients and servers, usually you put spawn this
+    /// Keep the DHT running so you can use the clients and servers, usually you put spawn this
     /// and abort the task when desired
     pub async fn run(mut self) {
         while let Some(_) = self.helper_tasks.join_next().await {}

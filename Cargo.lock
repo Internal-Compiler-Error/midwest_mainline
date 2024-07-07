@@ -1329,6 +1329,7 @@ dependencies = [
  "console-subscriber",
  "crc32c",
  "external-ip",
+ "eyre",
  "futures",
  "hex",
  "juicy_bencode",

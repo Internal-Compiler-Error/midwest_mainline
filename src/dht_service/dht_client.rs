@@ -1,24 +1,22 @@
 use crate::{
-    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageBroker},
+    dht_service::{transaction_id_pool::TransactionIdPool, MessageBroker},
     domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
     message::Krpc,
+    our_error::OurError,
     utils::ParSpawnAndAwait,
 };
 use async_recursion::async_recursion;
+use eyre::eyre;
 use num::BigUint;
 use std::{
     collections::HashSet,
-    error::Error,
-    fmt::{Display, Formatter},
     net::SocketAddrV4,
     ops::{BitXor, DerefMut},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    net::UdpSocket,
-    sync::{oneshot, oneshot::Sender, Mutex, RwLock},
-    task::JoinError,
+    sync::{oneshot, oneshot::Sender, Mutex},
     time::timeout,
 };
 use tracing::{debug, info, instrument, trace, warn};
@@ -27,41 +25,11 @@ use super::peer_guide::PeerGuide;
 
 #[derive(Debug)]
 pub struct DhtClientV4 {
-    // pub(crate) socket: Arc<UdpSocket>,
     pub(crate) our_id: NodeId,
     pub(crate) message_broker: Arc<MessageBroker>,
     pub(crate) routing_table: Arc<PeerGuide>,
-    // pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: TransactionIdPool,
 }
-
-#[derive(Debug)]
-pub enum RecursiveSearchError {
-    BottomedOut,
-    Cancelled,
-    JoinError,
-    DhtServiceFailure,
-}
-
-impl From<DhtServiceFailure> for RecursiveSearchError {
-    fn from(_: DhtServiceFailure) -> Self {
-        RecursiveSearchError::DhtServiceFailure
-    }
-}
-
-impl From<JoinError> for RecursiveSearchError {
-    fn from(_: JoinError) -> Self {
-        RecursiveSearchError::JoinError
-    }
-}
-
-impl Display for RecursiveSearchError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl Error for RecursiveSearchError {}
 
 impl DhtClientV4 {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
@@ -84,7 +52,7 @@ impl DhtClientV4 {
     /// Send a message out and await for a response.
     ///
     /// It does not alter the routing table, callers must decide what to do with the response.
-    pub async fn send_message(&self, message: &Krpc, recipient: SocketAddrV4) -> Result<Krpc, DhtServiceFailure> {
+    pub async fn send_message(&self, message: &Krpc, recipient: SocketAddrV4) -> Result<Krpc, OurError> {
         let rx = {
             let rx = self
                 .message_broker
@@ -97,7 +65,7 @@ impl DhtClientV4 {
         Ok(response)
     }
 
-    pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), DhtServiceFailure> {
+    pub async fn ping(self: Arc<Self>, recipient: SocketAddrV4) -> Result<(), OurError> {
         let this = &self;
         let transaction_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(transaction_id), this.our_id.clone());
@@ -113,9 +81,7 @@ impl DhtClientV4 {
             Ok(())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
-            Err(DhtServiceFailure {
-                message: "Unexpected response to ping".to_string(),
-            })
+            Err(eyre!("Unexpected response to ping"))
         };
     }
 
@@ -127,7 +93,7 @@ impl DhtClientV4 {
         self: Arc<Self>,
         interlocutor: SocketAddrV4,
         target: NodeId,
-    ) -> Result<Vec<NodeInfo>, DhtServiceFailure> {
+    ) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
         let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), self.our_id.clone(), target);
@@ -147,9 +113,7 @@ impl DhtClientV4 {
 
             Ok(nodes)
         } else {
-            Err(DhtServiceFailure {
-                message: "Did not get an find node response".to_string(),
-            })
+            Err(eyre!("Did not get an find node response"))
         }
     }
 
@@ -160,7 +124,7 @@ impl DhtClientV4 {
         target: NodeId,
         // TODO: the assumption that success has no nodes is fundamentally wrong, sometimes, they
         // do
-    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), DhtServiceFailure> {
+    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
         // trace!("Asking {:?} for peers", interlocutor);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
@@ -179,9 +143,7 @@ impl DhtClientV4 {
         return match response {
             Krpc::ErrorResponse(response) => {
                 warn!("Got an error response to get peers: {:?}", response);
-                Err(DhtServiceFailure {
-                    message: "Got an error response to get peers".to_string(),
-                })
+                return Err(eyre!("Got an error response to get peers"));
             }
             Krpc::FindNodeGetPeersResponse(response) => {
                 let token = response.token().cloned();
@@ -198,15 +160,13 @@ impl DhtClientV4 {
             }
             other => {
                 warn!("Unexpected response to get peers: {:?}", other);
-                Err(DhtServiceFailure {
-                    message: "Unexpected response to get peers".to_string(),
-                })
+                Err(eyre!("Unexpected response to get peers"))
             }
         };
     }
 
     /// starting point of trying to find any nodes on the network
-    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, DhtServiceFailure> {
+    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.find(target) {
             return Ok(node.contact.clone());
@@ -236,9 +196,7 @@ impl DhtClientV4 {
 
         // if they all ended in failure, then we can't find the node
         if returned_nodes.len() == 0 {
-            return Err(DhtServiceFailure {
-                message: "Could not find node, all nodes requests ended in failure".to_string(),
-            });
+            return Err(eyre!("Could not find node, all nodes requests ended in failure"));
         }
 
         // it's possible that some of the nodes returned are actually the node we're looking for
@@ -287,9 +245,7 @@ impl DhtClientV4 {
 
         tokio::select! {
              _ = &mut parallel_find => {
-                Err(DhtServiceFailure {
-                    message: "Could not find node, all nodes requests ended in failure".to_string(),
-                })
+                Err(eyre!("Could not find node, all nodes requests ended in failure"))
             },
             Ok(target) = rx => {
                 parallel_find.abort();
@@ -309,7 +265,7 @@ impl DhtClientV4 {
         finding: NodeId,
         seen: Arc<Mutex<HashSet<NodeInfo>>>,
         slot: Arc<Mutex<Option<Sender<NodeInfo>>>>,
-    ) -> Result<(), RecursiveSearchError> {
+    ) -> Result<(), OurError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
             let seen = seen.lock().await;
@@ -326,7 +282,7 @@ impl DhtClientV4 {
         // it's ok to assume that this will never get hit for the first time, since the starting
         // pool is always unseen
         if starting_pool.len() == 0 {
-            return Err(RecursiveSearchError::BottomedOut);
+            return Err(eyre!("Bottomed out"));
         }
 
         // ask all the nodes for target!
@@ -364,7 +320,7 @@ impl DhtClientV4 {
                                 .expect("some one else should ready have finished sending and killed us");
                             Ok(())
                         } else {
-                            Err(RecursiveSearchError::Cancelled)
+                            Err(eyre!("Cancelled"))
                         }
                     } else {
                         // if we didn't, then we add the nodes we got to the seen list and recurse
@@ -381,7 +337,8 @@ impl DhtClientV4 {
 
         // if we ever reach here, that means we haven't been cancelled, which means nothing were
         // found
-        Err(RecursiveSearchError::BottomedOut)
+        // Err(RecursiveSearchError::BottomedOut)
+        Err(eyre!("Bottomed out"))
     }
 
     #[async_recursion]
@@ -392,7 +349,7 @@ impl DhtClientV4 {
         finding: NodeId,
         seen: Arc<Mutex<HashSet<NodeInfo>>>,
         slot: Arc<Mutex<Option<Sender<(Box<[u8]>, Vec<PeerContact>)>>>>,
-    ) -> Result<(), RecursiveSearchError> {
+    ) -> Result<(), OurError> {
         // filter the pool to only include nodes that we haven't seen yet
         starting_pool = async {
             let seen = seen.lock().await;
@@ -406,7 +363,7 @@ impl DhtClientV4 {
 
         if starting_pool.len() == 0 {
             debug!("bottomed out");
-            return Err(RecursiveSearchError::BottomedOut);
+            return eyre!("Bottomed out");
         }
 
         // ask all the nodes for target!
@@ -447,7 +404,7 @@ impl DhtClientV4 {
                                 ));
                                 Ok(())
                             }
-                            None => Err(RecursiveSearchError::Cancelled),
+                            None => Err(eyre!("Cancelled")),
                         }
                     }
 
@@ -489,13 +446,10 @@ impl DhtClientV4 {
         // spawn all the tasks and await them
         debug!("spawning {} tasks", parallel_tasks.len());
         let _results = parallel_tasks.par_spawn_and_await().await?;
-        Err(RecursiveSearchError::BottomedOut)
+        eyre!("Bottomed out")
     }
 
-    pub async fn get_peers(
-        self: Arc<Self>,
-        info_hash: InfoHash,
-    ) -> Result<(Box<[u8]>, Vec<PeerContact>), DhtServiceFailure> {
+    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Box<[u8]>, Vec<PeerContact>), OurError> {
         // TODO: verify this
 
         // the info hash and node is occupy the same address space, nodes are supposed to store
@@ -516,9 +470,7 @@ impl DhtClientV4 {
 
         return tokio::select! {
             _ = &mut search => {
-                Err(DhtServiceFailure {
-                    message: "all branches in get peers failed".to_string(),
-                })
+                Err(eyre!("All branches in get peers failed"))
             }
             Ok(result) = &mut rx => {
                 trace!("Received peers from channel, cancelling search");
@@ -539,7 +491,7 @@ impl DhtClientV4 {
         info_hash: InfoHash,
         port: Option<u16>,
         token: Token,
-    ) -> Result<(), DhtServiceFailure> {
+    ) -> Result<(), OurError> {
         let transaction_id = self.transaction_id_pool.next();
         let query = if let Some(port) = port {
             Krpc::new_announce_peer_query(
@@ -567,12 +519,10 @@ impl DhtClientV4 {
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
-            Krpc::ErrorResponse(err) => Err(DhtServiceFailure {
-                message: format!("node responded with an error to our announce peer request {err:?}"),
-            }),
-            _ => Err(DhtServiceFailure {
-                message: "non-compliant response from DHT node".to_string(),
-            }),
+            Krpc::ErrorResponse(err) => Err(eyre!(
+                "node responded with an error to our announce peer request {err:?}"
+            )),
+            _ => Err(eyre!("non-compliant response from DHT node")),
         };
     }
 }
