@@ -121,12 +121,12 @@ impl NodeInfo {
         NodeInfo { id, contact }
     }
 
-    pub fn node_id(&self) -> &NodeId {
-        &self.id
+    pub fn node_id(&self) -> NodeId {
+        self.id
     }
 
-    pub fn contact(&self) -> &PeerContact {
-        &self.contact
+    pub fn contact(&self) -> PeerContact {
+        self.contact
     }
 }
 

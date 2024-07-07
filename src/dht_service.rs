@@ -69,6 +69,9 @@ impl DhtV4 {
     /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
     /// external IP address of the machine. Note there is no way to verify the external IP address
     /// is correct and it's duty to make sure it's correct.
+    /// # Arguments
+    /// * `external_addr`: the ip address that can be reachable from the outside, in Ipv4 land, it
+    /// means this needs to be a public IP
     #[instrument(skip_all)]
     pub async fn bootstrap_with_random_id(
         bind_addr: SocketAddrV4,
@@ -126,7 +129,7 @@ impl DhtV4 {
         let message_broker_clone = message_broker.clone();
         join_set
             .build_task()
-            .name(&*format!("message demultiplexer for {bind_addr}"))
+            .name(&*format!("message broker for {bind_addr}"))
             .spawn(async move {
                 let _ = message_broker_clone.run().await;
             })
@@ -134,7 +137,15 @@ impl DhtV4 {
 
         let peer_guide = Arc::new(PeerGuide::new(our_id));
 
-        let client = DhtClientV4::new(message_broker.clone(), peer_guide.clone(), our_id.clone());
+        let rx = message_broker.subscribe_inbound();
+        let peer_guide_clone = peer_guide.clone();
+        join_set
+            .build_task()
+            .name("Peer guide")
+            .spawn(async move { peer_guide_clone.run(rx).await })
+            .unwrap();
+
+        let client = DhtClientV4::new(message_broker.clone(), peer_guide.clone(), our_id);
         let client = Arc::new(client);
 
         // ask all the known nodes for ourselves
@@ -193,16 +204,14 @@ impl DhtV4 {
     #[instrument(skip_all)]
     async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
-        let transaction_id = dht.transaction_id_pool.next();
+        let txn_id = dht.transaction_id_pool.next();
         // TODO: clearly wrong
         // actually might be right, the goal of bootstrapping is to discover peers near ourselves
-        let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), our_id.clone(), our_id.clone());
+        let query = Krpc::new_find_node_query(TransactionId::from(txn_id), our_id, our_id);
 
         info!("bootstrapping with {contact}");
         let response = timeout(Duration::from_secs(5), async {
-            dht.send_message(&query, contact)
-                .await
-                .expect("failure to send message")
+            dht.send_message(query, contact).await.expect("failure to send message")
         })
         .await?;
 
@@ -210,16 +219,7 @@ impl DhtV4 {
             let mut nodes = response.nodes().clone();
             nodes.sort_unstable_by_key(|node| node.contact().0);
             nodes.dedup();
-
-            // {
-            //     // add the bootstrapping node to our routing table
-            //     let mut table = dht.routing_table.write().await;
-            //     table.add_new_node(NodeInfo::new(response.peer_id().clone(), PeerContact(contact)))
-            // }
-
             for node in nodes {
-                // dht.routing_table.write().await.add_new_node(node);
-
                 let dht = dht.clone();
                 let contact: SocketAddrV4 = node.contact().0;
                 let our_id = dht.our_id.clone();
@@ -233,13 +233,11 @@ impl DhtV4 {
                     .name(&*format!("leave level bootstrap to {}", contact))
                     .spawn(async move {
                         let response = timeout(Duration::from_secs(5), async {
-                            dht.send_message(&query, contact)
-                                .await
-                                .expect("failure to send message")
+                            dht.send_message(query, contact).await.expect("failure to send message")
                         })
                         .await?;
 
-                        if let Krpc::FindNodeGetPeersResponse(response) = response {
+                        if let Krpc::FindNodeGetPeersResponse(_response) = response {
                             // let nodes = response.nodes();
 
                             // for node in nodes {

@@ -118,26 +118,16 @@ impl TokenPool {
 pub struct DhtServer {
     peer_guide: Arc<PeerGuide>,
     our_id: NodeId,
-    // requests: Mutex<Receiver<(Krpc, SocketAddrV4)>>,
     hash_table: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
-    // socket: Arc<UdpSocket>,
     message_broker: Arc<MessageBroker>,
 }
 
 impl DhtServer {
-    pub(crate) fn new(
-        // requests: Receiver<(Krpc, SocketAddrV4)>,
-        // socket: Arc<UdpSocket>,
-        id: NodeId,
-        peer_guide: Arc<PeerGuide>,
-        message_broker: Arc<MessageBroker>,
-    ) -> Self {
+    pub(crate) fn new(id: NodeId, peer_guide: Arc<PeerGuide>, message_broker: Arc<MessageBroker>) -> Self {
         Self {
-            // requests: Mutex::new(requests),
             hash_table: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
-            // socket,
             our_id: id,
             peer_guide,
             message_broker,
@@ -152,56 +142,26 @@ impl DhtServer {
             .unwrap();
         let mut rx = self.message_broker.subscribe_inbound();
 
+        // respond to messages, as fast as possible
         while let Some((request, socket_addr)) = rx.recv().await {
-            let server = self.clone();
-            TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
+            let this = self.clone();
+            let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
                 async move {
-                    let server = &*server;
+                    let this = &*this;
 
-                    let response = match server.generate_response(request, socket_addr).await {
+                    let response = match this.generate_response(request, socket_addr).await {
                         Some(msg) => msg,
                         None => return,
                     };
 
                     trace!("Handling request from {socket_addr}");
 
-                    server.message_broker.send_msg(response, socket_addr);
+                    this.message_broker.send_msg(response, socket_addr);
                     trace!("response sending for {socket_addr}");
-
-                    // info!("table = {:#?}", server.hash_table.read().await.len());
-                    // Ok::<_, color_eyre::Report>(())
                 }
                 .instrument(info_span!("handle_requests")),
             );
         }
-
-        // let mut requests = (&self).requests.lock().await;
-        // while let Some((request, socket_addr)) = requests.recv().await {
-        //     trace!("Received request: {:?}", request);
-        //
-        //     let server = self.clone();
-        //
-        //     TskBuilder::new()
-        //         .name(&*format!("responding to {socket_addr}"))
-        //         .spawn(
-        //             async move {
-        //                 let server = &*server;
-        //                 let response = server.generate_response(request, socket_addr).await;
-        //                 trace!("Handling request from {socket_addr}");
-        //
-        //                 if let Some(response) = response {
-        //                     let serialized = response.to_raw_krpc();
-        //                     server.socket.send_to(&serialized, socket_addr).await?;
-        //                     trace!("response sent for {socket_addr}");
-        //                 }
-        //
-        //                 info!("table = {:#?}", server.hash_table.read().await.len());
-        //                 Ok::<_, color_eyre::Report>(())
-        //             }
-        //             .instrument(info_span!("handle_requests")),
-        //         )
-        //         .unwrap();
-        // }
     }
 
     #[tracing::instrument]
@@ -224,29 +184,13 @@ impl DhtServer {
 
     #[tracing::instrument]
     async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
-        // add the node into our routing table
-        // {
-        //     let mut routing_table = self.peer_guide.write().await;
-        //
-        //     let peer = NodeInfo::new(*ping.target_id(), PeerContact(origin));
-        //     routing_table.add_new_node(peer);
-        // }
-
         Krpc::new_ping_response(ping.txn_id().clone(), self.our_id.clone())
     }
 
     #[tracing::instrument]
     async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
-        // add the node into our routing table
-        // {
-        //     let mut routing_table = self.peer_guide.write().await;
-        //
-        //     let peer = NodeInfo::new(*query.target_id(), PeerContact(origin));
-        //     routing_table.add_new_node(peer);
-        // }
-
         let table = &self.peer_guide;
-        let closest_eight: Vec<_> = table.find_closest(*query.target_id()).into_iter().collect();
+        let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
         return if closest_eight[0].node_id() == query.target_id() {
@@ -265,14 +209,6 @@ impl DhtServer {
 
     #[tracing::instrument]
     async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
-        // add the node into our routing table
-        // {
-        // let mut routing_table = self.peer_guide.write().await;
-        //
-        // let peer = NodeInfo::new(*query.peer_id(), PeerContact(origin));
-        // routing_table.add_new_node(peer);
-        // }
-
         // see if know about the info hash
         let table = self.hash_table.read().await;
         let token_pool = &self.token_pool;
@@ -314,14 +250,6 @@ impl DhtServer {
         if !self.token_pool.is_valid_token(&origin.ip(), announce.token()).await {
             return Krpc::new_standard_protocol_error(announce.txn_id().clone());
         }
-
-        // // add the node into our routing table
-        // {
-        //     let mut routing_table = self.peer_guide.write().await;
-        //
-        //     let peer = NodeInfo::new(announce.querying().clone(), PeerContact(origin));
-        //     routing_table.add_new_node(peer);
-        // }
 
         // generate the correct peer contact according to the implied port argument, the port
         // argument is ignored if the implied port is not 0 and we use the origin port instead

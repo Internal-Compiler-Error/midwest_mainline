@@ -2,7 +2,8 @@ use std::io;
 use thiserror::Error;
 use tokio::{task::JoinError, time::error::Elapsed};
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
+/// An old joke on soviet union
 pub enum OurError {
     // #[error("Issue with parsing bencode")]
     // #[error(transparent)]
@@ -32,6 +33,17 @@ pub enum OurError {
     JoinError(#[from] JoinError),
 
     // wtf
-    #[error("Join Error")]
+    #[error("Timed out")]
     Timeout(#[from] Elapsed),
 }
+
+/// When Australians purpose no
+macro_rules! naur {
+    ($msg:literal $(,)?) => { OurError::Generic(eyre::eyre!($msg)) };
+    ($err:expr $(,)?) => { OurError::Generic(eyre::eyre!($expr)) };
+    ($fmt:expr, $($arg:tt)*) => { OurError::Generic(eyre::eyre!($fmt $($arg)*)) };
+}
+
+// https://stackoverflow.com/questions/26731243/how-do-i-use-a-macro-across-module-files
+// don't ask me why or how
+pub(crate) use naur;

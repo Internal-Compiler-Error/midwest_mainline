@@ -59,6 +59,8 @@ impl RoutingTable {
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
     pub fn add_new_node(&mut self, contact: NodeInfo) {
+        // TODO: handle duplicate nodes
+
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
         if let Some(node) = self
@@ -137,7 +139,8 @@ impl RoutingTable {
             .iter()
             .map(|bucket| {
                 bucket.nodes.iter().map(|node| {
-                    let node_id = node.contact.node_id().as_bytes();
+                    let node_id = node.contact.node_id();
+                    let node_id = node_id.as_bytes();
                     let target = target.as_bytes();
 
                     let mut distance = [0u8; 20];
@@ -158,7 +161,7 @@ impl RoutingTable {
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
         closest_nodes
             .iter()
-            .filter(|(_, node)| *node.node_id() != target)
+            .filter(|(_, node)| node.node_id() != target)
             .take(8)
             .map(|x| x.1)
             .cloned()
@@ -170,7 +173,7 @@ impl RoutingTable {
             .iter()
             .map(|bucket| bucket.nodes.iter())
             .flatten()
-            .find(|node| *node.contact.node_id() == target)
+            .find(|node| node.contact.node_id() == target)
             .cloned()
     }
 }

@@ -22,8 +22,8 @@ impl FindNodeQuery {
         &self.transaction_id
     }
 
-    pub fn target_id(&self) -> &NodeId {
-        &self.target
+    pub fn target_id(&self) -> NodeId {
+        self.target
     }
 }
 
