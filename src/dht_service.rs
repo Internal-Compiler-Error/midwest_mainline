@@ -1,7 +1,7 @@
 use crate::{
     dht_service::dht_server::DhtServer,
     domain_knowledge::{NodeId, NodeInfo, PeerContact, TransactionId},
-    message::{Krpc, ParseKrpc},
+    message::{Krpc, ParseKrpc, ToRawKrpc},
     routing::RoutingTable,
 };
 
@@ -10,14 +10,19 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt::{Display, Formatter},
+    io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot, oneshot::Sender, Mutex, RwLock},
-    task::{Builder, JoinError, JoinSet},
+    sync::{
+        mpsc,
+        oneshot::{self, Sender},
+        Mutex, RwLock,
+    },
+    task::{AbortHandle, Builder, JoinError, JoinHandle, JoinSet},
     time::{error::Elapsed, timeout},
 };
 
@@ -35,7 +40,7 @@ mod transaction_id_pool;
 pub struct DhtV4 {
     client: Arc<DhtClientV4>,
     server: Arc<DhtServer>,
-    demultiplexer: Arc<MessageDemultiplexer>,
+    demultiplexer: Arc<MessageBroker>,
     routing_table: Arc<RwLock<RoutingTable>>,
     helper_tasks: JoinSet<()>,
 }
@@ -57,54 +62,99 @@ impl Error for DhtServiceFailure {}
 /// A message demultiplexer keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
 /// so the client and await the response.
+/// TODO: replace this with some proper pubsub
 #[derive(Debug)]
-pub(crate) struct MessageDemultiplexer {
+pub(crate) struct MessageBroker {
     /// a map to keep track of the responses we await from the client
-    pending_responses: Mutex<HashMap<TransactionId, Sender<Krpc>>>,
+    pending_responses: Arc<Mutex<HashMap<TransactionId, Sender<Krpc>>>>,
 
     /// all messages belong to the server are put into this queue.
-    query_queue: Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>,
+    query_queue: Arc<Mutex<mpsc::Sender<(Krpc, SocketAddrV4)>>>,
 
     /// a channel to receive new krpc read from the socket
-    incoming_messages: Mutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>,
+    outbound_messages: Arc<Mutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>>,
+
+    socket: Arc<UdpSocket>,
 }
 
-impl MessageDemultiplexer {
+impl MessageBroker {
     pub fn new(
         incoming_queue: mpsc::Receiver<(Krpc, SocketAddrV4)>,
         query_channel: mpsc::Sender<(Krpc, SocketAddrV4)>,
     ) -> Self {
         Self {
-            pending_responses: Mutex::new(HashMap::new()),
-            query_queue: Mutex::new(query_channel),
-            incoming_messages: Mutex::new(incoming_queue),
+            pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            query_queue: Arc::new(Mutex::new(query_channel)),
+            outbound_messages: Arc::new(Mutex::new(incoming_queue)),
+            socket: todo!(),
         }
     }
 
     #[instrument(skip_all)]
-    pub async fn run(&self) {
-        let mut incoming_messages = self.incoming_messages.lock().await;
-        while let Some((msg, socket_addr)) = incoming_messages.recv().await {
-            let id = msg.transaction_id();
-            trace!(
-                "received message for transaction id {:?}",
-                hex::encode_upper(id.as_bytes())
-            );
+    pub async fn run(&self) -> io::Result<JoinHandle<()>> {
+        let socket = self.socket.clone();
+        let pending_responses = self.pending_responses.clone();
+        let query_queue = self.query_queue.clone();
 
-            // see if we have a slot for this transaction id, if we do, that means one of the
-            // messages that we expect, otherwise the message is a query we need to handle
-            if let Some(sender) = self.pending_responses.lock().await.remove(id) {
-                // failing means we're no longer interested, which is ok
-                let _ = sender.send(msg);
-            } else {
-                self.query_queue
-                    .lock()
-                    .await
-                    .send((msg, socket_addr))
-                    .await
-                    .expect("the server died before the demultiplexer could send the message");
+        let socket_reader = async move {
+            let mut buf = [0u8; 1500];
+
+            loop {
+                let (amount, socket_addr) = socket.recv_from(&mut buf).await.expect("common MTU 1500 exceeded");
+                trace!("packet from {socket_addr}");
+                if let Ok(msg) = (&buf[..amount]).parse() {
+                    let socket_addr = {
+                        match socket_addr {
+                            SocketAddr::V4(addr) => addr,
+                            _ => panic!("Expected V4 socket address"),
+                        }
+                    };
+
+                    let id = msg.transaction_id();
+                    trace!(
+                        "received message for transaction id {:?}",
+                        hex::encode_upper(id.as_bytes())
+                    );
+
+                    // see if we have a slot for this transaction id, if we do, that means one of the
+                    // messages that we expect, otherwise the message is a query we need to handle
+                    if let Some(sender) = pending_responses.lock().await.remove(id) {
+                        // failing means we're no longer interested, which is ok
+                        let _ = sender.send(msg);
+                    } else {
+                        query_queue
+                            .lock()
+                            .await
+                            .send((msg, socket_addr))
+                            .await
+                            .expect("the server died before the broker could send the message");
+                    }
+                } else {
+                    warn!(
+                        "Failed to parse message from {socket_addr}, bytes = {:?}",
+                        &buf[..amount]
+                    );
+                }
             }
-        }
+        };
+
+        let outbound_messages = self.outbound_messages.clone();
+        let socket = self.socket.clone();
+        let stupid = async move {
+            let mut outbound_messages = outbound_messages.lock().await;
+            loop {
+                let outbound = outbound_messages.recv().await;
+                if outbound.is_none() {
+                    break;
+                }
+
+                let (msg, peer) = outbound.unwrap();
+                let _ = socket.send_to(&msg.to_raw_krpc(), peer).await;
+            }
+        };
+
+        use tokio::task::Builder;
+        Builder::new().name("Message broker").spawn(socket_reader)
     }
 
     /// Tell the placer we should expect some messages
@@ -113,6 +163,16 @@ impl MessageDemultiplexer {
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
         let _ = guard.insert(transaction_id, sending_half);
+    }
+
+    pub fn send_msg(&self, msg: Krpc, peer: SocketAddrV4) {
+        let socket = self.socket.clone();
+
+        tokio::spawn(async move {
+            let buf = msg.to_raw_krpc();
+
+            let _ = socket.send_to(&buf, peer);
+        });
     }
 }
 
@@ -237,7 +297,7 @@ impl DhtV4 {
             .spawn(socket_reader.instrument(info_span!("socket reader")))
             .unwrap();
 
-        let demultiplexer = MessageDemultiplexer::new(incoming_packets_rx, queries_tx);
+        let demultiplexer = MessageBroker::new(incoming_packets_rx, queries_tx);
         let demultiplexer = Arc::new(demultiplexer);
 
         let demultiplexer_clone = demultiplexer.clone();

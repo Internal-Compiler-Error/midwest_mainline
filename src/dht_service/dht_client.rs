@@ -1,5 +1,5 @@
 use crate::{
-    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageDemultiplexer},
+    dht_service::{transaction_id_pool::TransactionIdPool, DhtServiceFailure, MessageBroker},
     domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
     message::{Krpc, ToRawKrpc},
     routing::RoutingTable,
@@ -28,7 +28,7 @@ use tracing::{debug, info, instrument, trace, warn};
 pub struct DhtClientV4 {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) our_id: NodeId,
-    pub(crate) demultiplexer: Arc<MessageDemultiplexer>,
+    pub(crate) demultiplexer: Arc<MessageBroker>,
     pub(crate) routing_table: Arc<RwLock<RoutingTable>>,
     pub(crate) socket_address: SocketAddrV4,
     pub(crate) transaction_id_pool: TransactionIdPool,
@@ -68,7 +68,7 @@ impl DhtClientV4 {
     pub(crate) fn new(
         bind_addr: SocketAddrV4,
         socket: Arc<UdpSocket>,
-        demultiplexer: Arc<MessageDemultiplexer>,
+        demultiplexer: Arc<MessageBroker>,
         routing_table: Arc<RwLock<RoutingTable>>,
         our_id: NodeId,
     ) -> Self {
