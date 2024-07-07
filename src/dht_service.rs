@@ -15,16 +15,14 @@ use message_broker::MessageBroker;
 use peer_guide::PeerGuide;
 use rand::{Rng, RngCore};
 use std::{
-    error::Error,
-    fmt::{Display, Formatter},
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    task::{Builder, JoinError, JoinSet},
-    time::{error::Elapsed, timeout},
+    task::{Builder, JoinSet},
+    time::timeout,
 };
 
 use dht_client::DhtClientV4;
@@ -193,7 +191,7 @@ impl DhtV4 {
     ///
     /// This is subject to change in the future.
     #[instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), BootstrapError> {
+    async fn bootstrap_from(dht: Arc<DhtClientV4>, contact: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
         // TODO: clearly wrong
@@ -251,7 +249,7 @@ impl DhtV4 {
                             //     table.add_new_node(peer);
                             // }
                         }
-                        Ok::<_, color_eyre::Report>(())
+                        Ok::<_, OurError>(())
                     })
                     .unwrap();
             }

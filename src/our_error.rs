@@ -1,5 +1,6 @@
 use std::io;
 use thiserror::Error;
+use tokio::{task::JoinError, time::error::Elapsed};
 
 #[derive(Error, Debug)]
 pub enum OurError {
@@ -12,7 +13,7 @@ pub enum OurError {
     //     backtrace: Backtrace,
     // },
     #[error(transparent)]
-    DecodeError(#[from] color_eyre::Report),
+    DecodeError(eyre::Error),
     // stupid ass bendy library's error type only implements Debug + Display and not actually Error
     #[error("Bendy complained {0}")]
     BendyDecodeError(bendy::decoding::Error),
@@ -25,4 +26,12 @@ pub enum OurError {
 
     #[error(transparent)]
     Generic(#[from] eyre::Error),
+
+    // wtf
+    #[error("Join Error")]
+    JoinError(#[from] JoinError),
+
+    // wtf
+    #[error("Join Error")]
+    Timeout(#[from] Elapsed),
 }

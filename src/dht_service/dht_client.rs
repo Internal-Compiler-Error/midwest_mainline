@@ -81,7 +81,7 @@ impl DhtClientV4 {
             Ok(())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
-            Err(eyre!("Unexpected response to ping"))
+            Err(OurError::Generic(eyre!("Unexpected response to ping")))
         };
     }
 
@@ -113,7 +113,7 @@ impl DhtClientV4 {
 
             Ok(nodes)
         } else {
-            Err(eyre!("Did not get an find node response"))
+            Err(OurError::Generic(eyre!("Did not get an find node response")))
         }
     }
 
@@ -143,7 +143,7 @@ impl DhtClientV4 {
         return match response {
             Krpc::ErrorResponse(response) => {
                 warn!("Got an error response to get peers: {:?}", response);
-                return Err(eyre!("Got an error response to get peers"));
+                return Err(OurError::Generic(eyre!("Got an error response to get peers")));
             }
             Krpc::FindNodeGetPeersResponse(response) => {
                 let token = response.token().cloned();
@@ -160,7 +160,7 @@ impl DhtClientV4 {
             }
             other => {
                 warn!("Unexpected response to get peers: {:?}", other);
-                Err(eyre!("Unexpected response to get peers"))
+                Err(OurError::Generic(eyre!("Unexpected response to get peers")))
             }
         };
     }
@@ -196,7 +196,9 @@ impl DhtClientV4 {
 
         // if they all ended in failure, then we can't find the node
         if returned_nodes.len() == 0 {
-            return Err(eyre!("Could not find node, all nodes requests ended in failure"));
+            return Err(OurError::Generic(eyre!(
+                "Could not find node, all nodes requests ended in failure"
+            )));
         }
 
         // it's possible that some of the nodes returned are actually the node we're looking for
@@ -245,7 +247,7 @@ impl DhtClientV4 {
 
         tokio::select! {
              _ = &mut parallel_find => {
-                Err(eyre!("Could not find node, all nodes requests ended in failure"))
+                Err(OurError::Generic(eyre!("Could not find node, all nodes requests ended in failure")))
             },
             Ok(target) = rx => {
                 parallel_find.abort();
@@ -282,7 +284,7 @@ impl DhtClientV4 {
         // it's ok to assume that this will never get hit for the first time, since the starting
         // pool is always unseen
         if starting_pool.len() == 0 {
-            return Err(eyre!("Bottomed out"));
+            return Err(OurError::Generic(eyre!("Bottomed out")));
         }
 
         // ask all the nodes for target!
@@ -320,7 +322,7 @@ impl DhtClientV4 {
                                 .expect("some one else should ready have finished sending and killed us");
                             Ok(())
                         } else {
-                            Err(eyre!("Cancelled"))
+                            Err(OurError::Generic(eyre!("Cancelled")))
                         }
                     } else {
                         // if we didn't, then we add the nodes we got to the seen list and recurse
@@ -338,7 +340,7 @@ impl DhtClientV4 {
         // if we ever reach here, that means we haven't been cancelled, which means nothing were
         // found
         // Err(RecursiveSearchError::BottomedOut)
-        Err(eyre!("Bottomed out"))
+        Err(OurError::Generic(eyre!("Bottomed out")))
     }
 
     #[async_recursion]
@@ -363,7 +365,7 @@ impl DhtClientV4 {
 
         if starting_pool.len() == 0 {
             debug!("bottomed out");
-            return eyre!("Bottomed out");
+            return Err(OurError::Generic(eyre!("Bottomed out")));
         }
 
         // ask all the nodes for target!
@@ -404,7 +406,7 @@ impl DhtClientV4 {
                                 ));
                                 Ok(())
                             }
-                            None => Err(eyre!("Cancelled")),
+                            None => Err(OurError::Generic(eyre!("Cancelled"))),
                         }
                     }
 
@@ -446,7 +448,8 @@ impl DhtClientV4 {
         // spawn all the tasks and await them
         debug!("spawning {} tasks", parallel_tasks.len());
         let _results = parallel_tasks.par_spawn_and_await().await?;
-        eyre!("Bottomed out")
+
+        Err(OurError::Generic(eyre!("Bottomed out")))
     }
 
     pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Box<[u8]>, Vec<PeerContact>), OurError> {
@@ -470,7 +473,7 @@ impl DhtClientV4 {
 
         return tokio::select! {
             _ = &mut search => {
-                Err(eyre!("All branches in get peers failed"))
+                Err(OurError::Generic(eyre!("All branches in get peers failed")))
             }
             Ok(result) = &mut rx => {
                 trace!("Received peers from channel, cancelling search");
@@ -519,10 +522,10 @@ impl DhtClientV4 {
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
-            Krpc::ErrorResponse(err) => Err(eyre!(
+            Krpc::ErrorResponse(err) => Err(OurError::Generic(eyre!(
                 "node responded with an error to our announce peer request {err:?}"
-            )),
-            _ => Err(eyre!("non-compliant response from DHT node")),
+            ))),
+            _ => Err(OurError::Generic(eyre!("non-compliant response from DHT node"))),
         };
     }
 }
