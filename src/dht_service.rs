@@ -317,6 +317,7 @@ impl DhtV4 {
         let our_id = dht.our_id.clone();
         let transaction_id = dht.transaction_id_pool.next();
         // TODO: clearly wrong
+        // actually might be right, the goal of bootstrapping is to discover peers near ourselves
         let query = Krpc::new_find_node_query(TransactionId::from(transaction_id), our_id.clone(), our_id.clone());
 
         info!("bootstrapping with {contact}");

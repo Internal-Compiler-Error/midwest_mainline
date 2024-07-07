@@ -155,10 +155,10 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
                         // nodes is a list of node id concated with the their ip and port
                         e.emit_pair_with(b"nodes", |e| {
                             let combined = self.nodes.iter().map(|peer| {
-                                let node_id = &peer.id;
+                                let node_id = &peer.node_id();
 
-                                let octets = peer.contact.0.ip().octets();
-                                let port_in_be = peer.contact.0.port().to_be_bytes();
+                                let octets = peer.contact().0.ip().octets();
+                                let port_in_be = peer.contact().0.port().to_be_bytes();
 
                                 let mut arr = [0u8; 26];
                                 let id = &mut arr[0..20];

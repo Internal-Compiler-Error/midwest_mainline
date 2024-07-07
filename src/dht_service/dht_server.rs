@@ -8,6 +8,7 @@ use crate::{
 };
 use rand::RngCore;
 
+use crate::message::find_node_get_peers_response::Builder as ResBuilder;
 use sha3::{Digest, Sha3_256};
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -18,11 +19,10 @@ use std::{
 use tokio::{
     net::UdpSocket,
     sync::{mpsc::Receiver, Mutex, RwLock},
-    task::Builder,
+    task::Builder as TskBuilder,
     time::Instant,
 };
 use tracing::{error, info, info_span, trace, Instrument};
-
 #[derive(Debug)]
 struct TokenPool {
     assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
@@ -57,7 +57,7 @@ impl TokenPool {
         };
 
         // TODO: huh?
-        let task = Builder::new()
+        let task = TskBuilder::new()
             .name("five minute salt")
             .spawn(new_salt_every_five_minutes);
         // let _ = task.await;
@@ -143,7 +143,7 @@ impl DhtServer {
 
     #[tracing::instrument]
     pub(crate) async fn run(self: Arc<Self>) {
-        Builder::new()
+        TskBuilder::new()
             .name("token pool")
             .spawn(self.token_pool.clone().run())
             .unwrap();
@@ -154,7 +154,7 @@ impl DhtServer {
 
             let server = self.clone();
 
-            Builder::new()
+            TskBuilder::new()
                 .name(&*format!("responding to {socket_addr}"))
                 .spawn(
                     async move {
@@ -200,12 +200,8 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            // TODO: use new
-            let peer = NodeInfo {
-                id: ping.target_id().clone(),
-                contact: PeerContact(origin),
-            };
 
+            let peer = NodeInfo::new(*ping.target_id(), PeerContact(origin));
             routing_table.add_new_node(peer);
         }
 
@@ -217,26 +213,23 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = NodeInfo {
-                id: query.target_id().clone(),
-                contact: PeerContact(origin),
-            };
+
+            let peer = NodeInfo::new(*query.target_id(), PeerContact(origin));
             routing_table.add_new_node(peer);
         }
 
         let table = self.routing_table.read().await;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
-        use crate::message::find_node_get_peers_response::Builder;
         // if we have an exact match, it will be the first element in the vector
-        return if &closest_eight[0].id == query.target_id() {
-            let res = Builder::new(query.txn_id().clone(), self.our_id)
+        return if closest_eight[0].node_id() == query.target_id() {
+            let res = ResBuilder::new(query.txn_id().clone(), self.our_id)
                 .with_node(closest_eight[0].clone())
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
         } else {
             let stupid: Vec<_> = closest_eight.into_iter().cloned().collect();
-            let res = Builder::new(query.txn_id().clone(), self.our_id)
+            let res = ResBuilder::new(query.txn_id().clone(), self.our_id)
                 .with_nodes(&stupid)
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
@@ -248,10 +241,8 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = NodeInfo {
-                id: query.our_id().clone(),
-                contact: PeerContact(origin),
-            };
+
+            let peer = NodeInfo::new(*query.peer_id(), PeerContact(origin));
             routing_table.add_new_node(peer);
         }
 
@@ -264,9 +255,7 @@ impl DhtServer {
 
             let token = token_pool.token_for_addr(origin.ip()).await;
 
-            use crate::message::find_node_get_peers_response::Builder;
-
-            let res = Builder::new(query.txn_id().clone(), self.our_id.clone())
+            let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
                 .with_token(token)
                 .with_values(&peers)
                 .build();
@@ -276,7 +265,7 @@ impl DhtServer {
                 .routing_table
                 .read()
                 .await
-                .find_closest(query.our_id()) // TODO: wtf, why are we finding via info_hash
+                .find_closest(query.peer_id()) // TODO: wtf, why are we finding via info_hash
                 // before
                 .into_iter()
                 .cloned()
@@ -286,8 +275,7 @@ impl DhtServer {
 
             // defferred
 
-            use crate::message::find_node_get_peers_response::Builder;
-            let res = Builder::new(query.txn_id().clone(), self.our_id.clone())
+            let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
                 .with_token(token)
                 .with_nodes(&closest_eight)
                 .build();
@@ -305,10 +293,8 @@ impl DhtServer {
         // add the node into our routing table
         {
             let mut routing_table = self.routing_table.write().await;
-            let peer = NodeInfo {
-                id: announce.querying().clone(),
-                contact: PeerContact(origin),
-            };
+
+            let peer = NodeInfo::new(announce.querying().clone(), PeerContact(origin));
             routing_table.add_new_node(peer);
         }
 
@@ -317,10 +303,8 @@ impl DhtServer {
         let peer_contact = {
             if !announce.implied_port() {
                 PeerContact(SocketAddrV4::new(*origin.ip(), announce.port()))
-                // CompactPeerContact::from(SocketAddrV4::new(*origin.ip(), announce.port()))
             } else {
                 PeerContact(origin)
-                // CompactPeerContact::from(origin)
             }
         };
 

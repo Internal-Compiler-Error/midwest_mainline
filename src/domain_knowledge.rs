@@ -112,8 +112,8 @@ pub struct PeerContact(pub SocketAddrV4);
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct NodeInfo {
-    pub id: NodeId,
-    pub contact: PeerContact,
+    id: NodeId,
+    contact: PeerContact,
 }
 
 impl NodeInfo {

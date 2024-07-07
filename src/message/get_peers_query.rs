@@ -5,7 +5,7 @@ use super::ToRawKrpc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct GetPeersQuery {
     transaction_id: TransactionId,
-    ourself: NodeId,
+    peer_id: NodeId,
     info_hash: InfoHash,
 }
 
@@ -13,7 +13,7 @@ impl GetPeersQuery {
     pub fn new(transaction_id: TransactionId, ourself: NodeId, info_hash: InfoHash) -> Self {
         Self {
             transaction_id,
-            ourself,
+            peer_id: ourself,
             info_hash,
         }
     }
@@ -23,8 +23,8 @@ impl GetPeersQuery {
     }
 
     // TODO: horrible name, when we recive a request, it's clearly not from ourself
-    pub fn our_id(&self) -> &NodeId {
-        &self.ourself
+    pub fn peer_id(&self) -> &NodeId {
+        &self.peer_id
     }
 
     pub fn info_hash(&self) -> &InfoHash {
@@ -46,7 +46,7 @@ impl ToRawKrpc for GetPeersQuery {
 
             e.emit_pair_with(b"a", |e| {
                 e.emit_unsorted_dict(|e| {
-                    e.emit_pair(b"id", &self.ourself);
+                    e.emit_pair(b"id", &self.peer_id);
                     e.emit_pair(b"info_hash", &self.info_hash)
                 })
             })
