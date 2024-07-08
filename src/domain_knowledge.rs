@@ -121,7 +121,7 @@ impl NodeInfo {
         NodeInfo { id, contact }
     }
 
-    pub fn node_id(&self) -> NodeId {
+    pub fn id(&self) -> NodeId {
         self.id
     }
 

@@ -68,14 +68,14 @@ impl RoutingTable {
             .iter_mut()
             .map(|b| b.nodes.iter_mut())
             .flatten()
-            .find(|node| node.contact.node_id() == contact.node_id())
+            .find(|node| node.contact.id() == contact.id())
         {
             node.last_checked = Instant::now();
             return;
         }
 
         let our_id = &self.id;
-        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.node_id().as_bytes()));
+        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.id().as_bytes()));
 
         // first, find the bucket that this node belongs in
         let target_bucket = self
@@ -102,8 +102,7 @@ impl RoutingTable {
                 // do I prefer the draining_filter API? yes but that's sadly nightly only
                 let mut i = 0;
                 while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id =
-                        BigUint::from_bytes_be(target_bucket.nodes[i].contact.node_id().as_bytes());
+                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.id().as_bytes());
                     if &target_bucket_node_id <= &new_bucket.lower_bound {
                         let node = target_bucket.nodes.remove(i);
                         new_bucket.nodes.push(node);
@@ -139,7 +138,7 @@ impl RoutingTable {
             .iter()
             .map(|bucket| {
                 bucket.nodes.iter().map(|node| {
-                    let node_id = node.contact.node_id();
+                    let node_id = node.contact.id();
                     let node_id = node_id.as_bytes();
                     let target = target.as_bytes();
 
@@ -161,7 +160,7 @@ impl RoutingTable {
         closest_nodes.sort_unstable_by_key(|x| x.0.clone());
         closest_nodes
             .iter()
-            .filter(|(_, node)| node.node_id() != target)
+            .filter(|(_, node)| node.id() != target)
             .take(8)
             .map(|x| x.1)
             .cloned()
@@ -173,7 +172,7 @@ impl RoutingTable {
             .iter()
             .map(|bucket| bucket.nodes.iter())
             .flatten()
-            .find(|node| node.contact.node_id() == target)
+            .find(|node| node.contact.id() == target)
             .cloned()
     }
 }

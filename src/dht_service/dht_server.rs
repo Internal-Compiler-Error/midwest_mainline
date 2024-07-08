@@ -56,11 +56,10 @@ impl TokenPool {
             }
         };
 
-        // TODO: huh?
-        let task = TskBuilder::new()
+        TskBuilder::new()
             .name("five minute salt")
-            .spawn(new_salt_every_five_minutes);
-        // let _ = task.await;
+            .spawn(new_salt_every_five_minutes)
+            .unwrap();
     }
 
     /// Generate a new token if the address is not in the pool or expired, otherwise return the
@@ -118,6 +117,9 @@ impl TokenPool {
 pub struct DhtServer {
     peer_guide: Arc<PeerGuide>,
     our_id: NodeId,
+    /// Records which bittorrent clients are last known to be downloading identified by the info
+    /// hash.
+    /// TODO: replace this with a db
     hash_table: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
     message_broker: Arc<MessageBroker>,
@@ -193,7 +195,7 @@ impl DhtServer {
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
-        return if closest_eight[0].node_id() == query.target_id() {
+        return if closest_eight[0].id() == query.target_id() {
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id)
                 .with_node(closest_eight[0].clone())
                 .build();
@@ -229,7 +231,6 @@ impl DhtServer {
                 .find_closest(*query.peer_id()) // TODO: wtf, why are we finding via info_hash
                 // before
                 .into_iter()
-                // .cloned()
                 .collect();
 
             let token = token_pool.token_for_addr(&origin.ip()).await;

@@ -15,14 +15,12 @@ use crate::{
 /// A PeerGuide will tell you who are the closest nodes that we know
 pub struct PeerGuide {
     routing_table: Arc<Mutex<RoutingTable>>,
-    id: NodeId,
 }
 
 impl PeerGuide {
     pub fn new(id: NodeId) -> PeerGuide {
         PeerGuide {
             routing_table: Arc::new(Mutex::new(RoutingTable::new(id))),
-            id,
         }
     }
 

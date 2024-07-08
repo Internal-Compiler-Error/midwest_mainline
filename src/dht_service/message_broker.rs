@@ -38,15 +38,9 @@ pub(crate) struct MessageBroker {
 }
 
 impl MessageBroker {
-    pub fn new(
-        // incoming_queue: mpsc::Receiver<(Krpc, SocketAddrV4)>,
-        // query_channel: mpsc::Sender<(Krpc, SocketAddrV4)>,
-        socket: UdpSocket,
-    ) -> Self {
+    pub fn new(socket: UdpSocket) -> Self {
         Self {
             pending_responses: Arc::new(AsyncMutex::new(HashMap::new())),
-            // query_queue: Arc::new(AsyncMutex::new(query_channel)),
-            // outbound_messages: Arc::new(AsyncMutex::new(incoming_queue)),
             socket: Arc::new(socket),
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
         }
@@ -64,8 +58,10 @@ impl MessageBroker {
 
             loop {
                 let (amount, socket_addr) = socket.recv_from(&mut buf).await.expect("common MTU 1500 exceeded");
+                println!("yo!");
                 trace!("packet from {socket_addr}");
                 if let Ok(msg) = (&buf[..amount]).parse() {
+                    println!("{:?}", msg);
                     let socket_addr = {
                         match socket_addr {
                             SocketAddr::V4(addr) => addr,
@@ -98,25 +94,11 @@ impl MessageBroker {
                         "Failed to parse message from {socket_addr}, bytes = {:?}",
                         &buf[..amount]
                     );
+                } else {
+                    println!("wtf!!!!!!!!!");
                 }
             }
         };
-
-        // let outbound_messages = self.outbound_messages.clone();
-        // let socket = self.socket.clone();
-        // let stupid = async move {
-        //     let mut outbound_messages = outbound_messages.lock().await;
-        //     loop {
-        //         let outbound = outbound_messages.recv().await;
-        //         if outbound.is_none() {
-        //             break;
-        //         }
-        //
-        //         let (msg, peer) = outbound.unwrap();
-        //         let _ = socket.send_to(&msg.to_raw_krpc(), peer).await;
-        //     }
-        // };
-
         use tokio::task::Builder;
         Builder::new().name("Message broker").spawn(socket_reader)
     }
@@ -140,7 +122,7 @@ impl MessageBroker {
         tokio::spawn(async move {
             let buf = msg.to_raw_krpc();
 
-            let _ = socket.send_to(&buf, peer);
+            socket.send_to(&buf, peer).await.unwrap();
         });
     }
 
