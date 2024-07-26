@@ -1,0 +1,5 @@
+.git/
+#.cargo/
+.idea/
+target/
+tests/digests/
