@@ -6,6 +6,7 @@ use crate::{
     utils::ParSpawnAndAwait,
 };
 use async_recursion::async_recursion;
+use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use num::BigUint;
 use std::{
     collections::HashSet,
@@ -192,6 +193,8 @@ impl DhtHandle {
         }
     }
 
+    // TODO: API is broken, since we can't gurantee that the peer will exist or we can find them,
+    // we should return a list of K closest nodes or the target itself if can be found
     pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<PeerContact>), OurError> {
         // TODO: verify this
         // the info hash and node is occupy the same address space, nodes are supposed to store
@@ -271,7 +274,7 @@ impl DhtHandle {
 
     #[instrument(skip(self))]
     async fn ask_her_for_peers(
-        self: Arc<Self>,
+        &self,
         interlocutor: SocketAddrV4,
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
@@ -282,6 +285,7 @@ impl DhtHandle {
         let query = Krpc::new_get_peers_query(TransactionId::from(transaction_id), self.our_id.clone(), info_hash);
 
         // send the message and await for a response
+        // TODO: make timeout configurable
         let time_out = Duration::from_secs(15);
         let response = timeout(time_out, self.send_and_wait(query, interlocutor)).await??;
 
@@ -310,6 +314,7 @@ impl DhtHandle {
         };
     }
 
+    // NOTE: called in find_node
     #[async_recursion]
     #[instrument(skip_all)]
     /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
@@ -387,75 +392,72 @@ impl DhtHandle {
         Err(naur!("Bottmed out"))
     }
 
+    // NOTE: called in get_peers
     /// TODO: need to add a hard recursion depth limit
+    ///
+    /// - seen: all the nodes that we already alrady contacted
     #[async_recursion]
     #[instrument(skip_all)]
     async fn recursive_get_peers_from_pool(
         self: Arc<Self>,
         mut starting_pool: Vec<NodeInfo>,
         finding: InfoHash,
-        seen: Arc<Mutex<HashSet<NodeInfo>>>,
-        slot: Arc<Mutex<Option<Sender<(Token, Vec<PeerContact>)>>>>,
-    ) -> Result<(), OurError> {
-        // filter the pool to only include nodes that we haven't seen yet
-        starting_pool = async {
-            let seen = seen.lock().await;
-            starting_pool
-                .into_iter()
-                .filter(|node| !seen.contains(&node))
-                .collect::<Vec<_>>()
-        }
-        .await;
+    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
+        let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
+        //
+        // sort by the distance to ourself
+        starting_pool.sort_unstable_by(|lhs, rhs| {
+            let lhs = BigUint::from_bytes_be(lhs.id().as_bytes());
+            let rhs = BigUint::from_bytes_be(rhs.id().as_bytes());
+            let l_dist = lhs.bitxor(our_id.clone());
+            let r_dist = rhs.bitxor(our_id.clone());
+
+            l_dist.cmp(&r_dist)
+        });
         info!("Starting pool size: {:?}", starting_pool.len());
 
-        if starting_pool.len() == 0 {
-            debug!("bottomed out");
-            return Err(naur!("Bottomed out"));
+        let mut seen = HashSet::new();
+
+        // when the nodes returned stop being closer, terminate
+        let mut lst_dist = BigUint::new(vec![1; 20]);
+        let mut cur_dist = BigUint::new(vec![1; 20]) - 1u32;
+        let mut tasks = FuturesOrdered::new();
+
+        for node in starting_pool {
+            tasks.push_back(self.ask_her_for_peers(node.contact().0, finding));
+            seen.insert(node);
         }
 
-        let mut requests = JoinSet::new();
+        loop {
+            if cur_dist >= lst_dist || tasks.size_hint().0 == 0 {
+                break;
+            }
+            let msg = tasks.next().await;
+            if msg.is_none() {
+                break;
+            }
 
-        // ask all the nodes for target!
-        for node in starting_pool {
-            let seen = seen.clone();
-            let this = self.clone();
-            let slot = slot.clone();
-
-            requests.spawn(async move {
-                let (token, closest_nodes, peers) = this.clone().ask_her_for_peers(node.contact().0, finding).await?;
-
-                if peers.is_empty() {
-                    // need to keep asking
-                    {
-                        let mut seen = seen.lock().await;
-                        seen.insert(node);
-                    }
-
-                    this.recursive_get_peers_from_pool(closest_nodes, finding.clone(), seen, slot)
-                        .await
-                } else {
-                    trace!("got success response, {peers:#?}");
-                    let mut slot = slot.lock().await;
-                    let slot = slot.take();
-
-                    match slot {
-                        Some(sender) => {
-                            // TODO: revisit this
-                            let _ = sender.send((token.expect("success response must have the token"), peers));
-                            Ok(())
-                        }
-                        // this means some other search operation has already found a list of
-                        // peers so we should stop here
-                        None => Err(naur!("Cancelled")),
+            let msg = msg.unwrap();
+            match msg {
+                Ok((token, infos, contacts)) => {
+                    // jackpot! we found it
+                    if contacts.len() != 0 {
+                        todo!()
+                    } else {
                     }
                 }
-            });
+                Err(_) => {
+                    // TODO: log about it
+                    continue;
+                }
+            }
         }
-
-        // spawn all the tasks and await them
-        debug!("spawning {} tasks", requests.len());
-        while let Some(_) = requests.join_next().await {}
 
         Err(naur!("Bottomed out"))
     }
+}
+
+enum PeersResponse {
+    Success(Vec<NodeInfo>),
+    Deferred(Vec<PeerContact>),
 }
