@@ -27,24 +27,26 @@ use tracing::{debug, info, instrument, trace, warn};
 use super::peer_guide::PeerGuide;
 
 #[derive(Debug)]
-pub struct DhtClientV4 {
+pub struct DhtHandle {
     pub(crate) our_id: NodeId,
     pub(crate) message_broker: Arc<MessageBroker>,
     pub(crate) routing_table: Arc<PeerGuide>,
     pub(crate) transaction_id_pool: TransactionIdPool,
 }
 
-impl DhtClientV4 {
+impl DhtHandle {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
     /// a port and IP address
     pub(crate) fn new(message_broker: Arc<MessageBroker>, peer_guide: Arc<PeerGuide>, our_id: NodeId) -> Self {
-        DhtClientV4 {
+        DhtHandle {
             message_broker,
             our_id,
             routing_table: peer_guide,
             transaction_id_pool: TransactionIdPool::new(),
         }
     }
+
+    // TODO: need a function to send with timeout, unsubscribe and clean up when timeout expires
 
     /// Send a message out and await for a response.
     ///
@@ -131,13 +133,13 @@ impl DhtClientV4 {
         let seen_node: Arc<Mutex<HashSet<NodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
         {
             let mut seen = seen_node.lock().await;
-            sorted_by_distance.iter().for_each(|(node, _)| {
+            for (node, _) in sorted_by_distance.iter() {
                 seen.insert(*node);
-            });
+            }
         }
 
-        let (tx, rx) = oneshot::channel();
-        let tx = Arc::new(Mutex::new(Some(tx)));
+        let (ack, syn) = oneshot::channel();
+        let ack = Arc::new(Mutex::new(Some(ack)));
 
         let starting_pool: Vec<NodeInfo> = sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
 
@@ -145,7 +147,7 @@ impl DhtClientV4 {
         let target = target.clone();
         let mut parallel_find = tokio::spawn(async move {
             let _ = dht
-                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, tx)
+                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, ack)
                 .await;
         });
 
@@ -153,7 +155,7 @@ impl DhtClientV4 {
              _ = &mut parallel_find => {
                 Err(naur!("Could not find node, all nodes requests ended in failure"))
             },
-            Ok(target) = rx => {
+            Ok(target) = syn => {
                 parallel_find.abort();
                 Ok(target)
             },
@@ -171,7 +173,8 @@ impl DhtClientV4 {
         let query = Krpc::new_find_node_query(TransactionId::from(txn_id), self.our_id, target);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(15);
+        let time_out = Duration::from_secs(15); // TODO: make this configurable or let parent
+                                                // handle timeout
         let response = timeout(time_out, self.send_and_wait(query, peer_addr)).await??;
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
@@ -419,34 +422,31 @@ impl DhtClientV4 {
             let slot = slot.clone();
 
             requests.spawn(async move {
-                async move {
-                    let (token, closest_nodes, peers) =
-                        this.clone().ask_her_for_peers(node.contact().0, finding).await?;
+                let (token, closest_nodes, peers) = this.clone().ask_her_for_peers(node.contact().0, finding).await?;
 
-                    if peers.is_empty() {
-                        // need to keep asking
-                        {
-                            let mut seen = seen.lock().await;
-                            seen.insert(node);
+                if peers.is_empty() {
+                    // need to keep asking
+                    {
+                        let mut seen = seen.lock().await;
+                        seen.insert(node);
+                    }
+
+                    this.recursive_get_peers_from_pool(closest_nodes, finding.clone(), seen, slot)
+                        .await
+                } else {
+                    trace!("got success response, {peers:#?}");
+                    let mut slot = slot.lock().await;
+                    let slot = slot.take();
+
+                    match slot {
+                        Some(sender) => {
+                            // TODO: revisit this
+                            let _ = sender.send((token.expect("success response must have the token"), peers));
+                            Ok(())
                         }
-
-                        this.recursive_get_peers_from_pool(closest_nodes, finding.clone(), seen, slot)
-                            .await
-                    } else {
-                        trace!("got success response, {peers:#?}");
-                        let mut slot = slot.lock().await;
-                        let slot = slot.take();
-
-                        match slot {
-                            Some(sender) => {
-                                // TODO: revisit this
-                                let _ = sender.send((token.expect("success response must have the token"), peers));
-                                Ok(())
-                            }
-                            // this means some other search operation has already found a list of
-                            // peers so we should stop here
-                            None => Err(naur!("Cancelled")),
-                        }
+                        // this means some other search operation has already found a list of
+                        // peers so we should stop here
+                        None => Err(naur!("Cancelled")),
                     }
                 }
             });

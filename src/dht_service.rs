@@ -25,7 +25,7 @@ use tokio::{
     time::timeout,
 };
 
-use dht_client::DhtClientV4;
+use dht_client::DhtHandle;
 use tracing::{info, instrument};
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
@@ -33,7 +33,7 @@ use tracing::{info, instrument};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct DhtV4 {
-    client: Arc<DhtClientV4>,
+    client: Arc<DhtHandle>,
     server: Arc<DhtServer>,
     message_broker: Arc<MessageBroker>,
     peer_guide: Arc<PeerGuide>,
@@ -108,7 +108,7 @@ impl DhtV4 {
             .spawn(async move { peer_guide_clone.run(rx).await })
             .unwrap();
 
-        let client = DhtClientV4::new(message_broker.clone(), peer_guide.clone(), our_id);
+        let client = DhtHandle::new(message_broker.clone(), peer_guide.clone(), our_id);
         let client = Arc::new(client);
 
         // ask all the known nodes for ourselves
@@ -165,7 +165,7 @@ impl DhtV4 {
     ///
     /// This is subject to change in the future.
     #[instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtClientV4>, peer: SocketAddrV4) -> Result<(), OurError> {
+    async fn bootstrap_from(dht: Arc<DhtHandle>, peer: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
         let txn_id = dht.transaction_id_pool.next();
         let query = Krpc::new_find_node_query(TransactionId::from(txn_id), our_id, our_id);
@@ -208,7 +208,7 @@ impl DhtV4 {
     }
 
     /// Returns a handle to the client so you can perform queries
-    pub fn client(&self) -> Arc<DhtClientV4> {
+    pub fn client(&self) -> Arc<DhtHandle> {
         self.client.clone()
     }
 

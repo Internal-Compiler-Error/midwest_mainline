@@ -23,7 +23,6 @@ path = "src/parser_tester.rs"
 num = { version = "^0.4", features = ["alloc"] }
 bendy = { version = "^0.3" }
 juicy_bencode = "^0.1"
-# derive_more = "^0.99"
 rand = { version = "^0.8", features = ["small_rng"] }
 tokio = { version = "^1.38", features = ["full", "tracing"] }
 async-recursion = "1.1.0"
