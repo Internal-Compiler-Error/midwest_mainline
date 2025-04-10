@@ -20,7 +20,7 @@ path = "src/parser_tester.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-num = { version = "^0.4", features = ["alloc"] }
+num = { version = "^0.4" }
 bendy = { version = "^0.3" }
 juicy_bencode = "^0.1"
 rand = { version = "^0.8", features = ["small_rng"] }

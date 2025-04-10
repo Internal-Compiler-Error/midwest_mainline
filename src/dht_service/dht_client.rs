@@ -5,8 +5,7 @@ use crate::{
     our_error::{naur, OurError},
     utils::ParSpawnAndAwait,
 };
-use num::BigUint;
-use std::{collections::HashSet, net::SocketAddrV4, ops::BitXor, sync::Arc, time::Duration};
+use std::{collections::HashSet, net::SocketAddrV4, sync::Arc, time::Duration};
 use tokio::time::timeout;
 use tracing::warn;
 use tracing::{instrument, trace};
@@ -118,10 +117,7 @@ impl DhtHandle {
             let mut sorted_by_distance: Vec<_> = returned_nodes
                 .into_iter()
                 .map(|node| {
-                    let node_id = BigUint::from_bytes_be(node.id().as_bytes());
-                    let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
-                    let distance = our_id.bitxor(node_id);
-
+                    let distance = node.id().dist(&self.our_id);
                     (node, distance)
                 })
                 .collect();

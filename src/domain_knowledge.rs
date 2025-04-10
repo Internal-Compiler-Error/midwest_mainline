@@ -7,7 +7,7 @@ const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
-pub struct NodeId(pub [u8; 20]);
+pub struct NodeId(pub [u8; NODE_ID_LEN]);
 
 impl Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,13 +19,13 @@ impl Debug for NodeId {
 }
 
 impl NodeId {
-    /// Panics if the length is not exactly 20
+    /// Panics if the length is not exactly NODE_ID_LEN
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
-        if bytes.len() != 20 {
-            panic!("Node id must be exactly 20 bytes");
+        if bytes.len() != NODE_ID_LEN {
+            panic!("Node id must be exactly {NODE_ID_LEN} bytes");
         }
 
-        let mut arr = [0u8; 20];
+        let mut arr = [0u8; NODE_ID_LEN];
         arr.copy_from_slice(bytes);
         NodeId(arr)
     }
@@ -40,9 +40,9 @@ impl NodeId {
         our_id ^ node_id
     }
 
-    pub fn dist(&self, rhs: &Self) -> [u8; 20] {
-        let mut dist = [0u8; 20];
-        for i in 0..20 {
+    pub fn dist(&self, rhs: &Self) -> [u8; NODE_ID_LEN] {
+        let mut dist = [0u8; NODE_ID_LEN];
+        for i in 0..NODE_ID_LEN {
             dist[i] = self.0[i] ^ rhs.0[i]
         }
         dist
@@ -77,21 +77,41 @@ impl ToBencode for NodeId {
 // }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct InfoHash(pub [u8; 20]);
+pub struct InfoHash(pub [u8; NODE_ID_LEN]);
 
 impl InfoHash {
+    /// Panics if `bytes` is not 20 bytes in length
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
-        if bytes.len() != 20 {
-            panic!("Info hash must be exactly 20 bytes");
+        if bytes.len() != NODE_ID_LEN {
+            panic!("Info hash must be exactly {NODE_ID_LEN} bytes");
         }
 
-        let mut arr = [0u8; 20];
+        let mut arr = [0u8; NODE_ID_LEN];
         arr.copy_from_slice(bytes);
         InfoHash(arr)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn from_hex_str(str: &str) -> Self {
+        if str.len() != NODE_ID_LEN * 2 {
+            panic!("Info hash must be exactly {NODE_ID_LEN} bytes");
+        }
+        if !str.is_ascii() {
+            panic!("input has non ascii characters");
+        }
+
+        let mut arr = [0u8; NODE_ID_LEN];
+        let mut i = 0;
+        while i != str.len() {
+            let bytes = &str[i..i + 2];
+            arr[i >> 1] = u8::from_str_radix(bytes, 16).expect("input string must be consist of soley hex digits");
+            i <<= 1;
+        }
+
+        Self(arr)
     }
 }
 

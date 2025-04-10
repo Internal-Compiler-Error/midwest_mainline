@@ -193,7 +193,6 @@ mod tests {
         dht_service::DhtV4,
         domain_knowledge::{InfoHash, NodeId},
     };
-    use num::{BigUint, Num};
     use opentelemetry::global;
     use rand::RngCore;
     use std::{net::SocketAddrV4, str::FromStr, sync::Once};
@@ -291,13 +290,7 @@ mod tests {
         )
         .await?;
 
-        let info_hash = BigUint::from_str_radix("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b", 16).unwrap();
-        let info_hash = info_hash.to_bytes_be();
-
-        let mut stupid = [0u8; 20];
-        stupid.copy_from_slice(&info_hash[0..20]);
-
-        let info_hash = InfoHash(stupid);
+        let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
 
         let client = dht.client();
         let (token, peers) = client.get_peers(info_hash).await?;
