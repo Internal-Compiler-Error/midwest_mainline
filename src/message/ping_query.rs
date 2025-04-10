@@ -5,14 +5,14 @@ use super::ToRawKrpc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct PingQuery {
     transaction_id: TransactionId,
-    target_id: NodeId,
+    querier: NodeId,
 }
 
 impl PingQuery {
     pub fn new(transaction_id: TransactionId, target_id: NodeId) -> Self {
         Self {
             transaction_id,
-            target_id,
+            querier: target_id,
         }
     }
 
@@ -20,8 +20,8 @@ impl PingQuery {
         &self.transaction_id
     }
 
-    pub fn target_id(&self) -> &NodeId {
-        &self.target_id
+    pub fn querier(&self) -> &NodeId {
+        &self.querier
     }
 }
 
@@ -35,7 +35,7 @@ impl ToRawKrpc for PingQuery {
             e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
             e.emit_pair(b"y", "q");
             e.emit_pair(b"q", "ping");
-            e.emit_pair_with(b"a", |e| e.emit_dict(|mut e| e.emit_pair(b"id", &self.target_id)))
+            e.emit_pair_with(b"a", |e| e.emit_dict(|mut e| e.emit_pair(b"id", &self.querier)))
         });
 
         encoder

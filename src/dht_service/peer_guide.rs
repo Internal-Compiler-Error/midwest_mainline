@@ -61,4 +61,13 @@ impl PeerGuide {
         let routing_table = self.routing_table.lock().unwrap();
         routing_table.find(target)
     }
+
+    pub fn add(&self, node_id: NodeId, addr: SocketAddrV4) {
+        let mut routing_table = self.routing_table.lock().unwrap();
+        routing_table.add_new_node(NodeInfo::new(node_id, crate::domain_knowledge::PeerContact(addr)));
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.routing_table.lock().unwrap().node_count()
+    }
 }

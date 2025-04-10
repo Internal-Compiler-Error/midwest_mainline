@@ -58,44 +58,42 @@ impl MessageBroker {
 
             loop {
                 let (amount, socket_addr) = socket.recv_from(&mut buf).await.expect("common MTU 1500 exceeded");
-                println!("yo!");
-                trace!("packet from {socket_addr}");
-                if let Ok(msg) = (&buf[..amount]).parse() {
-                    println!("{:?}", msg);
-                    let socket_addr = {
-                        match socket_addr {
-                            SocketAddr::V4(addr) => addr,
-                            _ => panic!("Expected V4 socket address"),
+                trace!("recived packet from {socket_addr}");
+                match (&buf[..amount]).parse() {
+                    Ok(msg) => {
+                        trace!("{} sent {:?}", socket_addr, msg);
+                        let socket_addr = {
+                            match socket_addr {
+                                SocketAddr::V4(addr) => addr,
+                                _ => panic!("Expected V4 socket address"), // TODO: obviously we can't panic
+                            }
+                        };
+
+                        let id = msg.transaction_id();
+                        trace!(
+                            "received message for transaction id {:?}",
+                            hex::encode_upper(id.as_bytes())
+                        );
+
+                        // notify those that subscribed for all inbound messages
+                        {
+                            let subcribers = inbound_subscribers.lock().unwrap();
+                            for sub in &*subcribers {
+                                // TODO: worry about what to do about disconnected or full queues later
+                                let _ = sub.try_send((msg.clone(), socket_addr));
+                            }
                         }
-                    };
 
-                    let id = msg.transaction_id();
-                    trace!(
-                        "received message for transaction id {:?}",
-                        hex::encode_upper(id.as_bytes())
-                    );
-
-                    // notify those that subscribed for all inbound messages
-                    {
-                        let subcribers = inbound_subscribers.lock().unwrap();
-                        for sub in &*subcribers {
-                            // TODO: worry about what to do about disconnected or full queues later
-                            let _ = sub.try_send((msg.clone(), socket_addr));
+                        // see if we have a slot for this transaction id, if we do, that means one of the
+                        // messages that we expect, otherwise the message is a query we need to handle
+                        if let Some(sender) = pending_responses.lock().await.remove(id) {
+                            // failing means we're no longer interested, which is ok
+                            let _ = sender.send((msg, socket_addr));
                         }
                     }
-
-                    // see if we have a slot for this transaction id, if we do, that means one of the
-                    // messages that we expect, otherwise the message is a query we need to handle
-                    if let Some(sender) = pending_responses.lock().await.remove(id) {
-                        // failing means we're no longer interested, which is ok
-                        let _ = sender.send((msg, socket_addr));
+                    Err(e) => {
+                        warn!("Error in parsing packets {e} from {socket_addr}")
                     }
-                    warn!(
-                        "Failed to parse message from {socket_addr}, bytes = {:?}",
-                        &buf[..amount]
-                    );
-                } else {
-                    println!("wtf!!!!!!!!!");
                 }
             }
         };

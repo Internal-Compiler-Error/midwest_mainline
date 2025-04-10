@@ -5,7 +5,7 @@ use super::ToRawKrpc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeQuery {
     transaction_id: TransactionId,
-    ourself: NodeId,
+    querier: NodeId,
     target: NodeId,
 }
 
@@ -13,7 +13,7 @@ impl FindNodeQuery {
     pub fn new(transaction_id: TransactionId, ourself: NodeId, target: NodeId) -> Self {
         Self {
             transaction_id,
-            ourself,
+            querier: ourself,
             target,
         }
     }
@@ -24,6 +24,10 @@ impl FindNodeQuery {
 
     pub fn target_id(&self) -> NodeId {
         self.target
+    }
+
+    pub fn querier(&self) -> NodeId {
+        self.querier
     }
 }
 
@@ -40,7 +44,7 @@ impl ToRawKrpc for FindNodeQuery {
 
             e.emit_pair_with(b"a", |e| {
                 e.emit_unsorted_dict(|e| {
-                    e.emit_pair(b"id", &self.ourself);
+                    e.emit_pair(b"id", &self.querier);
                     e.emit_pair(b"target", &self.target)
                 })
             })

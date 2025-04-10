@@ -4,7 +4,7 @@ use crate::message::ToRawKrpc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct AnnouncePeerQuery {
     transaction_id: TransactionId,
-    ourself: NodeId,
+    querier: NodeId,
     implied_port: bool,
     info_hash: InfoHash,
     port: u16,
@@ -21,7 +21,7 @@ impl AnnouncePeerQuery {
     ) -> Self {
         Self {
             transaction_id,
-            ourself,
+            querier: ourself,
             implied_port: port.is_none(),
             info_hash,
             port: port.unwrap_or(6881),
@@ -38,8 +38,8 @@ impl AnnouncePeerQuery {
         &self.token
     }
 
-    pub fn querying(&self) -> &NodeId {
-        &self.ourself
+    pub fn querier(&self) -> &NodeId {
+        &self.querier
     }
 
     pub fn implied_port(&self) -> bool {
@@ -68,7 +68,7 @@ impl ToRawKrpc for AnnouncePeerQuery {
 
             e.emit_pair_with(b"a", |e| {
                 e.emit_unsorted_dict(|e| {
-                    e.emit_pair(b"id", &self.ourself);
+                    e.emit_pair(b"id", &self.querier);
                     e.emit_pair(b"token", &self.token);
                     e.emit_pair(b"implied_port", if self.implied_port { 1 } else { 0 });
                     e.emit_pair(b"info_hash", &self.info_hash);

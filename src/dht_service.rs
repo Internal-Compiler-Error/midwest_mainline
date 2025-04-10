@@ -4,12 +4,7 @@ pub mod message_broker;
 pub mod peer_guide;
 mod transaction_id_pool;
 
-use crate::{
-    dht_service::dht_server::DhtServer,
-    domain_knowledge::{NodeId, TransactionId},
-    message::Krpc,
-    our_error::OurError,
-};
+use crate::{dht_service::dht_server::DhtServer, domain_knowledge::NodeId, our_error::OurError};
 
 use message_broker::MessageBroker;
 use peer_guide::PeerGuide;
@@ -111,28 +106,6 @@ impl DhtV4 {
         let client = DhtHandle::new(message_broker.clone(), peer_guide.clone(), our_id);
         let client = Arc::new(client);
 
-        // ask all the known nodes for ourselves
-        let mut bootstrap_join_set = JoinSet::new();
-
-        for contact in known_nodes {
-            bootstrap_join_set
-                .build_task()
-                .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(client.clone(), contact))
-                .unwrap();
-        }
-
-        while let Some(_) = bootstrap_join_set.join_next().await {}
-
-        // info!(
-        //     "DHT bootstrapped, routing table has {} nodes",
-        //     peer_guide.read().await.node_count()
-        // );
-        drop(bootstrap_join_set);
-
-        // TODO: huh, since when this this make sense?
-        //
-        // only spawn the server after the bootstrap has completed
         let server = DhtServer::new(our_id.clone(), peer_guide.clone(), message_broker.clone());
         let server = Arc::new(server);
 
@@ -149,6 +122,23 @@ impl DhtV4 {
             peer_guide: peer_guide.clone(),
             helper_tasks: join_set,
         };
+
+        // ask all the known nodes for ourselves
+        let mut bootstrap_join_set = JoinSet::new();
+
+        for contact in known_nodes {
+            bootstrap_join_set
+                .build_task()
+                .name(&*format!("bootstrap with {contact}"))
+                .spawn(Self::bootstrap_from(client.clone(), contact))
+                .unwrap();
+        }
+
+        while let Some(_) = bootstrap_join_set.join_next().await {}
+        drop(bootstrap_join_set);
+
+        println!("I should be done");
+        info!("DHT bootstrapped, routing table has {} nodes", peer_guide.node_count());
 
         Ok(dht)
     }
@@ -167,43 +157,20 @@ impl DhtV4 {
     #[instrument(skip_all)]
     async fn bootstrap_from(dht: Arc<DhtHandle>, peer: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
-        let txn_id = dht.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(TransactionId::from(txn_id), our_id, our_id);
 
         info!("bootstrapping with {peer}");
         let response = timeout(Duration::from_secs(5), async {
-            dht.send_and_wait(query, peer).await.expect("failure to send message")
+            let node_id = dht.ping(peer).await?;
+            dht.routing_table.add(node_id, peer);
+
+            dht.find_node(our_id).await;
+            println!("done finding node");
+
+            Ok::<(), eyre::Report>(())
         })
         .await?;
 
-        // TODO: use ensure!
-        if let Krpc::FindNodeGetPeersResponse(response) = response {
-            let mut nodes = response.nodes().clone();
-            nodes.sort_unstable_by_key(|node| node.contact().0);
-            nodes.dedup();
-
-            for node in nodes {
-                let dht = dht.clone();
-                let contact = node.contact().0;
-                let our_id = dht.our_id;
-                let txn_id = dht.transaction_id_pool.next();
-                let find_ourself = Krpc::new_find_node_query(TransactionId::from(txn_id), our_id, node.id());
-
-                TskBuilder::new()
-                    .name(&*format!("leave level bootstrap to {}", contact))
-                    .spawn(async move {
-                        let _response = timeout(Duration::from_secs(5), async {
-                            dht.send_and_wait(find_ourself, contact)
-                                .await
-                                .expect("failure to send message")
-                        })
-                        .await?;
-                        Ok::<_, OurError>(())
-                    })
-                    .unwrap();
-            }
-            info!("bootstrapping with {peer} succeeded");
-        }
+        info!("{peer} bootstrap success");
         Ok(())
     }
 
@@ -237,21 +204,21 @@ mod tests {
 
     fn set_up_tracing() {
         let _ = color_eyre::install();
-        // let fmt_layer = fmt::layer()
-        //     .compact()
-        //     .with_line_number(true)
-        //     .with_filter(LevelFilter::DEBUG);
-        //
+        let fmt_layer = fmt::layer()
+            .compact()
+            .with_line_number(true)
+            .with_filter(LevelFilter::DEBUG);
+
         // global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
         // let tracer = opentelemetry_jaeger::new_pipeline().install_simple().unwrap();
-        //
+
         // let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-        //
-        // tracing_subscriber::registry()
-        //     .with(console_subscriber::spawn())
-        //     .with(telemetry)
-        //     .with(fmt_layer)
-        //     .init();
+
+        tracing_subscriber::registry()
+            .with(console_subscriber::spawn())
+            // .with(telemetry)
+            .with(fmt_layer)
+            .init();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -261,7 +228,7 @@ mod tests {
         let external_ip = public_ip::addr_v4().await.unwrap();
 
         let dht = DhtV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+            SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
             external_ip,
             vec![
                 // dht.tansmissionbt.com
@@ -292,7 +259,6 @@ mod tests {
         rng.fill_bytes(&mut bytes);
 
         let node = client.find_node(NodeId(bytes)).await;
-        println!("{node:?}");
         if let Ok(node) = node {
             println!("found node {:?}", node);
         } else {

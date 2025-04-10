@@ -8,8 +8,8 @@ use crate::{
 use num::BigUint;
 use std::{collections::HashSet, net::SocketAddrV4, ops::BitXor, sync::Arc, time::Duration};
 use tokio::time::timeout;
-use tracing::instrument;
 use tracing::warn;
+use tracing::{instrument, trace};
 
 use super::peer_guide::PeerGuide;
 
@@ -56,15 +56,14 @@ impl DhtHandle {
         Ok(response)
     }
 
-    pub async fn ping(self: Arc<Self>, peer: SocketAddrV4) -> Result<(), OurError> {
-        let this = &self;
+    pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
         let txn_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), this.our_id);
+        let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.our_id);
 
         let response = self.send_and_wait(ping_msg, peer).await?;
 
-        return if let Krpc::PingAnnouncePeerResponse(_response) = response {
-            Ok(())
+        return if let Krpc::PingAnnouncePeerResponse(response) = response {
+            Ok(*response.target_id())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
             Err(naur!("Unexpected response to ping"))
@@ -140,7 +139,7 @@ impl DhtHandle {
     // attempt to find the target node via a peer on this address
     async fn send_find_nodes_rpc(
         self: Arc<Self>,
-        peer_addr: SocketAddrV4,
+        dest: SocketAddrV4,
         target: NodeId,
     ) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
@@ -151,7 +150,11 @@ impl DhtHandle {
         let time_out = Duration::from_secs(REQ_TIMEOUT);
         // TODO: make this configurable or let parent handle timeout, wooo maybe we can configure this
         // based on ip geo location distance
-        let response = timeout(time_out, self.send_and_wait(query, peer_addr)).await??;
+        let response = timeout(time_out, self.send_and_wait(query, dest))
+            .await
+            .inspect_err(|_e| trace!("find_nodes for {:?} timed out", dest))
+            ?  // timeout error
+            ?; // send_and_wait error
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
             // TODO:: does the following actually handle the giant bitstring thing correctly?
@@ -170,7 +173,7 @@ impl DhtHandle {
         }
     }
 
-    // TODO: API is broken, since we can't gurantee that the peer will exist or we can find them,
+    // TODO: API is broken, since we can't guarantee that the peer will exist or we can find them,
     // we should return a list of K closest nodes or the target itself if can be found
     pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<PeerContact>), OurError> {
         let resonsible = NodeId(info_hash.0);
@@ -289,10 +292,10 @@ impl DhtHandle {
     #[instrument(skip(self))]
     async fn send_get_peers_rpc(
         self: Arc<Self>,
-        interlocutor: SocketAddrV4,
+        dest: SocketAddrV4,
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
-        // trace!("Asking {:?} for peers", interlocutor);
+        trace!("Asking {:?} for peers", dest);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
 
@@ -300,7 +303,13 @@ impl DhtHandle {
 
         // send the message and await for a response
         let time_out = Duration::from_secs(REQ_TIMEOUT);
-        let response = timeout(time_out, self.send_and_wait(query, interlocutor)).await??;
+        let response = timeout(time_out, self.send_and_wait(query, dest))
+            .await
+            .inspect_err(|_e| {
+                trace!("get_peers for {:?} timed out", dest);
+            })
+            ?  // timeout error
+            ?; // send_and_wait related error
 
         return match response {
             Krpc::ErrorResponse(response) => {

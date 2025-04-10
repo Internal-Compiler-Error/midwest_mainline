@@ -1,8 +1,12 @@
 use crate::{
     domain_knowledge::{InfoHash, NodeId, PeerContact, Token},
     message::{
-        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-        ping_query::PingQuery, Krpc,
+        announce_peer_query::AnnouncePeerQuery,
+        find_node_get_peers_response::{self, FindNodeGetPeersResponse},
+        find_node_query::{self, FindNodeQuery},
+        get_peers_query::GetPeersQuery,
+        ping_query::PingQuery,
+        Krpc,
     },
 };
 use rand::RngCore;
@@ -20,7 +24,7 @@ use tokio::{
     task::Builder as TskBuilder,
     time::Instant,
 };
-use tracing::{error, info_span, trace, Instrument};
+use tracing::{error, info, info_span, trace, Instrument};
 
 use super::{peer_guide::PeerGuide, MessageBroker};
 #[derive(Debug)]
@@ -136,7 +140,7 @@ impl DhtServer {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn run(self: Arc<Self>) {
         TskBuilder::new()
             .name("token pool")
@@ -145,13 +149,14 @@ impl DhtServer {
         let mut rx = self.message_broker.subscribe_inbound();
 
         // respond to messages, as fast as possible
-        while let Some((request, socket_addr)) = rx.recv().await {
+        while let Some((inbound_msg, socket_addr)) = rx.recv().await {
             let this = self.clone();
             let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
                 async move {
                     let this = &*this;
 
-                    let response = match this.generate_response(request, socket_addr).await {
+                    this.add_to_routing_table(socket_addr, &inbound_msg);
+                    let response = match this.generate_response(&inbound_msg, socket_addr).await {
                         Some(msg) => msg,
                         None => return,
                     };
@@ -166,8 +171,35 @@ impl DhtServer {
         }
     }
 
-    #[tracing::instrument]
-    async fn generate_response(&self, request: Krpc, from: SocketAddrV4) -> Option<Krpc> {
+    fn add_to_routing_table(&self, from: SocketAddrV4, message: &Krpc) {
+        if let Krpc::ErrorResponse(_) = message {
+            return;
+        }
+
+        let node_id = match message {
+            Krpc::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
+            Krpc::FindNodeQuery(find_node_query) => find_node_query.querier(),
+            Krpc::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
+            Krpc::PingQuery(ping_query) => *ping_query.querier(),
+            Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
+            Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
+            Krpc::ErrorResponse(_) => unreachable!("errors should get early returned"),
+        };
+
+        self.peer_guide.add(node_id, from);
+        info!("Add {from} with {:?} to the routing table", node_id);
+
+        // if it's response from find_peers or get_nodes, they have additional info
+        if let Krpc::FindNodeGetPeersResponse(res) = message {
+            for node in res.nodes() {
+                // TODO: this is a bit stupid as we destroy the structure just to copy but fix later
+                self.peer_guide.add(node.id(), node.contact().0);
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn generate_response(&self, request: &Krpc, from: SocketAddrV4) -> Option<Krpc> {
         let response = match request {
             Krpc::PingQuery(ping) => Some(self.generate_ping_response(ping, from).await),
             Krpc::FindNodeQuery(find_node) => Some(self.generate_find_node_response(find_node, from).await),
@@ -176,21 +208,20 @@ impl DhtServer {
             }
             Krpc::GetPeersQuery(get_peers) => Some(self.generate_get_peers_response(get_peers, from).await),
             _ => {
-                // TODO: implement Value for Krpc so we can use structured logging
-                error!("unexpected message in the server response queue, {request:?}");
+                assert!(request.is_response());
                 None
             }
         };
         response
     }
 
-    #[tracing::instrument]
-    async fn generate_ping_response(&self, ping: PingQuery, origin: SocketAddrV4) -> Krpc {
+    #[tracing::instrument(skip(self))]
+    async fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> Krpc {
         Krpc::new_ping_response(ping.txn_id().clone(), self.our_id.clone())
     }
 
-    #[tracing::instrument]
-    async fn generate_find_node_response(&self, query: FindNodeQuery, origin: SocketAddrV4) -> Krpc {
+    #[tracing::instrument(skip(self))]
+    async fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> Krpc {
         let table = &self.peer_guide;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
@@ -209,8 +240,8 @@ impl DhtServer {
         };
     }
 
-    #[tracing::instrument]
-    async fn generate_get_peers_response(&self, query: GetPeersQuery, origin: SocketAddrV4) -> Krpc {
+    #[tracing::instrument(skip(self))]
+    async fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         // see if know about the info hash
         let table = self.hash_table.read().await;
         let token_pool = &self.token_pool;
@@ -228,7 +259,7 @@ impl DhtServer {
         } else {
             let closest_eight: Vec<_> = self
                 .peer_guide
-                .find_closest(*query.peer_id()) // TODO: wtf, why are we finding via info_hash
+                .find_closest(*query.querier()) // TODO: wtf, why are we finding via info_hash
                 // before
                 .into_iter()
                 .collect();
@@ -245,8 +276,8 @@ impl DhtServer {
         };
     }
 
-    #[tracing::instrument]
-    async fn generate_announce_peer_response(&self, announce: AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
+    #[tracing::instrument(skip(self))]
+    async fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
         if !self.token_pool.is_valid_token(&origin.ip(), announce.token()).await {
             return Krpc::new_standard_protocol_error(announce.txn_id().clone());

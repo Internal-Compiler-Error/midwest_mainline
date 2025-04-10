@@ -11,7 +11,7 @@ use super::ToRawKrpc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     transaction_id: TransactionId,
-    peer_id: NodeId,
+    queried: NodeId,
     token: Option<Token>,
     values: Vec<PeerContact>,
     nodes: Vec<NodeInfo>,
@@ -20,7 +20,7 @@ pub struct FindNodeGetPeersResponse {
 #[derive(Debug, Hash, Clone)]
 pub struct Builder {
     transaction_id: TransactionId,
-    peer_id: NodeId,
+    queried: NodeId,
     token: Option<Token>,
     values: Vec<PeerContact>,
     nodes: Vec<NodeInfo>,
@@ -30,7 +30,7 @@ impl Builder {
     pub fn new(transaction_id: TransactionId, peer_id: NodeId) -> Builder {
         Self {
             transaction_id,
-            peer_id,
+            queried: peer_id,
             token: None,
             values: vec![],
             nodes: vec![],
@@ -65,7 +65,7 @@ impl Builder {
     pub fn build(self) -> FindNodeGetPeersResponse {
         FindNodeGetPeersResponse {
             transaction_id: self.transaction_id,
-            peer_id: self.peer_id,
+            queried: self.queried,
             token: self.token,
             values: self.values,
             nodes: self.nodes,
@@ -91,8 +91,8 @@ impl FindNodeGetPeersResponse {
         self.token.is_some()
     }
 
-    pub fn peer_id(&self) -> &NodeId {
-        &self.peer_id
+    pub fn queried(&self) -> &NodeId {
+        &self.queried
     }
 
     pub fn token(&self) -> Option<&Token> {
@@ -122,7 +122,7 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
             e.emit_pair(b"y", "r");
             e.emit_pair_with(b"r", |e| {
                 e.emit_unsorted_dict(|e| {
-                    e.emit_pair(b"id", &self.peer_id);
+                    e.emit_pair(b"id", &self.queried);
                     if let Some(ref token) = self.token {
                         e.emit_pair(b"token", token);
                     }
