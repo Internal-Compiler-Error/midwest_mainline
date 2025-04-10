@@ -1,178 +1,134 @@
-use crate::domain_knowledge::{NodeId, NodeInfo};
-use num::BigUint;
-use std::{ops::BitXor, str::FromStr, time::Instant};
-use tracing::{info, trace};
+use crate::domain_knowledge::{self, NodeId, NodeInfo};
+use std::time::Instant;
+use tracing::info;
 
 /// The routing table at the heart of the Kademlia DHT. It keep the near neighbors of ourself.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct RoutingTable {
+    bucket_size: usize,
     /// The node id of the ourself.
-    id: BigUint,
+    id: NodeId,
 
-    /// each bucket contains
-    pub(crate) buckets: Vec<Bucket>,
-}
-
-#[derive(Debug)]
-pub struct Bucket {
-    /// inclusive
-    lower_bound: BigUint,
-    /// exclusive
-    upper_bound: BigUint,
-
-    // TODO: technically a bucket is at most 8 nodes, use a fixed size vector
-    nodes: Vec<Node>,
-}
-
-impl Bucket {
-    pub fn full(&self) -> bool {
-        assert!(self.nodes.len() <= 8);
-        self.nodes.len() >= 8
-    }
+    pub(crate) buckets: Box<[Option<NodeEntry>]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-// TODO: this name is shit, think of a better one
-pub struct Node {
+pub struct NodeEntry {
     pub(crate) contact: NodeInfo,
     pub(crate) last_checked: Instant,
 }
 
 impl RoutingTable {
     pub fn new(id: NodeId) -> Self {
-        let default_bucket = Bucket {
-            lower_bound: BigUint::from(0u8),
-            // 2^160
-            upper_bound: BigUint::from_str("1461501637330902918203684832716283019655932542976").unwrap(),
-            nodes: Vec::new(),
-        };
-
+        let bucket_size = 16;
+        let mem: Vec<Option<NodeEntry>> = vec![None; 160 * bucket_size];
         RoutingTable {
-            id: BigUint::from_bytes_be(id.as_bytes()),
-            buckets: vec![default_bucket],
+            bucket_size,
+            id,
+            buckets: mem.into_boxed_slice(),
         }
     }
 
     pub fn node_count(&self) -> usize {
-        self.buckets.iter().map(|b| b.nodes.len()).sum()
+        // TODO: optimize this
+        self.buckets.iter().filter(|n| n.is_some()).count()
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
     pub fn add_new_node(&mut self, contact: NodeInfo) {
-        // TODO: handle duplicate nodes
-
+        let size = self.node_count();
+        info!("Adding new node to routing table of size: {size}");
         // there is a special case, when we already know this node, in that case, we just update the
         // last_checked timestamp.
-        if let Some(node) = self
+        let exact_match = self
             .buckets
             .iter_mut()
-            .map(|b| b.nodes.iter_mut())
             .flatten()
-            .find(|node| node.contact.id() == contact.id())
-        {
-            node.last_checked = Instant::now();
+            .find(|node| node.contact.id() == contact.id());
+        if let Some(n) = exact_match {
+            n.last_checked = Instant::now();
             return;
         }
 
-        let our_id = &self.id;
-        let distance = our_id.bitxor(BigUint::from_bytes_be(contact.id().as_bytes()));
+        let bucket = self.bucket_for_mut(&contact.id());
+        let slot = bucket.iter_mut().find(|n| n.is_none());
 
-        // first, find the bucket that this node belongs in
-        let target_bucket = self
-            .buckets
-            .iter_mut()
-            .find(|bucket| bucket.lower_bound <= distance && distance < bucket.upper_bound)
-            .unwrap();
-
-        let (full, within_our_bucket) = (
-            target_bucket.full(),
-            &target_bucket.lower_bound <= our_id && our_id < &target_bucket.upper_bound,
-        );
-        match (full, within_our_bucket) {
-            // if the bucket is full and our id is within our bucket, we need to split it
-            (true, true) => {
-                // split the bucket, the new bucket is the upper half of the old bucket
-                let mut new_bucket = Bucket {
-                    lower_bound: &target_bucket.upper_bound / 2u8,
-                    upper_bound: target_bucket.upper_bound.clone(),
-                    nodes: Vec::new(),
-                };
-
-                // transfer all the nodes that should go into the new bucket into the right place
-                // do I prefer the draining_filter API? yes but that's sadly nightly only
-                let mut i = 0;
-                while i < target_bucket.nodes.len() {
-                    let target_bucket_node_id = BigUint::from_bytes_be(target_bucket.nodes[i].contact.id().as_bytes());
-                    if &target_bucket_node_id <= &new_bucket.lower_bound {
-                        let node = target_bucket.nodes.remove(i);
-                        new_bucket.nodes.push(node);
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                target_bucket.upper_bound = &target_bucket.upper_bound / 2u8;
-                self.buckets.push(new_bucket);
-                trace!("bucket split");
-            }
-            // if the bucket id range is not within our id and the bucket is full, we don't need to do
-            // anything
-            (true, false) => {
-                trace!("node not added, bucket full and not within our id");
-            }
-            // if the buckets are not full, then happy days, we just add the new node
-            (false, _) => {
-                target_bucket.nodes.push(Node {
+        // TODO: I recall there is more sophisticated to whether to ignore the insertion or not
+        match slot {
+            Some(inner) => {
+                inner.replace(NodeEntry {
                     contact,
                     last_checked: Instant::now(),
                 });
-                trace!("node added");
+                info!("{contact:?} added to routing table");
+                return ();
+            }
+            None => {
+                info!("table full, {contact:?} not added");
+                return (); // we're full
             }
         }
-        info!("node processed, node count: {}", self.node_count());
     }
 
+    // TODO: return an iterator instead?
     pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
-        let mut closest_nodes: Vec<_> = self
-            .buckets
-            .iter()
-            .map(|bucket| {
-                bucket.nodes.iter().map(|node| {
-                    let node_id = node.contact.id();
-                    let node_id = node_id.as_bytes();
-                    let target = target.as_bytes();
+        let (bucket_i, bucket_i_end) = self.indices(&target);
+        let bucket = &self.buckets[bucket_i..bucket_i_end];
 
-                    let mut distance = [0u8; 20];
+        let mut valid_entries: Vec<_> = bucket.iter().flatten().collect();
+        valid_entries.sort_unstable_by_key(|e| e.contact.id());
 
-                    // zip for array is sadly unstable
-                    let mut i = 0;
-                    while i < 20 {
-                        distance[i] = node_id[i] ^ target[i];
-                        i += 1;
-                    }
-
-                    (BigUint::from_bytes_be(&distance), &node.contact)
-                })
-            })
-            .flatten()
-            .collect();
-
-        closest_nodes.sort_unstable_by_key(|x| x.0.clone());
-        closest_nodes
-            .iter()
-            .filter(|(_, node)| node.id() != target)
-            .take(8)
-            .map(|x| x.1)
-            .cloned()
-            .collect()
+        valid_entries.into_iter().map(|n| n.contact).collect()
     }
 
-    pub fn find(&self, target: NodeId) -> Option<Node> {
+    pub fn find(&self, target: NodeId) -> Option<NodeInfo> {
         self.buckets
             .iter()
-            .map(|bucket| bucket.nodes.iter())
             .flatten()
             .find(|node| node.contact.id() == target)
-            .cloned()
+            .map(|n| n.contact)
+            .clone()
+    }
+
+    /// Returns the `index` where `self.buckets[index]` is the first entry in the corresponding
+    /// k-bucket, and `index + (self.bucket_size - 1)` is the last entry (inclusive), so
+    /// `index..(index + self.bucket_size)` is the valid range.
+    fn index(&self, target: &NodeId) -> usize {
+        // Each k-bucket at index i stores nodes of distance [2^i, 2^(i + 1)) from ourself. The
+        // first byte with index `j`, meaning there are (19 - j) trailling non zeros bytes, each
+        // bytes has 8 bits, so 2^(19 - j) <= i < 2(19 - j + 1). Furthermore, the first bit from
+        // MSB within that non zero byte tell us how many additional bits we need to offset to from
+        // 2^(19 - j)
+        let dist = self.id.dist(&target);
+        if dist == domain_knowledge::ZERO_DIST {
+            // all zero means we're finding outself, then we go look for in the 0th bucket.
+            return 0;
+        }
+
+        let first_nonzero = dist.into_iter().position(|radix| radix != 0).unwrap();
+        let byte = dist[first_nonzero];
+        let leading_zeros_inx = 7 - byte.leading_zeros() as usize;
+
+        let bucket_idx = (19 - first_nonzero) * 8 + leading_zeros_inx;
+        bucket_idx * self.bucket_size
+    }
+
+    /// [begin, end) range of the corresponding k-bucket for `target`, the range should be accessed
+    /// directly like `self.buckets[begin]`, the stride jumping is already done for you.
+    fn indices(&self, target: &NodeId) -> (usize, usize) {
+        let begin = self.index(target);
+        let end = begin + self.bucket_size;
+        (begin, end)
+    }
+
+    #[allow(unused)]
+    fn bucket_for(&self, target: &NodeId) -> &[Option<NodeEntry>] {
+        let (begin, end) = self.indices(target);
+        &self.buckets[begin..end]
+    }
+
+    fn bucket_for_mut(&mut self, target: &NodeId) -> &mut [Option<NodeEntry>] {
+        let (begin, end) = self.indices(target);
+        &mut self.buckets[begin..end]
     }
 }

@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::{
     domain_knowledge::{NodeId, NodeInfo},
     message::Krpc,
-    routing::{Node, RoutingTable},
+    routing::RoutingTable,
 };
 
 #[derive(Debug)]
@@ -57,7 +57,7 @@ impl PeerGuide {
         routing_table.find_closest(target)
     }
 
-    pub fn find(&self, target: NodeId) -> Option<Node> {
+    pub fn find(&self, target: NodeId) -> Option<NodeInfo> {
         let routing_table = self.routing_table.lock().unwrap();
         routing_table.find(target)
     }

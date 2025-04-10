@@ -1,12 +1,8 @@
 use crate::{
     domain_knowledge::{InfoHash, NodeId, PeerContact, Token},
     message::{
-        announce_peer_query::AnnouncePeerQuery,
-        find_node_get_peers_response::{self, FindNodeGetPeersResponse},
-        find_node_query::{self, FindNodeQuery},
-        get_peers_query::GetPeersQuery,
-        ping_query::PingQuery,
-        Krpc,
+        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
+        ping_query::PingQuery, Krpc,
     },
 };
 use rand::RngCore;
@@ -24,7 +20,7 @@ use tokio::{
     task::Builder as TskBuilder,
     time::Instant,
 };
-use tracing::{error, info, info_span, trace, Instrument};
+use tracing::{info, info_span, trace, Instrument};
 
 use super::{peer_guide::PeerGuide, MessageBroker};
 #[derive(Debug)]

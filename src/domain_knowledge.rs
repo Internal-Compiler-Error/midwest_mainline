@@ -3,7 +3,10 @@ use num::{traits::ops::bytes, BigUint};
 use smallvec::SmallVec;
 use std::{fmt::Debug, net::SocketAddrV4};
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+const NODE_ID_LEN: usize = 20;
+pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct NodeId(pub [u8; 20]);
 
 impl Debug for NodeId {
@@ -36,6 +39,14 @@ impl NodeId {
         let node_id = BigUint::from_bytes_be(rhs.as_bytes());
         our_id ^ node_id
     }
+
+    pub fn dist(&self, rhs: &Self) -> [u8; 20] {
+        let mut dist = [0u8; 20];
+        for i in 0..20 {
+            dist[i] = self.0[i] ^ rhs.0[i]
+        }
+        dist
+    }
 }
 
 impl ToBencode for NodeId {
@@ -45,6 +56,25 @@ impl ToBencode for NodeId {
         encoder.emit_bytes(&self.0)
     }
 }
+
+// impl PartialOrd for NodeId {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         for (lhs, rhs) in self.0.iter().zip(other.0.iter()) {
+//             match lhs.cmp(rhs) {
+//                 Ordering::Equal => continue,
+//                 Ordering::Less => return Some(Ordering::Less),
+//                 Ordering::Greater => return Some(Ordering::Greater),
+//             }
+//         }
+//         Some(Ordering::Equal)
+//     }
+// }
+//
+// impl Ord for NodeId {
+//     fn cmp(&self, other: &Self) -> Ordering {
+//         self.partial_cmp(other).unwrap()
+//     }
+// }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct InfoHash(pub [u8; 20]);

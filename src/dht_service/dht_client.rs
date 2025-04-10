@@ -74,7 +74,7 @@ impl DhtHandle {
     pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.find(target) {
-            return Ok(node.contact);
+            return Ok(node);
         }
 
         let mut queried: HashSet<NodeInfo> = HashSet::new();
@@ -180,7 +180,7 @@ impl DhtHandle {
         //
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).routing_table.find(resonsible) {
-            let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact.contact().0, info_hash).await?;
+            let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact().0, info_hash).await?;
             return Ok((
                 token.expect("A node directly responsible for a piece would return a token"),
                 peers,

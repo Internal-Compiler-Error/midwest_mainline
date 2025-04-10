@@ -137,7 +137,6 @@ impl DhtV4 {
         while let Some(_) = bootstrap_join_set.join_next().await {}
         drop(bootstrap_join_set);
 
-        println!("I should be done");
         info!("DHT bootstrapped, routing table has {} nodes", peer_guide.node_count());
 
         Ok(dht)
@@ -159,11 +158,13 @@ impl DhtV4 {
         let our_id = dht.our_id.clone();
 
         info!("bootstrapping with {peer}");
-        let response = timeout(Duration::from_secs(5), async {
+        let _response = timeout(Duration::from_secs(5), async {
             let node_id = dht.ping(peer).await?;
             dht.routing_table.add(node_id, peer);
 
-            dht.find_node(our_id).await;
+            // the find node only obviously we know ourselves, this only serves us to get us info
+            // about other nodes
+            let _ = dht.find_node(our_id).await;
             println!("done finding node");
 
             Ok::<(), eyre::Report>(())
