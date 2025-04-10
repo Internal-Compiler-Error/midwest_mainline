@@ -36,7 +36,7 @@ nodes can ask us about our neighbors and gradually lead to the node that has the
 - [x] respond to find node
 - [ ] expiration for hash table
 - [ ] ping and prune for routing table
-- [x] upload to crate.io
+- [x] upload to <https://crates.io>
 
 ## state of the development
 
