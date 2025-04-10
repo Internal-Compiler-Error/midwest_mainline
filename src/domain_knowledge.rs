@@ -1,5 +1,5 @@
 use bendy::encoding::ToBencode;
-use num::traits::ops::bytes;
+use num::{traits::ops::bytes, BigUint};
 use smallvec::SmallVec;
 use std::{fmt::Debug, net::SocketAddrV4};
 
@@ -16,7 +16,7 @@ impl Debug for NodeId {
 }
 
 impl NodeId {
-    /// Panics if the lenght is not exactly 20
+    /// Panics if the length is not exactly 20
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
         if bytes.len() != 20 {
             panic!("Node id must be exactly 20 bytes");
@@ -29,6 +29,12 @@ impl NodeId {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn dist_big_unit(&self, rhs: &Self) -> BigUint {
+        let our_id = BigUint::from_bytes_be(self.as_bytes());
+        let node_id = BigUint::from_bytes_be(rhs.as_bytes());
+        our_id ^ node_id
     }
 }
 

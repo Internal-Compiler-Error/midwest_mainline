@@ -37,7 +37,7 @@ pub enum OurError {
     Timeout(#[from] Elapsed),
 }
 
-/// When Australians purpose no
+/// When Australians say no
 macro_rules! naur {
     ($msg:literal $(,)?) => { OurError::Generic(eyre::eyre!($msg)) };
     ($err:expr $(,)?) => { OurError::Generic(eyre::eyre!($expr)) };

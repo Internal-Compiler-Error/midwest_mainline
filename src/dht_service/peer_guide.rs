@@ -24,7 +24,7 @@ impl PeerGuide {
         }
     }
 
-    /// keep listening for all incoming responses and upate our table
+    /// keep listening for all incoming responses and update our table
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddrV4)>) {
         let routing_table = self.routing_table.clone();
         let stuff = async move {

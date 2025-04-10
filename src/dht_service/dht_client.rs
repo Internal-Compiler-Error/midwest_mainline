@@ -5,25 +5,11 @@ use crate::{
     our_error::{naur, OurError},
     utils::ParSpawnAndAwait,
 };
-use async_recursion::async_recursion;
-use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use num::BigUint;
-use std::{
-    collections::HashSet,
-    net::SocketAddrV4,
-    ops::{BitXor, DerefMut},
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    sync::{
-        oneshot::{self, Sender},
-        Mutex,
-    },
-    task::JoinSet,
-    time::timeout,
-};
-use tracing::{debug, info, instrument, trace, warn};
+use std::{collections::HashSet, net::SocketAddrV4, ops::BitXor, sync::Arc, time::Duration};
+use tokio::time::timeout;
+use tracing::instrument;
+use tracing::warn;
 
 use super::peer_guide::PeerGuide;
 
@@ -34,6 +20,11 @@ pub struct DhtHandle {
     pub(crate) routing_table: Arc<PeerGuide>,
     pub(crate) transaction_id_pool: TransactionIdPool,
 }
+
+// TODO: make these configurable some day
+const REQ_TIMEOUT: u64 = 15;
+const ROUNDS_LIMIT: i32 = 8;
+const CONCURRENT_REQS: usize = 3;
 
 impl DhtHandle {
     /// A default DHT node when you really don't know anything about DHTs and just want to provide
@@ -87,84 +78,67 @@ impl DhtHandle {
             return Ok(node.contact);
         }
 
+        let mut queried: HashSet<NodeInfo> = HashSet::new();
+
         // find the closest nodes that we know
-        let closest = self.routing_table.find_closest(target);
-
-        let returned_nodes = closest
-            .into_iter()
-            .map(|node| node.contact().0)
-            .map(|ip| self.clone().find_nodes_via_peer(ip, target))
-            .collect::<Vec<_>>();
-
-        let returned_nodes = returned_nodes.par_spawn_and_await().await?;
-
-        let returned_nodes: Vec<_> = returned_nodes
-            .into_iter()
-            .filter_map(|node| node.ok())
-            .flatten()
-            .collect();
-
-        // if they all ended in failure, then we can't find the node
-        if returned_nodes.is_empty() {
-            return Err(naur!("Could not find node, all nodes requests ended in failure"));
+        let mut closest = self.routing_table.find_closest(target);
+        for node in closest.iter() {
+            queried.insert(*node);
         }
 
-        // it's possible that some of the nodes returned are actually the node we're looking for
-        // so we check for that and return it if it's the case
-        let target_node = returned_nodes.iter().find(|node| node.id() == target);
-
-        if target_node.is_some() {
-            return Ok(target_node.unwrap().clone());
-        }
-
-        // if we don't have the node, then we find the alpha closest nodes and ask them in turn
-        let mut sorted_by_distance: Vec<_> = returned_nodes
-            .into_iter()
-            .map(|node| {
-                let node_id = BigUint::from_bytes_be(node.id().as_bytes());
-                let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
-                let distance = our_id.bitxor(node_id);
-
-                (node, distance)
-            })
-            .collect();
-        sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
-
-        // add all the nodes we have visited so far
-        let seen_node: Arc<Mutex<HashSet<NodeInfo>>> = Arc::new(Mutex::new(HashSet::new()));
-        {
-            let mut seen = seen_node.lock().await;
-            for (node, _) in sorted_by_distance.iter() {
-                seen.insert(*node);
+        let mut round = 0;
+        loop {
+            if round == ROUNDS_LIMIT {
+                return Err(naur!("Too many rounds of find node"));
             }
-        }
+            round += 1;
 
-        let (ack, syn) = oneshot::channel();
-        let ack = Arc::new(Mutex::new(Some(ack)));
+            let returned_nodes = closest
+                .iter()
+                .map(|node| node.contact().0)
+                .map(|ip| self.clone().send_find_nodes_rpc(ip, target))
+                .collect::<Vec<_>>();
 
-        let starting_pool: Vec<NodeInfo> = sorted_by_distance.into_iter().take(3).map(|(node, _)| node).collect();
+            let returned_nodes = returned_nodes.par_spawn_and_await().await?;
 
-        let dht = self.clone();
-        let target = target.clone();
-        let mut parallel_find = tokio::spawn(async move {
-            let _ = dht
-                .recursive_find_from_pool(starting_pool, target.clone(), seen_node, ack)
-                .await;
-        });
+            // filter out the ones that resulted in failure, such as due to time out
+            let returned_nodes: Vec<_> = returned_nodes
+                .into_iter()
+                .filter_map(|node| node.ok())
+                .flatten()
+                .collect();
 
-        tokio::select! {
-             _ = &mut parallel_find => {
-                Err(naur!("Could not find node, all nodes requests ended in failure"))
-            },
-            Ok(target) = syn => {
-                parallel_find.abort();
-                Ok(target)
-            },
+            // it's possible that some of the nodes returned are actually the node we're looking for
+            // so we check for that and return it if it's the case
+            let target_node = returned_nodes.iter().find(|node| node.id() == target);
+            if target_node.is_some() {
+                return Result::Ok(*target_node.unwrap());
+            }
+
+            // if we don't have the node, then we find the alpha closest nodes and ask them in turn
+            let mut sorted_by_distance: Vec<_> = returned_nodes
+                .into_iter()
+                .map(|node| {
+                    let node_id = BigUint::from_bytes_be(node.id().as_bytes());
+                    let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
+                    let distance = our_id.bitxor(node_id);
+
+                    (node, distance)
+                })
+                .collect();
+            sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
+
+            closest.clear();
+            for (node_info, _dist) in sorted_by_distance.iter().take(CONCURRENT_REQS) {
+                if !queried.contains(node_info) {
+                    closest.push(*node_info);
+                }
+            }
         }
     }
 
     // attempt to find the target node via a peer on this address
-    async fn find_nodes_via_peer(
+    async fn send_find_nodes_rpc(
         self: Arc<Self>,
         peer_addr: SocketAddrV4,
         target: NodeId,
@@ -174,11 +148,14 @@ impl DhtHandle {
         let query = Krpc::new_find_node_query(TransactionId::from(txn_id), self.our_id, target);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(15); // TODO: make this configurable or let parent
-                                                // handle timeout
+        let time_out = Duration::from_secs(REQ_TIMEOUT);
+        // TODO: make this configurable or let parent handle timeout, wooo maybe we can configure this
+        // based on ip geo location distance
         let response = timeout(time_out, self.send_and_wait(query, peer_addr)).await??;
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
+            // TODO:: does the following actually handle the giant bitstring thing correctly?
+            //
             // the nodes come back as one giant byte string, each 26 bytes is a node
             // we split them up and create a vector of them
             let mut nodes: Vec<_> = find_node_response.nodes().clone();
@@ -187,7 +164,7 @@ impl DhtHandle {
             nodes.sort_unstable_by_key(|node| node.contact().0);
             nodes.dedup();
 
-            Ok(nodes)
+            Result::Ok(nodes)
         } else {
             Err(naur!("Did not get a find node response"))
         }
@@ -196,38 +173,75 @@ impl DhtHandle {
     // TODO: API is broken, since we can't gurantee that the peer will exist or we can find them,
     // we should return a list of K closest nodes or the target itself if can be found
     pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<PeerContact>), OurError> {
-        // TODO: verify this
-        // the info hash and node is occupy the same address space, nodes are supposed to store
-        // info_hashes close to its id
-        let target = NodeId(info_hash.0);
+        let resonsible = NodeId(info_hash.0);
+        //
+        // if we already know the node, then no need for any network requests
+        if let Some(node) = (&self).routing_table.find(resonsible) {
+            let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact.contact().0, info_hash).await?;
+            return Ok((
+                token.expect("A node directly responsible for a piece would return a token"),
+                peers,
+            ));
+        }
 
-        // get all the closest nodes to the info_hash
-        let closest_nodes: Vec<_> = self.routing_table.find_closest(target).into_iter().collect();
+        let mut queried: HashSet<NodeInfo> = HashSet::new();
 
-        let seen = Arc::new(Mutex::new(HashSet::new()));
-        let (tx, mut rx) = oneshot::channel();
-        let slot = Arc::new(Mutex::new(Some(tx)));
+        // find the closest nodes that we know
+        let mut closest = self.routing_table.find_closest(resonsible);
+        for node in closest.iter() {
+            queried.insert(*node);
+        }
 
-        let mut search = tokio::spawn(async move {
-            self.recursive_get_peers_from_pool(closest_nodes, info_hash, seen.clone(), slot.clone())
-                .await
-        });
-
-        return tokio::select! {
-            _ = &mut search => {
-                Err(naur!("All branches in get peers failed"))
+        let mut round = 0;
+        loop {
+            if round == ROUNDS_LIMIT {
+                return Err(naur!("Too many rounds of find node"));
             }
-            Ok(result) = &mut rx => {
-                trace!("Received peers from channel, cancelling search");
-                search.abort();
-                Ok(result)
+            round += 1;
+
+            let returned_nodes = closest
+                .iter()
+                .map(|node| node.contact().0)
+                .map(|ip| self.clone().send_get_peers_rpc(ip, info_hash))
+                .collect::<Vec<_>>();
+
+            let returned_nodes = returned_nodes.par_spawn_and_await().await?;
+
+            // filter out the ones that resulted in failure, such as due to time out
+            let responses: Vec<_> = returned_nodes.into_iter().filter_map(|res| res.ok()).collect();
+
+            // if any of them has a list of peers already, we can stop
+            let peers_list = responses.iter().find(|(_token, _nodes, peers)| !peers.is_empty());
+            if peers_list.is_some() {
+                let peers_list = peers_list.unwrap().clone();
+                return Ok((
+                    peers_list
+                        .0
+                        .expect("If they have a list of peers, they will provide a token"),
+                    peers_list.2,
+                ));
             }
-            else => {
-                warn!("are all the tasks done = {:?}", search.is_finished());
-                eprintln!("rx = {:?}",rx);
-                panic!()
+
+            // if we don't have the node, then we find the alpha closest nodes and ask them in turn
+            let mut sorted_by_distance: Vec<_> = responses
+                .into_iter()
+                .flat_map(|(_token, nodes, _peers)| {
+                    let our_id = self.our_id;
+                    let distances = nodes
+                        .into_iter()
+                        .map(move |node| (node, node.id().dist_big_unit(&our_id)));
+                    distances
+                })
+                .collect();
+            sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
+
+            closest.clear();
+            for (node_info, _dist) in sorted_by_distance.iter().take(CONCURRENT_REQS) {
+                if !queried.contains(node_info) {
+                    closest.push(*node_info);
+                }
             }
-        };
+        }
     }
 
     pub async fn announce_peers(
@@ -273,8 +287,8 @@ impl DhtHandle {
     }
 
     #[instrument(skip(self))]
-    async fn ask_her_for_peers(
-        &self,
+    async fn send_get_peers_rpc(
+        self: Arc<Self>,
         interlocutor: SocketAddrV4,
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
@@ -285,8 +299,7 @@ impl DhtHandle {
         let query = Krpc::new_get_peers_query(TransactionId::from(transaction_id), self.our_id.clone(), info_hash);
 
         // send the message and await for a response
-        // TODO: make timeout configurable
-        let time_out = Duration::from_secs(15);
+        let time_out = Duration::from_secs(REQ_TIMEOUT);
         let response = timeout(time_out, self.send_and_wait(query, interlocutor)).await??;
 
         return match response {
@@ -313,151 +326,4 @@ impl DhtHandle {
             }
         };
     }
-
-    // NOTE: called in find_node
-    #[async_recursion]
-    #[instrument(skip_all)]
-    /// Given a pool of potential nodes, ask them concurrently to see if they have the node we're
-    /// looking for, the target return is observed via the slot variable, once it has been filled,
-    /// the caller should drop the future to cancel all remaining tasks
-    async fn recursive_find_from_pool(
-        self: Arc<Self>,
-        mut starting_pool: Vec<NodeInfo>,
-        finding: NodeId,
-        seen: Arc<Mutex<HashSet<NodeInfo>>>,
-        slot: Arc<Mutex<Option<Sender<NodeInfo>>>>,
-    ) -> Result<(), OurError> {
-        // filter the pool to only include nodes that we haven't seen yet
-        starting_pool = async {
-            let seen = seen.lock().await;
-            let seen = starting_pool
-                .into_iter()
-                .filter(|node| !seen.contains(&node))
-                .collect::<Vec<_>>();
-            info!("len = {}", seen.len());
-
-            seen
-        }
-        .await;
-
-        // it's ok to assume that this will never get hit for the first time, since the starting
-        // pool is always unseen
-        if starting_pool.len() == 0 {
-            return Err(naur!("Bottomed out"));
-        }
-
-        // ask all the nodes for target!
-        let parallel_tasks: Vec<_> = starting_pool
-            .into_iter()
-            .map(|starting_node| {
-                let seen = seen.clone();
-                let dht = self.clone();
-                let slot = slot.clone();
-                async move {
-                    let returned_nodes = dht
-                        .clone()
-                        .find_nodes_via_peer(starting_node.contact().0, finding)
-                        .await?;
-
-                    // see if we got the node we're looking for
-                    return if let Some(node) = returned_nodes.iter().find(|node| node.id() == finding) {
-                        // if we did, then we're done
-                        let mut slot = slot.lock().await;
-                        let slot = slot.deref_mut();
-                        // lock the sender and sent the value
-                        if let Some(_sender) = slot {
-                            let slot = slot.take();
-                            slot.expect("some one else should ready have finished sending and killed us")
-                                .send(node.clone())
-                                .expect("some one else should ready have finished sending and killed us");
-                            Ok(())
-                        } else {
-                            Err(naur!("Cancelled"))
-                        }
-                    } else {
-                        // if we didn't, then we add the nodes we got to the seen list and recurse
-                        seen.lock().await.insert(starting_node.clone());
-
-                        dht.recursive_find_from_pool(returned_nodes, finding, seen, slot).await
-                    };
-                }
-            })
-            .collect();
-
-        // spawn all the tasks and await them
-        let _results = parallel_tasks.par_spawn_and_await().await?;
-
-        // if we ever reach here, that means we haven't been cancelled, which means nothing were
-        // found
-        Err(naur!("Bottmed out"))
-    }
-
-    // NOTE: called in get_peers
-    /// TODO: need to add a hard recursion depth limit
-    ///
-    /// - seen: all the nodes that we already alrady contacted
-    #[async_recursion]
-    #[instrument(skip_all)]
-    async fn recursive_get_peers_from_pool(
-        self: Arc<Self>,
-        mut starting_pool: Vec<NodeInfo>,
-        finding: InfoHash,
-    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
-        let our_id = BigUint::from_bytes_be(self.our_id.as_bytes());
-        //
-        // sort by the distance to ourself
-        starting_pool.sort_unstable_by(|lhs, rhs| {
-            let lhs = BigUint::from_bytes_be(lhs.id().as_bytes());
-            let rhs = BigUint::from_bytes_be(rhs.id().as_bytes());
-            let l_dist = lhs.bitxor(our_id.clone());
-            let r_dist = rhs.bitxor(our_id.clone());
-
-            l_dist.cmp(&r_dist)
-        });
-        info!("Starting pool size: {:?}", starting_pool.len());
-
-        let mut seen = HashSet::new();
-
-        // when the nodes returned stop being closer, terminate
-        let mut lst_dist = BigUint::new(vec![1; 20]);
-        let mut cur_dist = BigUint::new(vec![1; 20]) - 1u32;
-        let mut tasks = FuturesOrdered::new();
-
-        for node in starting_pool {
-            tasks.push_back(self.ask_her_for_peers(node.contact().0, finding));
-            seen.insert(node);
-        }
-
-        loop {
-            if cur_dist >= lst_dist || tasks.size_hint().0 == 0 {
-                break;
-            }
-            let msg = tasks.next().await;
-            if msg.is_none() {
-                break;
-            }
-
-            let msg = msg.unwrap();
-            match msg {
-                Ok((token, infos, contacts)) => {
-                    // jackpot! we found it
-                    if contacts.len() != 0 {
-                        todo!()
-                    } else {
-                    }
-                }
-                Err(_) => {
-                    // TODO: log about it
-                    continue;
-                }
-            }
-        }
-
-        Err(naur!("Bottomed out"))
-    }
-}
-
-enum PeersResponse {
-    Success(Vec<NodeInfo>),
-    Deferred(Vec<PeerContact>),
 }
