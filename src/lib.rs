@@ -88,5 +88,4 @@ pub mod dht_service;
 pub mod domain_knowledge;
 pub mod message;
 pub mod our_error;
-pub mod routing;
 pub mod utils;

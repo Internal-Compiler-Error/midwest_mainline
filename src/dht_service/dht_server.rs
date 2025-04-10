@@ -24,7 +24,7 @@ use tokio::{
 };
 use tracing::{info, info_span, trace, warn, Instrument};
 
-use super::{peer_guide::PeerGuide, transaction_id_pool::TransactionIdPool, MessageBroker};
+use super::{router::Router, transaction_id_pool::TransactionIdPool, MessageBroker};
 #[derive(Debug)]
 struct TokenPool {
     assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
@@ -123,13 +123,13 @@ const CONCURRENT_REQS: usize = 3;
 #[derive(Debug)]
 pub struct DhtHandle {
     pub(crate) our_id: NodeId,
-    pub(crate) peer_guide: Arc<PeerGuide>,
+    pub(crate) router: Arc<Router>,
 
     // parts needed to respond to requests
     /// Records which bittorrent clients are last known to be downloading identified by the info
     /// hash.
     /// TODO: replace this with a db
-    hash_table: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
+    swarm_records: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
     message_broker: Arc<MessageBroker>,
 
@@ -138,12 +138,12 @@ pub struct DhtHandle {
 }
 
 impl DhtHandle {
-    pub(crate) fn new(id: NodeId, peer_guide: Arc<PeerGuide>, message_broker: Arc<MessageBroker>) -> Self {
+    pub(crate) fn new(id: NodeId, router: Arc<Router>, message_broker: Arc<MessageBroker>) -> Self {
         Self {
-            hash_table: Arc::new(RwLock::new(HashMap::new())),
+            swarm_records: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
             our_id: id,
-            peer_guide,
+            router,
             message_broker,
             transaction_id_pool: TransactionIdPool::new(),
         }
@@ -197,14 +197,14 @@ impl DhtHandle {
             Krpc::ErrorResponse(_) => unreachable!("errors should get early returned"),
         };
 
-        self.peer_guide.add(node_id, from);
+        self.router.add(node_id, from);
         info!("Add {from} with {:?} to the routing table", node_id);
 
         // if it's response from find_peers or get_nodes, they have additional info
         if let Krpc::FindNodeGetPeersResponse(res) = message {
             for node in res.nodes() {
                 // TODO: this is a bit stupid as we destroy the structure just to copy but fix later
-                self.peer_guide.add(node.id(), node.contact().0);
+                self.router.add(node.id(), node.contact().0);
             }
         }
     }
@@ -233,7 +233,7 @@ impl DhtHandle {
 
     #[tracing::instrument(skip(self))]
     async fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> Krpc {
-        let table = &self.peer_guide;
+        let table = &self.router;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
@@ -254,7 +254,7 @@ impl DhtHandle {
     #[tracing::instrument(skip(self))]
     async fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         // see if know about the info hash
-        let table = self.hash_table.read().await;
+        let table = self.swarm_records.read().await;
         let token_pool = &self.token_pool;
 
         return if let Some(peers) = table.get(query.info_hash()) {
@@ -269,7 +269,7 @@ impl DhtHandle {
             Krpc::FindNodeGetPeersResponse(res)
         } else {
             let closest_eight: Vec<_> = self
-                .peer_guide
+                .router
                 .find_closest(*query.querier()) // TODO: wtf, why are we finding via info_hash
                 // before
                 .into_iter()
@@ -305,7 +305,7 @@ impl DhtHandle {
         };
 
         // add the peer contact to the hash table, if it already exists, we don't care
-        let mut table = self.hash_table.write().await;
+        let mut table = self.swarm_records.write().await;
         table
             .entry(announce.info_hash().clone())
             .or_insert_with(Vec::new)
@@ -351,14 +351,14 @@ impl DhtHandle {
     /// starting point of trying to find any nodes on the network
     pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).peer_guide.find(target) {
+        if let Some(node) = (&self).router.find(target) {
             return Ok(node);
         }
 
         let mut queried: HashSet<NodeInfo> = HashSet::new();
 
         // find the closest nodes that we know
-        let mut closest = self.peer_guide.find_closest(target);
+        let mut closest = self.router.find_closest(target);
         for node in closest.iter() {
             queried.insert(*node);
         }
@@ -454,7 +454,7 @@ impl DhtHandle {
         let resonsible = NodeId(info_hash.0);
         //
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).peer_guide.find(resonsible) {
+        if let Some(node) = (&self).router.find(resonsible) {
             let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact().0, info_hash).await?;
             return Ok((
                 token.expect("A node directly responsible for a piece would return a token"),
@@ -465,7 +465,7 @@ impl DhtHandle {
         let mut queried: HashSet<NodeInfo> = HashSet::new();
 
         // find the closest nodes that we know
-        let mut closest = self.peer_guide.find_closest(resonsible);
+        let mut closest = self.router.find_closest(resonsible);
         for node in closest.iter() {
             queried.insert(*node);
         }

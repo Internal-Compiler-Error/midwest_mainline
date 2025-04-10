@@ -1,14 +1,14 @@
 pub mod dht_server;
 pub mod message_broker;
-pub mod peer_guide;
+pub mod router;
 mod transaction_id_pool;
 
 use crate::{dht_service::dht_server::DhtHandle, domain_knowledge::NodeId, our_error::OurError};
 use tracing::info;
 
 use message_broker::MessageBroker;
-use peer_guide::PeerGuide;
 use rand::{Rng, RngCore};
+use router::Router;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
@@ -27,7 +27,7 @@ use tokio::{
 pub struct DhtV4 {
     server: Arc<DhtHandle>,
     message_broker: Arc<MessageBroker>,
-    peer_guide: Arc<PeerGuide>,
+    router: Arc<Router>,
     helper_tasks: JoinSet<()>,
 }
 
@@ -89,17 +89,17 @@ impl DhtV4 {
             })
             .unwrap();
 
-        let peer_guide = Arc::new(PeerGuide::new(our_id));
+        let router = Arc::new(Router::new(our_id));
 
         let rx = message_broker.subscribe_inbound();
-        let peer_guide_clone = peer_guide.clone();
+        let peer_guide_clone = router.clone();
         join_set
             .build_task()
             .name("Peer guide")
             .spawn(async move { peer_guide_clone.run(rx).await })
             .unwrap();
 
-        let server = DhtHandle::new(our_id.clone(), peer_guide.clone(), message_broker.clone());
+        let server = DhtHandle::new(our_id.clone(), router.clone(), message_broker.clone());
         let server = Arc::new(server);
 
         join_set
@@ -111,7 +111,7 @@ impl DhtV4 {
         let dht = DhtV4 {
             server: server.clone(),
             message_broker,
-            peer_guide: peer_guide.clone(),
+            router: router.clone(),
             helper_tasks: join_set,
         };
 
@@ -129,7 +129,7 @@ impl DhtV4 {
         while let Some(_) = bootstrap_join_set.join_next().await {}
         drop(bootstrap_join_set);
 
-        info!("DHT bootstrapped, routing table has {} nodes", peer_guide.node_count());
+        info!("DHT bootstrapped, routing table has {} nodes", router.node_count());
 
         Ok(dht)
     }
@@ -152,7 +152,7 @@ impl DhtV4 {
         info!("bootstrapping with {peer}");
         let _response = timeout(Duration::from_secs(5), async {
             let node_id = dht.ping(peer).await?;
-            dht.peer_guide.add(node_id, peer);
+            dht.router.add(node_id, peer);
 
             // the find node only obviously we know ourselves, this only serves us to get us info
             // about other nodes
