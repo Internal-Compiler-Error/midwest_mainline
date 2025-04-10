@@ -1,10 +1,10 @@
-pub mod dht_client;
 pub mod dht_server;
 pub mod message_broker;
 pub mod peer_guide;
 mod transaction_id_pool;
 
-use crate::{dht_service::dht_server::DhtServer, domain_knowledge::NodeId, our_error::OurError};
+use crate::{dht_service::dht_server::DhtHandle, domain_knowledge::NodeId, our_error::OurError};
+use tracing::info;
 
 use message_broker::MessageBroker;
 use peer_guide::PeerGuide;
@@ -20,16 +20,12 @@ use tokio::{
     time::timeout,
 };
 
-use dht_client::DhtHandle;
-use tracing::{info, instrument};
-
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct DhtV4 {
-    client: Arc<DhtHandle>,
-    server: Arc<DhtServer>,
+    server: Arc<DhtHandle>,
     message_broker: Arc<MessageBroker>,
     peer_guide: Arc<PeerGuide>,
     helper_tasks: JoinSet<()>,
@@ -67,7 +63,7 @@ impl DhtV4 {
     /// # Arguments
     /// * `external_addr`: the ip address that can be reachable from the outside, in Ipv4 land, it
     /// means this needs to be a public IP
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     pub async fn bootstrap_with_random_id(
         bind_addr: SocketAddrV4,
         external_addr: Ipv4Addr,
@@ -103,10 +99,7 @@ impl DhtV4 {
             .spawn(async move { peer_guide_clone.run(rx).await })
             .unwrap();
 
-        let client = DhtHandle::new(message_broker.clone(), peer_guide.clone(), our_id);
-        let client = Arc::new(client);
-
-        let server = DhtServer::new(our_id.clone(), peer_guide.clone(), message_broker.clone());
+        let server = DhtHandle::new(our_id.clone(), peer_guide.clone(), message_broker.clone());
         let server = Arc::new(server);
 
         join_set
@@ -116,7 +109,6 @@ impl DhtV4 {
             .unwrap();
 
         let dht = DhtV4 {
-            client: client.clone(),
             server: server.clone(),
             message_broker,
             peer_guide: peer_guide.clone(),
@@ -130,7 +122,7 @@ impl DhtV4 {
             bootstrap_join_set
                 .build_task()
                 .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(client.clone(), contact))
+                .spawn(Self::bootstrap_from(server.clone(), contact))
                 .unwrap();
         }
 
@@ -153,14 +145,14 @@ impl DhtV4 {
     /// node.
     ///
     /// This is subject to change in the future.
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn bootstrap_from(dht: Arc<DhtHandle>, peer: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
 
         info!("bootstrapping with {peer}");
         let _response = timeout(Duration::from_secs(5), async {
             let node_id = dht.ping(peer).await?;
-            dht.routing_table.add(node_id, peer);
+            dht.peer_guide.add(node_id, peer);
 
             // the find node only obviously we know ourselves, this only serves us to get us info
             // about other nodes
@@ -175,14 +167,9 @@ impl DhtV4 {
         Ok(())
     }
 
-    /// Returns a handle to the client so you can perform queries
-    pub fn client(&self) -> Arc<DhtHandle> {
-        self.client.clone()
-    }
-
     /// Returns a handle to the server, currently there is no public API for the server. In the
     /// the sever will support some APIs to allow you to query about its state
-    pub fn server(&self) -> Arc<DhtServer> {
+    pub fn handle(&self) -> Arc<DhtHandle> {
         self.server.clone()
     }
 }
@@ -244,21 +231,13 @@ mod tests {
 
         let dht = timeout(time::Duration::from_secs(60), dht).await??;
         info!("Now I'm bootstrapped!");
-        // {
-        //     let table = dht.client.routing_table;
-        //     info!(
-        //         "we've found {:?} nodes and recorded in our routing table",
-        //         table.node_count()
-        //     );
-        // }
 
-        let client = dht.client;
-
+        let server = dht.handle();
         let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 20];
         rng.fill_bytes(&mut bytes);
 
-        let node = client.find_node(NodeId(bytes)).await;
+        let node = server.find_node(NodeId(bytes)).await;
         if let Ok(node) = node {
             println!("found node {:?}", node);
         } else {
@@ -292,8 +271,8 @@ mod tests {
 
         let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
 
-        let client = dht.client();
-        let (token, peers) = client.get_peers(info_hash).await?;
+        let handle = dht.handle();
+        let (token, peers) = handle.get_peers(info_hash).await?;
         info!("token {token:?}, peers {peers:?}");
         Ok(())
     }
