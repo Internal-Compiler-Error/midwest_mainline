@@ -7,13 +7,13 @@ use std::{
 
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot, Mutex as AsyncMutex},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tracing::{instrument, trace, warn};
 
 use crate::{
-    domain_knowledge::TransactionId,
+    domain_knowledge::{NodeInfo, TransactionId},
     message::{Krpc, ParseKrpc, ToRawKrpc},
 };
 
@@ -21,16 +21,11 @@ use crate::{
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
 /// so the client and await the response.
 /// TODO: replace this with some proper pubsub
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct MessageBroker {
     /// a map to keep track of the responses we await from the client
-    pending_responses: Arc<AsyncMutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
+    pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
 
-    /// all messages belong to the server are put into this queue.
-    // query_queue: Arc<AsyncMutex<mpsc::Sender<(Krpc, SocketAddrV4)>>>,
-
-    /// a channel to receive new krpc read from the socket
-    // outbound_messages: Arc<AsyncMutex<mpsc::Receiver<(Krpc, SocketAddrV4)>>>,
     socket: Arc<UdpSocket>,
 
     /// a list of subscribers that wishes to hear all messages inbound
@@ -40,7 +35,7 @@ pub(crate) struct MessageBroker {
 impl MessageBroker {
     pub fn new(socket: UdpSocket) -> Self {
         Self {
-            pending_responses: Arc::new(AsyncMutex::new(HashMap::new())),
+            pending_responses: Arc::new(Mutex::new(HashMap::new())),
             socket: Arc::new(socket),
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
         }
@@ -50,7 +45,6 @@ impl MessageBroker {
     pub async fn run(&self) -> io::Result<JoinHandle<()>> {
         let socket = self.socket.clone();
         let pending_responses = self.pending_responses.clone();
-        // let query_queue = self.query_queue.clone();
         let inbound_subscribers = self.inbound_subscribers.clone();
 
         let socket_reader = async move {
@@ -84,11 +78,13 @@ impl MessageBroker {
                             }
                         }
 
-                        // see if we have a slot for this transaction id, if we do, that means one of the
-                        // messages that we expect, otherwise the message is a query we need to handle
-                        if let Some(sender) = pending_responses.lock().await.remove(id) {
-                            // failing means we're no longer interested, which is ok
-                            let _ = sender.send((msg, socket_addr));
+                        {
+                            // see if we have a slot for this transaction id, if we do, that means one of the
+                            // messages that we expect, otherwise the message is a query we need to handle
+                            if let Some(sender) = pending_responses.lock().unwrap().remove(id) {
+                                // failing means we're no longer interested, which is ok
+                                let _ = sender.send((msg, socket_addr));
+                            }
                         }
                     }
                     Err(e) => {
@@ -103,10 +99,10 @@ impl MessageBroker {
 
     /// Tell the broker we should expect some messages
     // TODO: maybe it should return Receiver<Option<(Krpc, SocketAddrV4)>
-    pub async fn subscribe_one(&self, transaction_id: TransactionId) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
+    pub fn subscribe_one(&self, transaction_id: TransactionId) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
         let (tx, rx) = oneshot::channel();
 
-        let mut guard = self.pending_responses.lock().await;
+        let mut guard = self.pending_responses.lock().unwrap();
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
         let _ = guard.insert(transaction_id, tx);
@@ -122,6 +118,10 @@ impl MessageBroker {
 
             socket.send_to(&buf, peer).await.unwrap();
         });
+    }
+
+    pub fn send_msg_to_node(&self, msg: Krpc, peer: &NodeInfo) {
+        self.send_msg(msg, peer.contact().0)
     }
 
     // TODO: think of a good way to let them unsubscribe later

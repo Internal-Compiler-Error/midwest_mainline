@@ -24,7 +24,11 @@ use tokio::{
 };
 use tracing::{info, info_span, trace, warn, Instrument};
 
-use super::{router::Router, transaction_id_pool::TransactionIdPool, MessageBroker};
+use super::{
+    router::Router,
+    transaction_id_pool::{self, TransactionIdPool},
+    MessageBroker,
+};
 #[derive(Debug)]
 struct TokenPool {
     assigned: Arc<Mutex<HashMap<Ipv4Addr, (Token, Instant)>>>,
@@ -116,14 +120,14 @@ impl TokenPool {
 }
 
 // TODO: make these configurable some day
-const REQ_TIMEOUT: u64 = 15;
+pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUNDS_LIMIT: i32 = 8;
 const CONCURRENT_REQS: usize = 3;
 
 #[derive(Debug)]
 pub struct DhtHandle {
     pub(crate) our_id: NodeId,
-    pub(crate) router: Arc<Router>,
+    pub(crate) router: Router,
 
     // parts needed to respond to requests
     /// Records which bittorrent clients are last known to be downloading identified by the info
@@ -131,21 +135,26 @@ pub struct DhtHandle {
     /// TODO: replace this with a db
     swarm_records: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
     token_pool: Arc<TokenPool>,
-    message_broker: Arc<MessageBroker>,
+    message_broker: MessageBroker,
 
     // parts needed to make requests
-    pub(crate) transaction_id_pool: TransactionIdPool,
+    pub(crate) transaction_id_pool: Arc<TransactionIdPool>,
 }
 
 impl DhtHandle {
-    pub(crate) fn new(id: NodeId, router: Arc<Router>, message_broker: Arc<MessageBroker>) -> Self {
+    pub(crate) fn new(
+        id: NodeId,
+        router: Router,
+        message_broker: MessageBroker,
+        transaction_id_pool: Arc<TransactionIdPool>,
+    ) -> Self {
         Self {
             swarm_records: Arc::new(RwLock::new(HashMap::new())),
             token_pool: Arc::new(TokenPool::new()),
             our_id: id,
             router,
             message_broker,
-            transaction_id_pool: TransactionIdPool::new(),
+            transaction_id_pool,
         }
     }
 
@@ -271,7 +280,6 @@ impl DhtHandle {
             let closest_eight: Vec<_> = self
                 .router
                 .find_closest(*query.querier()) // TODO: wtf, why are we finding via info_hash
-                // before
                 .into_iter()
                 .collect();
 
@@ -323,10 +331,7 @@ impl DhtHandle {
     /// It does not alter the routing table, callers must decide what to do with the response.
     pub async fn send_and_wait(&self, message: Krpc, recipient: SocketAddrV4) -> Result<Krpc, OurError> {
         let rx = {
-            let rx = self
-                .message_broker
-                .subscribe_one(message.transaction_id().clone())
-                .await;
+            let rx = self.message_broker.subscribe_one(message.transaction_id().clone());
             self.message_broker.send_msg(message.clone(), recipient);
             rx
         };
@@ -351,7 +356,7 @@ impl DhtHandle {
     /// starting point of trying to find any nodes on the network
     pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find(target) {
+        if let Some(node) = (&self).router.find_exact(target) {
             return Ok(node);
         }
 
@@ -422,7 +427,7 @@ impl DhtHandle {
         let query = Krpc::new_find_node_query(TransactionId::from(txn_id), self.our_id, target);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(REQ_TIMEOUT);
+        let time_out = REQ_TIMEOUT;
         // TODO: make this configurable or let parent handle timeout, wooo maybe we can configure this
         // based on ip geo location distance
         let response = timeout(time_out, self.send_and_wait(query, dest))
@@ -454,7 +459,7 @@ impl DhtHandle {
         let resonsible = NodeId(info_hash.0);
         //
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find(resonsible) {
+        if let Some(node) = (&self).router.find_exact(resonsible) {
             let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact().0, info_hash).await?;
             return Ok((
                 token.expect("A node directly responsible for a piece would return a token"),
@@ -577,7 +582,7 @@ impl DhtHandle {
         let query = Krpc::new_get_peers_query(TransactionId::from(transaction_id), self.our_id.clone(), info_hash);
 
         // send the message and await for a response
-        let time_out = Duration::from_secs(REQ_TIMEOUT);
+        let time_out = REQ_TIMEOUT;
         let response = timeout(time_out, self.send_and_wait(query, dest))
             .await
             .inspect_err(|_e| {
