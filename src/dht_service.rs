@@ -19,6 +19,7 @@ use tokio::{
     task::{Builder as TskBuilder, JoinSet},
     time::timeout,
 };
+use transaction_id_pool::TransactionIdPool;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -26,8 +27,8 @@ use tokio::{
 #[allow(dead_code)]
 pub struct DhtV4 {
     server: Arc<DhtHandle>,
-    message_broker: Arc<MessageBroker>,
-    router: Arc<Router>,
+    message_broker: MessageBroker,
+    router: Router,
     helper_tasks: JoinSet<()>,
 }
 
@@ -78,7 +79,7 @@ impl DhtV4 {
         let mut join_set = JoinSet::new();
 
         let message_broker = MessageBroker::new(socket);
-        let message_broker = Arc::new(message_broker);
+        // let message_broker = Arc::new(message_broker.clone());
 
         let message_broker_clone = message_broker.clone();
         join_set
@@ -89,17 +90,23 @@ impl DhtV4 {
             })
             .unwrap();
 
-        let router = Arc::new(Router::new(our_id));
+        let transaction_id_pool = Arc::new(TransactionIdPool::new());
+        let router = Router::new(our_id, (message_broker).clone(), Arc::clone(&transaction_id_pool));
 
         let rx = message_broker.subscribe_inbound();
-        let peer_guide_clone = router.clone();
+        let inner_router = router.clone();
         join_set
             .build_task()
-            .name("Peer guide")
-            .spawn(async move { peer_guide_clone.run(rx).await })
+            .name("Router")
+            .spawn(async move { inner_router.run(rx).await })
             .unwrap();
 
-        let server = DhtHandle::new(our_id.clone(), router.clone(), message_broker.clone());
+        let server = DhtHandle::new(
+            our_id,
+            router.clone(),
+            message_broker.clone(),
+            Arc::clone(&transaction_id_pool),
+        );
         let server = Arc::new(server);
 
         join_set

@@ -22,7 +22,7 @@ use crate::{
 /// so the client and await the response.
 /// TODO: replace this with some proper pubsub
 #[derive(Debug, Clone)]
-pub(crate) struct MessageBroker {
+pub struct MessageBroker {
     /// a map to keep track of the responses we await from the client
     pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
 

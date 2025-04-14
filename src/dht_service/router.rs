@@ -27,6 +27,7 @@ macro_rules! bail_on_err {
     };
 }
 
+#[allow(unused)]
 macro_rules! bail_on_none {
     ($result:expr) => {
         match $result {
@@ -59,6 +60,18 @@ struct NodeEntry {
     /// if current time - last_checked >= 15 mins, how many requests this node *didn't* respond?
     failed_request_count: u8,
     quality: Quality,
+}
+
+impl PartialOrd for NodeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NodeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.quality.cmp(&other.quality)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -214,6 +227,16 @@ impl RoutingTable {
         let (begin, end) = self.indices(target);
         (&self.buckets[begin..end], begin)
     }
+
+    pub fn sort(&mut self) {
+        // sort each bucket accroding to each nodes quality
+        for i in 0..160 {
+            let begin = i * self.bucket_size;
+            let end = begin + self.bucket_size;
+            let bucket = &mut self.buckets[begin..end];
+            bucket.sort();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,25 +274,40 @@ impl Router {
         }
     }
 
+    fn add_new_nodes(&self, from: SocketAddrV4, message: &Krpc) {
+        if let Krpc::ErrorResponse(_) = message {
+            return;
+        }
+
+        let node_id = match message {
+            Krpc::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
+            Krpc::FindNodeQuery(find_node_query) => find_node_query.querier(),
+            Krpc::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
+            Krpc::PingQuery(ping_query) => *ping_query.querier(),
+            Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
+            Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
+            Krpc::ErrorResponse(_) => unreachable!("errors should get early returned"),
+        };
+
+        self.add(node_id, from);
+        info!("Add {from} with {:?} to the routing table", node_id);
+
+        // if it's response from find_peers or get_nodes, they have additional info
+        if let Krpc::FindNodeGetPeersResponse(res) = message {
+            for node in res.nodes() {
+                // TODO: this is a bit stupid as we destroy the structure just to copy but fix later
+                self.add(node.id(), node.contact().0);
+            }
+        }
+    }
+
     /// keep listening for all incoming responses and update our table
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddrV4)>) {
         loop {
             // TODO: worry about the unwrap later
             let (msg, origin) = inbound.recv().await.unwrap();
 
-            let msg = match msg {
-                Krpc::FindNodeGetPeersResponse(msg) => msg,
-                _ => break,
-            };
-
-            {
-                let nodes = msg.nodes();
-
-                for node in nodes {
-                    let node = node.clone();
-                    self.add(node.id(), origin);
-                }
-            }
+            self.add_new_nodes(origin, &msg);
         }
     }
 
@@ -302,6 +340,7 @@ impl Router {
                         let inner = inner.as_mut().unwrap();
                         if update_only(inner, &new_node_id) {
                             inner.update_quality(false);
+                            routing_table.sort();
                             return;
                         } else {
                             inner.contact
@@ -328,6 +367,7 @@ impl Router {
                     None => {
                         let insertion_point = routing_table.insertion_candidate_mut(&new_node_id).unwrap();
                         *insertion_point = Some(replacment);
+                        routing_table.sort();
                         return;
                     }
                 };
@@ -338,10 +378,12 @@ impl Router {
                     // TODO: handle when the response is an error message
                     Some((_response, _origin)) => {
                         slot.update_quality(false);
+                        routing_table.sort();
                     }
                     None => {
                         let insertion_point = routing_table.insertion_candidate_mut(&new_node_id).unwrap();
                         *insertion_point = Some(replacment);
+                        routing_table.sort();
                         return;
                     }
                 }
