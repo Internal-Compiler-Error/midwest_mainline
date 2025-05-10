@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::future::Future;
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinSet};
 
 #[async_trait]
 pub trait ParSpawnAndAwait {
@@ -18,13 +18,10 @@ where
     type Awaited = Vec<R>;
 
     async fn par_spawn_and_await(self) -> Result<Self::Awaited, JoinError> {
-        let handles: Vec<_> = self.into_iter().map(|f| tokio::spawn(f)).collect();
-
-        let mut results = Vec::new();
-        for handle in handles {
-            results.push(handle.await?);
+        let mut set = JoinSet::new();
+        for task in self {
+            set.spawn(task);
         }
-
-        Ok(results)
+        Ok(set.join_all().await)
     }
 }

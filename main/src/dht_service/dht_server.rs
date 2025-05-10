@@ -22,7 +22,7 @@ use tokio::{
     task::Builder as TskBuilder,
     time::{timeout, Instant},
 };
-use tracing::{info, info_span, trace, warn, Instrument};
+use tracing::{info_span, trace, warn, Instrument};
 
 use super::{router::Router, transaction_id_pool::TransactionIdPool, MessageBroker};
 #[derive(Debug)]
@@ -97,6 +97,8 @@ impl TokenPool {
     }
 
     /// See as the moment of calling, is the token correct?
+    // TODO: the spec says "The BitTorrent implementation uses the SHA1 hash of the IP address concatenated onto a secret that changes every five minutes and tokens up to ten minutes old are accepted."
+    // this implementation actually refuses once the 5 minute window is passed
     pub(crate) async fn is_valid_token(&self, addr: &Ipv4Addr, token: &Token) -> bool {
         let expected_token = self.generate_token(addr).await;
         expected_token == *token
@@ -113,6 +115,12 @@ impl TokenPool {
         // String::from_utf8(digest.as_slice().to_vec()).unwrap()
         // Box::from(digest.as_slice())
         Token::from_bytes(digest.as_slice())
+    }
+
+    async fn prune_expired(&self) {
+        let mut assigned = self.assigned.lock().await;
+        let now = Instant::now();
+        assigned.retain(|_addr, (_token, last_update)| now.duration_since(*last_update) < TOKEN_EXPIRATION_TIME);
     }
 }
 

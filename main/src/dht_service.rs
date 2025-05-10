@@ -14,11 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    net::UdpSocket,
-    task::{Builder as TskBuilder, JoinSet},
-    time::timeout,
-};
+use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use transaction_id_pool::TransactionIdPool;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the

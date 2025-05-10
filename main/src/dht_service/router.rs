@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    hash::Hash,
     net::SocketAddrV4,
     sync::{Arc, RwLock},
     time::Duration,
@@ -394,6 +395,10 @@ impl Router {
 
     pub fn node_count(&self) -> usize {
         self.routing_table.read().unwrap().node_count()
+    }
+
+    pub fn refresh_table(&self) {
+        let mut table = self.routing_table.write().unwrap();
     }
 }
 
