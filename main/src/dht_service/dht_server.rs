@@ -289,6 +289,7 @@ impl DhtHandle {
             }
         };
 
+        // TODO: replace it with DB
         // add the peer contact to the hash table, if it already exists, we don't care
         let mut table = self.swarm_records.write().await;
         table

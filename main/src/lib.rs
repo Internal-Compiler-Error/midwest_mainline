@@ -86,6 +86,7 @@
 
 pub mod dht_service;
 pub mod domain_knowledge;
+mod entities;
 pub mod message;
 pub mod our_error;
 pub mod utils;

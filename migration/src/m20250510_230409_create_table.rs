@@ -15,7 +15,6 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(Swarm::Id))
                     .col(binary_len(Swarm::InfoHash, 20))
-                    .col(timestamp(Swarm::LastUpdated))
                     .to_owned(),
             )
             .await?;
@@ -39,6 +38,7 @@ impl MigrationTrait for Migration {
                     .col(unsigned(Peer::IpAddr))
                     .col(small_unsigned(Peer::Port))
                     .col(integer(Peer::Swarm))
+                    .col(big_unsigned(Peer::LastAnnounced))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk-swarm")
@@ -56,8 +56,9 @@ impl MigrationTrait for Migration {
                 Index::create()
                     .if_not_exists()
                     .table(Peer::Table)
-                    .name("idx-peer-swarm")
+                    .name("idx-peer-swarm-last-announced")
                     .col(Peer::Swarm)
+                    .col(Peer::LastAnnounced)
                     .to_owned(),
             )
             .await
@@ -73,7 +74,7 @@ impl MigrationTrait for Migration {
 
         manager.drop_table(Table::drop().table(Peer::Table).to_owned()).await?;
         manager
-            .drop_index(Index::drop().name("idx-peer-swarm").to_owned())
+            .drop_index(Index::drop().name("idx-peer-swarm-last-announced").to_owned())
             .await
     }
 }
@@ -83,7 +84,6 @@ enum Swarm {
     Table,
     Id,
     InfoHash,
-    LastUpdated,
 }
 
 #[derive(DeriveIden)]
@@ -93,4 +93,5 @@ enum Peer {
     Swarm,
     IpAddr,
     Port,
+    LastAnnounced,
 }
