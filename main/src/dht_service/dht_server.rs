@@ -1,3 +1,4 @@
+use crate::schema::*;
 use crate::{
     domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
     message::{
@@ -7,6 +8,9 @@ use crate::{
     our_error::{naur, OurError},
     utils::ParSpawnAndAwait,
 };
+use diesel::insert_into;
+use diesel::r2d2::Pool;
+use diesel::{prelude::*, r2d2::ConnectionManager};
 use rand::RngCore;
 
 use crate::message::find_node_get_peers_response::Builder as ResBuilder;
@@ -15,7 +19,7 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     sync::{Mutex, RwLock},
@@ -33,6 +37,15 @@ struct TokenPool {
 }
 
 const TOKEN_EXPIRATION_TIME: Duration = Duration::from_secs(60 * 10);
+
+fn unix_timestmap_ms() -> i64 {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("Time was before unix epoch, we don't deal with such exotic cases")
+        .as_millis();
+    // see models.rs for why it's a stupid i64
+    i64::try_from(timestamp_ms).expect("Timestmap couldn't fit into a i64, we don't support such exotic cases")
+}
 
 impl TokenPool {
     pub(crate) fn new() -> Self {
@@ -134,11 +147,8 @@ pub struct DhtHandle {
     pub(crate) our_id: NodeId,
     pub(crate) router: Router,
 
-    // parts needed to respond to requests
-    /// Records which bittorrent clients are last known to be downloading identified by the info
-    /// hash.
-    /// TODO: replace this with a db
-    swarm_records: Arc<RwLock<HashMap<InfoHash, Vec<PeerContact>>>>,
+    swarms: Pool<ConnectionManager<SqliteConnection>>,
+
     token_pool: Arc<TokenPool>,
     message_broker: MessageBroker,
 
@@ -152,9 +162,10 @@ impl DhtHandle {
         router: Router,
         message_broker: MessageBroker,
         transaction_id_pool: Arc<TransactionIdPool>,
+        swarms: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
         Self {
-            swarm_records: Arc::new(RwLock::new(HashMap::new())),
+            swarms,
             token_pool: Arc::new(TokenPool::new()),
             our_id: id,
             router,
@@ -237,15 +248,48 @@ impl DhtHandle {
         };
     }
 
+    fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<PeerContact> {
+        // determines when does a peer is considered expired, default is 30 mins
+        // TODO: should be configurable in the future.
+        fn cutoff() -> i64 {
+            let thirty_minutes_ms = 30 * 60 * 1000;
+            unix_timestmap_ms() - thirty_minutes_ms
+        }
+
+        let mut conn = self.swarms.get().expect("failed to get one connection from pool");
+
+        let peers = peer::table
+            .inner_join(swarm::table.on(peer::swarm.eq(swarm::info_hash)))
+            .filter(swarm::info_hash.eq(&info_hash.0))
+            .filter(peer::last_announced.ge(cutoff()))
+            .select((peer::ip_addr, peer::port))
+            .load::<(i64, i32)>(&mut conn)
+            .unwrap();
+        let peers: Vec<PeerContact> = peers
+            .into_iter()
+            .map(|(ip, port)| {
+                assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
+                assert!(ip >= 0 && ip <= u32::MAX.into(), "ip should fit inside an u32");
+
+                let ip = ip as u32;
+                let a = ((ip >> 24) & 0xFF) as u8;
+                let b = ((ip >> 16) & 0xFF) as u8;
+                let c = ((ip >> 8) & 0xFF) as u8;
+                let d = ((ip >> 0) & 0xFF) as u8;
+
+                let ip = Ipv4Addr::new(a, b, c, d);
+                PeerContact(SocketAddrV4::new(ip, port as u16))
+            })
+            .collect();
+        peers
+    }
+
     #[tracing::instrument(skip(self))]
     async fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
-        // see if know about the info hash
-        let table = self.swarm_records.read().await;
+        let peers = self.swarm_peers(query.info_hash());
         let token_pool = &self.token_pool;
 
-        return if let Some(peers) = table.get(query.info_hash()) {
-            let peers: Vec<_> = peers.iter().cloned().collect();
-
+        if !peers.is_empty() {
             let token = token_pool.token_for_addr(origin.ip()).await;
 
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
@@ -254,6 +298,7 @@ impl DhtHandle {
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
         } else {
+            // when we don't have peer info on an info hash, respond with the cloests nodes so the querier can ask them
             let closest_eight: Vec<_> = self
                 .router
                 .find_closest(*query.querier()) // TODO: wtf, why are we finding via info_hash
@@ -262,14 +307,12 @@ impl DhtHandle {
 
             let token = token_pool.token_for_addr(&origin.ip()).await;
 
-            // defferred
-
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
                 .with_token(token)
                 .with_nodes(&closest_eight)
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
-        };
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -289,13 +332,40 @@ impl DhtHandle {
             }
         };
 
-        // TODO: replace it with DB
-        // add the peer contact to the hash table, if it already exists, we don't care
-        let mut table = self.swarm_records.write().await;
-        table
-            .entry(announce.info_hash().clone())
-            .or_insert_with(Vec::new)
-            .push(peer_contact);
+        let mut conn = self.swarms.get().unwrap();
+        conn.transaction(|conn| {
+            let info_hash = announce.info_hash().0.to_vec();
+            let swarm: Vec<u8> = insert_into(swarm::table)
+                .values(swarm::info_hash.eq(&info_hash))
+                .on_conflict_do_nothing()
+                .returning(swarm::info_hash)
+                .get_result(conn)?;
+
+            let now = unix_timestmap_ms();
+            insert_into(peer::table)
+                .values(
+                    // TODO: this comes in the host native endianness, but it should be fine as long as the db
+                    // file is not transfered between computers
+                    (
+                        peer::ip_addr.eq(peer_contact.0.ip().to_bits() as i64),
+                        peer::port.eq(peer_contact.0.port() as i32),
+                        peer::swarm.eq(swarm),
+                        peer::last_announced.eq(now),
+                    ),
+                )
+                .on_conflict((peer::ip_addr, peer::port, peer::swarm))
+                .do_update()
+                .set(peer::last_announced.eq(now))
+                .execute(conn)
+        })
+        .expect("transaction for recording new peers failed");
+
+        // // add the peer contact to the hash table, if it already exists, we don't care
+        // let mut table = self.swarm_records.write().await;
+        // table
+        //     .entry(announce.info_hash().clone())
+        //     .or_insert_with(Vec::new)
+        //     .push(peer_contact);
 
         Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
     }

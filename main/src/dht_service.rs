@@ -4,12 +4,17 @@ pub mod router;
 mod transaction_id_pool;
 
 use crate::{dht_service::dht_server::DhtHandle, domain_knowledge::NodeId, our_error::OurError};
+use diesel::{
+    r2d2::{ConnectionManager, Pool},
+    SqliteConnection,
+};
 use tracing::info;
 
 use message_broker::MessageBroker;
 use rand::{Rng, RngCore};
 use router::Router;
 use std::{
+    env,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
@@ -97,11 +102,19 @@ impl DhtV4 {
             .spawn(async move { inner_router.run(rx).await })
             .unwrap();
 
+        // TODO: make this configurable
+        let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
+        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+
         let server = DhtHandle::new(
             our_id,
             router.clone(),
             message_broker.clone(),
             Arc::clone(&transaction_id_pool),
+            Pool::builder()
+                .test_on_check_out(true)
+                .build(manager)
+                .expect("Could not build DB connection pool"),
         );
         let server = Arc::new(server);
 

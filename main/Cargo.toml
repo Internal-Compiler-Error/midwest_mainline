@@ -38,7 +38,7 @@ thiserror = "1.0.61"
 smallvec = "1.13.2"
 base64 = "0.22.1"
 eyre = "0.6.12"
-sea-orm = { version = "1.1.0", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-native-tls", "macros" ] }
+diesel = { version = "2.2.10", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2" ] }
 
 [dev-dependencies]
 serde_json = "^1.0"

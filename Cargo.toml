@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["migration", "main"]
+members = ["main"]
 
