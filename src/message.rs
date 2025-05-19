@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use crate::domain_knowledge::{NodeInfo, Token, TransactionId};
+use crate::types::{NodeInfo, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
@@ -9,7 +9,7 @@ use eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
 
-use crate::domain_knowledge::{InfoHash, NodeId};
+use crate::types::{InfoHash, NodeId};
 use crate::message::announce_peer_query::AnnouncePeerQuery;
 use crate::message::error::KrpcError;
 use crate::message::find_node_query::FindNodeQuery;

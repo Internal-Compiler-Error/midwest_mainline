@@ -14,12 +14,12 @@ use tracing::info;
 use crate::models::NodeNoMetaInfo;
 use crate::utils::unix_timestmap_ms;
 use crate::{
-    domain_knowledge::{self, NodeId, NodeInfo, TransactionId},
+    types::{self, NodeId, NodeInfo, TransactionId},
     message::Krpc,
 };
 
-use super::dht_server::REQ_TIMEOUT;
-use super::{message_broker::MessageBroker, transaction_id_pool::TransactionIdPool};
+use super::dht_handle::REQ_TIMEOUT;
+use super::{krpc_broker::MessageBroker, transaction_id_pool::TransactionIdPool};
 
 #[allow(unused)]
 macro_rules! bail_on_err {
@@ -107,7 +107,7 @@ impl Router {
     /// Returns the bucket index that the target node belongs in
     fn index(&self, target: &NodeId) -> i32 {
         let dist = self.id.dist(&target);
-        if dist == domain_knowledge::ZERO_DIST {
+        if dist == types::ZERO_DIST {
             // all zero means we're finding ourself, then we go look for in the 0th bucket.
             return 0;
         }
@@ -228,7 +228,7 @@ impl Router {
     }
 
     // Send a ping to fresh the node
-    async fn refresh(&self, target: &NodeInfo) {
+    async fn refresh_node(&self, target: &NodeInfo) {
         let txn_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.id);
 
@@ -257,15 +257,20 @@ impl Router {
             let ip: Ipv4Addr = n.ip_addr.parse().unwrap();
             let endpoint = SocketAddrV4::new(ip, n.port as u16);
             let target = NodeInfo::new(id, endpoint);
-            self.refresh(&target).await
+            self.refresh_node(&target).await
         });
         join_all(tasks).await;
     }
 
-    pub fn refresh_table(&self) {
-        todo!()
-        // let mut table = self.routing_table.write().unwrap();
+    pub async fn refresh_table(&self) {
+        let tasks = (0..20).map(|i| async move { self.refresh_bucket(i).await });
+        for i in 0..20 {
+            self.refresh_bucket(i).await;
+        }
+        join_all(tasks).await;
     }
+
+    pub async fn refresh_table_loop(&self) {}
 
     // TODO: use AsRef or Into to make it take in anything that can turn into an ID
     fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {

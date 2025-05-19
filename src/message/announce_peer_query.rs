@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{InfoHash, NodeId, Token, TransactionId};
+use crate::types::{InfoHash, NodeId, Token, TransactionId};
 use crate::message::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]

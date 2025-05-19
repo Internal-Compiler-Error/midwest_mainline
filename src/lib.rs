@@ -51,8 +51,8 @@
 //!
 //! ``` rust
 //! use std::io;
-//! use midwest_mainline::dht_service;
-//! use midwest_mainline::dht_service::DhtV4;
+//! use midwest_mainline::dht;
+//! use midwest_mainline::dht::DhtV4;
 //! use std::net::SocketAddrV4;
 //! use std::str::FromStr;
 //!
@@ -84,8 +84,8 @@
 //! }
 //! ```
 
-pub mod dht_service;
-pub mod domain_knowledge;
+pub mod dht;
+pub mod types;
 pub mod message;
 pub(crate) mod models;
 pub mod our_error;

@@ -1,4 +1,4 @@
-use crate::{domain_knowledge::TransactionId, message::ToRawKrpc};
+use crate::{types::TransactionId, message::ToRawKrpc};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct KrpcError {

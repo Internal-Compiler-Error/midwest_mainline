@@ -2,7 +2,7 @@
 
 use std::net::SocketAddrV4;
 
-use crate::domain_knowledge::{NodeId, NodeInfo, Token, TransactionId};
+use crate::types::{NodeId, NodeInfo, Token, TransactionId};
 
 use super::ToRawKrpc;
 
@@ -206,8 +206,8 @@ mod tests {
             NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
         )
         .with_token(Token::from_bytes(*&b"aoeusnth"))
-        .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893)))
-        .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269)))
+        .with_value(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893))
+        .with_value(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269))
         .build();
 
         let encoded = response.to_raw_krpc();

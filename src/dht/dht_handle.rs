@@ -1,7 +1,7 @@
 use crate::schema::*;
 use crate::utils::unix_timestmap_ms;
 use crate::{
-    domain_knowledge::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
+    types::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
     message::{
         announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
         ping_query::PingQuery, Krpc,

@@ -1,16 +1,16 @@
-pub mod dht_server;
-pub mod message_broker;
+pub mod dht_handle;
+pub mod krpc_broker;
 pub mod router;
 mod transaction_id_pool;
 
-use crate::{dht_service::dht_server::DhtHandle, domain_knowledge::NodeId, our_error::OurError};
+use crate::{dht::dht_handle::DhtHandle, types::NodeId, our_error::OurError};
 use diesel::{
     r2d2::{ConnectionManager, Pool},
     SqliteConnection,
 };
 use tracing::info;
 
-use message_broker::MessageBroker;
+use krpc_broker::MessageBroker;
 use rand::{Rng, RngCore};
 use router::Router;
 use std::{
@@ -200,8 +200,8 @@ impl DhtV4 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dht_service::DhtV4,
-        domain_knowledge::{InfoHash, NodeId},
+        dht::DhtV4,
+        types::{InfoHash, NodeId},
     };
     use opentelemetry::global;
     use rand::RngCore;

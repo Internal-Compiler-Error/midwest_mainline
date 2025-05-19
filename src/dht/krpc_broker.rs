@@ -19,7 +19,7 @@ use tokio::{
 use tracing::{instrument, trace, warn};
 
 use crate::{
-    domain_knowledge::{NodeInfo, TransactionId},
+    types::{NodeInfo, TransactionId},
     message::{Krpc, ParseKrpc, ToRawKrpc},
     our_error::OurError,
     utils::unix_timestmap_ms,

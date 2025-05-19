@@ -1,4 +1,4 @@
-use crate::domain_knowledge::{NodeId, TransactionId};
+use crate::types::{NodeId, TransactionId};
 
 use super::ToRawKrpc;
 
