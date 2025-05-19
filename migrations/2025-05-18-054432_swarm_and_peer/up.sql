@@ -3,7 +3,7 @@ create table swarm (
 ) without ROWID;
 
 create table peer (
-    ip_addr bigint not null, -- unsigned 32 bit integer of an ipv4 port
+    ip_addr text not null,
     port integer not null, -- unsigned 16 bit integer port
     last_announced bigint not null, -- unix timestamp in milliseconds
     swarm blob not null references swarm(info_hash) on delete cascade on update cascade,

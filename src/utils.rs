@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::future::Future;
+use std::{future::Future, time::SystemTime};
 use tokio::task::{JoinError, JoinSet};
 
 #[async_trait]
@@ -24,4 +24,13 @@ where
         }
         Ok(set.join_all().await)
     }
+}
+
+pub fn unix_timestmap_ms() -> i64 {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("Time was before unix epoch, we don't deal with such exotic cases")
+        .as_millis();
+    // see models.rs for why it's a stupid i64
+    i64::try_from(timestamp_ms).expect("Timestmap couldn't fit into a i64, we don't support such exotic cases")
 }

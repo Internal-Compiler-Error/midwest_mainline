@@ -1,4 +1,5 @@
 use crate::schema::*;
+use crate::utils::unix_timestmap_ms;
 use crate::{
     domain_knowledge::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
     message::{
@@ -19,7 +20,7 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use tokio::{
     sync::{Mutex, RwLock},
@@ -37,15 +38,6 @@ struct TokenPool {
 }
 
 const TOKEN_EXPIRATION_TIME: Duration = Duration::from_secs(60 * 10);
-
-fn unix_timestmap_ms() -> i64 {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("Time was before unix epoch, we don't deal with such exotic cases")
-        .as_millis();
-    // see models.rs for why it's a stupid i64
-    i64::try_from(timestamp_ms).expect("Timestmap couldn't fit into a i64, we don't support such exotic cases")
-}
 
 impl TokenPool {
     pub(crate) fn new() -> Self {
@@ -263,21 +255,17 @@ impl DhtHandle {
             .filter(swarm::info_hash.eq(&info_hash.0))
             .filter(peer::last_announced.ge(cutoff()))
             .select((peer::ip_addr, peer::port))
-            .load::<(i64, i32)>(&mut conn)
+            .load::<(String, i32)>(&mut conn)
             .unwrap();
         let peers: Vec<SocketAddrV4> = peers
             .into_iter()
             .map(|(ip, port)| {
                 assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
-                assert!(ip >= 0 && ip <= u32::MAX.into(), "ip should fit inside an u32");
 
-                let ip = ip as u32;
-                let a = ((ip >> 24) & 0xFF) as u8;
-                let b = ((ip >> 16) & 0xFF) as u8;
-                let c = ((ip >> 8) & 0xFF) as u8;
-                let d = ((ip >> 0) & 0xFF) as u8;
-
-                let ip = Ipv4Addr::new(a, b, c, d);
+                let ip: Ipv4Addr = ip.parse().expect(&format!(
+                    "invalid ip string representation got into the database: {}",
+                    ip
+                ));
                 SocketAddrV4::new(ip, port as u16)
             })
             .collect();
@@ -347,7 +335,7 @@ impl DhtHandle {
                     // TODO: this comes in the host native endianness, but it should be fine as long as the db
                     // file is not transfered between computers
                     (
-                        peer::ip_addr.eq(peer_contact.ip().to_bits() as i64),
+                        peer::ip_addr.eq(peer_contact.ip().to_string()),
                         peer::port.eq(peer_contact.port() as i32),
                         peer::swarm.eq(swarm),
                         peer::last_announced.eq(now),
@@ -374,24 +362,18 @@ impl DhtHandle {
 
     // TODO: need a function to send with timeout, unsubscribe and clean up when timeout expires
 
-    /// Send a message out and await for a response.
-    ///
-    /// It does not alter the routing table, callers must decide what to do with the response.
-    pub async fn send_and_wait(&self, message: Krpc, recipient: SocketAddrV4) -> Result<Krpc, OurError> {
-        let rx = {
-            let rx = self.message_broker.subscribe_one(message.transaction_id().clone());
-            self.message_broker.send_msg(message.clone(), recipient);
-            rx
-        };
-        let (response, _addr) = rx.await.unwrap();
-        Ok(response)
-    }
+    // /// Send a message out and await for a response.
+    // ///
+    // /// It does not alter the routing table, callers must decide what to do with the response.
+    // pub async fn send_and_wait(&self, message: Krpc, recipient: SocketAddrV4) -> Result<Krpc, OurError> {
+    //     self.message_broker.send_and_wait(message, recipient).await
+    // }
 
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
         let txn_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.our_id);
 
-        let response = self.send_and_wait(ping_msg, peer).await?;
+        let response = self.message_broker.send_and_wait(ping_msg, peer).await?;
 
         return if let Krpc::PingAnnouncePeerResponse(response) = response {
             Ok(*response.target_id())
@@ -478,7 +460,7 @@ impl DhtHandle {
         let time_out = REQ_TIMEOUT;
         // TODO: make this configurable or let parent handle timeout, wooo maybe we can configure this
         // based on ip geo location distance
-        let response = timeout(time_out, self.send_and_wait(query, dest))
+        let response = timeout(time_out, self.message_broker.send_and_wait(query, dest))
             .await
             .inspect_err(|_e| trace!("find_nodes for {:?} timed out", dest))
             ?  // timeout error
@@ -606,7 +588,7 @@ impl DhtHandle {
             )
         };
 
-        let response = self.send_and_wait(query, recipient).await?;
+        let response = self.message_broker.send_and_wait(query, recipient).await?;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
@@ -630,14 +612,17 @@ impl DhtHandle {
         let query = Krpc::new_get_peers_query(TransactionId::from(transaction_id), self.our_id.clone(), info_hash);
 
         // send the message and await for a response
-        let time_out = REQ_TIMEOUT;
-        let response = timeout(time_out, self.send_and_wait(query, dest))
-            .await
-            .inspect_err(|_e| {
-                trace!("get_peers for {:?} timed out", dest);
-            })
-            ?  // timeout error
-            ?; // send_and_wait related error
+        let response = self
+            .message_broker
+            .send_and_wait_timeout(query, dest, REQ_TIMEOUT)
+            .await?;
+        // let response = timeout(time_out, self.message_broker.send_and_wait(query, dest))
+        //     .await
+        //     .inspect_err(|_e| {
+        //         trace!("get_peers for {:?} timed out", dest);
+        //     })
+        //     ?  // timeout error
+        //     ?; // send_and_wait related error
 
         return match response {
             Krpc::ErrorResponse(response) => {

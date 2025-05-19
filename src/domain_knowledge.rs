@@ -1,7 +1,12 @@
 use bendy::encoding::ToBencode;
 use num::{traits::ops::bytes, BigUint};
 use smallvec::SmallVec;
-use std::{fmt::Debug, net::SocketAddrV4};
+use std::{
+    fmt::Debug,
+    net::{Ipv4Addr, SocketAddrV4},
+};
+
+use crate::models::NodeNoMetaInfo;
 
 const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
@@ -163,9 +168,6 @@ impl ToBencode for Token {
     }
 }
 
-// #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-// pub struct PeerContact(pub SocketAddrV4);
-
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct NodeInfo {
     id: NodeId,
@@ -183,6 +185,17 @@ impl NodeInfo {
 
     pub fn end_point(&self) -> SocketAddrV4 {
         self.end_point
+    }
+}
+
+impl From<NodeNoMetaInfo> for NodeInfo {
+    fn from(value: NodeNoMetaInfo) -> Self {
+        let idd = NodeId::from_bytes_unchecked(&*value.id);
+        // TODO: add err msg
+        let ip: Ipv4Addr = value.ip_addr.parse().unwrap();
+        let portt = value.port;
+        let endpoint = SocketAddrV4::new(ip, portt as u16);
+        NodeInfo::new(idd, endpoint)
     }
 }
 

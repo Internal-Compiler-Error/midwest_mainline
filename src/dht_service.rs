@@ -79,7 +79,15 @@ impl DhtV4 {
         // the JoinSet keeps all the tasks required to make the DHT node functional
         let mut join_set = JoinSet::new();
 
-        let message_broker = MessageBroker::new(socket);
+        // TODO: make this configurable
+        let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
+        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+        let db = Pool::builder()
+            .test_on_check_out(true)
+            .build(manager)
+            .expect("Could not build DB connection pool");
+
+        let message_broker = MessageBroker::new(socket, db.clone());
         // let message_broker = Arc::new(message_broker.clone());
 
         let message_broker_clone = message_broker.clone();
@@ -92,7 +100,13 @@ impl DhtV4 {
             .unwrap();
 
         let transaction_id_pool = Arc::new(TransactionIdPool::new());
-        let router = Router::new(our_id, (message_broker).clone(), Arc::clone(&transaction_id_pool));
+
+        let router = Router::new(
+            our_id,
+            (message_broker).clone(),
+            Arc::clone(&transaction_id_pool),
+            db.clone(),
+        );
 
         let rx = message_broker.subscribe_inbound();
         let inner_router = router.clone();
@@ -102,19 +116,12 @@ impl DhtV4 {
             .spawn(async move { inner_router.run(rx).await })
             .unwrap();
 
-        // TODO: make this configurable
-        let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
-        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-
         let server = DhtHandle::new(
             our_id,
             router.clone(),
             message_broker.clone(),
             Arc::clone(&transaction_id_pool),
-            Pool::builder()
-                .test_on_check_out(true)
-                .build(manager)
-                .expect("Could not build DB connection pool"),
+            db.clone(),
         );
         let server = Arc::new(server);
 

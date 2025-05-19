@@ -1,21 +1,24 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-    net::SocketAddrV4,
-    sync::{Arc, RwLock},
-    time::Duration,
-    usize,
-};
+use std::net::Ipv4Addr;
+use std::{net::SocketAddrV4, sync::Arc, usize};
 
-use tokio::{sync::mpsc, time::Instant};
+use diesel::r2d2::PooledConnection;
+use diesel::{insert_into, prelude::*};
+use diesel::{
+    r2d2::{ConnectionManager, Pool},
+    ExpressionMethods, SqliteConnection,
+};
+use futures::future::join_all;
+use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::models::NodeNoMetaInfo;
+use crate::utils::unix_timestmap_ms;
 use crate::{
-    dht_service::dht_server::REQ_TIMEOUT,
     domain_knowledge::{self, NodeId, NodeInfo, TransactionId},
     message::Krpc,
 };
 
+use super::dht_server::REQ_TIMEOUT;
 use super::{message_broker::MessageBroker, transaction_id_pool::TransactionIdPool};
 
 #[allow(unused)]
@@ -38,240 +41,29 @@ macro_rules! bail_on_none {
     };
 }
 
-// invaraint: each bucket is sorted by quality?
-
-/// The routing table at the heart of the Kademlia DHT. It keep the near neighbors of ourself.
-#[derive(Debug, PartialEq, Eq, Clone)]
-struct RoutingTable {
-    bucket_size: usize,
-    /// The node id of the ourself.
-    id: NodeId,
-
-    pub(crate) buckets: Box<[Option<NodeEntry>]>,
-    // for index `i`, `last_refreshed[i]` is the last time anything was modified about this bucket
-    last_refreshed: [Instant; 160],
-
-    id_to_ind: HashMap<NodeId, usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-struct NodeEntry {
-    pub(crate) contact: NodeInfo,
-    pub(crate) last_checked: Instant,
-    /// if current time - last_checked >= 15 mins, how many requests this node *didn't* respond?
-    failed_request_count: u8,
-    quality: Quality,
-}
-
-impl PartialOrd for NodeEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NodeEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.quality.cmp(&other.quality)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
-enum Quality {
-    Good,
-    #[allow(unused)]
-    Questionable(u8),
-    #[allow(unused)]
-    Bad,
-}
-
-impl NodeEntry {
-    pub fn new(contact: NodeInfo) -> Self {
-        Self {
-            contact,
-            last_checked: Instant::now(),
-            failed_request_count: 0,
-            quality: Quality::Good,
-        }
-    }
-    pub fn extract(&self) -> NodeInfo {
-        self.contact
-    }
-
-    pub fn expired(&self) -> bool {
-        let now = Instant::now();
-        const EXPIRING: Duration = Duration::from_secs(60 * 15); // 15 mins
-
-        now.saturating_duration_since(self.last_checked) >= EXPIRING
-    }
-    pub fn quality(&self) -> Quality {
-        let expired = self.expired();
-        let failed_count = self.failed_request_count;
-
-        match (expired, failed_count) {
-            (false, _) if failed_count == 0 => Quality::Good,
-            (false, count) => Quality::Questionable(count),
-            _ => Quality::Bad,
-        }
-    }
-
-    pub fn update_quality(&mut self, failed_request: bool) {
-        self.last_checked = Instant::now();
-        if failed_request {
-            self.failed_request_count = self.failed_request_count.saturating_add(1);
-        } else {
-            self.failed_request_count = self.failed_request_count.saturating_sub(1);
-            self.quality = Quality::Questionable(self.failed_request_count);
-        }
-    }
-}
-
-impl RoutingTable {
-    pub fn new(id: NodeId) -> Self {
-        let bucket_size = 16;
-        let mem: Vec<Option<NodeEntry>> = vec![None; 160 * bucket_size];
-        RoutingTable {
-            bucket_size,
-            id,
-            buckets: mem.into_boxed_slice(),
-            last_refreshed: [Instant::now(); 160],
-            id_to_ind: HashMap::new(),
-        }
-    }
-
-    // if we want to insert, what should the insertion point be
-    fn insertion_candidate_mut(&mut self, replacement: &NodeId) -> Option<&mut Option<NodeEntry>> {
-        let begin = self.index(replacement);
-        let kbucket = &mut self.buckets[begin..begin + self.bucket_size];
-        let empty_slot = kbucket.iter_mut().find(|n| n.is_none());
-        empty_slot
-    }
-
-    // if we want to replace, what should the replacement point be
-    fn replacement_candidate_mut(&mut self, replacement: &NodeId) -> Option<&mut Option<NodeEntry>> {
-        let begin = self.index(replacement);
-        let kbucket = &mut self.buckets[begin..begin + self.bucket_size];
-        let empty_slot = kbucket.iter_mut().find(|n| n.is_none());
-        match empty_slot {
-            Some(_) => None,
-            None => kbucket.last_mut(),
-        }
-    }
-
-    #[allow(unused)]
-    fn replacement_candidate(&self, replacement: &NodeId) -> Option<&Option<NodeEntry>> {
-        let begin = self.index(replacement);
-        let kbucket = &self.buckets[begin..begin + self.bucket_size];
-        let empty_slot = kbucket.iter().find(|n| n.is_none());
-        match empty_slot {
-            Some(_) => None,
-            None => kbucket.last(),
-        }
-    }
-
-    pub fn node_count(&self) -> usize {
-        // TODO: optimize this
-        self.buckets.iter().filter(|n| n.is_some()).count()
-    }
-
-    pub fn find_closest(&self, target: NodeId) -> Vec<&NodeEntry> {
-        let (bucket_i, bucket_i_end) = self.indices(&target);
-        let bucket = &self.buckets[bucket_i..bucket_i_end];
-
-        let mut valid_entries: Vec<_> = bucket.iter().flatten().collect();
-        valid_entries.sort_unstable_by_key(|e| e.contact.id());
-
-        valid_entries.into_iter().collect()
-    }
-
-    pub fn find(&self, target: NodeId) -> Option<NodeInfo> {
-        self.buckets
-            .iter()
-            .flatten()
-            .find(|node| node.contact.id() == target)
-            .map(|n| n.contact)
-            .clone()
-    }
-
-    /// Returns the `index` where `self.buckets[index]` is the first entry in the corresponding
-    /// k-bucket, and `index + (self.bucket_size - 1)` is the last entry (inclusive), so
-    /// `index..(index + self.bucket_size)` is the valid range.
-    fn index(&self, target: &NodeId) -> usize {
-        // Each k-bucket at index i stores nodes of distance [2^i, 2^(i + 1)) from ourself. The
-        // first byte with index `j`, meaning there are (19 - j) trailing non zeros bytes, each
-        // bytes has 8 bits, so 2^(19 - j) <= i < 2(19 - j + 1). Furthermore, the first bit from
-        // MSB within that non zero byte tell us how many additional bits we need to offset to from
-        // 2^(19 - j)
-        let dist = self.id.dist(&target);
-        if dist == domain_knowledge::ZERO_DIST {
-            // all zero means we're finding ourself, then we go look for in the 0th bucket.
-            return 0;
-        }
-
-        let first_nonzero = dist.into_iter().position(|radix| radix != 0).unwrap();
-        let byte = dist[first_nonzero];
-        let leading_zeros_inx = 7 - byte.leading_zeros() as usize;
-
-        let bucket_idx = (19 - first_nonzero) * 8 + leading_zeros_inx;
-        bucket_idx * self.bucket_size
-    }
-
-    /// [begin, end) range of the corresponding k-bucket for `target`, the range should be accessed
-    /// directly like `self.buckets[begin]`, the stride jumping is already done for you.
-    fn indices(&self, target: &NodeId) -> (usize, usize) {
-        let begin = self.index(target);
-        let end = begin + self.bucket_size;
-        (begin, end)
-    }
-
-    #[allow(unused)]
-    fn bucket_for(&self, target: &NodeId) -> (&[Option<NodeEntry>], usize) {
-        let (begin, end) = self.indices(target);
-        (&self.buckets[begin..end], begin)
-    }
-
-    pub fn sort(&mut self) {
-        // sort each bucket accroding to each nodes quality
-        for i in 0..160 {
-            let begin = i * self.bucket_size;
-            let end = begin + self.bucket_size;
-            let bucket = &mut self.buckets[begin..end];
-            bucket.sort();
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 /// A Router will tell you who are the closest nodes that we know
 pub struct Router {
     id: NodeId,
-    routing_table: Arc<std::sync::RwLock<RoutingTable>>,
+    table: Pool<ConnectionManager<SqliteConnection>>,
     message_broker: MessageBroker,
     transaction_id_pool: Arc<TransactionIdPool>,
-}
-
-async fn send(
-    message_broker: MessageBroker,
-    txid: TransactionId,
-    node: &NodeInfo,
-    quering_id: NodeId,
-    timeout: Duration,
-) -> Option<(Krpc, SocketAddrV4)> {
-    let rx = message_broker.subscribe_one(txid.clone());
-    message_broker.send_msg_to_node(Krpc::new_ping_query(txid, quering_id), node);
-
-    tokio::time::timeout(timeout, async move { rx.await.ok() })
-        .await
-        .ok()
-        .flatten()
+    bucket_size: usize,
 }
 
 impl Router {
-    pub fn new(id: NodeId, message_broker: MessageBroker, transaction_id_pool: Arc<TransactionIdPool>) -> Router {
+    pub fn new(
+        id: NodeId,
+        message_broker: MessageBroker,
+        transaction_id_pool: Arc<TransactionIdPool>,
+        table: Pool<ConnectionManager<SqliteConnection>>,
+    ) -> Router {
         Router {
             id,
-            routing_table: Arc::new(RwLock::new(RoutingTable::new(id))),
+            table,
             message_broker,
             transaction_id_pool,
+            bucket_size: 1024, // TODO: make this configurable in the future
         }
     }
 
@@ -312,97 +104,213 @@ impl Router {
         }
     }
 
+    /// Returns the bucket index that the target node belongs in
+    fn index(&self, target: &NodeId) -> i32 {
+        let dist = self.id.dist(&target);
+        if dist == domain_knowledge::ZERO_DIST {
+            // all zero means we're finding ourself, then we go look for in the 0th bucket.
+            return 0;
+        }
+
+        let first_nonzero_byte = dist.into_iter().position(|radix| radix != 0).unwrap();
+        let byte = dist[first_nonzero_byte];
+        let leading_zeros_inx = 7 - byte.leading_zeros() as usize;
+
+        let bucket_idx = (19 - first_nonzero_byte) * 8 + leading_zeros_inx;
+        bucket_idx.try_into().unwrap()
+    }
+
     pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
-        let routing_table = self.routing_table.read().unwrap();
-        routing_table.find_closest(target).iter().map(|n| n.extract()).collect()
+        use crate::schema::node::dsl::*;
+        let mut conn = self.table.get().unwrap();
+        let nodes = node
+            .filter(bucket.eq(self.index(&target)))
+            .order(last_contacted.desc())
+            .limit(64)
+            .select(NodeNoMetaInfo::as_select())
+            .load(&mut conn)
+            .unwrap();
+
+        nodes.into_iter().map(|nodee| nodee.into()).collect::<Vec<_>>()
     }
 
     pub fn find_exact(&self, target: NodeId) -> Option<NodeInfo> {
-        let routing_table = self.routing_table.read().unwrap();
-        routing_table.find(target)
+        use crate::schema::node::dsl::*;
+        let mut conn = self.table.get().unwrap();
+        let target_id = target.0.to_vec();
+        node.filter(id.eq(target_id))
+            .select(NodeNoMetaInfo::as_select())
+            .first(&mut conn)
+            .ok()
+            .map(|nodee| nodee.into())
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
     pub fn add(&self, new_node_id: NodeId, addr: SocketAddrV4) {
         let this = self.clone();
-        let work = async move {
-            // None: has empty slots, should insert
-            // Some(good): only update, don't insert
-            // Some(bad): replace it
+        // let node_info = NodeInfo::new(new_node_id, addr);
 
-            // invariant: kbuckets are always sorted by quality
-            let node_info = NodeInfo::new(new_node_id, addr);
-            let replacment = NodeEntry::new(node_info);
-            let to_contact = {
-                let mut routing_table = this.routing_table.write().unwrap();
-                let slot = routing_table.replacement_candidate_mut(&new_node_id);
-                match slot {
-                    Some(inner) => {
-                        let inner = inner.as_mut().unwrap();
-                        if update_only(inner, &new_node_id) {
-                            inner.update_quality(false);
-                            routing_table.sort();
-                            return;
-                        } else {
-                            inner.contact
-                        }
-                    }
-                    None => return,
-                }
-            };
-
-            let message_broker = this.message_broker.clone();
-            let quering_id = this.id;
-            let timeout = REQ_TIMEOUT;
-
-            let txid = this.transaction_id_pool.next();
-            let txid = TransactionId::from(txid);
-            let ttxid = txid.clone();
-            let ping_response = send(message_broker, ttxid, &to_contact, quering_id, timeout).await;
-            {
-                let mut routing_table = this.routing_table.write().unwrap();
-                let slot = routing_table.replacement_candidate_mut(&new_node_id);
-
-                let slot = match slot {
-                    Some(inner) => inner.as_mut().unwrap(),
-                    None => {
-                        let insertion_point = routing_table.insertion_candidate_mut(&new_node_id).unwrap();
-                        *insertion_point = Some(replacment);
-                        routing_table.sort();
-                        return;
-                    }
-                };
-
-                // SIMPLIFIED design: if the existing node doens't reply, we'll just replace it imediately,
-                // otherwise update
-                match ping_response {
-                    // TODO: handle when the response is an error message
-                    Some((_response, _origin)) => {
-                        slot.update_quality(false);
-                        routing_table.sort();
-                    }
-                    None => {
-                        let insertion_point = routing_table.insertion_candidate_mut(&new_node_id).unwrap();
-                        *insertion_point = Some(replacment);
-                        routing_table.sort();
-                        return;
-                    }
-                }
+        // TODO: find_exact will request another connection from the pool..., should be fine
+        // for now
+        let exact = self.find_exact(new_node_id);
+        match exact {
+            Some(_node) => {
+                // Only need to update the quality metric, no IO needed
+                let mut conn = self.conn();
+                self.marks_as_good(&new_node_id, &mut conn);
+                return;
             }
+            None => {
+                // Need to ping the worst quality node in the bucket to see if it should be replaced
+            }
+        }
+
+        let work = async move {
+            let node_info = NodeInfo::new(new_node_id, addr);
+            // let replacment = NodeEntry::new(node_info);
+
+            // instead of going from least recently seen and probe one by one, just refresh the
+            // entire bucket
+            let bucket_idx = this.index(&new_node_id);
+            this.refresh_bucket(bucket_idx).await;
+
+            let bucket_count = this.bucket_count(bucket_idx);
+            // all nodes are good, no slots left for new node
+            if bucket_count >= this.bucket_size {
+                return;
+            }
+            let mut conn = this.conn();
+            this.append_to_bucket(node_info, &mut conn);
         };
         tokio::spawn(work);
     }
 
+    fn conn(&self) -> PooledConnection<ConnectionManager<SqliteConnection>> {
+        self.table.get().unwrap()
+    }
     pub fn node_count(&self) -> usize {
-        self.routing_table.read().unwrap().node_count()
+        use crate::schema::node::dsl::*;
+        let mut conn = self.conn();
+        let count: i64 = node.filter(removed.eq(false)).count().get_result(&mut conn).unwrap();
+        count as usize
+    }
+
+    /// How many nodes are in the ith bucket (0-indexed)
+    pub fn bucket_count(&self, i: i32) -> usize {
+        use crate::schema::node::dsl::*;
+        let mut conn = self.conn();
+        let count: i64 = node
+            .filter(removed.eq(false))
+            .filter(bucket.eq(i))
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        count as usize
+    }
+
+    /// Find the list of "problematic" nodes that if not responded, should be removed
+    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<crate::models::Node> {
+        use crate::schema::node::dsl::*;
+
+        fn cutoff() -> i64 {
+            let fifteenth_mins_ms = 15 * 60 * 1000;
+            unix_timestmap_ms() - fifteenth_mins_ms
+        }
+
+        node.filter(removed.eq(false))
+            .filter(bucket.eq(i))
+            .filter(failed_requests.ge(3)) // TODO: make this configurable
+            .filter(last_sent.le(cutoff()))
+            .order(last_contacted.desc())
+            .select(crate::models::Node::as_select())
+            .get_results(conn)
+            .unwrap()
+    }
+
+    // Send a ping to fresh the node
+    async fn refresh(&self, target: &NodeInfo) {
+        let txn_id = self.transaction_id_pool.next();
+        let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.id);
+
+        {
+            let mut conn = self.conn();
+            update_last_sent(&target.id(), unix_timestmap_ms(), &mut conn);
+        }
+
+        let response = self
+            .message_broker
+            .send_and_wait_timeout(ping_msg, target.end_point(), REQ_TIMEOUT)
+            .await;
+        let mut conn = self.conn();
+        match response {
+            Ok(_) => self.marks_as_good(&target.id(), &mut conn),
+            Err(_) => self.mark_as_dead(&target.id(), &mut conn),
+        }
+    }
+
+    async fn refresh_bucket(&self, i: i32) {
+        let mut conn = self.conn();
+        let problematics = self.replacement_queue(i, &mut conn);
+
+        let tasks = problematics.into_iter().map(|n| async move {
+            let id = NodeId::from_bytes_unchecked(&*n.id);
+            let ip: Ipv4Addr = n.ip_addr.parse().unwrap();
+            let endpoint = SocketAddrV4::new(ip, n.port as u16);
+            let target = NodeInfo::new(id, endpoint);
+            self.refresh(&target).await
+        });
+        join_all(tasks).await;
     }
 
     pub fn refresh_table(&self) {
-        let mut table = self.routing_table.write().unwrap();
+        todo!()
+        // let mut table = self.routing_table.write().unwrap();
+    }
+
+    // TODO: use AsRef or Into to make it take in anything that can turn into an ID
+    fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
+        use crate::schema::node::dsl::*;
+        let now = unix_timestmap_ms();
+        // let mut conn = self.table.get().unwrap();
+        let idd = nodee.0.to_vec();
+        diesel::update(node)
+            .filter(id.eq(idd))
+            .set((last_contacted.eq(now), failed_requests.eq(0)))
+            .execute(conn);
+    }
+
+    fn mark_as_dead(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
+        use crate::schema::node::dsl::*;
+
+        let idd = nodee.0.to_vec();
+        diesel::update(node)
+            .filter(id.eq(idd))
+            .set(removed.eq(true))
+            .execute(conn);
+    }
+
+    fn append_to_bucket(&self, nodee: NodeInfo, conn: &mut SqliteConnection) {
+        use crate::schema::node::dsl::*;
+
+        insert_into(node)
+            .values(crate::models::Node {
+                id: nodee.id().0.to_vec(),
+                last_contacted: unix_timestmap_ms(),
+                ip_addr: nodee.end_point().ip().to_string(),
+                port: nodee.end_point().port() as i32,
+                failed_requests: 0,
+                removed: false,
+            })
+            .execute(conn);
     }
 }
 
-fn update_only(old: &NodeEntry, new: &NodeId) -> bool {
-    let old_id = old.extract().id();
-    old_id == *new
+pub fn update_last_sent(nodee: &NodeId, sent_timestamp: i64, conn: &mut SqliteConnection) {
+    use crate::schema::node::dsl::*;
+
+    let idd = nodee.0.to_vec();
+    diesel::update(node)
+        .set(last_sent.eq(sent_timestamp))
+        .filter(id.eq(idd))
+        .execute(conn);
 }
