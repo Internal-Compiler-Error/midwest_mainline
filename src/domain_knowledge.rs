@@ -163,26 +163,26 @@ impl ToBencode for Token {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct PeerContact(pub SocketAddrV4);
+// #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+// pub struct PeerContact(pub SocketAddrV4);
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct NodeInfo {
     id: NodeId,
-    contact: PeerContact,
+    end_point: SocketAddrV4,
 }
 
 impl NodeInfo {
-    pub fn new(id: NodeId, contact: PeerContact) -> NodeInfo {
-        NodeInfo { id, contact }
+    pub fn new(id: NodeId, end_point: SocketAddrV4) -> NodeInfo {
+        NodeInfo { id, end_point }
     }
 
     pub fn id(&self) -> NodeId {
         self.id
     }
 
-    pub fn contact(&self) -> PeerContact {
-        self.contact
+    pub fn end_point(&self) -> SocketAddrV4 {
+        self.end_point
     }
 }
 

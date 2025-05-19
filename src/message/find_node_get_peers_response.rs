@@ -1,6 +1,8 @@
 #![allow(unused_variables, dead_code)]
 
-use crate::domain_knowledge::{NodeId, NodeInfo, PeerContact, Token, TransactionId};
+use std::net::SocketAddrV4;
+
+use crate::domain_knowledge::{NodeId, NodeInfo, Token, TransactionId};
 
 use super::ToRawKrpc;
 
@@ -13,7 +15,7 @@ pub struct FindNodeGetPeersResponse {
     transaction_id: TransactionId,
     queried: NodeId,
     token: Option<Token>,
-    values: Vec<PeerContact>,
+    values: Vec<SocketAddrV4>,
     nodes: Vec<NodeInfo>,
 }
 
@@ -22,7 +24,7 @@ pub struct Builder {
     transaction_id: TransactionId,
     queried: NodeId,
     token: Option<Token>,
-    values: Vec<PeerContact>,
+    values: Vec<SocketAddrV4>,
     nodes: Vec<NodeInfo>,
 }
 
@@ -52,12 +54,12 @@ impl Builder {
         self
     }
 
-    pub fn with_value(mut self, value: PeerContact) -> Self {
+    pub fn with_value(mut self, value: SocketAddrV4) -> Self {
         self.values.push(value);
         self
     }
 
-    pub fn with_values(mut self, values: &[PeerContact]) -> Self {
+    pub fn with_values(mut self, values: &[SocketAddrV4]) -> Self {
         self.values.extend_from_slice(values);
         self
     }
@@ -99,7 +101,7 @@ impl FindNodeGetPeersResponse {
         self.token.as_ref()
     }
 
-    pub fn values(&self) -> &Vec<PeerContact> {
+    pub fn values(&self) -> &Vec<SocketAddrV4> {
         &self.values
     }
 
@@ -133,8 +135,8 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
                         // using ascii in network/big endian.
                         e.emit_pair_with(b"values", |e| {
                             let combined = self.values.iter().map(|peer| {
-                                let octets = peer.0.ip().octets();
-                                let port_in_be = peer.0.port().to_be_bytes();
+                                let octets = peer.ip().octets();
+                                let port_in_be = peer.port().to_be_bytes();
 
                                 let mut arr = [0u8; 6];
                                 let ip = &mut arr[0..4];
@@ -157,8 +159,8 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
                             let combined = self.nodes.iter().map(|peer| {
                                 let node_id = &peer.id();
 
-                                let octets = peer.contact().0.ip().octets();
-                                let port_in_be = peer.contact().0.port().to_be_bytes();
+                                let octets = peer.end_point().ip().octets();
+                                let port_in_be = peer.end_point().port().to_be_bytes();
 
                                 let mut arr = [0u8; 26];
                                 let id = &mut arr[0..20];

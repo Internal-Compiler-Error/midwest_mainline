@@ -1,6 +1,6 @@
 use crate::schema::*;
 use crate::{
-    domain_knowledge::{InfoHash, NodeId, NodeInfo, PeerContact, Token, TransactionId},
+    domain_knowledge::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
     message::{
         announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
         ping_query::PingQuery, Krpc,
@@ -248,7 +248,7 @@ impl DhtHandle {
         };
     }
 
-    fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<PeerContact> {
+    fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<SocketAddrV4> {
         // determines when does a peer is considered expired, default is 30 mins
         // TODO: should be configurable in the future.
         fn cutoff() -> i64 {
@@ -265,7 +265,7 @@ impl DhtHandle {
             .select((peer::ip_addr, peer::port))
             .load::<(i64, i32)>(&mut conn)
             .unwrap();
-        let peers: Vec<PeerContact> = peers
+        let peers: Vec<SocketAddrV4> = peers
             .into_iter()
             .map(|(ip, port)| {
                 assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
@@ -278,7 +278,7 @@ impl DhtHandle {
                 let d = ((ip >> 0) & 0xFF) as u8;
 
                 let ip = Ipv4Addr::new(a, b, c, d);
-                PeerContact(SocketAddrV4::new(ip, port as u16))
+                SocketAddrV4::new(ip, port as u16)
             })
             .collect();
         peers
@@ -294,7 +294,7 @@ impl DhtHandle {
 
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
                 .with_token(token)
-                .with_values(&peers)
+                .with_values(&*peers)
                 .build();
             Krpc::FindNodeGetPeersResponse(res)
         } else {
@@ -326,9 +326,9 @@ impl DhtHandle {
         // argument is ignored if the implied port is not 0 and we use the origin port instead
         let peer_contact = {
             if !announce.implied_port() {
-                PeerContact(SocketAddrV4::new(*origin.ip(), announce.port()))
+                SocketAddrV4::new(*origin.ip(), announce.port())
             } else {
-                PeerContact(origin)
+                origin
             }
         };
 
@@ -347,8 +347,8 @@ impl DhtHandle {
                     // TODO: this comes in the host native endianness, but it should be fine as long as the db
                     // file is not transfered between computers
                     (
-                        peer::ip_addr.eq(peer_contact.0.ip().to_bits() as i64),
-                        peer::port.eq(peer_contact.0.port() as i32),
+                        peer::ip_addr.eq(peer_contact.ip().to_bits() as i64),
+                        peer::port.eq(peer_contact.port() as i32),
                         peer::swarm.eq(swarm),
                         peer::last_announced.eq(now),
                     ),
@@ -425,7 +425,7 @@ impl DhtHandle {
 
             let returned_nodes = closest
                 .iter()
-                .map(|node| node.contact().0)
+                .map(|node| node.end_point())
                 .map(|ip| self.clone().send_find_nodes_rpc(ip, target))
                 .collect::<Vec<_>>();
 
@@ -492,7 +492,7 @@ impl DhtHandle {
             let mut nodes: Vec<_> = find_node_response.nodes().clone();
 
             // some clients will return duplicate nodes, so we remove them
-            nodes.sort_unstable_by_key(|node| node.contact().0);
+            nodes.sort_unstable_by_key(|node| node.end_point());
             nodes.dedup();
 
             Result::Ok(nodes)
@@ -503,12 +503,12 @@ impl DhtHandle {
 
     // TODO: API is broken, since we can't guarantee that the peer will exist or we can find them,
     // we should return a list of K closest nodes or the target itself if can be found
-    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<PeerContact>), OurError> {
+    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<SocketAddrV4>), OurError> {
         let resonsible = NodeId(info_hash.0);
         //
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).router.find_exact(resonsible) {
-            let (token, _nodes, peers) = self.send_get_peers_rpc(node.contact().0, info_hash).await?;
+            let (token, _nodes, peers) = self.send_get_peers_rpc(node.end_point(), info_hash).await?;
             return Ok((
                 token.expect("A node directly responsible for a piece would return a token"),
                 peers,
@@ -532,7 +532,7 @@ impl DhtHandle {
 
             let returned_nodes = closest
                 .iter()
-                .map(|node| node.contact().0)
+                .map(|node| node.end_point())
                 .map(|ip| self.clone().send_get_peers_rpc(ip, info_hash))
                 .collect::<Vec<_>>();
 
@@ -622,7 +622,7 @@ impl DhtHandle {
         self: Arc<Self>,
         dest: SocketAddrV4,
         info_hash: InfoHash,
-    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<PeerContact>), OurError> {
+    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {
         trace!("Asking {:?} for peers", dest);
         // construct the message to query our friends
         let transaction_id = self.transaction_id_pool.next();
@@ -648,11 +648,11 @@ impl DhtHandle {
                 let token = response.token().cloned();
 
                 let mut nodes = response.nodes().clone();
-                nodes.sort_unstable_by_key(|node| node.contact().0);
+                nodes.sort_unstable_by_key(|node| node.end_point());
                 nodes.dedup();
 
                 let mut values = response.values().clone();
-                nodes.sort_unstable_by_key(|node| node.contact().0);
+                nodes.sort_unstable_by_key(|node| node.end_point());
                 values.dedup();
 
                 Ok((token, nodes, values))

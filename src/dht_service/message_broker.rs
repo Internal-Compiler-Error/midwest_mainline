@@ -121,7 +121,7 @@ impl MessageBroker {
     }
 
     pub fn send_msg_to_node(&self, msg: Krpc, peer: &NodeInfo) {
-        self.send_msg(msg, peer.contact().0)
+        self.send_msg(msg, peer.end_point())
     }
 
     // TODO: think of a good way to let them unsubscribe later

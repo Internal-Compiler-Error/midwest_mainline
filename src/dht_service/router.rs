@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::{
     dht_service::dht_server::REQ_TIMEOUT,
-    domain_knowledge::{self, NodeId, NodeInfo, PeerContact, TransactionId},
+    domain_knowledge::{self, NodeId, NodeInfo, TransactionId},
     message::Krpc,
 };
 
@@ -297,7 +297,7 @@ impl Router {
         if let Krpc::FindNodeGetPeersResponse(res) = message {
             for node in res.nodes() {
                 // TODO: this is a bit stupid as we destroy the structure just to copy but fix later
-                self.add(node.id(), node.contact().0);
+                self.add(node.id(), node.end_point());
             }
         }
     }
@@ -331,7 +331,7 @@ impl Router {
             // Some(bad): replace it
 
             // invariant: kbuckets are always sorted by quality
-            let node_info = NodeInfo::new(new_node_id, PeerContact(addr));
+            let node_info = NodeInfo::new(new_node_id, addr);
             let replacment = NodeEntry::new(node_info);
             let to_contact = {
                 let mut routing_table = this.routing_table.write().unwrap();

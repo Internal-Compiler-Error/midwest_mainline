@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use crate::domain_knowledge::{NodeInfo, PeerContact, Token, TransactionId};
+use crate::domain_knowledge::{NodeInfo, Token, TransactionId};
 use crate::our_error::OurError;
 use bendy::decoding::{Decoder, Object};
 
@@ -262,7 +262,7 @@ impl ParseKrpc for &[u8] {
 
                             let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
                             let port = u16::from_be_bytes([contact[4], contact[5]]);
-                            let contact = PeerContact(SocketAddrV4::new(ip, port));
+                            let contact = SocketAddrV4::new(ip, port);
 
                             NodeInfo::new(node_id, contact)
                         })
@@ -287,7 +287,7 @@ impl ParseKrpc for &[u8] {
                             let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
                             let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
 
-                            PeerContact(SocketAddrV4::new(ip, port))
+                            SocketAddrV4::new(ip, port)
                         })
                         .collect();
 
@@ -569,9 +569,9 @@ mod test {
         use find_node_get_peers_response::Builder;
         let expected = Builder::new(txn_id, responding)
             .with_token(res_token)
-            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385)))
-            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878)))
-            .with_value(PeerContact(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070)))
+            .with_value(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385))
+            .with_value(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878))
+            .with_value(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070))
             .build();
         let expected = Krpc::FindNodeGetPeersResponse(expected);
 
@@ -591,7 +591,7 @@ mod test {
         .with_node(NodeInfo::new(
             NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
             // TODO: place holder values
-            PeerContact(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
+            SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
         ))
         .build();
         let expected = Krpc::FindNodeGetPeersResponse(expected);
