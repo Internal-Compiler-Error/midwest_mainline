@@ -85,6 +85,10 @@ impl Router {
             Krpc::ErrorResponse(_) => unreachable!("errors should get early returned"),
         };
 
+        {
+            let mut conn = self.conn();
+            self.marks_as_good(&node_id, &mut conn);
+        }
         self.add(node_id, from);
 
         // if it's response from find_peers or get_nodes, they have additional info
@@ -228,10 +232,7 @@ impl Router {
         // TODO: contains will request another connection from the pool..., should be fine
         // for now
         if self.contains(&new_node_id) {
-            info!("Already contains this node in routing table, updating quality metrics");
-            // Only need to update the quality metric, no network IO needed
-            let mut conn = self.conn();
-            self.marks_as_good(&new_node_id, &mut conn);
+            info!("Already contains this node in routing table, skipping");
             return;
         }
 

@@ -162,7 +162,7 @@ impl ToBencode for Token {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct NodeInfo {
     id: NodeId,
     end_point: SocketAddrV4,

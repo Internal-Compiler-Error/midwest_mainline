@@ -183,11 +183,7 @@ impl DhtHandle {
             Krpc::FindNodeGetPeersResponse(res)
         } else {
             // when we don't have peer info on an info hash, respond with the cloests nodes so the querier can ask them
-            let closest_eight: Vec<_> = self
-                .router
-                .find_closest(*query.querier()) // TODO: wtf, why are we finding via info_hash
-                .into_iter()
-                .collect();
+            let closest_eight: Vec<_> = self.router.find_closest(*query.querier()).into_iter().collect();
 
             let res = ResBuilder::new(query.txn_id().clone(), self.our_id.clone())
                 .with_token(token)
@@ -357,7 +353,7 @@ impl DhtHandle {
             let mut nodes: Vec<_> = find_node_response.nodes().clone();
 
             // some clients will return duplicate nodes, so we remove them
-            nodes.sort_unstable_by_key(|node| node.end_point());
+            nodes.sort_unstable();
             nodes.dedup();
 
             Result::Ok(nodes)
@@ -499,13 +495,6 @@ impl DhtHandle {
             .message_broker
             .send_and_wait_timeout(query, dest, REQ_TIMEOUT)
             .await?;
-        // let response = timeout(time_out, self.message_broker.send_and_wait(query, dest))
-        //     .await
-        //     .inspect_err(|_e| {
-        //         trace!("get_peers for {:?} timed out", dest);
-        //     })
-        //     ?  // timeout error
-        //     ?; // send_and_wait related error
 
         return match response {
             Krpc::ErrorResponse(response) => {

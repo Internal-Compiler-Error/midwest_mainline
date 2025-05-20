@@ -16,7 +16,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tracing::{instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 use crate::{
     message::{Krpc, ParseKrpc, ToRawKrpc},
@@ -30,7 +30,6 @@ use super::router::update_last_sent;
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
 /// so the client and await the response.
-/// TODO: replace this with some proper pubsub
 #[derive(Debug, Clone)]
 pub struct KrpcBroker {
     /// a map to keep track of the responses we await from the client
@@ -38,7 +37,7 @@ pub struct KrpcBroker {
 
     socket: Arc<UdpSocket>,
 
-    /// a list of subscribers that wishes to hear all messages inbound
+    /// a SPMC-esque queue, each readers can progress indepednelty
     inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<(Krpc, SocketAddrV4)>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
 }
@@ -71,7 +70,10 @@ impl KrpcBroker {
                         let socket_addr = {
                             match socket_addr {
                                 SocketAddr::V4(addr) => addr,
-                                _ => panic!("Expected V4 socket address"), // TODO: obviously we can't panic
+                                _ => {
+                                    info!("Non Ipv4 UDP packet received, should not be possible");
+                                    continue;
+                                }
                             }
                         };
 
@@ -83,9 +85,14 @@ impl KrpcBroker {
 
                         // notify those that subscribed for all inbound messages
                         {
-                            let subcribers = inbound_subscribers.lock().unwrap();
+                            let mut subcribers = inbound_subscribers.lock().unwrap();
+
+                            subcribers.retain(|s| !s.is_closed());
+
                             for sub in &*subcribers {
-                                // TODO: worry about what to do about disconnected or full queues later
+                                // TODO: It should really be a ring buffer instead of a regular
+                                // channel. Not using send here because `subcribers` mutex guard
+                                // is not Send and it lives across await points
                                 let _ = sub.try_send((msg.clone(), socket_addr));
                             }
                         }
@@ -182,7 +189,6 @@ impl KrpcBroker {
         self.send_msg(msg, peer.end_point())
     }
 
-    // TODO: think of a good way to let them unsubscribe later
     pub fn subscribe_inbound(&self) -> mpsc::Receiver<(Krpc, SocketAddrV4)> {
         // TODO: make this configurable
         let (tx, rx) = mpsc::channel(1024);

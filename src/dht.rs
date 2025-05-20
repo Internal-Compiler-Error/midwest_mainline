@@ -145,12 +145,12 @@ impl DhtV4 {
             })
             .unwrap();
 
-        let transaction_id_pool = Arc::new(TxnIdGenerator::new());
+        let txn_id_generator = Arc::new(TxnIdGenerator::new());
 
         let router = Router::new(
             our_id,
-            (message_broker).clone(),
-            Arc::clone(&transaction_id_pool),
+            message_broker.clone(),
+            Arc::clone(&txn_id_generator),
             db.clone(),
         );
 
@@ -166,7 +166,7 @@ impl DhtV4 {
             our_id,
             router.clone(),
             message_broker.clone(),
-            Arc::clone(&transaction_id_pool),
+            Arc::clone(&txn_id_generator),
             db.clone(),
         );
         let server = Arc::new(server);
@@ -209,7 +209,7 @@ impl DhtV4 {
         while let Some(_) = self.helper_tasks.join_next().await {}
     }
 
-    /// Given a known know, perform one find node to ourself add the response to the routing table
+    /// Given a known node, perform one find node to ourself add the response to the routing table
     /// *and* do one additional round of find node to all the returned nodes from the bootstrapping
     /// node.
     ///
