@@ -40,6 +40,7 @@ diesel::table! {
     txn_id (id) {
         id -> Binary,
         next_txn_id -> Integer,
+        last_updated -> BigInt,
     }
 }
 

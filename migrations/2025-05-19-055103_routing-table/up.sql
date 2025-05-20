@@ -15,10 +15,5 @@ create table node(
     added bigint not null default (unixepoch('subsec') * 1000)
 );
 
-create table `txn_id`(
-    id blob not null primary key,
-    next_txn_id integer not null default -1
-);
-
 create index 'idx-node-bucket-on-alive-nodes' on node (bucket) where removed = FALSE;
 create index 'idx-node-bucket-removed-last_contacted' on node(bucket, removed, last_contacted);

@@ -19,9 +19,9 @@ use tokio::{
 use tracing::{instrument, trace, warn};
 
 use crate::{
-    types::{NodeInfo, TransactionId},
     message::{Krpc, ParseKrpc, ToRawKrpc},
     our_error::OurError,
+    types::{NodeInfo, TransactionId},
     utils::unix_timestmap_ms,
 };
 
@@ -32,7 +32,7 @@ use super::router::update_last_sent;
 /// so the client and await the response.
 /// TODO: replace this with some proper pubsub
 #[derive(Debug, Clone)]
-pub struct MessageBroker {
+pub struct KrpcBroker {
     /// a map to keep track of the responses we await from the client
     pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
 
@@ -43,7 +43,7 @@ pub struct MessageBroker {
     db: Pool<ConnectionManager<SqliteConnection>>,
 }
 
-impl MessageBroker {
+impl KrpcBroker {
     pub fn new(socket: UdpSocket, db: Pool<ConnectionManager<SqliteConnection>>) -> Self {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),

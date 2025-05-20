@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use std::{net::SocketAddrV4, sync::Arc, usize};
 
 use diesel::r2d2::PooledConnection;
@@ -9,17 +10,18 @@ use diesel::{
 };
 use futures::future::join_all;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tracing::info;
 
 use crate::models::NodeNoMetaInfo;
 use crate::utils::unix_timestmap_ms;
 use crate::{
-    types::{self, NodeId, NodeInfo, TransactionId},
     message::Krpc,
+    types::{self, NodeId, NodeInfo, TransactionId},
 };
 
 use super::dht_handle::REQ_TIMEOUT;
-use super::{krpc_broker::MessageBroker, transaction_id_pool::TransactionIdPool};
+use super::{krpc_broker::KrpcBroker, transaction_id_pool::TransactionIdPool};
 
 #[allow(unused)]
 macro_rules! bail_on_err {
@@ -46,7 +48,7 @@ macro_rules! bail_on_none {
 pub struct Router {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
-    message_broker: MessageBroker,
+    message_broker: KrpcBroker,
     transaction_id_pool: Arc<TransactionIdPool>,
     bucket_size: usize,
 }
@@ -54,7 +56,7 @@ pub struct Router {
 impl Router {
     pub fn new(
         id: NodeId,
-        message_broker: MessageBroker,
+        message_broker: KrpcBroker,
         transaction_id_pool: Arc<TransactionIdPool>,
         table: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Router {
@@ -97,10 +99,20 @@ impl Router {
     /// keep listening for all incoming responses and update our table
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddrV4)>) {
         loop {
-            // TODO: worry about the unwrap later
-            let (msg, origin) = inbound.recv().await.unwrap();
-
-            self.add_new_nodes(origin, &msg);
+            tokio::select! {
+                maybe_msg = inbound.recv() => {
+                    if let Some((msg, origin)) = maybe_msg {
+                        self.add_new_nodes(origin, &msg);
+                    } else {
+                        // Channel closed, exit loop
+                        break;
+                    }
+                }
+                // TODO: refresh duration, make it configurable
+                _ = sleep(Duration::from_secs(180)) => {
+                    self.refresh_table().await;
+                }
+            }
         }
     }
 
@@ -270,7 +282,14 @@ impl Router {
         join_all(tasks).await;
     }
 
-    pub async fn refresh_table_loop(&self) {}
+    pub async fn refresh_table_loop(&self) {
+        // TODO: make this configurable
+        let refresh_duration = Duration::from_secs(3 * 60);
+        loop {
+            self.refresh_table().await;
+            sleep(refresh_duration).await;
+        }
+    }
 
     // TODO: use AsRef or Into to make it take in anything that can turn into an ID
     fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {

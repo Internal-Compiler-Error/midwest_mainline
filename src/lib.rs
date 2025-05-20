@@ -85,9 +85,10 @@
 //! ```
 
 pub mod dht;
-pub mod types;
 pub mod message;
 pub(crate) mod models;
 pub mod our_error;
 pub(crate) mod schema;
+pub(crate) mod token_pool;
+pub mod types;
 pub mod utils;

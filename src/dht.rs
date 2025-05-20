@@ -3,14 +3,14 @@ pub mod krpc_broker;
 pub mod router;
 mod transaction_id_pool;
 
-use crate::{dht::dht_handle::DhtHandle, types::NodeId, our_error::OurError};
+use crate::{dht::dht_handle::DhtHandle, our_error::OurError, types::NodeId};
 use diesel::{
     r2d2::{ConnectionManager, Pool},
     SqliteConnection,
 };
 use tracing::info;
 
-use krpc_broker::MessageBroker;
+use krpc_broker::KrpcBroker;
 use rand::{Rng, RngCore};
 use router::Router;
 use std::{
@@ -28,7 +28,7 @@ use transaction_id_pool::TransactionIdPool;
 #[allow(dead_code)]
 pub struct DhtV4 {
     server: Arc<DhtHandle>,
-    message_broker: MessageBroker,
+    message_broker: KrpcBroker,
     router: Router,
     helper_tasks: JoinSet<()>,
 }
@@ -87,8 +87,7 @@ impl DhtV4 {
             .build(manager)
             .expect("Could not build DB connection pool");
 
-        let message_broker = MessageBroker::new(socket, db.clone());
-        // let message_broker = Arc::new(message_broker.clone());
+        let message_broker = KrpcBroker::new(socket, db.clone());
 
         let message_broker_clone = message_broker.clone();
         join_set
