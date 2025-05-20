@@ -22,6 +22,7 @@ pub struct Peer {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct Node {
     pub id: Vec<u8>,
+    pub bucket: i32,
     pub last_contacted: i64,
     pub ip_addr: String,
     pub port: i32,

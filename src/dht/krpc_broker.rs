@@ -64,7 +64,7 @@ impl KrpcBroker {
 
             loop {
                 let (amount, socket_addr) = socket.recv_from(&mut buf).await.expect("common MTU 1500 exceeded");
-                trace!("recived packet from {socket_addr}");
+                trace!("received packet from {socket_addr}");
                 match (&buf[..amount]).parse() {
                     Ok(msg) => {
                         trace!("{} sent {:?}", socket_addr, msg);

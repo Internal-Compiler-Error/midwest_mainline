@@ -1,5 +1,5 @@
 use crate::schema::*;
-use crate::token_pool::TokenPool;
+use crate::token_generator::TokenGenerator;
 use crate::utils::unix_timestmap_ms;
 use crate::{
     message::{
@@ -25,7 +25,7 @@ use std::{
 use tokio::{task::Builder as TskBuilder, time::timeout};
 use tracing::{info_span, trace, warn, Instrument};
 
-use super::{router::Router, transaction_id_pool::TransactionIdPool, KrpcBroker};
+use super::{router::Router, txn_id_generator::TxnIdGenerator, KrpcBroker};
 
 // TODO: make these configurable some day
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -39,11 +39,11 @@ pub struct DhtHandle {
 
     swarms: Pool<ConnectionManager<SqliteConnection>>,
 
-    token_pool: TokenPool,
+    token_pool: TokenGenerator,
     message_broker: KrpcBroker,
 
     // parts needed to make requests
-    pub(crate) transaction_id_pool: Arc<TransactionIdPool>,
+    pub(crate) transaction_id_pool: Arc<TxnIdGenerator>,
 }
 
 impl DhtHandle {
@@ -51,7 +51,7 @@ impl DhtHandle {
         id: NodeId,
         router: Router,
         message_broker: KrpcBroker,
-        transaction_id_pool: Arc<TransactionIdPool>,
+        transaction_id_pool: Arc<TxnIdGenerator>,
         swarms: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
         let mut rng = rand::thread_rng();
@@ -59,7 +59,7 @@ impl DhtHandle {
 
         Self {
             swarms,
-            token_pool: TokenPool::new(seed),
+            token_pool: TokenGenerator::new(seed),
             our_id: id,
             router,
             message_broker,
@@ -242,13 +242,6 @@ impl DhtHandle {
         })
         .expect("transaction for recording new peers failed");
 
-        // // add the peer contact to the hash table, if it already exists, we don't care
-        // let mut table = self.swarm_records.write().await;
-        // table
-        //     .entry(announce.info_hash().clone())
-        //     .or_insert_with(Vec::new)
-        //     .push(peer_contact);
-
         Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
     }
 
@@ -256,6 +249,7 @@ impl DhtHandle {
 
     // TODO: need a function to send with timeout, unsubscribe and clean up when timeout expires
 
+    #[tracing::instrument(skip(self))]
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
         let txn_id = self.transaction_id_pool.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.our_id);
@@ -271,9 +265,10 @@ impl DhtHandle {
     }
 
     /// starting point of trying to find any nodes on the network
+    #[tracing::instrument(skip(self))]
     pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find_exact(target) {
+        if let Some(node) = (&self).router.find_exact(&target) {
             return Ok(node);
         }
 
@@ -334,6 +329,7 @@ impl DhtHandle {
     }
 
     // attempt to find the target node via a peer on this address
+    #[tracing::instrument(skip(self))]
     async fn send_find_nodes_rpc(
         self: Arc<Self>,
         dest: SocketAddrV4,
@@ -372,11 +368,12 @@ impl DhtHandle {
 
     // TODO: API is broken, since we can't guarantee that the peer will exist or we can find them,
     // we should return a list of K closest nodes or the target itself if can be found
+    #[tracing::instrument(skip(self))]
     pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<SocketAddrV4>), OurError> {
         let resonsible = NodeId(info_hash.0);
         //
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find_exact(resonsible) {
+        if let Some(node) = (&self).router.find_exact(&resonsible) {
             let (token, _nodes, peers) = self.send_get_peers_rpc(node.end_point(), info_hash).await?;
             return Ok((
                 token.expect("A node directly responsible for a piece would return a token"),
@@ -444,6 +441,7 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn announce_peers(
         self: Arc<Self>,
         recipient: SocketAddrV4,

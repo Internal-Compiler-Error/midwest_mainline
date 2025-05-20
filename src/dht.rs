@@ -1,7 +1,7 @@
 pub mod dht_handle;
 pub mod krpc_broker;
 pub mod router;
-mod transaction_id_pool;
+mod txn_id_generator;
 
 use crate::{dht::dht_handle::DhtHandle, our_error::OurError, types::NodeId};
 use diesel::{
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
-use transaction_id_pool::TransactionIdPool;
+use txn_id_generator::TxnIdGenerator;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -98,7 +98,7 @@ impl DhtV4 {
             })
             .unwrap();
 
-        let transaction_id_pool = Arc::new(TransactionIdPool::new());
+        let transaction_id_pool = Arc::new(TxnIdGenerator::new());
 
         let router = Router::new(
             our_id,
@@ -179,12 +179,13 @@ impl DhtV4 {
             // the find node only obviously we know ourselves, this only serves us to get us info
             // about other nodes
             let _ = dht.find_node(our_id).await;
-            println!("done finding node");
+            info!("done finding node");
 
             Ok::<(), eyre::Report>(())
         })
         .await?;
 
+        tokio::time::sleep(Duration::from_secs(60 * 5)).await;
         info!("{peer} bootstrap success");
         Ok(())
     }

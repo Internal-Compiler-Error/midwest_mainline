@@ -89,6 +89,6 @@ pub mod message;
 pub(crate) mod models;
 pub mod our_error;
 pub(crate) mod schema;
-pub(crate) mod token_pool;
+pub(crate) mod token_generator;
 pub mod types;
 pub mod utils;

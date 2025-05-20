@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // TODO: while tempting, maybe do the type masturbation of generic over all atomic integers part
 // some other day
 #[derive(Debug)]
-pub struct TransactionIdPool {
+pub struct TxnIdGenerator {
     next_id: AtomicU32,
 }
 
-impl TransactionIdPool {
+impl TxnIdGenerator {
     pub fn new() -> Self {
-        TransactionIdPool {
+        TxnIdGenerator {
             next_id: AtomicU32::new(0),
         }
     }

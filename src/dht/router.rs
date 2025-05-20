@@ -11,7 +11,7 @@ use diesel::{
 use futures::future::join_all;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::models::NodeNoMetaInfo;
 use crate::utils::unix_timestmap_ms;
@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::dht_handle::REQ_TIMEOUT;
-use super::{krpc_broker::KrpcBroker, transaction_id_pool::TransactionIdPool};
+use super::{krpc_broker::KrpcBroker, txn_id_generator::TxnIdGenerator};
 
 #[allow(unused)]
 macro_rules! bail_on_err {
@@ -49,7 +49,7 @@ pub struct Router {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
     message_broker: KrpcBroker,
-    transaction_id_pool: Arc<TransactionIdPool>,
+    txn_id_generator: Arc<TxnIdGenerator>,
     bucket_size: usize,
 }
 
@@ -57,14 +57,14 @@ impl Router {
     pub fn new(
         id: NodeId,
         message_broker: KrpcBroker,
-        transaction_id_pool: Arc<TransactionIdPool>,
+        txn_id_generator: Arc<TxnIdGenerator>,
         table: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Router {
         Router {
             id,
             table,
             message_broker,
-            transaction_id_pool,
+            txn_id_generator,
             bucket_size: 1024, // TODO: make this configurable in the future
         }
     }
@@ -85,7 +85,6 @@ impl Router {
         };
 
         self.add(node_id, from);
-        info!("Add {from} with {:?} to the routing table", node_id);
 
         // if it's response from find_peers or get_nodes, they have additional info
         if let Krpc::FindNodeGetPeersResponse(res) = message {
@@ -134,9 +133,11 @@ impl Router {
 
     pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
         use crate::schema::node::dsl::*;
-        let mut conn = self.table.get().unwrap();
+        let mut conn = self.conn();
         let nodes = node
-            .filter(bucket.eq(self.index(&target)))
+            // .filter(bucket.eq(self.index(&target)))
+            .filter(removed.eq(false))
+            .order(bucket.asc())
             .order(last_contacted.desc())
             .limit(64)
             .select(NodeNoMetaInfo::as_select())
@@ -146,60 +147,79 @@ impl Router {
         nodes.into_iter().map(|nodee| nodee.into()).collect::<Vec<_>>()
     }
 
-    pub fn find_exact(&self, target: NodeId) -> Option<NodeInfo> {
+    pub fn find_exact(&self, target: &NodeId) -> Option<NodeInfo> {
         use crate::schema::node::dsl::*;
         let mut conn = self.table.get().unwrap();
         let target_id = target.0.to_vec();
-        node.filter(id.eq(target_id))
+        node.filter(removed.eq(false))
+            .filter(id.eq(target_id))
             .select(NodeNoMetaInfo::as_select())
             .first(&mut conn)
             .ok()
             .map(|nodee| nodee.into())
     }
 
-    /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
-    pub fn add(&self, new_node_id: NodeId, addr: SocketAddrV4) {
-        let this = self.clone();
-        // let node_info = NodeInfo::new(new_node_id, addr);
+    pub fn contains(&self, target: &NodeId) -> bool {
+        self.find_exact(target).is_some()
+    }
 
-        // TODO: find_exact will request another connection from the pool..., should be fine
+    pub fn full_bucket(&self, i: i32) -> bool {
+        let size = self.bucket_size(i);
+        assert!(
+            !(size > self.bucket_size),
+            "bucket managed to grow beyond the size limit"
+        );
+        self.bucket_size(i) == self.bucket_size
+    }
+
+    /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
+    #[tracing::instrument(skip(self))]
+    pub fn add(&self, new_node_id: NodeId, addr: SocketAddrV4) {
+        // TODO: contains will request another connection from the pool..., should be fine
         // for now
-        let exact = self.find_exact(new_node_id);
-        match exact {
-            Some(_node) => {
-                // Only need to update the quality metric, no IO needed
-                let mut conn = self.conn();
-                self.marks_as_good(&new_node_id, &mut conn);
-                return;
-            }
-            None => {
-                // Need to ping the worst quality node in the bucket to see if it should be replaced
-            }
+        if self.contains(&new_node_id) {
+            info!("Already contains this node in routing table, updating quality metrics");
+            // Only need to update the quality metric, no network IO needed
+            let mut conn = self.conn();
+            self.marks_as_good(&new_node_id, &mut conn);
+            return;
         }
 
+        let bucket_idx = self.index(&new_node_id);
+        if !self.full_bucket(bucket_idx) {
+            info!("Bucket {bucket_idx} has capacity, inserting");
+            let node = NodeInfo::new(new_node_id, addr);
+            let mut conn = self.conn();
+            self.put_to_bucket(node, &mut conn);
+            return;
+        }
+
+        info!("Bucket {bucket_idx} full, refreshing all buckets to evict");
+        let this = self.clone();
         let work = async move {
-            let node_info = NodeInfo::new(new_node_id, addr);
-            // let replacment = NodeEntry::new(node_info);
+            let node = NodeInfo::new(new_node_id, addr);
 
             // instead of going from least recently seen and probe one by one, just refresh the
             // entire bucket
             let bucket_idx = this.index(&new_node_id);
             this.refresh_bucket(bucket_idx).await;
 
-            let bucket_count = this.bucket_count(bucket_idx);
-            // all nodes are good, no slots left for new node
-            if bucket_count >= this.bucket_size {
+            if this.full_bucket(bucket_idx) {
+                info!("Bucket {bucket_idx} remains full after refreshing, node not added");
                 return;
             }
+
+            info!("Bucket {bucket_idx} now has spare capacity, adding");
             let mut conn = this.conn();
-            this.append_to_bucket(node_info, &mut conn);
+            this.put_to_bucket(node, &mut conn);
         };
         tokio::spawn(work);
     }
 
     fn conn(&self) -> PooledConnection<ConnectionManager<SqliteConnection>> {
-        self.table.get().unwrap()
+        self.table.get().expect("Pool should just work")
     }
+
     pub fn node_count(&self) -> usize {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
@@ -208,7 +228,7 @@ impl Router {
     }
 
     /// How many nodes are in the ith bucket (0-indexed)
-    pub fn bucket_count(&self, i: i32) -> usize {
+    pub fn bucket_size(&self, i: i32) -> usize {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
         let count: i64 = node
@@ -241,7 +261,7 @@ impl Router {
 
     // Send a ping to fresh the node
     async fn refresh_node(&self, target: &NodeInfo) {
-        let txn_id = self.transaction_id_pool.next();
+        let txn_id = self.txn_id_generator.next();
         let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.id);
 
         {
@@ -295,37 +315,41 @@ impl Router {
     fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
         let now = unix_timestmap_ms();
-        // let mut conn = self.table.get().unwrap();
         let idd = nodee.0.to_vec();
-        diesel::update(node)
+        let _ = diesel::update(node)
             .filter(id.eq(idd))
             .set((last_contacted.eq(now), failed_requests.eq(0)))
-            .execute(conn);
+            .execute(conn)
+            .inspect_err(|e| error!("{e}"));
     }
 
     fn mark_as_dead(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
 
         let idd = nodee.0.to_vec();
-        diesel::update(node)
+        let _ = diesel::update(node)
             .filter(id.eq(idd))
             .set(removed.eq(true))
-            .execute(conn);
+            .execute(conn)
+            .inspect_err(|e| error!("{e}"));
     }
 
-    fn append_to_bucket(&self, nodee: NodeInfo, conn: &mut SqliteConnection) {
+    fn put_to_bucket(&self, nodee: NodeInfo, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
 
-        insert_into(node)
+        let index = self.index(&nodee.id());
+        let _ = insert_into(node)
             .values(crate::models::Node {
                 id: nodee.id().0.to_vec(),
+                bucket: index,
                 last_contacted: unix_timestmap_ms(),
                 ip_addr: nodee.end_point().ip().to_string(),
                 port: nodee.end_point().port() as i32,
                 failed_requests: 0,
                 removed: false,
             })
-            .execute(conn);
+            .execute(conn)
+            .inspect_err(|e| error!("{e}"));
     }
 }
 
@@ -333,8 +357,9 @@ pub fn update_last_sent(nodee: &NodeId, sent_timestamp: i64, conn: &mut SqliteCo
     use crate::schema::node::dsl::*;
 
     let idd = nodee.0.to_vec();
-    diesel::update(node)
+    let _ = diesel::update(node)
         .set(last_sent.eq(sent_timestamp))
         .filter(id.eq(idd))
-        .execute(conn);
+        .execute(conn)
+        .inspect_err(|e| error!("{e}"));
 }
