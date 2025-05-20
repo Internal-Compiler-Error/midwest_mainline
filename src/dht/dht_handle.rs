@@ -424,9 +424,7 @@ impl DhtHandle {
                 .into_iter()
                 .flat_map(|(_token, nodes, _peers)| {
                     let our_id = self.our_id;
-                    let distances = nodes
-                        .into_iter()
-                        .map(move |node| (node, node.id().dist_big_unit(&our_id)));
+                    let distances = nodes.into_iter().map(move |node| (node, node.id().dist(&our_id)));
                     distances
                 })
                 .collect();

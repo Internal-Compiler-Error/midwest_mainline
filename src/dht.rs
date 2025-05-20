@@ -3,10 +3,16 @@ pub mod krpc_broker;
 pub mod router;
 mod txn_id_generator;
 
-use crate::{dht::dht_handle::DhtHandle, our_error::OurError, types::NodeId};
+use crate::{
+    dht::dht_handle::DhtHandle,
+    our_error::OurError,
+    types::{NodeId, NODE_ID_LEN},
+};
 use diesel::{
-    r2d2::{ConnectionManager, Pool},
-    SqliteConnection,
+    connection::SimpleConnection,
+    prelude::*,
+    r2d2::{self, ConnectionManager, CustomizeConnection, Pool},
+    sql_types,
 };
 use tracing::info;
 
@@ -31,6 +37,46 @@ pub struct DhtV4 {
     message_broker: KrpcBroker,
     router: Router,
     helper_tasks: JoinSet<()>,
+}
+
+#[derive(Debug)]
+struct SensibleOptions;
+
+impl CustomizeConnection<SqliteConnection, r2d2::Error> for SensibleOptions {
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), r2d2::Error> {
+        conn.batch_execute(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 4000000;
+            ",
+        )
+        .map_err(diesel::r2d2::Error::QueryError)?;
+
+        xor_utils::register_impl(conn, |x: *const [u8], y: *const [u8]| {
+            // safety: they came from C, not my problem if they're wonky
+            let x = unsafe { &*x };
+            let y = unsafe { &*y };
+
+            let mut buf = [0u8; NODE_ID_LEN];
+            for i in 0..NODE_ID_LEN {
+                buf[i] = x[i] ^ y[i]
+            }
+
+            buf
+        })
+        .map_err(diesel::r2d2::Error::QueryError)
+    }
+
+    fn on_release(&self, _conn: SqliteConnection) {}
+}
+
+define_sql_function! {
+    /// In Kademlia, bitwise xor is the distance metric. As we are storing the node id in BLOB, we
+    /// can just xor each bytes and return as a BLOB, ordering on BLOB is defined as C `memcmp`,
+    /// see <https://sqlite.org/datatype3.html#sort_order>
+    fn xor(x: sql_types::Binary, y: sql_types::Binary) -> sql_types::Binary;
 }
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
@@ -84,6 +130,7 @@ impl DhtV4 {
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         let db = Pool::builder()
             .test_on_check_out(true)
+            .connection_customizer(Box::new(SensibleOptions {}))
             .build(manager)
             .expect("Could not build DB connection pool");
 
@@ -185,7 +232,7 @@ impl DhtV4 {
         })
         .await?;
 
-        tokio::time::sleep(Duration::from_secs(60 * 5)).await;
+        // tokio::time::sleep(Duration::from_secs(60 * 5)).await;
         info!("{peer} bootstrap success");
         Ok(())
     }
@@ -201,10 +248,10 @@ impl DhtV4 {
 mod tests {
     use crate::{
         dht::DhtV4,
-        types::{InfoHash, NodeId},
+        types::{InfoHash /* , NodeId */},
     };
-    use opentelemetry::global;
-    use rand::RngCore;
+    // use opentelemetry::global;
+    // use rand::RngCore;
     use std::{net::SocketAddrV4, str::FromStr, sync::Once};
     use tokio::time::{self, timeout};
     use tracing::info;
@@ -255,17 +302,17 @@ mod tests {
         let dht = timeout(time::Duration::from_secs(60), dht).await??;
         info!("Now I'm bootstrapped!");
 
-        let server = dht.handle();
-        let mut rng = rand::thread_rng();
-        let mut bytes = [0u8; 20];
-        rng.fill_bytes(&mut bytes);
-
-        let node = server.find_node(NodeId(bytes)).await;
-        if let Ok(node) = node {
-            println!("found node {:?}", node);
-        } else {
-            println!("I guess we just didn't find anything")
-        }
+        // let server = dht.handle();
+        // let mut rng = rand::thread_rng();
+        // let mut bytes = [0u8; 20];
+        // rng.fill_bytes(&mut bytes);
+        //
+        // let node = server.find_node(NodeId(bytes)).await;
+        // if let Ok(node) = node {
+        //     println!("found node {:?}", node);
+        // } else {
+        //     println!("I guess we just didn't find anything")
+        // }
 
         Ok(())
     }

@@ -1,5 +1,5 @@
 use bendy::encoding::ToBencode;
-use num::{traits::ops::bytes, BigUint};
+use num::traits::ops::bytes;
 use smallvec::SmallVec;
 use std::{
     fmt::Debug,
@@ -8,7 +8,7 @@ use std::{
 
 use crate::models::NodeNoMetaInfo;
 
-const NODE_ID_LEN: usize = 20;
+pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
@@ -37,12 +37,6 @@ impl NodeId {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
-    }
-
-    pub fn dist_big_unit(&self, rhs: &Self) -> BigUint {
-        let our_id = BigUint::from_bytes_be(self.as_bytes());
-        let node_id = BigUint::from_bytes_be(rhs.as_bytes());
-        our_id ^ node_id
     }
 
     pub fn dist(&self, rhs: &Self) -> [u8; NODE_ID_LEN] {

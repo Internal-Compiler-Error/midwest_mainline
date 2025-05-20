@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+use crate::dht::xor;
 use crate::models::NodeNoMetaInfo;
 use crate::utils::unix_timestmap_ms;
 use crate::{
@@ -119,32 +120,81 @@ impl Router {
     fn index(&self, target: &NodeId) -> i32 {
         let dist = self.id.dist(&target);
         if dist == types::ZERO_DIST {
-            // all zero means we're finding ourself, then we go look for in the 0th bucket.
-            return 0;
+            // all zero means we're finding ourself, then we go look for in the last bucket
+            return 159;
         }
 
         let first_nonzero_byte = dist.into_iter().position(|radix| radix != 0).unwrap();
         let byte = dist[first_nonzero_byte];
-        let leading_zeros_inx = 7 - byte.leading_zeros() as usize;
 
-        let bucket_idx = (19 - first_nonzero_byte) * 8 + leading_zeros_inx;
+        let bucket_idx = 159 - (first_nonzero_byte * 8 + byte.leading_zeros() as usize);
         bucket_idx.try_into().unwrap()
     }
 
-    pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
+    fn closest_in_bucket(&self, target: &NodeId, i: i32, limit: i64, conn: &mut SqliteConnection) -> Vec<NodeInfo> {
         use crate::schema::node::dsl::*;
-        let mut conn = self.conn();
+
         let nodes = node
-            // .filter(bucket.eq(self.index(&target)))
-            .filter(removed.eq(false))
-            .order(bucket.asc())
-            .order(last_contacted.desc())
-            .limit(64)
             .select(NodeNoMetaInfo::as_select())
-            .load(&mut conn)
-            .unwrap();
+            .filter(removed.eq(false))
+            .filter(bucket.eq(i))
+            // order by Kadamlia XOR distance
+            .order(xor(id, target.as_bytes()))
+            .limit(limit)
+            .load(conn)
+            .expect("Writers don't block readers");
 
         nodes.into_iter().map(|nodee| nodee.into()).collect::<Vec<_>>()
+    }
+
+    pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
+        // NOTE: Start with the center and alternating left and right expansion, none of this is
+        // done in a transaction so we don't block other writers due to sqlite only allowing one
+        // writers at anytime. It's possible that other writers may modify the table while we
+        // fetch, that's ok, the DHT is allowed to be somewhat sloppy.
+
+        let total: u16 = 8; // TODO: make this as a param
+
+        let mut conn = self.conn();
+
+        let target_idx = self.index(&self.id);
+        let mut closest = self.closest_in_bucket(&target, target_idx, total.into(), &mut conn);
+
+        let mut offset = 1;
+        let mut remaining: u16 = total.saturating_sub(closest.len().try_into().expect("we spcified the limit"));
+        loop {
+            // if got we wanted, or both sides are out of bounds, then there's no more we can do
+            if remaining == 0 || (target_idx - offset < 0 && target_idx + offset >= 256) {
+                break;
+            }
+
+            // favours the nodes closer to us, i.e buckets with larger index, I have no theory on
+            // why this might be better
+            let right_bucket = target_idx + offset;
+            if remaining != 0 && right_bucket < 256 {
+                let mut additional = self.closest_in_bucket(&target, right_bucket, remaining.into(), &mut conn);
+                remaining = remaining.saturating_sub(additional.len().try_into().expect("we spcified the limit"));
+                closest.append(&mut additional);
+            }
+
+            let left_bucket = target_idx - offset;
+            if remaining != 0 && left_bucket >= 0 {
+                let mut additional = self.closest_in_bucket(&target, left_bucket, remaining.into(), &mut conn);
+                remaining = remaining.saturating_sub(additional.len().try_into().expect("we spcified the limit"));
+                closest.append(&mut additional);
+            }
+
+            offset += 1;
+        }
+
+        closest.sort_unstable_by(|a, b| {
+            let a_dist = &self.id.dist(&a.id());
+            let b_dist = &self.id.dist(&b.id());
+
+            a_dist.cmp(b_dist)
+        });
+
+        closest
     }
 
     pub fn find_exact(&self, target: &NodeId) -> Option<NodeInfo> {
@@ -348,6 +398,7 @@ impl Router {
                 failed_requests: 0,
                 removed: false,
             })
+            .on_conflict_do_nothing()
             .execute(conn)
             .inspect_err(|e| error!("{e}"));
     }
