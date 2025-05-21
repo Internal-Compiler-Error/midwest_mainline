@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
 };
 
-use crate::models::NodeNoMetaInfo;
+use crate::{dht::krpc_broker::Routable, models::NodeNoMetaInfo};
 
 pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
@@ -192,6 +192,12 @@ impl NodeInfo {
     }
 }
 
+impl Routable for NodeInfo {
+    fn endpoint(&self) -> SocketAddrV4 {
+        self.end_point()
+    }
+}
+
 impl From<NodeNoMetaInfo> for NodeInfo {
     fn from(value: NodeNoMetaInfo) -> Self {
         let idd = NodeId::from_bytes_unchecked(&*value.id);
@@ -205,6 +211,10 @@ impl From<NodeNoMetaInfo> for NodeInfo {
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct TransactionId(pub SmallVec<[u8; 2]>);
+
+// Only exists to have something you can use for the old ways of constructing messsages, should be
+// removed eventually
+pub const TXN_ID_PLACEHOLDER: TransactionId = TransactionId(SmallVec::from_const([u8::MAX, u8::MAX]));
 
 impl Debug for TransactionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

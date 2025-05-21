@@ -1547,6 +1547,7 @@ dependencies = [
  "smallvec",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

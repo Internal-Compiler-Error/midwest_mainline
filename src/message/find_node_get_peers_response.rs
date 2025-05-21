@@ -12,7 +12,7 @@ use super::ToRawKrpc;
 /// easier to just keep all of them in one place
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
-    transaction_id: TransactionId,
+    pub transaction_id: TransactionId,
     queried: NodeId,
     token: Option<Token>,
     values: Vec<SocketAddrV4>,

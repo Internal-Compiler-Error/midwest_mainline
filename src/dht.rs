@@ -125,6 +125,8 @@ impl DhtV4 {
         // the JoinSet keeps all the tasks required to make the DHT node functional
         let mut join_set = JoinSet::new();
 
+        let txn_id_generator = Arc::new(TxnIdGenerator::new());
+        //
         // TODO: make this configurable
         let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
@@ -134,7 +136,7 @@ impl DhtV4 {
             .build(manager)
             .expect("Could not build DB connection pool");
 
-        let message_broker = KrpcBroker::new(socket, db.clone());
+        let message_broker = KrpcBroker::new(socket, db.clone(), txn_id_generator.clone());
 
         let message_broker_clone = message_broker.clone();
         join_set
@@ -144,8 +146,6 @@ impl DhtV4 {
                 let _ = message_broker_clone.run().await;
             })
             .unwrap();
-
-        let txn_id_generator = Arc::new(TxnIdGenerator::new());
 
         let router = Router::new(
             our_id,
@@ -162,13 +162,7 @@ impl DhtV4 {
             .spawn(async move { inner_router.run(rx).await })
             .unwrap();
 
-        let server = DhtHandle::new(
-            our_id,
-            router.clone(),
-            message_broker.clone(),
-            Arc::clone(&txn_id_generator),
-            db.clone(),
-        );
+        let server = DhtHandle::new(our_id, router.clone(), message_broker.clone(), db.clone());
         let server = Arc::new(server);
 
         join_set

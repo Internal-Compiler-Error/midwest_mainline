@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use crate::types::{NodeInfo, Token, TransactionId};
 use crate::our_error::OurError;
+use crate::types::{NodeInfo, Token, TransactionId};
 use bendy::decoding::{Decoder, Object};
 
 // use color_eyre::eyre::eyre;
@@ -9,12 +9,12 @@ use eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
 
-use crate::types::{InfoHash, NodeId};
 use crate::message::announce_peer_query::AnnouncePeerQuery;
 use crate::message::error::KrpcError;
 use crate::message::find_node_query::FindNodeQuery;
 use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
+use crate::types::{InfoHash, NodeId};
 use juicy_bencode::{parse_bencode_dict, BencodeItemView};
 
 pub mod announce_peer_query;
@@ -374,6 +374,37 @@ impl ToRawKrpc for Krpc {
 }
 
 impl Krpc {
+    pub fn set_txn_id(&mut self, txn_id: TransactionId) {
+        match self {
+            Krpc::AnnouncePeerQuery(m) => m.transaction_id = txn_id,
+            Krpc::FindNodeQuery(m) => m.transaction_id = txn_id,
+            Krpc::GetPeersQuery(m) => m.transaction_id = txn_id,
+            Krpc::PingQuery(m) => m.transaction_id = txn_id,
+            Krpc::PingAnnouncePeerResponse(m) => m.transaction_id = txn_id,
+            Krpc::FindNodeGetPeersResponse(m) => m.transaction_id = txn_id,
+            Krpc::ErrorResponse(m) => m.transaction_id = txn_id,
+        }
+    }
+
+    // IS this function a good idea?
+    pub fn node_id(&self) -> Option<NodeId> {
+        // TODO: we really need to agree on whether to copy or share with node_id by default
+        match &self {
+            Krpc::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.querier()),
+            Krpc::FindNodeQuery(find_node_query) => Some(find_node_query.querier()),
+            Krpc::GetPeersQuery(get_peers_query) => Some(*get_peers_query.querier()),
+            Krpc::PingQuery(ping_query) => Some(*ping_query.querier()),
+
+            Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => {
+                Some(*ping_announce_peer_response.target_id())
+            }
+            Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => {
+                Some(*find_node_get_peers_response.queried())
+            }
+            Krpc::ErrorResponse(_) => None,
+        }
+    }
+
     pub fn is_response(&self) -> bool {
         match self {
             Krpc::PingAnnouncePeerResponse(_) => true,

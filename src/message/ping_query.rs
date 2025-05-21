@@ -4,7 +4,7 @@ use super::ToRawKrpc;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct PingQuery {
-    transaction_id: TransactionId,
+    pub transaction_id: TransactionId,
     querier: NodeId,
 }
 

@@ -25,6 +25,7 @@ bendy = { version = "^0.3" }
 juicy_bencode = "^0.1"
 rand = { version = "^0.8", features = ["small_rng"] }
 tokio = { version = "^1.38", features = ["full", "tracing"] }
+tokio-stream = "0.1"
 async-recursion = "1.1.0"
 futures = "0.3.30"
 color-eyre = "^0.6"
@@ -35,7 +36,7 @@ hex = "^0.4"
 sha3 = "^0.10"
 pretty-hex = "0.4.1"
 thiserror = "1.0.61"
-smallvec = "1.13.2"
+smallvec = { version = "1.13.2", features = ["const_new"] }
 base64 = "0.22.1"
 eyre = "0.6.12"
 diesel = { version = "2.2.10", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2" ] }

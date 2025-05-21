@@ -1,6 +1,6 @@
 use crate::schema::*;
 use crate::token_generator::TokenGenerator;
-use crate::types::{cmp_resp, MAX_DIST};
+use crate::types::{cmp_resp, MAX_DIST, TXN_ID_PLACEHOLDER};
 use crate::utils::{bail_on_err, unix_timestmap_ms};
 use crate::{
     message::{
@@ -14,6 +14,8 @@ use diesel::insert_into;
 use diesel::r2d2::{Pool, PooledConnection};
 use diesel::{prelude::*, r2d2::ConnectionManager};
 use futures::future::join_all;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 use crate::message::find_node_get_peers_response::Builder as ResBuilder;
 use rand::prelude::*;
@@ -24,10 +26,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{task::Builder as TskBuilder, time::timeout};
+use tokio::task::Builder as TskBuilder;
 use tracing::{error, info, info_span, trace, warn, Instrument};
 
-use super::{router::Router, txn_id_generator::TxnIdGenerator, KrpcBroker};
+use super::{router::Router, KrpcBroker};
 
 // TODO: make these configurable some day
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -43,9 +45,6 @@ pub struct DhtHandle {
 
     token_generator: TokenGenerator,
     message_broker: KrpcBroker,
-
-    // parts needed to make requests
-    pub(crate) transaction_id_pool: Arc<TxnIdGenerator>,
 }
 
 impl DhtHandle {
@@ -53,7 +52,6 @@ impl DhtHandle {
         id: NodeId,
         router: Router,
         message_broker: KrpcBroker,
-        transaction_id_pool: Arc<TxnIdGenerator>,
         swarms: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
         let mut rng = rand::thread_rng();
@@ -65,29 +63,33 @@ impl DhtHandle {
             our_id: id,
             router,
             message_broker,
-            transaction_id_pool,
         }
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(self: Arc<Self>) {
-        let mut rx = self.message_broker.subscribe_inbound();
+        let rx = self.message_broker.subscribe_inbound();
+        let rx = ReceiverStream::new(rx);
+        let mut requests = rx.filter(|(msg, _)| !msg.is_error() && !msg.is_response());
 
         // respond to messages, as fast as possible
-        while let Some((inbound_msg, socket_addr)) = rx.recv().await {
+        while let Some((inbound_msg, socket_addr)) = requests.next().await {
             let this = self.clone();
             let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
                 async move {
                     let this = &*this;
 
-                    let response = match this.generate_response(&inbound_msg, socket_addr).await {
-                        Some(msg) => msg,
-                        None => return,
-                    };
-
                     trace!("Handling request from {socket_addr}");
+                    let response = this.generate_response(&inbound_msg, socket_addr);
 
-                    this.message_broker.send_msg(response, socket_addr);
+                    let txn_id = inbound_msg.transaction_id().clone();
+                    let node_info =
+                        NodeInfo::new(inbound_msg.node_id().expect("non qeuries are filtered"), socket_addr);
+                    let _ = this
+                        .message_broker
+                        .reply(response, &node_info, txn_id, Duration::MAX)
+                        .await
+                        .inspect_err(|e| error!("{e}"));
                     trace!("response sending for {socket_addr}");
                 }
                 .instrument(info_span!("handle_requests")),
@@ -98,29 +100,25 @@ impl DhtHandle {
     /**************************************   SERVER SECTION   *********************************************/
 
     #[tracing::instrument(skip(self))]
-    async fn generate_response(&self, request: &Krpc, from: SocketAddrV4) -> Option<Krpc> {
-        let response = match request {
-            Krpc::PingQuery(ping) => Some(self.generate_ping_response(ping, from).await),
-            Krpc::FindNodeQuery(find_node) => Some(self.generate_find_node_response(find_node, from).await),
-            Krpc::AnnouncePeerQuery(announce_peer) => {
-                Some(self.generate_announce_peer_response(announce_peer, from).await)
-            }
-            Krpc::GetPeersQuery(get_peers) => Some(self.generate_get_peers_response(get_peers, from).await),
-            _ => {
-                assert!(request.is_response());
-                None
-            }
-        };
-        response
+    fn generate_response(&self, request: &Krpc, from: SocketAddrV4) -> Krpc {
+        assert!(request.is_query());
+
+        match request {
+            Krpc::PingQuery(ping) => self.generate_ping_response(ping, from),
+            Krpc::FindNodeQuery(find_node) => self.generate_find_node_response(find_node, from),
+            Krpc::AnnouncePeerQuery(announce_peer) => self.generate_announce_peer_response(announce_peer, from),
+            Krpc::GetPeersQuery(get_peers) => self.generate_get_peers_response(get_peers, from),
+            _ => unreachable!("caught by assert"),
+        }
     }
 
     #[tracing::instrument(skip(self))]
-    async fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> Krpc {
+    fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> Krpc {
         Krpc::new_ping_response(ping.txn_id().clone(), self.our_id.clone())
     }
 
     #[tracing::instrument(skip(self))]
-    async fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> Krpc {
+    fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> Krpc {
         let table = &self.router;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
@@ -172,7 +170,7 @@ impl DhtHandle {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
+    fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         let peers = self.swarm_peers(query.info_hash());
         let token_pool = &self.token_generator;
 
@@ -196,7 +194,7 @@ impl DhtHandle {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
+    fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
         if !self
             .token_generator
@@ -259,10 +257,9 @@ impl DhtHandle {
 
     #[tracing::instrument(skip(self))]
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
-        let txn_id = self.transaction_id_pool.next();
-        let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.our_id);
+        let ping_msg = Krpc::new_ping_query(TXN_ID_PLACEHOLDER, self.our_id);
 
-        let response = self.message_broker.send_and_wait(ping_msg, peer).await?;
+        let response = self.message_broker.query(ping_msg, &peer, REQ_TIMEOUT).await?;
 
         return if let Krpc::PingAnnouncePeerResponse(response) = response {
             Ok(*response.target_id())
@@ -366,18 +363,10 @@ impl DhtHandle {
         target: NodeId,
     ) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
-        let txn_id = self.transaction_id_pool.next();
-        let query = Krpc::new_find_node_query(TransactionId::from(txn_id), self.our_id, target);
+        let query = Krpc::new_find_node_query(TXN_ID_PLACEHOLDER, self.our_id, target);
 
         // send the message and await for a response
-        let time_out = REQ_TIMEOUT;
-        // TODO: make this configurable or let parent handle timeout, wooo maybe we can configure this
-        // based on ip geo location distance
-        let response = timeout(time_out, self.message_broker.send_and_wait(query, dest))
-            .await
-            .inspect_err(|_e| trace!("find_nodes for {:?} timed out", dest))
-            ?  // timeout error
-            ?; // send_and_wait error
+        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
             // TODO:: does the following actually handle the giant bitstring thing correctly?
@@ -461,11 +450,9 @@ impl DhtHandle {
         port: Option<u16>,
         token: Token,
     ) -> Result<(), OurError> {
-        let transaction_id = self.transaction_id_pool.next();
-
         let query = if let Some(port) = port {
             Krpc::new_announce_peer_query(
-                TransactionId::from(transaction_id),
+                TransactionId::from(TXN_ID_PLACEHOLDER),
                 info_hash,
                 self.our_id.clone(),
                 port,
@@ -474,7 +461,7 @@ impl DhtHandle {
             )
         } else {
             Krpc::new_announce_peer_query(
-                TransactionId::from(transaction_id),
+                TransactionId::from(TXN_ID_PLACEHOLDER),
                 info_hash,
                 self.our_id.clone(),
                 // TODO: hmm, this interesting
@@ -485,7 +472,7 @@ impl DhtHandle {
             )
         };
 
-        let response = self.message_broker.send_and_wait(query, recipient).await?;
+        let response = self.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;
 
         return match response {
             Krpc::PingAnnouncePeerResponse(_) => Ok(()),
@@ -504,15 +491,10 @@ impl DhtHandle {
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {
         trace!("Asking {:?} for peers", dest);
         // construct the message to query our friends
-        let transaction_id = self.transaction_id_pool.next();
-
-        let query = Krpc::new_get_peers_query(TransactionId::from(transaction_id), self.our_id.clone(), info_hash);
+        let query = Krpc::new_get_peers_query(TXN_ID_PLACEHOLDER, self.our_id.clone(), info_hash);
 
         // send the message and await for a response
-        let response = self
-            .message_broker
-            .send_and_wait_timeout(query, dest, REQ_TIMEOUT)
-            .await?;
+        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
 
         return match response {
             Krpc::ErrorResponse(response) => {

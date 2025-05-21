@@ -300,10 +300,7 @@ impl Router {
             update_last_sent(&target.id(), unix_timestmap_ms(), &mut conn);
         }
 
-        let response = self
-            .message_broker
-            .send_and_wait_timeout(ping_msg, target.end_point(), REQ_TIMEOUT)
-            .await;
+        let response = self.message_broker.query(ping_msg, target, REQ_TIMEOUT).await;
         let mut conn = self.conn();
         match response {
             Ok(_) => self.marks_as_good(&target.id(), &mut conn),

@@ -1,9 +1,10 @@
-use crate::types::{InfoHash, NodeId, Token, TransactionId};
 use crate::message::ToRawKrpc;
+use crate::types::{InfoHash, NodeId, Token, TransactionId};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct AnnouncePeerQuery {
-    transaction_id: TransactionId,
+    /// TODO: use function eventually
+    pub transaction_id: TransactionId,
     querier: NodeId,
     implied_port: bool,
     info_hash: InfoHash,

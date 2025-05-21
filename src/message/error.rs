@@ -1,8 +1,8 @@
-use crate::{types::TransactionId, message::ToRawKrpc};
+use crate::{message::ToRawKrpc, types::TransactionId};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct KrpcError {
-    transaction_id: TransactionId,
+    pub transaction_id: TransactionId,
     code: u32,
     message: String,
 }

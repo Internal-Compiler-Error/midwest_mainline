@@ -20,12 +20,12 @@ use tracing::{info, instrument, trace, warn};
 
 use crate::{
     message::{Krpc, ParseKrpc, ToRawKrpc},
-    our_error::OurError,
+    our_error::{naur, OurError},
     types::{NodeInfo, TransactionId},
     utils::unix_timestmap_ms,
 };
 
-use super::router::update_last_sent;
+use super::{router::update_last_sent, TxnIdGenerator};
 
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
@@ -36,19 +36,35 @@ pub struct KrpcBroker {
     pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
 
     socket: Arc<UdpSocket>,
+    txn_id_generator: Arc<TxnIdGenerator>,
 
     /// a SPMC-esque queue, each readers can progress indepednelty
     inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<(Krpc, SocketAddrV4)>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
 }
 
+pub trait Routable {
+    fn endpoint(&self) -> SocketAddrV4;
+}
+
+impl Routable for SocketAddrV4 {
+    fn endpoint(&self) -> SocketAddrV4 {
+        *self
+    }
+}
+
 impl KrpcBroker {
-    pub fn new(socket: UdpSocket, db: Pool<ConnectionManager<SqliteConnection>>) -> Self {
+    pub fn new(
+        socket: UdpSocket,
+        db: Pool<ConnectionManager<SqliteConnection>>,
+        txn_id_generator: Arc<TxnIdGenerator>,
+    ) -> KrpcBroker {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             socket: Arc::new(socket),
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
+            txn_id_generator,
         }
     }
 
@@ -128,7 +144,8 @@ impl KrpcBroker {
         rx
     }
 
-    pub fn send_msg(&self, msg: Krpc, peer: SocketAddrV4) {
+    /// Send a message, fires up a new stask in background
+    fn send_msg(&self, msg: Krpc, peer: SocketAddrV4) {
         let socket = self.socket.clone();
 
         tokio::spawn(async move {
@@ -139,7 +156,7 @@ impl KrpcBroker {
     }
 
     /// Send a message out and await for a response.
-    pub async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddrV4) -> Result<Krpc, OurError> {
+    async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddrV4) -> Result<Krpc, OurError> {
         let sent_time = unix_timestmap_ms();
         let rx = {
             let rx = self.subscribe_one(message.transaction_id().clone());
@@ -149,27 +166,15 @@ impl KrpcBroker {
         let (response, _addr) = rx.await.unwrap();
 
         // don't wanna write a new function, so abuse a loop so I have access to `break`
-        loop {
-            // TODO: we really need to agree on whether to copy or share with node_id by default
-            let response_node_id = match &response {
-                Krpc::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
-                Krpc::FindNodeQuery(find_node_query) => find_node_query.querier(),
-                Krpc::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
-                Krpc::PingQuery(ping_query) => *ping_query.querier(),
-                Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
-                Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
-                Krpc::ErrorResponse(_) => break,
-            };
-
-            let mut conn = self.db.get().unwrap();
-            // it's a double update but that's issue for another day
-            update_last_sent(&response_node_id, sent_time, &mut conn);
-            break;
-        }
+        // no node_id means we have an error
+        let response_node_id = response.node_id().ok_or(naur!("node responded with error"))?;
+        let mut conn = self.db.get().unwrap();
+        // it's a double update but that's issue for another day
+        update_last_sent(&response_node_id, sent_time, &mut conn);
         Ok(response)
     }
 
-    pub async fn send_and_wait_timeout(
+    async fn send_and_wait_timeout(
         &self,
         message: Krpc,
         endpoint: SocketAddrV4,
@@ -185,15 +190,37 @@ impl KrpcBroker {
         Ok(response)
     }
 
-    pub fn send_msg_to_node(&self, msg: Krpc, peer: &NodeInfo) {
-        self.send_msg(msg, peer.end_point())
-    }
-
     pub fn subscribe_inbound(&self) -> mpsc::Receiver<(Krpc, SocketAddrV4)> {
         // TODO: make this configurable
         let (tx, rx) = mpsc::channel(1024);
         let mut subscribers = self.inbound_subscribers.lock().unwrap();
         subscribers.push(tx);
         rx
+    }
+
+    pub async fn reply(
+        &self,
+        mut message: Krpc,
+        node: &NodeInfo,
+        txn_id: TransactionId,
+        timeout: Duration,
+    ) -> Result<Krpc, OurError> {
+        // TODO: eventually people should *not* be able to set txn id themselves, if it's a reply,
+        // then provide it explitly in this function as param, if it's query, it will be
+        // automatically generated
+        message.set_txn_id(txn_id);
+        self.send_and_wait_timeout(message, node.end_point(), timeout).await
+    }
+
+    pub async fn query<E: Routable>(
+        &self,
+        mut message: Krpc,
+        endpoint: &E,
+        timeout: Duration,
+    ) -> Result<Krpc, OurError> {
+        let endpoint = endpoint.endpoint();
+
+        message.set_txn_id(self.txn_id_generator.next().into());
+        self.send_and_wait_timeout(message, endpoint, timeout).await
     }
 }
