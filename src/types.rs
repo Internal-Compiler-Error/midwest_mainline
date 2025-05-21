@@ -2,6 +2,7 @@ use bendy::encoding::ToBencode;
 use num::traits::ops::bytes;
 use smallvec::SmallVec;
 use std::{
+    cmp::Ordering,
     fmt::Debug,
     net::{Ipv4Addr, SocketAddrV4},
 };
@@ -10,6 +11,7 @@ use crate::models::NodeNoMetaInfo;
 
 pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
+pub const MAX_DIST: [u8; NODE_ID_LEN] = [u8::MAX; NODE_ID_LEN];
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct NodeId(pub [u8; NODE_ID_LEN]);
@@ -46,6 +48,14 @@ impl NodeId {
         }
         dist
     }
+}
+
+/// Compare the xor distance between `lhs` and `rhs` with respect the reference point
+pub fn cmp_resp(lhs: &NodeId, rhs: &NodeId, reference: &NodeId) -> Ordering {
+    let lhs_dist = reference.dist(&lhs);
+    let rhs_dist = reference.dist(&rhs);
+
+    lhs_dist.cmp(&rhs_dist)
 }
 
 impl ToBencode for NodeId {

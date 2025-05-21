@@ -24,26 +24,6 @@ use crate::{
 use super::dht_handle::REQ_TIMEOUT;
 use super::{krpc_broker::KrpcBroker, txn_id_generator::TxnIdGenerator};
 
-#[allow(unused)]
-macro_rules! bail_on_err {
-    ($result:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(_e) => return,
-        }
-    };
-}
-
-#[allow(unused)]
-macro_rules! bail_on_none {
-    ($result:expr) => {
-        match $result {
-            Some(val) => val,
-            None => return,
-        }
-    };
-}
-
 #[derive(Debug, Clone)]
 /// A Router will tell you who are the closest nodes that we know
 pub struct Router {

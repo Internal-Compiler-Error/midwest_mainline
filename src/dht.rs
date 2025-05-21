@@ -248,7 +248,8 @@ impl DhtV4 {
 mod tests {
     use crate::{
         dht::DhtV4,
-        types::{InfoHash /* , NodeId */},
+        types::InfoHash,
+        // types::{InfoHash /* , NodeId */},
     };
     // use opentelemetry::global;
     // use rand::RngCore;
@@ -324,7 +325,7 @@ mod tests {
         let external_ip = public_ip::addr_v4().await.unwrap();
 
         let dht = DhtV4::bootstrap_with_random_id(
-            SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
+            SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
             external_ip,
             vec![
                 // dht.tansmissionbt.com
@@ -339,11 +340,14 @@ mod tests {
         )
         .await?;
 
+        // XXX: get_peers design is problematic, impl has been replaced with todo!(), see the
+        // comment on the function itself for more info.
+        //
         let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
 
         let handle = dht.handle();
-        let (token, peers) = handle.get_peers(info_hash).await?;
-        info!("token {token:?}, peers {peers:?}");
+        let peers = handle.get_peers(info_hash).await?;
+        info!("peers {peers:?}");
         Ok(())
     }
 

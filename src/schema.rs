@@ -36,14 +36,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    txn_id (id) {
-        id -> Binary,
-        next_txn_id -> Integer,
-        last_updated -> BigInt,
-    }
-}
-
 diesel::joinable!(peer -> swarm (swarm));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -51,5 +43,4 @@ diesel::allow_tables_to_appear_in_same_query!(
     node,
     peer,
     swarm,
-    txn_id,
 );

@@ -1,6 +1,7 @@
 use crate::schema::*;
 use crate::token_generator::TokenGenerator;
-use crate::utils::unix_timestmap_ms;
+use crate::types::{cmp_resp, MAX_DIST};
+use crate::utils::{bail_on_err, unix_timestmap_ms};
 use crate::{
     message::{
         announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
@@ -8,14 +9,15 @@ use crate::{
     },
     our_error::{naur, OurError},
     types::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
-    utils::ParSpawnAndAwait,
 };
 use diesel::insert_into;
-use diesel::r2d2::Pool;
+use diesel::r2d2::{Pool, PooledConnection};
 use diesel::{prelude::*, r2d2::ConnectionManager};
+use futures::future::join_all;
 
 use crate::message::find_node_get_peers_response::Builder as ResBuilder;
 use rand::prelude::*;
+use std::cmp::min;
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddrV4},
@@ -23,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tokio::{task::Builder as TskBuilder, time::timeout};
-use tracing::{info_span, trace, warn, Instrument};
+use tracing::{error, info, info_span, trace, warn, Instrument};
 
 use super::{router::Router, txn_id_generator::TxnIdGenerator, KrpcBroker};
 
@@ -39,7 +41,7 @@ pub struct DhtHandle {
 
     swarms: Pool<ConnectionManager<SqliteConnection>>,
 
-    token_pool: TokenGenerator,
+    token_generator: TokenGenerator,
     message_broker: KrpcBroker,
 
     // parts needed to make requests
@@ -59,7 +61,7 @@ impl DhtHandle {
 
         Self {
             swarms,
-            token_pool: TokenGenerator::new(seed),
+            token_generator: TokenGenerator::new(seed),
             our_id: id,
             router,
             message_broker,
@@ -172,7 +174,7 @@ impl DhtHandle {
     #[tracing::instrument(skip(self))]
     async fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> Krpc {
         let peers = self.swarm_peers(query.info_hash());
-        let token_pool = &self.token_pool;
+        let token_pool = &self.token_generator;
 
         let token = token_pool.token_for_node(query.querier());
         if !peers.is_empty() {
@@ -196,7 +198,10 @@ impl DhtHandle {
     #[tracing::instrument(skip(self))]
     async fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> Krpc {
         // see if the token is valid
-        if !self.token_pool.is_valid_token(announce.querier(), announce.token()) {
+        if !self
+            .token_generator
+            .is_valid_token(announce.querier(), announce.token())
+        {
             return Krpc::new_standard_protocol_error(announce.txn_id().clone());
         }
 
@@ -211,8 +216,19 @@ impl DhtHandle {
         };
 
         let mut conn = self.swarms.get().unwrap();
+        let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, &mut conn).inspect_err(|e| warn!("{e}"));
+
+        Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
+    }
+
+    fn add_peers_to_db(
+        info_hash: &InfoHash,
+        peer_contact: SocketAddrV4,
+        conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
+    ) -> Result<usize, diesel::result::Error> {
+        // the ensure that the swarm bit should probably be a separate function
         conn.transaction(|conn| {
-            let info_hash = announce.info_hash().0.to_vec();
+            let info_hash = info_hash.as_bytes().to_vec();
             let swarm: Vec<u8> = insert_into(swarm::table)
                 .values(swarm::info_hash.eq(&info_hash))
                 .on_conflict_do_nothing()
@@ -222,8 +238,8 @@ impl DhtHandle {
             let now = unix_timestmap_ms();
             insert_into(peer::table)
                 .values(
-                    // TODO: this comes in the host native endianness, but it should be fine as long as the db
-                    // file is not transfered between computers
+                    // NOTE: this comes in the host native endianness, but it should be fine as long as the db
+                    // file is not transferred between computers
                     (
                         peer::ip_addr.eq(peer_contact.ip().to_string()),
                         peer::port.eq(peer_contact.port() as i32),
@@ -236,11 +252,7 @@ impl DhtHandle {
                 .set(peer::last_announced.eq(now))
                 .execute(conn)
         })
-        .expect("transaction for recording new peers failed");
-
-        Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
     }
-
     /**************************************   CLIENT SECTION   *********************************************/
 
     // TODO: need a function to send with timeout, unsubscribe and clean up when timeout expires
@@ -262,65 +274,87 @@ impl DhtHandle {
 
     /// starting point of trying to find any nodes on the network
     #[tracing::instrument(skip(self))]
-    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Result<NodeInfo, OurError> {
+    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Vec<NodeInfo> {
+        // TODO: While timout out of an individual request in the process of searching is not an
+        // error per se, it's still desirable to deliver these information to the caller somehow
+
         // if we already know the node, then no need for any network requests
         if let Some(node) = (&self).router.find_exact(&target) {
-            return Ok(node);
+            return vec![node];
         }
 
         let mut queried: HashSet<NodeInfo> = HashSet::new();
 
         // find the closest nodes that we know
         let mut closest = self.router.find_closest(target);
+        let mut querying = closest.clone();
         for node in closest.iter() {
             queried.insert(*node);
         }
 
+        let mut prev_distance = MAX_DIST;
         let mut round = 0;
         loop {
             if round == ROUNDS_LIMIT {
-                return Err(naur!("Too many rounds of find node"));
+                info!(
+                    "Too many rounds of find node, returning with {} closest nodes",
+                    closest.len()
+                );
+                return closest;
             }
             round += 1;
 
-            let returned_nodes = closest
+            let returned_nodes = querying
                 .iter()
                 .map(|node| node.end_point())
                 .map(|ip| self.clone().send_find_nodes_rpc(ip, target))
                 .collect::<Vec<_>>();
 
-            let returned_nodes = returned_nodes.par_spawn_and_await().await?;
+            let returned_nodes = join_all(returned_nodes).await;
 
             // filter out the ones that resulted in failure, such as due to time out
-            let returned_nodes: Vec<_> = returned_nodes
+            let mut returned_nodes: Vec<_> = returned_nodes
                 .into_iter()
                 .filter_map(|node| node.ok())
-                .flatten()
+                .flatten() // combine the "branched out" closests nodes together
                 .collect();
+
+            // the node we reached to might be dead already, which will return as a timeout
+            if returned_nodes.is_empty() {
+                info!(
+                    "Last round of branching returned nothing, returning with {} closest nodes",
+                    closest.len()
+                );
+                return closest;
+            }
 
             // it's possible that some of the nodes returned are actually the node we're looking for
             // so we check for that and return it if it's the case
             let target_node = returned_nodes.iter().find(|node| node.id() == target);
             if target_node.is_some() {
-                return Result::Ok(*target_node.unwrap());
+                return vec![*target_node.unwrap()];
             }
 
-            // if we don't have the node, then we find the alpha closest nodes and ask them in turn
-            let mut sorted_by_distance: Vec<_> = returned_nodes
-                .into_iter()
-                .map(|node| {
-                    let distance = node.id().dist(&self.our_id);
-                    (node, distance)
-                })
-                .collect();
-            sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
+            let next_round_dist = returned_nodes.iter().map(|n| n.id().dist(&target)).min().unwrap();
 
-            closest.clear();
-            for (node_info, _dist) in sorted_by_distance.iter().take(CONCURRENT_REQS) {
-                if !queried.contains(node_info) {
-                    closest.push(*node_info);
-                }
-            }
+            closest.append(&mut returned_nodes);
+            // TODO: while individually each request has been deduped, it's possible after
+            // combining, there are duplicates again, but sorting again seems kinda wasteful
+            closest.sort_unstable_by(|lhs, rhs| cmp_resp(&lhs.id(), &rhs.id(), &target));
+
+            querying.clear();
+            querying.extend(
+                closest
+                    .iter()
+                    .take_while(|n| {
+                        let dist = self.our_id.dist(&n.id());
+                        dist <= prev_distance
+                    })
+                    .take(CONCURRENT_REQS),
+            );
+            prev_distance = min(prev_distance, next_round_dist);
+
+            // another round we go!
         }
     }
 
@@ -362,77 +396,61 @@ impl DhtHandle {
         }
     }
 
-    // TODO: API is broken, since we can't guarantee that the peer will exist or we can find them,
-    // we should return a list of K closest nodes or the target itself if can be found
+    // TODO: think of a better name
+    async fn query_and_update(&self, endpoint: SocketAddrV4, info_hash: &InfoHash) {
+        // TODO: definitely not using the token, although we might be interested in adding the
+        // nodes?
+        let (_token, _nodes, peers) = bail_on_err!(self.send_get_peers_rpc(endpoint, *info_hash).await);
+
+        let mut conn = self.swarms.get().unwrap();
+        for peer in peers {
+            Self::add_peers_to_db(info_hash, peer, &mut conn).inspect_err(|e| error!("{e}"));
+        }
+    }
+
     #[tracing::instrument(skip(self))]
-    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<(Token, Vec<SocketAddrV4>), OurError> {
-        let resonsible = NodeId(info_hash.0);
+    // TODO:
+    // 1. should probably include a variant that always does reaches out even if we have entries
+    // in the database
+    // 2. the design of this API is problematic, instead of taking in an InfoHash, we should take
+    //    in an endpoint like `ping`, because the point of get_peers is two fold:
+    //    a. to obtain a list of peers if the querier needs them
+    //    b. (far more important) obtain the token so the querier can follow up with an
+    //       AnnouncePeer query to update *our* database
+    // 3. We should have a function that aggregates the peers we found by querying others, but not
+    //    this function with its current deisgn
+    // May 2025
+    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<Vec<SocketAddrV4>, OurError> {
+        let known_peers = self.swarm_peers(&info_hash);
+        if !known_peers.is_empty() {
+            return Ok(known_peers);
+        }
+
+        // TODO: what should be the terminating condition? Stop when any node returns a list of
+        // peers or similar to find_node that stops once we stop "improving"? If the latter, what
+        // does it mean by to improve?
         //
-        // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find_exact(&resonsible) {
-            let (token, _nodes, peers) = self.send_get_peers_rpc(node.end_point(), info_hash).await?;
-            return Ok((
-                token.expect("A node directly responsible for a piece would return a token"),
-                peers,
-            ));
-        }
+        // Current design just does *one* round of get_peers message
 
-        let mut queried: HashSet<NodeInfo> = HashSet::new();
+        // if let Some(node) = (&self).router.find_exact(&resonsible) {
+        //     let (token, nodes, peers) = self.send_get_peers_rpc(node.end_point(), info_hash).await?;
+        //
+        //     return Ok((
+        //         token.expect("A node directly responsible for a piece would return a token"),
+        //         peers,
+        //     ));
+        // }
 
-        // find the closest nodes that we know
-        let mut closest = self.router.find_closest(resonsible);
-        for node in closest.iter() {
-            queried.insert(*node);
-        }
+        let resonsible = NodeId(info_hash.0);
+        let closest = self.router.find_closest(resonsible);
+        let work: Vec<_> = closest
+            .into_iter()
+            .map(|n| self.query_and_update(n.end_point(), &info_hash))
+            .collect();
 
-        let mut round = 0;
-        loop {
-            if round == ROUNDS_LIMIT {
-                return Err(naur!("Too many rounds of find node"));
-            }
-            round += 1;
+        join_all(work).await;
 
-            let returned_nodes = closest
-                .iter()
-                .map(|node| node.end_point())
-                .map(|ip| self.clone().send_get_peers_rpc(ip, info_hash))
-                .collect::<Vec<_>>();
-
-            let returned_nodes = returned_nodes.par_spawn_and_await().await?;
-
-            // filter out the ones that resulted in failure, such as due to time out
-            let responses: Vec<_> = returned_nodes.into_iter().filter_map(|res| res.ok()).collect();
-
-            // if any of them has a list of peers already, we can stop
-            let peers_list = responses.iter().find(|(_token, _nodes, peers)| !peers.is_empty());
-            if peers_list.is_some() {
-                let peers_list = peers_list.unwrap().clone();
-                return Ok((
-                    peers_list
-                        .0
-                        .expect("If they have a list of peers, they will provide a token"),
-                    peers_list.2,
-                ));
-            }
-
-            // if we don't have the node, then we find the alpha closest nodes and ask them in turn
-            let mut sorted_by_distance: Vec<_> = responses
-                .into_iter()
-                .flat_map(|(_token, nodes, _peers)| {
-                    let our_id = self.our_id;
-                    let distances = nodes.into_iter().map(move |node| (node, node.id().dist(&our_id)));
-                    distances
-                })
-                .collect();
-            sorted_by_distance.sort_unstable_by_key(|(_, distance)| distance.clone());
-
-            closest.clear();
-            for (node_info, _dist) in sorted_by_distance.iter().take(CONCURRENT_REQS) {
-                if !queried.contains(node_info) {
-                    closest.push(*node_info);
-                }
-            }
-        }
+        Ok(self.swarm_peers(&info_hash))
     }
 
     #[tracing::instrument(skip(self))]
@@ -480,7 +498,7 @@ impl DhtHandle {
 
     #[tracing::instrument(skip(self))]
     async fn send_get_peers_rpc(
-        self: Arc<Self>,
+        &self,
         dest: SocketAddrV4,
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {

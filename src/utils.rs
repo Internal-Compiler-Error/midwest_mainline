@@ -34,3 +34,26 @@ pub fn unix_timestmap_ms() -> i64 {
     // see models.rs for why it's a stupid i64
     i64::try_from(timestamp_ms).expect("Timestmap couldn't fit into a i64, we don't support such exotic cases")
 }
+
+#[allow(unused)]
+macro_rules! bail_on_err {
+    ($result:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(_e) => return,
+        }
+    };
+}
+
+#[allow(unused)]
+macro_rules! bail_on_none {
+    ($result:expr) => {
+        match $result {
+            Some(val) => val,
+            None => return,
+        }
+    };
+}
+
+#[allow(unused)]
+pub(crate) use {bail_on_err, bail_on_none};
