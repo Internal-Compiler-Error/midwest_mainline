@@ -38,3 +38,18 @@ pub struct NodeNoMetaInfo {
     pub ip_addr: String,
     pub port: i32,
 }
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = crate::schema::misc)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct MiscVal {
+    pub value: String,
+}
+
+#[derive(Queryable, Selectable, Insertable)]
+#[diesel(table_name = crate::schema::misc)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Misc {
+    pub key: String,
+    pub value: String,
+}

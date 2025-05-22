@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
 };
 
-use crate::{dht::krpc_broker::Routable, models::NodeNoMetaInfo};
+use crate::{dht::krpc_broker::Routable, models::NodeNoMetaInfo, utils::base64_enc};
 
 pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
@@ -29,7 +29,7 @@ impl NodeId {
     /// Panics if the length is not exactly NODE_ID_LEN
     pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
         if bytes.len() != NODE_ID_LEN {
-            panic!("Node id must be exactly {NODE_ID_LEN} bytes");
+            panic!("Node id must be exactly {NODE_ID_LEN} bytes got {} bytes", bytes.len());
         }
 
         let mut arr = [0u8; NODE_ID_LEN];
@@ -218,10 +218,7 @@ pub const TXN_ID_PLACEHOLDER: TransactionId = TransactionId(SmallVec::from_const
 
 impl Debug for TransactionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use base64::prelude::*;
-        // let hex = hex::encode(self.0);
-        let str = BASE64_STANDARD.encode(&self.0);
-        write!(f, "{}", str)
+        write!(f, "{}", base64_enc(&self.0))
     }
 }
 

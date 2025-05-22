@@ -292,6 +292,7 @@ impl DhtHandle {
         let mut prev_distance = MAX_DIST;
         let mut round = 0;
         loop {
+            info!("round {round} of finding {target:?}");
             if round == ROUNDS_LIMIT {
                 info!(
                     "Too many rounds of find node, returning with {} closest nodes",

@@ -35,6 +35,18 @@ pub fn unix_timestmap_ms() -> i64 {
     i64::try_from(timestamp_ms).expect("Timestmap couldn't fit into a i64, we don't support such exotic cases")
 }
 
+pub fn base64_enc<T: AsRef<[u8]>>(data: T) -> String {
+    use base64::prelude::*;
+
+    BASE64_STANDARD.encode(data)
+}
+
+pub fn base64_dec<T: AsRef<[u8]>>(data: T) -> Vec<u8> {
+    use base64::prelude::*;
+
+    BASE64_STANDARD.decode(data).unwrap()
+}
+
 #[allow(unused)]
 macro_rules! bail_on_err {
     ($result:expr) => {

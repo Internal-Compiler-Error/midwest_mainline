@@ -5,8 +5,10 @@ mod txn_id_generator;
 
 use crate::{
     dht::dht_handle::DhtHandle,
+    models::{Misc, MiscVal},
     our_error::OurError,
     types::{NodeId, NODE_ID_LEN},
+    utils::{base64_dec, base64_enc},
 };
 use diesel::{
     connection::SimpleConnection,
@@ -14,7 +16,7 @@ use diesel::{
     r2d2::{self, ConnectionManager, CustomizeConnection, Pool},
     sql_types,
 };
-use tracing::info;
+use tracing::{error, info};
 
 use krpc_broker::KrpcBroker;
 use rand::{Rng, RngCore};
@@ -44,12 +46,13 @@ struct SensibleOptions;
 
 impl CustomizeConnection<SqliteConnection, r2d2::Error> for SensibleOptions {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), r2d2::Error> {
+        // NOTE: very important to set the timeout before any other pragma because they can require
+        // taking a lock themselves!
         conn.batch_execute(
             "
-            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 4000000;
             ",
         )
         .map_err(diesel::r2d2::Error::QueryError)?;
@@ -66,7 +69,9 @@ impl CustomizeConnection<SqliteConnection, r2d2::Error> for SensibleOptions {
 
             buf
         })
-        .map_err(diesel::r2d2::Error::QueryError)
+        .unwrap();
+
+        Ok(())
     }
 
     fn on_release(&self, _conn: SqliteConnection) {}
@@ -104,29 +109,71 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     NodeId(id)
 }
 
+fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<NodeId, diesel::result::Error> {
+    fn put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+        use crate::schema::misc::dsl::*;
+        diesel::insert_into(misc)
+            .values(Misc { key: keyy, value: vall })
+            .execute(conn)
+            .inspect_err(|e| error!("{e}"))?;
+        Ok(())
+    }
+
+    fn get(keyy: &str, conn: &mut SqliteConnection) -> Result<Option<String>, diesel::result::Error> {
+        use crate::schema::misc::dsl::*;
+        misc.filter(key.eq(keyy))
+            .select(MiscVal::as_select())
+            .get_result(conn)
+            .inspect_err(|e| {
+                // the return type is Result<Option<T>, E>, not finding a value is not a bug
+                if !matches!(e, diesel::result::Error::NotFound) {
+                    error!("{e}")
+                }
+            })
+            .map(|v| v.value)
+            .optional()
+    }
+
+    conn.transaction(|conn| {
+        let prev_ip = get("public_ip", conn)?;
+        let prev_id = get("id", conn)?;
+
+        let Some(prev_ip) = prev_ip else {
+            // No previous IP, so store the current one and generate a new ID
+            put("public_ip".to_string(), public_ip.to_string(), conn)?;
+            let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
+            put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
+            return Ok(id);
+        };
+
+        let prev_ip: Ipv4Addr = prev_ip.parse().unwrap();
+        if prev_ip == public_ip {
+            // IP matches, reuse ID
+            let id_in_base64 =
+                prev_id.expect("if the public ip of last session matches this session, id should have been set");
+            let id = base64_dec(id_in_base64);
+            Ok(NodeId::from_bytes_unchecked(&*id))
+        } else {
+            // IP changed, generate new ID
+            let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
+            put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
+            Ok(id)
+        }
+    })
+}
+
 impl DhtV4 {
-    /// Create a new DHT service the id is generated randomly in according to BEP-42 using the
-    /// external IP address of the machine. Note there is no way to verify the external IP address
+    /// Create a new DHT service, if the external_addr matches what was used last time, then reuse
+    /// the previous identity, otherwise adopt a new id. Note there is no way to verify the external IP address
     /// is correct and it's duty to make sure it's correct.
-    /// # Arguments
-    /// * `external_addr`: the ip address that can be reachable from the outside, in Ipv4 land, it
-    /// means this needs to be a public IP
     #[tracing::instrument(skip_all)]
-    pub async fn bootstrap_with_random_id(
+    pub async fn bootstrap_with_stable_id(
         bind_addr: SocketAddrV4,
         external_addr: Ipv4Addr,
         known_nodes: Vec<SocketAddrV4>,
     ) -> Result<Self, OurError> {
         let socket = UdpSocket::bind(&bind_addr).await?;
 
-        // id is randomly generated according to BEP-42
-        let our_id = random_idv4(&external_addr, rand::thread_rng().gen::<u8>());
-
-        // the JoinSet keeps all the tasks required to make the DHT node functional
-        let mut join_set = JoinSet::new();
-
-        let txn_id_generator = Arc::new(TxnIdGenerator::new());
-        //
         // TODO: make this configurable
         let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
@@ -135,6 +182,14 @@ impl DhtV4 {
             .connection_customizer(Box::new(SensibleOptions {}))
             .build(manager)
             .expect("Could not build DB connection pool");
+
+        let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
+
+        // the JoinSet keeps all the tasks required to make the DHT node functional
+        let mut join_set = JoinSet::new();
+
+        let txn_id_generator = Arc::new(TxnIdGenerator::new());
+        //
 
         let message_broker = KrpcBroker::new(socket, db.clone(), txn_id_generator.clone());
 
@@ -209,25 +264,18 @@ impl DhtV4 {
     ///
     /// This is subject to change in the future.
     #[tracing::instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtHandle>, peer: SocketAddrV4) -> Result<(), OurError> {
+    async fn bootstrap_from(dht: Arc<DhtHandle>, endpoint: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id.clone();
 
-        info!("bootstrapping with {peer}");
-        let _response = timeout(Duration::from_secs(5), async {
-            let node_id = dht.ping(peer).await?;
-            dht.router.add(node_id, peer);
+        info!("bootstrapping with {endpoint}");
 
-            // the find node only obviously we know ourselves, this only serves us to get us info
-            // about other nodes
-            let _ = dht.find_node(our_id).await;
-            info!("done finding node");
+        let node_id = dht.ping(endpoint).await?;
+        info!("obtained bootstrap node id {node_id:?}");
 
-            Ok::<(), eyre::Report>(())
-        })
-        .await?;
+        dht.router.add(node_id, endpoint);
+        dht.find_node(our_id).await;
 
-        // tokio::time::sleep(Duration::from_secs(60 * 5)).await;
-        info!("{peer} bootstrap success");
+        info!("{endpoint} bootstrap success");
         Ok(())
     }
 
@@ -279,7 +327,7 @@ mod tests {
 
         let external_ip = public_ip::addr_v4().await.unwrap();
 
-        let dht = DhtV4::bootstrap_with_random_id(
+        let dht = DhtV4::bootstrap_with_stable_id(
             SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
             external_ip,
             vec![
@@ -318,7 +366,7 @@ mod tests {
 
         let external_ip = public_ip::addr_v4().await.unwrap();
 
-        let dht = DhtV4::bootstrap_with_random_id(
+        let dht = DhtV4::bootstrap_with_stable_id(
             SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
             external_ip,
             vec![
@@ -390,7 +438,7 @@ mod tests {
         TEST_INIT.call_once(set_up_tracing);
         let external_ip = public_ip::addr_v4().await.unwrap();
 
-        let dht = DhtV4::bootstrap_with_random_id(
+        let dht = DhtV4::bootstrap_with_stable_id(
             SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
             external_ip,
             vec![

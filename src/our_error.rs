@@ -1,6 +1,5 @@
 use std::io;
 use thiserror::Error;
-use tokio::{task::JoinError, time::error::Elapsed};
 
 #[derive(Debug, Error)]
 /// An old joke on soviet union
@@ -30,11 +29,14 @@ pub enum OurError {
 
     // wtf
     #[error("Join Error")]
-    JoinError(#[from] JoinError),
+    JoinError(#[from] tokio::task::JoinError),
 
     // wtf
     #[error("Timed out")]
-    Timeout(#[from] Elapsed),
+    Timeout(#[from] tokio::time::error::Elapsed),
+
+    #[error("Internal database error")]
+    DatabaseError(#[from] diesel::result::Error),
 }
 
 /// When Australians say no
