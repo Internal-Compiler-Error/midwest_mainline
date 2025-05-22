@@ -1,6 +1,6 @@
 [package]
 name = "midwest_mainline"
-version = "0.1.1-beta"
+version = "0.2.0-beta"
 edition = "2024"
 license = "MIT"
 description = "A BitTorrent DHT implementation in async Rust"
@@ -12,9 +12,10 @@ documentation = "https://docs.rs/crate/midwest_mainline/"
 # [package.metadata.docs.rs]
 # rustc-args = ["--cfg", "tokio_unstable"]
 
-[[bin]]
-name = "parser_tester"
-path = "src/parser_tester.rs"
+# use workspace or something, it uses color-eyre and I don't want it as non dev dependencies anymore
+# [[bin]]
+# name = "parser_tester"
+# path = "src/parser_tester.rs"
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,7 +29,6 @@ tokio = { version = "^1.38", features = ["full", "tracing"] }
 tokio-stream = "0.1"
 async-recursion = "1.1.0"
 futures = "0.3.30"
-color-eyre = "^0.6"
 tracing = "^0.1"
 async-trait = "^0.1"
 crc32c = "^0.6"
@@ -42,6 +42,7 @@ eyre = "0.6.12"
 diesel = { version = "2.2.10", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2" ] }
 
 [dev-dependencies]
+color-eyre = "^0.6"
 serde_json = "^1.0"
 console-subscriber = "0.3.0"
 tracing-subscriber = "^0.3"
