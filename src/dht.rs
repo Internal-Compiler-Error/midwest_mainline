@@ -25,9 +25,8 @@ use std::{
     env,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
-    time::Duration,
 };
-use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
+use tokio::{net::UdpSocket, task::JoinSet};
 use txn_id_generator::TxnIdGenerator;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
@@ -189,7 +188,6 @@ impl DhtV4 {
         let mut join_set = JoinSet::new();
 
         let txn_id_generator = Arc::new(TxnIdGenerator::new());
-        //
 
         let message_broker = KrpcBroker::new(socket, db.clone(), txn_id_generator.clone());
 
@@ -202,12 +200,7 @@ impl DhtV4 {
             })
             .unwrap();
 
-        let router = Router::new(
-            our_id,
-            message_broker.clone(),
-            Arc::clone(&txn_id_generator),
-            db.clone(),
-        );
+        let router = Router::new(our_id, message_broker.clone(), db.clone());
 
         let rx = message_broker.subscribe_inbound();
         let inner_router = router.clone();

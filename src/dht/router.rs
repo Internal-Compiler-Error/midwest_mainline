@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
-use std::{net::SocketAddrV4, sync::Arc, usize};
+use std::{net::SocketAddrV4, usize};
 
 use diesel::r2d2::PooledConnection;
 use diesel::{insert_into, prelude::*};
@@ -15,14 +15,15 @@ use tracing::{error, info};
 
 use crate::dht::xor;
 use crate::models::NodeNoMetaInfo;
+use crate::types::TXN_ID_PLACEHOLDER;
 use crate::utils::unix_timestmap_ms;
 use crate::{
     message::Krpc,
-    types::{self, NodeId, NodeInfo, TransactionId},
+    types::{self, NodeId, NodeInfo},
 };
 
 use super::dht_handle::REQ_TIMEOUT;
-use super::{krpc_broker::KrpcBroker, txn_id_generator::TxnIdGenerator};
+use super::krpc_broker::KrpcBroker;
 
 #[derive(Debug, Clone)]
 /// A Router will tell you who are the closest nodes that we know
@@ -30,22 +31,15 @@ pub struct Router {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
     message_broker: KrpcBroker,
-    txn_id_generator: Arc<TxnIdGenerator>,
     bucket_size: usize,
 }
 
 impl Router {
-    pub fn new(
-        id: NodeId,
-        message_broker: KrpcBroker,
-        txn_id_generator: Arc<TxnIdGenerator>,
-        table: Pool<ConnectionManager<SqliteConnection>>,
-    ) -> Router {
+    pub fn new(id: NodeId, message_broker: KrpcBroker, table: Pool<ConnectionManager<SqliteConnection>>) -> Router {
         Router {
             id,
             table,
             message_broker,
-            txn_id_generator,
             bucket_size: 1024, // TODO: make this configurable in the future
         }
     }
@@ -292,8 +286,7 @@ impl Router {
 
     // Send a ping to fresh the node
     async fn refresh_node(&self, target: &NodeInfo) {
-        let txn_id = self.txn_id_generator.next();
-        let ping_msg = Krpc::new_ping_query(TransactionId::from(txn_id), self.id);
+        let ping_msg = Krpc::new_ping_query(TXN_ID_PLACEHOLDER, self.id);
 
         {
             let mut conn = self.conn();
