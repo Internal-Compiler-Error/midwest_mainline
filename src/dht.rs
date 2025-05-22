@@ -5,7 +5,6 @@ mod txn_id_generator;
 
 use crate::{
     dht::dht_handle::DhtHandle,
-    models::{Misc, MiscVal},
     our_error::OurError,
     types::{NodeId, NODE_ID_LEN},
     utils::{base64_dec, base64_enc, db_get, db_put},
@@ -16,7 +15,7 @@ use diesel::{
     r2d2::{self, ConnectionManager, CustomizeConnection, Pool},
     sql_types,
 };
-use tracing::{error, info};
+use tracing::info;
 
 use krpc_broker::KrpcBroker;
 use rand::{Rng, RngCore};
@@ -230,6 +229,8 @@ impl DhtV4 {
     pub async fn run(mut self) {
         while let Some(_) = self.helper_tasks.join_next().await {}
     }
+
+    pub async fn populate_random(&self) {}
 
     /// Given a known node, perform one find node to ourself add the response to the routing table
     /// *and* do one additional round of find node to all the returned nodes from the bootstrapping

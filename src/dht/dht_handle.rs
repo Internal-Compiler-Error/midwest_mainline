@@ -41,7 +41,7 @@ pub struct DhtHandle {
     pub(crate) our_id: NodeId,
     pub(crate) router: Router,
 
-    swarms: Pool<ConnectionManager<SqliteConnection>>,
+    conn: Pool<ConnectionManager<SqliteConnection>>,
 
     token_generator: TokenGenerator,
     message_broker: KrpcBroker,
@@ -58,7 +58,7 @@ impl DhtHandle {
         let seed: u128 = rng.gen();
 
         Self {
-            swarms,
+            conn: swarms,
             token_generator: TokenGenerator::new(seed),
             our_id: id,
             router,
@@ -145,7 +145,7 @@ impl DhtHandle {
             unix_timestmap_ms() - thirty_minutes_ms
         }
 
-        let mut conn = self.swarms.get().expect("failed to get one connection from pool");
+        let mut conn = self.conn.get().expect("failed to get one connection from pool");
 
         let peers = peer::table
             .inner_join(swarm::table.on(peer::swarm.eq(swarm::info_hash)))
@@ -213,7 +213,7 @@ impl DhtHandle {
             }
         };
 
-        let mut conn = self.swarms.get().unwrap();
+        let mut conn = self.conn.get().unwrap();
         let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, &mut conn).inspect_err(|e| warn!("{e}"));
 
         Krpc::new_announce_peer_response(announce.txn_id().clone(), self.our_id.clone())
@@ -387,14 +387,15 @@ impl DhtHandle {
     }
 
     // TODO: think of a better name
+    /// Send a GetPeers query to the endpoint about the info_hash, and add all the peers obtained to the database
     async fn query_and_update(&self, endpoint: SocketAddrV4, info_hash: &InfoHash) {
         // TODO: definitely not using the token, although we might be interested in adding the
         // nodes?
         let (_token, _nodes, peers) = bail_on_err!(self.send_get_peers_rpc(endpoint, *info_hash).await);
 
-        let mut conn = self.swarms.get().unwrap();
+        let mut conn = self.conn.get().unwrap();
         for peer in peers {
-            Self::add_peers_to_db(info_hash, peer, &mut conn).inspect_err(|e| error!("{e}"));
+            let _ = Self::add_peers_to_db(info_hash, peer, &mut conn).inspect_err(|e| error!("{e}"));
         }
     }
 
