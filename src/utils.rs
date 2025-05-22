@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use diesel::prelude::*;
+use diesel::SqliteConnection;
 use std::{future::Future, time::SystemTime};
 use tokio::task::{JoinError, JoinSet};
 
@@ -66,6 +68,31 @@ macro_rules! bail_on_none {
         }
     };
 }
+
+pub fn db_put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    use crate::schema::misc::dsl::*;
+    diesel::insert_into(misc)
+        .values(Misc { key: keyy, value: vall })
+        .execute(conn)
+        .inspect_err(|e| tracing::error!("{e}"))?;
+    Ok(())
+}
+
+pub fn db_get(keyy: &str, conn: &mut SqliteConnection) -> Result<Option<String>, diesel::result::Error> {
+    use crate::schema::misc::dsl::*;
+    misc.filter(key.eq(keyy))
+        .select(MiscVal::as_select())
+        .get_result(conn)
+        .inspect_err(|e| {
+            // the return type is Result<Option<T>, E>, not finding a value is not a bug
+            if !matches!(e, diesel::result::Error::NotFound) {
+                tracing::error!("{e}")
+            }
+        })
+        .map(|v| v.value)
+        .optional()
+}
+use crate::models::{Misc, MiscVal};
 
 #[allow(unused)]
 pub(crate) use {bail_on_err, bail_on_none};

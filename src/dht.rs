@@ -8,7 +8,7 @@ use crate::{
     models::{Misc, MiscVal},
     our_error::OurError,
     types::{NodeId, NODE_ID_LEN},
-    utils::{base64_dec, base64_enc},
+    utils::{base64_dec, base64_enc, db_get, db_put},
 };
 use diesel::{
     connection::SimpleConnection,
@@ -109,40 +109,13 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
 }
 
 fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<NodeId, diesel::result::Error> {
-    fn put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-        use crate::schema::misc::dsl::*;
-        diesel::insert_into(misc)
-            .values(Misc { key: keyy, value: vall })
-            .execute(conn)
-            .inspect_err(|e| error!("{e}"))?;
-        Ok(())
-    }
-
-    fn get(keyy: &str, conn: &mut SqliteConnection) -> Result<Option<String>, diesel::result::Error> {
-        use crate::schema::misc::dsl::*;
-        misc.filter(key.eq(keyy))
-            .select(MiscVal::as_select())
-            .get_result(conn)
-            .inspect_err(|e| {
-                // the return type is Result<Option<T>, E>, not finding a value is not a bug
-                if !matches!(e, diesel::result::Error::NotFound) {
-                    error!("{e}")
-                }
-            })
-            .map(|v| v.value)
-            .optional()
-    }
-
     conn.transaction(|conn| {
-        let prev_ip = get("public_ip", conn)?;
-        let prev_id = get("id", conn)?;
+        let prev_ip = db_get("public_ip", conn)?;
+        let prev_id = db_get("id", conn)?;
 
         let Some(prev_ip) = prev_ip else {
             // No previous IP, so store the current one and generate a new ID
-            put("public_ip".to_string(), public_ip.to_string(), conn)?;
-            let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
-            put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
-            return Ok(id);
+            return new_identity(public_ip, conn);
         };
 
         let prev_ip: Ipv4Addr = prev_ip.parse().unwrap();
@@ -155,10 +128,17 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
         } else {
             // IP changed, generate new ID
             let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
-            put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
+            db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
             Ok(id)
         }
     })
+}
+
+fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<NodeId, diesel::result::Error> {
+    db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
+    let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
+    db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
+    Ok(id)
 }
 
 impl DhtV4 {
