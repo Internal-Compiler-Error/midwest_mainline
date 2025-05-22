@@ -15,7 +15,7 @@ use crate::message::find_node_query::FindNodeQuery;
 use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
 use crate::types::{InfoHash, NodeId};
-use juicy_bencode::{parse_bencode_dict, BencodeItemView};
+use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 
 pub mod announce_peer_query;
 pub mod error;
@@ -69,7 +69,7 @@ impl ParseKrpc for &[u8] {
         let message_type_indicator = parsed
             .get(b"y".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message as no 'y' key")))?;
-        let BencodeItemView::ByteString(ref message_type) = message_type_indicator else {
+        let BencodeItemView::ByteString(message_type) = message_type_indicator else {
             // invalid message
             return Err(OurError::DecodeError(eyre!("Message 'y' key is not a binary string")));
         };
@@ -77,7 +77,7 @@ impl ParseKrpc for &[u8] {
         let transaction_id = parsed
             .get(&b"t".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message has no 't' key")))?;
-        let BencodeItemView::ByteString(ref transaction_id) = transaction_id else {
+        let BencodeItemView::ByteString(transaction_id) = transaction_id else {
             return Err(OurError::DecodeError(eyre!("Message 't' key is not a binary string")));
         };
         let transaction_id = TransactionId::from_bytes(transaction_id);
@@ -101,7 +101,7 @@ impl ParseKrpc for &[u8] {
                 return Err(OurError::DecodeError(eyre!("First element is not an int")));
             };
 
-            let BencodeItemView::ByteString(ref message) = message else {
+            let BencodeItemView::ByteString(message) = message else {
                 return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
             };
             let message = str::from_utf8(message)
@@ -237,7 +237,7 @@ impl ParseKrpc for &[u8] {
             let id = response
                 .get(b"id".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Response message has no 'id' key")))?;
-            let BencodeItemView::ByteString(ref target_id) = id else {
+            let BencodeItemView::ByteString(target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
             let target_id = assert_len(&target_id, 20)?;
@@ -247,7 +247,7 @@ impl ParseKrpc for &[u8] {
             let nodes = match response.contains_key(b"nodes".as_slice()) {
                 true => {
                     let nodes = response.get(b"nodes".as_slice()).unwrap();
-                    let BencodeItemView::ByteString(ref nodes) = nodes else {
+                    let BencodeItemView::ByteString(nodes) = nodes else {
                         return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
                     };
 

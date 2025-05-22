@@ -6,7 +6,7 @@ mod txn_id_generator;
 use crate::{
     dht::dht_handle::DhtHandle,
     our_error::OurError,
-    types::{NodeId, NODE_ID_LEN},
+    types::{NODE_ID_LEN, NodeId},
     utils::{base64_dec, base64_enc, db_get, db_put},
 };
 use diesel::{
@@ -83,7 +83,7 @@ define_sql_function! {
 }
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let r = rand & 0x07;
     let mut id = [0u8; 20];
     let mut ip = external_ip.octets();
@@ -98,7 +98,7 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
 
     id[0] = (crc >> 24) as u8;
     id[1] = (crc >> 16) as u8;
-    id[2] = (((crc >> 8) & 0xf8) as u8) | (rng.gen::<u8>() & 0x7);
+    id[2] = (((crc >> 8) & 0xf8) as u8) | (rng.random::<u8>() & 0x7);
 
     rng.fill_bytes(&mut id[3..19]);
 
@@ -126,7 +126,7 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
             Ok(NodeId::from_bytes_unchecked(&*id))
         } else {
             // IP changed, generate new ID
-            let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
+            let id = random_idv4(&public_ip, rand::rng().random::<u8>());
             db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
             Ok(id)
         }
@@ -135,7 +135,7 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
 
 fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<NodeId, diesel::result::Error> {
     db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
-    let id = random_idv4(&public_ip, rand::thread_rng().gen::<u8>());
+    let id = random_idv4(&public_ip, rand::rng().random::<u8>());
     db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
     Ok(id)
 }
@@ -272,7 +272,7 @@ mod tests {
     use std::{net::SocketAddrV4, str::FromStr, sync::Once};
     use tokio::time::{self, timeout};
     use tracing::info;
-    use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+    use tracing_subscriber::{Layer, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     static TEST_INIT: Once = Once::new();
 

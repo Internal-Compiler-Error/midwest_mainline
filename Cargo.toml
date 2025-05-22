@@ -1,7 +1,7 @@
 [package]
 name = "midwest_mainline"
 version = "0.1.1-beta"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 description = "A BitTorrent DHT implementation in async Rust"
 readme = "README.md"
@@ -23,7 +23,7 @@ path = "src/parser_tester.rs"
 num = { version = "^0.4" }
 bendy = { version = "^0.3" }
 juicy_bencode = "^0.1"
-rand = { version = "^0.8", features = ["small_rng"] }
+rand = { version = "^0.9", features = ["small_rng"] }
 tokio = { version = "^1.38", features = ["full", "tracing"] }
 tokio-stream = "0.1"
 async-recursion = "1.1.0"

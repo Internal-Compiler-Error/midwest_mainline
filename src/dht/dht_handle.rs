@@ -1,21 +1,21 @@
 use crate::schema::*;
 use crate::token_generator::TokenGenerator;
-use crate::types::{cmp_resp, MAX_DIST, TXN_ID_PLACEHOLDER};
+use crate::types::{MAX_DIST, TXN_ID_PLACEHOLDER, cmp_resp};
 use crate::utils::{bail_on_err, unix_timestmap_ms};
 use crate::{
     message::{
-        announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-        ping_query::PingQuery, Krpc,
+        Krpc, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
+        ping_query::PingQuery,
     },
-    our_error::{naur, OurError},
+    our_error::{OurError, naur},
     types::{InfoHash, NodeId, NodeInfo, Token, TransactionId},
 };
 use diesel::insert_into;
 use diesel::r2d2::{Pool, PooledConnection};
 use diesel::{prelude::*, r2d2::ConnectionManager};
 use futures::future::join_all;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::message::find_node_get_peers_response::Builder as ResBuilder;
 use rand::prelude::*;
@@ -27,9 +27,9 @@ use std::{
     time::Duration,
 };
 use tokio::task::Builder as TskBuilder;
-use tracing::{error, info, info_span, trace, warn, Instrument};
+use tracing::{Instrument, error, info, info_span, trace, warn};
 
-use super::{router::Router, KrpcBroker};
+use super::{KrpcBroker, router::Router};
 
 // TODO: make these configurable some day
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,8 +54,8 @@ impl DhtHandle {
         message_broker: KrpcBroker,
         swarms: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let seed: u128 = rng.gen();
+        let mut rng = rand::rng();
+        let seed: u128 = rng.random();
 
         Self {
             conn: swarms,
