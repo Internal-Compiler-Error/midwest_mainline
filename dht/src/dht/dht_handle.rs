@@ -227,12 +227,11 @@ impl DhtHandle {
         // the ensure that the swarm bit should probably be a separate function
         conn.transaction(|conn| {
             let info_hash = info_hash.as_bytes().to_vec();
-            let swarm: Vec<u8> = insert_into(swarm::table)
+            let _ = insert_into(swarm::table)
                 .values(swarm::info_hash.eq(&info_hash))
                 .on_conflict_do_nothing()
-                .returning(swarm::info_hash)
-                .get_result(conn)
-                .inspect_err(|e| warn!("{e}"))?;
+                .execute(conn)
+                .inspect_err(|e| error!("{e}"))?;
 
             let now = unix_timestmap_ms();
             insert_into(peer::table)
@@ -242,7 +241,7 @@ impl DhtHandle {
                     (
                         peer::ip_addr.eq(peer_contact.ip().to_string()),
                         peer::port.eq(peer_contact.port() as i32),
-                        peer::swarm.eq(swarm),
+                        peer::swarm.eq(info_hash),
                         peer::last_announced.eq(now),
                     ),
                 )
