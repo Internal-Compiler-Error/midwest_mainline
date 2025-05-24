@@ -231,7 +231,8 @@ impl DhtHandle {
                 .values(swarm::info_hash.eq(&info_hash))
                 .on_conflict_do_nothing()
                 .returning(swarm::info_hash)
-                .get_result(conn)?;
+                .get_result(conn)
+                .inspect_err(|e| warn!("{e}"))?;
 
             let now = unix_timestmap_ms();
             insert_into(peer::table)
@@ -249,6 +250,7 @@ impl DhtHandle {
                 .do_update()
                 .set(peer::last_announced.eq(now))
                 .execute(conn)
+                .inspect_err(|e| warn!("{e}"))
         })
     }
     /**************************************   CLIENT SECTION   *********************************************/
