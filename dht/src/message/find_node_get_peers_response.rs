@@ -145,7 +145,6 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
                                 let port = &mut arr[4..6];
                                 port.copy_from_slice(&port_in_be);
 
-                                // bendy is stupid
                                 Value::Bytes(Cow::Owned(arr.as_slice().to_vec()))
                             });
 
@@ -154,28 +153,35 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
                     }
 
                     if !self.nodes.is_empty() {
-                        // nodes is a list of node id concated with the their ip and port
+                        // nodes is a giant binary string, its length is some product of 26, each
+                        // 26 byte is compromised of 20 bytes of node id, 4 bytes of ip address and
+                        // 2 bytes of port number
                         e.emit_pair_with(b"nodes", |e| {
-                            let combined = self.nodes.iter().map(|peer| {
-                                let node_id = &peer.id();
+                            let combined: Vec<u8> = self
+                                .nodes
+                                .iter()
+                                .map(|peer| {
+                                    let node_id = &peer.id();
 
-                                let octets = peer.end_point().ip().octets();
-                                let port_in_be = peer.end_point().port().to_be_bytes();
+                                    let octets = peer.end_point().ip().octets();
+                                    let port_in_be = peer.end_point().port().to_be_bytes();
 
-                                let mut arr = [0u8; 26];
-                                let id = &mut arr[0..20];
-                                id.copy_from_slice(&node_id.0);
+                                    let mut arr = [0u8; 26];
+                                    let id = &mut arr[0..20];
+                                    id.copy_from_slice(&node_id.0);
 
-                                let ip = &mut arr[20..24];
-                                ip.copy_from_slice(&octets);
+                                    let ip = &mut arr[20..24];
+                                    ip.copy_from_slice(&octets);
 
-                                let port = &mut arr[24..26];
-                                port.copy_from_slice(&port_in_be);
+                                    let port = &mut arr[24..26];
+                                    port.copy_from_slice(&port_in_be);
 
-                                // because bendy is stupid
-                                Vec::from_iter(arr)
-                            });
-                            e.emit_unchecked_list(combined)
+                                    arr
+                                })
+                                .flatten()
+                                .collect();
+
+                            e.emit_bytes(&combined)
                         });
                     }
 
@@ -198,7 +204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn can_encode_example() {
+    fn can_encode_has_peers_example() {
         use std::str;
 
         let response = Builder::new(
@@ -214,6 +220,34 @@ mod tests {
         let encoded = str::from_utf8(&*encoded).unwrap();
 
         let expected = "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:axje.u6:idhtnmee1:t2:aa1:y1:re";
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn can_encode_no_peers() {
+        use std::str;
+
+        let response = Builder::new(
+            TransactionId::from_bytes(*&b"aa"),
+            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+        )
+        .with_token(Token::from_bytes(*&b"aoeusnth"))
+        .with_node(NodeInfo::new(
+            NodeId::from_bytes_unchecked(*&b"lmnopqrstuvxyz098765"),
+            SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
+        ))
+        .with_node(NodeInfo::new(
+            NodeId::from_bytes_unchecked(*&b"lmnopqrstuvxyz098765"),
+            SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
+        ))
+        .build();
+
+        let encoded = response.to_raw_krpc();
+        let encoded = str::from_utf8(&*encoded).unwrap();
+
+        let expected =
+            "d1:rd2:id20:abcdefghij01234567895:nodes26:lmnopqrstuvxyz098765axje.u5:token8:aoeusnthe1:t2:aa1:y1:re";
 
         assert_eq!(encoded, expected);
     }

@@ -230,15 +230,6 @@ impl DhtV4 {
         while let Some(_) = self.helper_tasks.join_next().await {}
     }
 
-    /// Randomly generates a node_id and send a find_node, used to populate the DHT
-    pub async fn populate_random(&self) {
-        let mut rng = rand::rng();
-        let node_id: [u8; 20] = rng.random();
-        let node_id = NodeId(node_id);
-
-        self.handle().find_node(node_id).await;
-    }
-
     /// Given a known node, perform one find node to ourself add the response to the routing table
     /// *and* do one additional round of find node to all the returned nodes from the bootstrapping
     /// node.
