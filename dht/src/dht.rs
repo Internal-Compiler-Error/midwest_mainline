@@ -6,7 +6,7 @@ mod txn_id_generator;
 use crate::{
     dht::dht_handle::DhtHandle,
     our_error::OurError,
-    types::{NODE_ID_LEN, NodeId},
+    types::{InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
     utils::{base64_dec, base64_enc, db_get, db_put},
 };
 use diesel::{
@@ -22,7 +22,7 @@ use rand::{Rng, RngCore};
 use router::Router;
 use std::{
     env,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
 use tokio::{net::UdpSocket, task::JoinSet};
@@ -36,7 +36,7 @@ pub struct DhtV4 {
     server: Arc<DhtHandle>,
     message_broker: KrpcBroker,
     router: Router,
-    helper_tasks: JoinSet<()>,
+    addr: SocketAddrV4,
 }
 
 #[derive(Debug)]
@@ -144,13 +144,16 @@ impl DhtV4 {
     /// Create a new DHT service, if the external_addr matches what was used last time, then reuse
     /// the previous identity, otherwise adopt a new id. Note there is no way to verify the external IP address
     /// is correct and it's duty to make sure it's correct.
-    #[tracing::instrument(skip_all)]
-    pub async fn bootstrap_with_stable_id(
-        bind_addr: SocketAddrV4,
-        external_addr: Ipv4Addr,
-        known_nodes: Vec<SocketAddrV4>,
-    ) -> Result<Self, OurError> {
-        let socket = UdpSocket::bind(&bind_addr).await?;
+    ///
+    /// The UdpSocket must be already binded to an ipv4 address
+    pub fn with_stable_id(listen_socket: UdpSocket, external_addr: Ipv4Addr) -> Result<Self, OurError> {
+        let local_addr = match listen_socket
+            .local_addr()
+            .expect("listen socket should already be binded per doc")
+        {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("listen socket must be binded to ipv4"),
+        };
 
         // TODO: make this configurable
         let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
@@ -163,71 +166,93 @@ impl DhtV4 {
 
         let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
 
-        // the JoinSet keeps all the tasks required to make the DHT node functional
-        let mut join_set = JoinSet::new();
+        let message_broker = KrpcBroker::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()).clone());
 
-        let txn_id_generator = Arc::new(TxnIdGenerator::new());
+        let router = Router::new(
+            our_id,
+            message_broker.clone(),
+            db.clone(),
+            message_broker.subscribe_inbound(),
+        );
 
-        let message_broker = KrpcBroker::new(socket, db.clone(), txn_id_generator.clone());
-
-        let message_broker_clone = message_broker.clone();
-        join_set
-            .build_task()
-            .name(&*format!("message broker for {bind_addr}"))
-            .spawn(async move {
-                let _ = message_broker_clone.run().await;
-            })
-            .unwrap();
-
-        let router = Router::new(our_id, message_broker.clone(), db.clone());
-
-        let rx = message_broker.subscribe_inbound();
-        let inner_router = router.clone();
-        join_set
-            .build_task()
-            .name("Router")
-            .spawn(async move { inner_router.run(rx).await })
-            .unwrap();
-
-        let server = DhtHandle::new(our_id, router.clone(), message_broker.clone(), db.clone());
-        let server = Arc::new(server);
-
-        join_set
-            .build_task()
-            .name(&*format!("DHT server for {bind_addr}"))
-            .spawn(server.clone().run())
-            .unwrap();
+        let server = Arc::new(DhtHandle::new(
+            our_id,
+            router.clone(),
+            message_broker.clone(),
+            db.clone(),
+        ));
 
         let dht = DhtV4 {
             server: server.clone(),
             message_broker,
             router: router.clone(),
-            helper_tasks: join_set,
+            addr: local_addr,
         };
 
-        // ask all the known nodes for ourselves
+        Ok(dht)
+    }
+
+    pub async fn bootstrap(&self, known_nodes: Vec<SocketAddrV4>) -> Result<(), OurError> {
         let mut bootstrap_join_set = JoinSet::new();
 
         for contact in known_nodes {
             bootstrap_join_set
                 .build_task()
                 .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(server.clone(), contact))
+                .spawn(Self::bootstrap_from(self.handle().clone(), contact))
                 .unwrap();
         }
 
-        while let Some(_) = bootstrap_join_set.join_next().await {}
-        drop(bootstrap_join_set);
+        bootstrap_join_set.join_all().await;
 
-        info!("DHT bootstrapped, routing table has {} nodes", router.node_count());
+        info!("DHT bootstrapped, routing table has {} nodes", self.node_count());
 
-        Ok(dht)
+        Ok(())
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.router.node_count()
+    }
+
+    pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
+        self.server.find_node(target).await
+    }
+
+    pub async fn get_peers(&self, info_hash: InfoHash) -> Vec<SocketAddrV4> {
+        match self.server.get_peers(info_hash).await {
+            Result::Ok(peers) => peers,
+            _ => vec![],
+        }
     }
 
     /// Keep the DHT running so you can use the clients and servers, usually you put spawn this
     /// and abort the task when desired
-    pub async fn run(mut self) {
-        while let Some(_) = self.helper_tasks.join_next().await {}
+    pub async fn run(&self) {
+        let mut join_set = JoinSet::new();
+
+        let krpc_broker = self.message_broker.clone();
+        join_set
+            .build_task()
+            .name(&*format!("message broker for {}", self.addr))
+            .spawn(async move {
+                let _ = krpc_broker.run().await;
+            })
+            .unwrap();
+
+        let router = self.router.clone();
+        join_set
+            .build_task()
+            .name("Router")
+            .spawn(async move { router.clone().run().await })
+            .unwrap();
+
+        join_set
+            .build_task()
+            .name(&*format!("DHT server"))
+            .spawn(self.server.clone().run())
+            .unwrap();
+
+        join_set.join_all().await;
     }
 
     /// Given a known node, perform one find node to ourself add the response to the routing table
@@ -244,7 +269,6 @@ impl DhtV4 {
         let node_id = dht.ping(endpoint).await?;
         info!("obtained bootstrap node id {node_id:?}");
 
-        dht.router.add(node_id, endpoint);
         dht.find_node(our_id).await;
 
         info!("{endpoint} bootstrap success");
@@ -262,13 +286,16 @@ impl DhtV4 {
 mod tests {
     use crate::{
         dht::DhtV4,
-        types::InfoHash,
         // types::{InfoHash /* , NodeId */},
     };
     // use opentelemetry::global;
     // use rand::RngCore;
-    use std::{net::SocketAddrV4, str::FromStr, sync::Once};
-    use tokio::time::{self, timeout};
+    use std::{
+        net::SocketAddrV4,
+        str::FromStr,
+        sync::{Arc, Once},
+    };
+    use tokio::net::UdpSocket;
     use tracing::info;
     use tracing_subscriber::{Layer, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -299,22 +326,28 @@ mod tests {
 
         let external_ip = public_ip::addr_v4().await.unwrap();
 
-        let dht = DhtV4::bootstrap_with_stable_id(
-            SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:8991".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        );
+        let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:44444").unwrap())
+            .await
+            .unwrap();
+        let dht = DhtV4::with_stable_id(socket, external_ip).unwrap();
 
-        let dht = timeout(time::Duration::from_secs(60), dht).await??;
+        let dht = Arc::new(dht);
+        let dhtt = Arc::clone(&dht);
+        let dht_eventloop = tokio::spawn(async move {
+            dhtt.run().await;
+        });
+        dht.bootstrap(vec![
+            // dht.tansmissionbt.com
+            "87.98.162.88:6881".parse().unwrap(),
+            // router.utorrent.com
+            "67.215.246.10:6881".parse().unwrap(),
+            // router.bittorrent.com, ironically that this almost never responds
+            "82.221.103.244:8991".parse().unwrap(),
+            // dht.aelitis.com
+            "174.129.43.152:6881".parse().unwrap(),
+        ])
+        .await
+        .unwrap();
         info!("Now I'm bootstrapped!");
 
         // let server = dht.handle();
@@ -329,105 +362,41 @@ mod tests {
         //     println!("I guess we just didn't find anything")
         // }
 
+        drop(dht_eventloop);
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn find_peers() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
-
-        let external_ip = public_ip::addr_v4().await.unwrap();
-
-        let dht = DhtV4::bootstrap_with_stable_id(
-            SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:6881".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        )
-        .await?;
-
-        // XXX: get_peers design is problematic, impl has been replaced with todo!(), see the
-        // comment on the function itself for more info.
+        todo!("Proabaly just stick it inside of the json_rpc server instead of doing it here");
+        // TEST_INIT.call_once(set_up_tracing);
         //
-        let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
-
-        let handle = dht.handle();
-        let peers = handle.get_peers(info_hash).await?;
-        info!("peers {peers:?}");
-        Ok(())
-    }
-
-    // #[tokio::test(flavor = "multi_thread")]
-    // async fn server() -> color_eyre::Result<()> {
-    //     TEST_INIT.call_once(set_up_tracing);
-    //
-    //     let external_ip = public_ip::addr_v4().await.unwrap();
-    //
-    //     let dht = DhtClientV4::new(SocketAddrV4::from_str("0.0.0.0:51413")?, external_ip).await?;
-    //     info!("dht created");
-    //
-    //     let fake_client = async move {
-    //         info!("starting to bind");
-    //         let fake_peer_socket = UdpSocket::bind(SocketAddrV4::from_str("127.0.0.1:0")?).await?;
-    //         fake_peer_socket
-    //             .connect(SocketAddrV4::from_str("127.0.0.1:51413")?)
-    //             .await?;
-    //         info!("connected to dht");
-    //
-    //         for i in 0..5 {
-    //             let ping = Krpc::new_ping_query(Box::new([b'a', b'a' + i]), b"abcdefghij0123456789".clone());
-    //             let serialized = bendy::serde::to_bytes(&ping)?;
-    //
-    //             fake_peer_socket.send(&serialized).await?;
-    //
-    //             let mut buf = [0u8; 1024];
-    //             let len = fake_peer_socket.recv(&mut buf).await?;
-    //
-    //             let msg = bendy::serde::from_bytes::<Krpc>(&buf[..len])?;
-    //
-    //             // add some checks to ensure this is the stuff we actually expect in the future
-    //             // but since there is no way to know the id of the dht right now, we can't do that
-    //         }
-    //         Ok::<_, color_eyre::Report>(())
-    //     };
-    //     let client_handle = tokio::spawn(fake_client);
-    //
-    //     let _ = client_handle.await?;
-    //
-    //     Ok(())
-    // }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn run() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
-        let external_ip = public_ip::addr_v4().await.unwrap();
-
-        let dht = DhtV4::bootstrap_with_stable_id(
-            SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
-            external_ip,
-            vec![
-                // dht.tansmissionbt.com
-                "87.98.162.88:6881".parse().unwrap(),
-                // router.utorrent.com
-                "67.215.246.10:6881".parse().unwrap(),
-                // router.bittorrent.com, ironically that this almost never responds
-                "82.221.103.244:6881".parse().unwrap(),
-                // dht.aelitis.com
-                "174.129.43.152:6881".parse().unwrap(),
-            ],
-        )
-        .await?;
-
-        dht.run().await;
-
-        Ok(())
+        // let external_ip = public_ip::addr_v4().await.unwrap();
+        //
+        // let dht = DhtV4::with_stable_id(
+        //     SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
+        //     external_ip,
+        //     vec![
+        //         // dht.tansmissionbt.com
+        //         "87.98.162.88:6881".parse().unwrap(),
+        //         // router.utorrent.com
+        //         "67.215.246.10:6881".parse().unwrap(),
+        //         // router.bittorrent.com, ironically that this almost never responds
+        //         "82.221.103.244:6881".parse().unwrap(),
+        //         // dht.aelitis.com
+        //         "174.129.43.152:6881".parse().unwrap(),
+        //     ],
+        // )
+        // .await?;
+        //
+        // // XXX: get_peers design is problematic, impl has been replaced with todo!(), see the
+        // // comment on the function itself for more info.
+        // //
+        // let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
+        //
+        // let handle = dht.handle();
+        // let peers = handle.get_peers(info_hash).await?;
+        // info!("peers {peers:?}");
+        // Ok(())
     }
 }

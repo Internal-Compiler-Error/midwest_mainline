@@ -271,8 +271,8 @@ impl DhtHandle {
 
     /// starting point of trying to find any nodes on the network
     #[tracing::instrument(skip(self))]
-    pub async fn find_node(self: Arc<Self>, target: NodeId) -> Vec<NodeInfo> {
-        // TODO: While timout out of an individual request in the process of searching is not an
+    pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
+        // TODO: While timing out out on an individual request in the process of searching is not an
         // error per se, it's still desirable to deliver these information to the caller somehow
 
         // if we already know the node, then no need for any network requests
@@ -305,7 +305,7 @@ impl DhtHandle {
             let returned_nodes = querying
                 .iter()
                 .map(|node| node.end_point())
-                .map(|ip| self.clone().send_find_nodes_rpc(ip, target))
+                .map(|ip| self.send_find_nodes_rpc(ip, target))
                 .collect::<Vec<_>>();
 
             let returned_nodes = join_all(returned_nodes).await;
@@ -358,11 +358,7 @@ impl DhtHandle {
 
     // attempt to find the target node via a peer on this address
     #[tracing::instrument(skip(self))]
-    async fn send_find_nodes_rpc(
-        self: Arc<Self>,
-        dest: SocketAddrV4,
-        target: NodeId,
-    ) -> Result<Vec<NodeInfo>, OurError> {
+    async fn send_find_nodes_rpc(&self, dest: SocketAddrV4, target: NodeId) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
         let query = Krpc::new_find_node_query(TXN_ID_PLACEHOLDER, self.our_id, target);
 
@@ -370,10 +366,6 @@ impl DhtHandle {
         let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
 
         if let Krpc::FindNodeGetPeersResponse(find_node_response) = response {
-            // TODO:: does the following actually handle the giant bitstring thing correctly?
-            //
-            // the nodes come back as one giant byte string, each 26 bytes is a node
-            // we split them up and create a vector of them
             let mut nodes: Vec<_> = find_node_response.nodes().clone();
 
             // some clients will return duplicate nodes, so we remove them
@@ -411,7 +403,7 @@ impl DhtHandle {
     // 3. We should have a function that aggregates the peers we found by querying others, but not
     //    this function with its current deisgn
     // May 2025
-    pub async fn get_peers(self: Arc<Self>, info_hash: InfoHash) -> Result<Vec<SocketAddrV4>, OurError> {
+    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<Vec<SocketAddrV4>, OurError> {
         let known_peers = self.swarm_peers(&info_hash);
         if !known_peers.is_empty() {
             return Ok(known_peers);
@@ -446,32 +438,16 @@ impl DhtHandle {
 
     #[tracing::instrument(skip(self))]
     pub async fn announce_peers(
-        self: Arc<Self>,
+        &self,
         recipient: SocketAddrV4,
         info_hash: InfoHash,
         port: Option<u16>,
         token: Token,
     ) -> Result<(), OurError> {
         let query = if let Some(port) = port {
-            Krpc::new_announce_peer_query(
-                TransactionId::from(TXN_ID_PLACEHOLDER),
-                info_hash,
-                self.our_id.clone(),
-                port,
-                true,
-                token,
-            )
+            Krpc::new_announce_peer_query(TXN_ID_PLACEHOLDER, info_hash, self.our_id.clone(), port, false, token)
         } else {
-            Krpc::new_announce_peer_query(
-                TransactionId::from(TXN_ID_PLACEHOLDER),
-                info_hash,
-                self.our_id.clone(),
-                // TODO: hmm, this interesting
-                // self.socket_address.port(),
-                0, // obviously replace this later
-                true,
-                token,
-            )
+            Krpc::new_announce_peer_query(TXN_ID_PLACEHOLDER, info_hash, self.our_id.clone(), 0, true, token)
         };
 
         let response = self.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;

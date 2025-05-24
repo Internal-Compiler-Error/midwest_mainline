@@ -7,8 +7,8 @@ use std::{
 };
 
 use diesel::{
-    r2d2::{ConnectionManager, Pool},
     SqliteConnection,
+    r2d2::{ConnectionManager, Pool},
 };
 use tokio::{
     net::UdpSocket,
@@ -20,12 +20,12 @@ use tracing::{info, instrument, trace, warn};
 
 use crate::{
     message::{Krpc, ParseKrpc, ToRawKrpc},
-    our_error::{naur, OurError},
+    our_error::{OurError, naur},
     types::{NodeInfo, TransactionId},
     utils::unix_timestmap_ms,
 };
 
-use super::{router::update_last_sent, TxnIdGenerator};
+use super::{TxnIdGenerator, router::update_last_sent};
 
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
@@ -165,8 +165,8 @@ impl KrpcBroker {
         };
         let (response, _addr) = rx.await.unwrap();
 
-        // don't wanna write a new function, so abuse a loop so I have access to `break`
-        // no node_id means we have an error
+        // no node_id means the reponse is a krpc error message, only error message omit the node
+        // id
         let response_node_id = response.node_id().ok_or(naur!("node responded with error"))?;
         let mut conn = self.db.get().unwrap();
         // it's a double update but that's issue for another day

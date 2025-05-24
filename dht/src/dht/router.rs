@@ -1,13 +1,14 @@
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{net::SocketAddrV4, usize};
 
 use diesel::r2d2::PooledConnection;
-use diesel::{insert_into, prelude::*};
 use diesel::{
-    r2d2::{ConnectionManager, Pool},
     ExpressionMethods, SqliteConnection,
+    r2d2::{ConnectionManager, Pool},
 };
+use diesel::{insert_into, prelude::*};
 use futures::future::join_all;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -32,15 +33,22 @@ pub struct Router {
     table: Pool<ConnectionManager<SqliteConnection>>,
     message_broker: KrpcBroker,
     bucket_size: usize,
+    inbound_messages: Arc<Mutex<Option<mpsc::Receiver<(Krpc, SocketAddrV4)>>>>,
 }
 
 impl Router {
-    pub fn new(id: NodeId, message_broker: KrpcBroker, table: Pool<ConnectionManager<SqliteConnection>>) -> Router {
+    pub fn new(
+        id: NodeId,
+        message_broker: KrpcBroker,
+        table: Pool<ConnectionManager<SqliteConnection>>,
+        inbound_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
+    ) -> Router {
         Router {
             id,
             table,
             message_broker,
             bucket_size: 1024, // TODO: make this configurable in the future
+            inbound_messages: Arc::new(Mutex::new(Some(inbound_messages))),
         }
     }
 
@@ -75,7 +83,15 @@ impl Router {
     }
 
     /// keep listening for all incoming responses and update our table
-    pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddrV4)>) {
+    pub async fn run(&self) {
+        let mut inbound = {
+            self.inbound_messages
+                .lock()
+                .unwrap()
+                .take()
+                .expect("run for Router is only called once")
+        };
+
         loop {
             tokio::select! {
                 maybe_msg = inbound.recv() => {

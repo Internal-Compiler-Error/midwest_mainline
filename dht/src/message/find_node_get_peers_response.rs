@@ -237,10 +237,6 @@ mod tests {
             NodeId::from_bytes_unchecked(*&b"lmnopqrstuvxyz098765"),
             SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
         ))
-        .with_node(NodeInfo::new(
-            NodeId::from_bytes_unchecked(*&b"lmnopqrstuvxyz098765"),
-            SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
-        ))
         .build();
 
         let encoded = response.to_raw_krpc();
