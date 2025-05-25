@@ -5,6 +5,7 @@ use crate::our_error::OurError;
 use crate::types::{NodeInfo, Token, TransactionId};
 use bendy::decoding::{Decoder, Object};
 
+use bendy::encoding::{Encoder, SingleItemEncoder};
 use eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
@@ -25,15 +26,15 @@ pub mod get_peers_query;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
 
-pub trait ToRawKrpc {
-    fn to_raw_krpc(&self) -> Box<[u8]>;
+pub trait ToKrpcBody {
+    fn encode_body(&self, enc: SingleItemEncoder);
 }
 
 pub trait ParseKrpc {
     fn parse(&self) -> Result<Krpc, OurError>;
 }
 
-fn extract_error_content(body: &Vec<BencodeItemView>, transaction_id: TransactionId) -> Result<KrpcError, OurError> {
+fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurError> {
     let code = body.get(0).ok_or(OurError::DecodeError(eyre!(
         "Error message has no first elem/error code"
     )))?;
@@ -54,15 +55,7 @@ fn extract_error_content(body: &Vec<BencodeItemView>, transaction_id: Transactio
         .to_string();
 
     let code: u32 = *code as u32;
-    Ok(KrpcError::new(transaction_id, code, message))
-}
-
-fn assert_len(bytes: &[u8], len: usize) -> Result<&[u8], OurError> {
-    if bytes.len() == len {
-        Ok(bytes)
-    } else {
-        Err(OurError::DecodeError(eyre!("Should be {len} long")))
-    }
+    Ok(KrpcError::new(code, message))
 }
 
 fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<NodeId, OurError> {
@@ -74,23 +67,16 @@ fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<No
         return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
     };
 
-    let querier = assert_len(querier, 20)?;
     Ok(NodeId::from_bytes(querier))
 }
 
-fn extract_ping_arguments(
-    argument: &mut BTreeMap<&[u8], BencodeItemView>,
-    transaction_id: TransactionId,
-) -> Result<PingQuery, OurError> {
+fn extract_ping_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PingQuery, OurError> {
     let node_id = extract_node_id(argument)?;
-    let ping = PingQuery::new(transaction_id, node_id);
+    let ping = PingQuery::new(node_id);
     Ok(ping)
 }
 
-fn extract_find_node_arguments(
-    argument: &mut BTreeMap<&[u8], BencodeItemView>,
-    transaction_id: TransactionId,
-) -> Result<FindNodeQuery, OurError> {
+fn extract_find_node_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<FindNodeQuery, OurError> {
     let querier = extract_node_id(argument)?;
 
     let target = argument
@@ -100,15 +86,12 @@ fn extract_find_node_arguments(
         return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
     };
 
-    let find_node_request = FindNodeQuery::new(transaction_id, querier, NodeId::from_bytes(target));
+    let find_node_request = FindNodeQuery::new(querier, NodeId::from_bytes(target));
 
     Ok(find_node_request)
 }
 
-fn extract_get_peers_arguments(
-    argument: &mut BTreeMap<&[u8], BencodeItemView>,
-    transaction_id: TransactionId,
-) -> Result<GetPeersQuery, OurError> {
+fn extract_get_peers_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
     let querier = extract_node_id(argument)?;
 
     let info_hash = argument
@@ -119,14 +102,13 @@ fn extract_get_peers_arguments(
         return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
     };
 
-    let get_peers = GetPeersQuery::new(transaction_id, querier, InfoHash::from_bytes(info_hash));
+    let get_peers = GetPeersQuery::new(querier, InfoHash::from_bytes(info_hash));
 
     Ok(get_peers)
 }
 
 fn extract_announce_peer_arguments(
     arguments: &mut BTreeMap<&[u8], BencodeItemView>,
-    transaction_id: TransactionId,
 ) -> Result<AnnouncePeerQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
@@ -158,7 +140,6 @@ fn extract_announce_peer_arguments(
     };
 
     let announce_peer = AnnouncePeerQuery::new(
-        transaction_id,
         querier,
         implied_port,
         port as u16,
@@ -293,10 +274,8 @@ impl ParseKrpc for &[u8] {
                 return Err(OurError::DecodeError(eyre!("'e' key is not a list")));
             };
 
-            Ok(Krpc::ErrorResponse(extract_error_content(
-                code_and_message,
-                transaction_id,
-            )?))
+            let body = KrpcBody::ErrorResponse(extract_error_content(code_and_message)?);
+            Ok(Krpc::new_with_body(transaction_id, body))
         } else if message_type == &b"q" {
             // queries
 
@@ -319,17 +298,17 @@ impl ParseKrpc for &[u8] {
             };
 
             if &*query_type == b"ping" {
-                let ping = extract_ping_arguments(arguments, transaction_id)?;
-                return Ok(Krpc::PingQuery(ping));
+                let body = KrpcBody::PingQuery(extract_ping_arguments(arguments)?);
+                return Ok(Krpc::new_with_body(transaction_id, body));
             } else if &*query_type == b"find_node" {
-                let find_node_request = extract_find_node_arguments(arguments, transaction_id)?;
-                return Ok(Krpc::FindNodeQuery(find_node_request));
+                let body = KrpcBody::FindNodeQuery(extract_find_node_arguments(arguments)?);
+                return Ok(Krpc::new_with_body(transaction_id, body));
             } else if &*query_type == b"get_peers" {
-                let find_node_request = extract_get_peers_arguments(arguments, transaction_id)?;
-                return Ok(Krpc::GetPeersQuery(find_node_request));
+                let body = KrpcBody::GetPeersQuery(extract_get_peers_arguments(arguments)?);
+                return Ok(Krpc::new_with_body(transaction_id, body));
             } else if &*query_type == b"announce_peer" {
-                let announce_peer = extract_announce_peer_arguments(arguments, transaction_id)?;
-                return Ok(Krpc::AnnouncePeerQuery(announce_peer));
+                let body = KrpcBody::AnnouncePeerQuery(extract_announce_peer_arguments(arguments)?);
+                return Ok(Krpc::new_with_body(transaction_id, body));
             } else {
                 return Err(OurError::DecodeError(eyre!("unknown query type")));
             }
@@ -359,12 +338,11 @@ impl ParseKrpc for &[u8] {
 
             if nodes.is_none() && values.is_none() && token.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
-                let msg = PingAnnouncePeerResponse::new(transaction_id, target_id);
-                let msg = Krpc::PingAnnouncePeerResponse(msg);
-                return Ok(msg);
+                let body = KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id));
+                return Ok(Krpc::new_with_body(transaction_id, body));
             } else {
                 // otherwise it's response to get_peers or find_node
-                let builder = Builder::new(transaction_id, target_id);
+                let builder = Builder::new(target_id);
 
                 let builder = match token {
                     Some(token) => builder.with_token(token),
@@ -382,8 +360,8 @@ impl ParseKrpc for &[u8] {
                 };
 
                 let msg = builder.build();
-                let msg = Krpc::FindNodeGetPeersResponse(msg);
-                return Ok(msg);
+                let body = KrpcBody::FindNodeGetPeersResponse(msg);
+                return Ok(Krpc::new_with_body(transaction_id, body));
             }
         } else {
             // invalid message
@@ -392,8 +370,14 @@ impl ParseKrpc for &[u8] {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Krpc {
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct Krpc {
+    pub txn_id: TransactionId,
+    pub body: KrpcBody,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum KrpcBody {
     AnnouncePeerQuery(AnnouncePeerQuery),
     FindNodeQuery(FindNodeQuery),
     GetPeersQuery(GetPeersQuery),
@@ -405,102 +389,143 @@ pub enum Krpc {
     ErrorResponse(KrpcError),
 }
 
-impl ToRawKrpc for Krpc {
-    fn to_raw_krpc(&self) -> Box<[u8]> {
-        match self {
-            Krpc::AnnouncePeerQuery(a) => a.to_raw_krpc(),
-            Krpc::FindNodeQuery(a) => a.to_raw_krpc(),
-            Krpc::GetPeersQuery(a) => a.to_raw_krpc(),
-            Krpc::PingQuery(a) => a.to_raw_krpc(),
-            Krpc::FindNodeGetPeersResponse(a) => a.to_raw_krpc(),
-            Krpc::PingAnnouncePeerResponse(a) => a.to_raw_krpc(),
-            Krpc::ErrorResponse(a) => a.to_raw_krpc(),
-        }
-    }
-}
-
-impl Krpc {
-    pub fn set_txn_id(&mut self, txn_id: TransactionId) {
-        match self {
-            Krpc::AnnouncePeerQuery(m) => m.transaction_id = txn_id,
-            Krpc::FindNodeQuery(m) => m.transaction_id = txn_id,
-            Krpc::GetPeersQuery(m) => m.transaction_id = txn_id,
-            Krpc::PingQuery(m) => m.transaction_id = txn_id,
-            Krpc::PingAnnouncePeerResponse(m) => m.transaction_id = txn_id,
-            Krpc::FindNodeGetPeersResponse(m) => m.transaction_id = txn_id,
-            Krpc::ErrorResponse(m) => m.transaction_id = txn_id,
-        }
-    }
-
-    // IS this function a good idea?
-    pub fn node_id(&self) -> Option<NodeId> {
-        // TODO: we really need to agree on whether to copy or share with node_id by default
-        match &self {
-            Krpc::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.querier()),
-            Krpc::FindNodeQuery(find_node_query) => Some(find_node_query.querier()),
-            Krpc::GetPeersQuery(get_peers_query) => Some(*get_peers_query.querier()),
-            Krpc::PingQuery(ping_query) => Some(*ping_query.querier()),
-
-            Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => {
-                Some(*ping_announce_peer_response.target_id())
-            }
-            Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => {
-                Some(*find_node_get_peers_response.queried())
-            }
-            Krpc::ErrorResponse(_) => None,
-        }
-    }
-
+impl KrpcBody {
     pub fn is_response(&self) -> bool {
         match self {
-            Krpc::PingAnnouncePeerResponse(_) => true,
-            Krpc::FindNodeGetPeersResponse(_) => true,
+            KrpcBody::PingAnnouncePeerResponse(_) => true,
+            KrpcBody::FindNodeGetPeersResponse(_) => true,
             _ => false,
-        }
-    }
-
-    pub fn transaction_id(&self) -> &TransactionId {
-        match self {
-            Krpc::PingAnnouncePeerResponse(msg) => msg.txn_id(),
-            Krpc::FindNodeGetPeersResponse(msg) => msg.txn_id(),
-            Krpc::FindNodeQuery(msg) => msg.txn_id(),
-            Krpc::GetPeersQuery(msg) => msg.txn_id(),
-            Krpc::AnnouncePeerQuery(msg) => msg.txn_id(),
-            Krpc::PingQuery(msg) => msg.txn_id(),
-            Krpc::ErrorResponse(msg) => msg.txn_id(),
         }
     }
 
     pub fn is_error(&self) -> bool {
         match self {
-            Krpc::ErrorResponse(_) => true,
+            KrpcBody::ErrorResponse(_) => true,
             _ => false,
         }
     }
 
     pub fn is_query(&self) -> bool {
         match self {
-            Krpc::PingQuery(_) => true,
-            Krpc::FindNodeQuery(_) => true,
-            Krpc::GetPeersQuery(_) => true,
-            Krpc::AnnouncePeerQuery(_) => true,
+            KrpcBody::PingQuery(_) => true,
+            KrpcBody::FindNodeQuery(_) => true,
+            KrpcBody::GetPeersQuery(_) => true,
+            KrpcBody::AnnouncePeerQuery(_) => true,
             _ => false,
         }
     }
+}
 
-    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Krpc {
-        let ping = PingQuery::new(transaction_id, querying_id);
-        Krpc::PingQuery(ping)
+impl Krpc {
+    // TODO: maybe allow it to take in a list of additional fields to encode
+    pub fn encode(&self) -> Box<[u8]> {
+        let mut enc = Encoder::new();
+
+        enc.emit_and_sort_dict(|enc| {
+            enc.emit_pair_with(b"t", |enc| enc.emit_bytes(&self.txn_id.0))?;
+
+            match &self.body {
+                KrpcBody::AnnouncePeerQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "announce_peer")?;
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                }
+                KrpcBody::FindNodeQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "find_node")?;
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                }
+                KrpcBody::GetPeersQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "get_peers")?;
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                }
+                KrpcBody::PingQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "ping")?;
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                }
+
+                KrpcBody::PingAnnouncePeerResponse(r) => {
+                    enc.emit_pair(b"y", "r")?;
+                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))
+                }
+                KrpcBody::FindNodeGetPeersResponse(r) => {
+                    enc.emit_pair(b"y", "r")?;
+                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))
+                }
+                KrpcBody::ErrorResponse(err) => {
+                    enc.emit_pair(b"y", "e")?;
+                    enc.emit_pair_with(b"e", |e| Ok(err.encode_body(e)))
+                }
+            }
+        })
+        .unwrap();
+
+        enc.get_output().unwrap().into_boxed_slice()
+    }
+    pub fn set_txn_id(&mut self, txn_id: TransactionId) {
+        self.txn_id = txn_id;
     }
 
-    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Krpc {
-        let find_node = FindNodeQuery::new(transaction_id, querying_id, target_id);
-        Krpc::FindNodeQuery(find_node)
+    // IS this function a good idea?
+    pub fn node_id(&self) -> Option<NodeId> {
+        // TODO: we really need to agree on whether to copy or share with node_id by default
+        match &self.body {
+            KrpcBody::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.querier()),
+            KrpcBody::FindNodeQuery(find_node_query) => Some(find_node_query.querier()),
+            KrpcBody::GetPeersQuery(get_peers_query) => Some(*get_peers_query.querier()),
+            KrpcBody::PingQuery(ping_query) => Some(*ping_query.querier()),
+
+            KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => {
+                Some(*ping_announce_peer_response.target_id())
+            }
+            KrpcBody::FindNodeGetPeersResponse(find_node_get_peers_response) => {
+                Some(*find_node_get_peers_response.queried())
+            }
+            KrpcBody::ErrorResponse(_) => None,
+        }
     }
 
-    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Krpc {
-        let get_peers = GetPeersQuery::new(transaction_id, querying_id, info_hash);
-        Krpc::GetPeersQuery(get_peers)
+    pub fn is_response(&self) -> bool {
+        self.body.is_response()
+    }
+
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.txn_id
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.body.is_error()
+    }
+
+    pub fn is_query(&self) -> bool {
+        self.body.is_query()
+    }
+
+    pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::PingQuery(PingQuery::new(querying_id)),
+        }
+    }
+
+    pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::FindNodeQuery(FindNodeQuery::new(querying_id, target_id)),
+        }
+    }
+
+    pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::GetPeersQuery(GetPeersQuery::new(querying_id, info_hash)),
+        }
+    }
+
+    pub fn new_with_body(txn_id: TransactionId, body: KrpcBody) -> Self {
+        Self { txn_id, body }
     }
 
     pub fn new_announce_peer_query(
@@ -510,43 +535,62 @@ impl Krpc {
         port: u16,
         implied_port: bool,
         token: Token,
-    ) -> Krpc {
-        let announce_peer = AnnouncePeerQuery::new(transaction_id, querying_id, implied_port, port, info_hash, token);
-        Krpc::AnnouncePeerQuery(announce_peer)
+    ) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
+                querying_id,
+                implied_port,
+                port,
+                info_hash,
+                token,
+            )),
+        }
     }
 
-    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let ping_res = PingAnnouncePeerResponse::new(transaction_id, responding_id);
-        Krpc::PingAnnouncePeerResponse(ping_res)
+    pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
+        }
     }
 
-    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Krpc {
-        let announce_peer_res = PingAnnouncePeerResponse::new(transaction_id, responding_id);
-        Krpc::PingAnnouncePeerResponse(announce_peer_res)
+    pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
+        }
     }
 
-    pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Krpc {
-        let error_response = KrpcError::new(transaction_id, 201 as u32, "A Generic Error Occurred".to_string());
-        Krpc::ErrorResponse(error_response)
+    pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::ErrorResponse(KrpcError::new(201 as u32, "A Generic Error Occurred".to_string())),
+        }
     }
 
-    pub fn new_standard_server_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = KrpcError::new(transaction_id, 202 as u32, "A Server Error Occurred".to_string());
-        Krpc::ErrorResponse(error_response)
+    pub fn new_standard_server_error(transaction_id: TransactionId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::ErrorResponse(KrpcError::new(202 as u32, "A Server Error Occurred".to_string())),
+        }
     }
 
-    pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = KrpcError::new(transaction_id, 203 as u32, "A Protocol Error Occurred".to_string());
-        Krpc::ErrorResponse(error_response)
+    pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::ErrorResponse(KrpcError::new(203 as u32, "A Protocol Error Occurred".to_string())),
+        }
     }
 
-    pub fn new_unsupported_error(transaction_id: TransactionId) -> Krpc {
-        let error_response = KrpcError::new(
-            transaction_id,
-            204 as u32,
-            "A Unsupported Method Error Occurred".to_string(),
-        );
-        Krpc::ErrorResponse(error_response)
+    pub fn new_unsupported_error(transaction_id: TransactionId) -> Self {
+        Self {
+            txn_id: transaction_id,
+            body: KrpcBody::ErrorResponse(KrpcError::new(
+                204 as u32,
+                "A Unsupported Method Error Occurred".to_string(),
+            )),
+        }
     }
 }
 
@@ -643,13 +687,14 @@ mod test {
         let res_token = Token::from_bytes(&res_token);
 
         use find_node_get_peers_response::Builder;
-        let expected = Builder::new(txn_id, responding)
+        let body = Builder::new(responding)
             .with_token(res_token)
             .with_value(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070))
             .build();
-        let expected = Krpc::FindNodeGetPeersResponse(expected);
+        let body = KrpcBody::FindNodeGetPeersResponse(body);
+        let expected = Krpc::new_with_body(txn_id, body);
 
         assert_eq!(decoded, expected);
     }
@@ -660,17 +705,16 @@ mod test {
         let decoded = message.parse().unwrap();
 
         use find_node_get_peers_response::Builder;
-        let expected = Builder::new(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"0123456789abcdefghij"),
-        )
-        .with_node(NodeInfo::new(
-            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
-            // TODO: place holder values
-            SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
-        ))
-        .build();
-        let expected = Krpc::FindNodeGetPeersResponse(expected);
+        let txn_id = TransactionId::from_bytes(*&b"aa");
+        let expected = Builder::new(NodeId::from_bytes(*&b"0123456789abcdefghij"))
+            .with_node(NodeInfo::new(
+                NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
+                // TODO: place holder values
+                SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
+            ))
+            .build();
+        let body = KrpcBody::FindNodeGetPeersResponse(expected);
+        let expected = Krpc::new_with_body(txn_id, body);
 
         assert_eq!(expected, decoded);
     }

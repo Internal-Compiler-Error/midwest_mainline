@@ -15,11 +15,12 @@ use tokio::time::sleep;
 use tracing::{error, info};
 
 use crate::dht::xor;
+use crate::message::Krpc;
+use crate::message::ping_query::PingQuery;
 use crate::models::NodeNoMetaInfo;
-use crate::types::TXN_ID_PLACEHOLDER;
 use crate::utils::unix_timestmap_ms;
 use crate::{
-    message::Krpc,
+    message::KrpcBody,
     types::{self, NodeId, NodeInfo},
 };
 
@@ -53,18 +54,18 @@ impl Router {
     }
 
     fn add_new_nodes(&self, from: SocketAddrV4, message: &Krpc) {
-        if let Krpc::ErrorResponse(_) = message {
+        if let KrpcBody::ErrorResponse(_) = message.body {
             return;
         }
 
-        let node_id = match message {
-            Krpc::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
-            Krpc::FindNodeQuery(find_node_query) => find_node_query.querier(),
-            Krpc::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
-            Krpc::PingQuery(ping_query) => *ping_query.querier(),
-            Krpc::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
-            Krpc::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
-            Krpc::ErrorResponse(_) => unreachable!("errors should get early returned"),
+        let node_id = match &message.body {
+            KrpcBody::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
+            KrpcBody::FindNodeQuery(find_node_query) => find_node_query.querier(),
+            KrpcBody::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
+            KrpcBody::PingQuery(ping_query) => *ping_query.querier(),
+            KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
+            KrpcBody::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
+            KrpcBody::ErrorResponse(_) => unreachable!("errors should get early returned"),
         };
 
         {
@@ -74,7 +75,7 @@ impl Router {
         self.add(node_id, from);
 
         // if it's response from find_peers or get_nodes, they have additional info
-        if let Krpc::FindNodeGetPeersResponse(res) = message {
+        if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
             for node in res.nodes() {
                 // TODO: this is a bit stupid as we destroy the structure just to copy but fix later
                 self.add(node.id(), node.end_point());
@@ -302,7 +303,7 @@ impl Router {
 
     // Send a ping to fresh the node
     async fn refresh_node(&self, target: &NodeInfo) {
-        let ping_msg = Krpc::new_ping_query(TXN_ID_PLACEHOLDER, self.id);
+        let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.id));
 
         {
             let mut conn = self.conn();

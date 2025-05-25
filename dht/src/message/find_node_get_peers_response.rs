@@ -2,9 +2,11 @@
 
 use std::net::SocketAddrV4;
 
-use crate::types::{NodeId, NodeInfo, Token, TransactionId};
+use bendy::encoding::SingleItemEncoder;
 
-use super::ToRawKrpc;
+use crate::types::{NodeId, NodeInfo, Token};
+
+use super::ToKrpcBody;
 
 /// TODO:
 ///
@@ -12,7 +14,6 @@ use super::ToRawKrpc;
 /// easier to just keep all of them in one place
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
-    pub transaction_id: TransactionId,
     queried: NodeId,
     token: Option<Token>,
     values: Vec<SocketAddrV4>,
@@ -21,7 +22,6 @@ pub struct FindNodeGetPeersResponse {
 
 #[derive(Debug, Hash, Clone)]
 pub struct Builder {
-    transaction_id: TransactionId,
     queried: NodeId,
     token: Option<Token>,
     values: Vec<SocketAddrV4>,
@@ -29,9 +29,8 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new(transaction_id: TransactionId, peer_id: NodeId) -> Builder {
+    pub fn new(peer_id: NodeId) -> Builder {
         Self {
-            transaction_id,
             queried: peer_id,
             token: None,
             values: vec![],
@@ -66,7 +65,6 @@ impl Builder {
 
     pub fn build(self) -> FindNodeGetPeersResponse {
         FindNodeGetPeersResponse {
-            transaction_id: self.transaction_id,
             queried: self.queried,
             token: self.token,
             values: self.values,
@@ -76,10 +74,6 @@ impl Builder {
 }
 
 impl FindNodeGetPeersResponse {
-    pub fn txn_id(&self) -> &TransactionId {
-        &self.transaction_id
-    }
-
     pub fn is_get_peer_success(&self) -> bool {
         // TODO: do we need to care if the token exists?
         !self.values.is_empty()
@@ -110,90 +104,77 @@ impl FindNodeGetPeersResponse {
     }
 }
 
-impl ToRawKrpc for FindNodeGetPeersResponse {
+impl ToKrpcBody for FindNodeGetPeersResponse {
     #[allow(unused_must_use)]
     // If you are the poor soul who has to read this, I offer my condolences.
-    fn to_raw_krpc(&self) -> Box<[u8]> {
-        use bendy::encoding::Encoder;
-        use bendy::value::Value;
-        use std::borrow::Cow;
+    fn encode_body(&self, enc: SingleItemEncoder) {
+        enc.emit_unsorted_dict(|enc| {
+            use bendy::value::Value;
+            use std::borrow::Cow;
 
-        let mut encoder = Encoder::new();
-        encoder.emit_and_sort_dict(|e| {
-            e.emit_pair_with(b"t", |e| e.emit_bytes(self.transaction_id.as_bytes()));
-            e.emit_pair(b"y", "r");
-            e.emit_pair_with(b"r", |e| {
-                e.emit_unsorted_dict(|e| {
-                    e.emit_pair(b"id", &self.queried);
-                    if let Some(ref token) = self.token {
-                        e.emit_pair(b"token", token);
-                    }
+            enc.emit_pair(b"id", &self.queried);
+            if let Some(ref token) = self.token {
+                enc.emit_pair(b"token", token);
+            }
 
-                    if !self.values.is_empty() {
-                        // values is a list of compact peer contacts, which are a 4 byte ipv4 address and a 2 byte port
-                        // number. Unfortunately, the bittorrent people are insane and decided to encode this as a string
-                        // using ascii in network/big endian.
-                        e.emit_pair_with(b"values", |e| {
-                            let combined = self.values.iter().map(|peer| {
-                                let octets = peer.ip().octets();
-                                let port_in_be = peer.port().to_be_bytes();
+            if !self.values.is_empty() {
+                // values is a list of compact peer contacts, which are a 4 byte ipv4 address and a 2 byte port
+                // number. Unfortunately, the bittorrent people are insane and decided to encode this as a string
+                // using ascii in network/big endian.
+                enc.emit_pair_with(b"values", |e| {
+                    let combined = self.values.iter().map(|peer| {
+                        let octets = peer.ip().octets();
+                        let port_in_be = peer.port().to_be_bytes();
 
-                                let mut arr = [0u8; 6];
-                                let ip = &mut arr[0..4];
-                                ip.copy_from_slice(&octets);
+                        let mut arr = [0u8; 6];
+                        let ip = &mut arr[0..4];
+                        ip.copy_from_slice(&octets);
 
-                                let port = &mut arr[4..6];
-                                port.copy_from_slice(&port_in_be);
+                        let port = &mut arr[4..6];
+                        port.copy_from_slice(&port_in_be);
 
-                                Value::Bytes(Cow::Owned(arr.as_slice().to_vec()))
-                            });
+                        Value::Bytes(Cow::Owned(arr.as_slice().to_vec()))
+                    });
 
-                            e.emit_unchecked_list(combined)
-                        });
-                    }
+                    e.emit_unchecked_list(combined)
+                });
+            }
 
-                    if !self.nodes.is_empty() {
-                        // nodes is a giant binary string, its length is some product of 26, each
-                        // 26 byte is compromised of 20 bytes of node id, 4 bytes of ip address and
-                        // 2 bytes of port number
-                        e.emit_pair_with(b"nodes", |e| {
-                            let combined: Vec<u8> = self
-                                .nodes
-                                .iter()
-                                .map(|peer| {
-                                    let node_id = &peer.id();
+            if !self.nodes.is_empty() {
+                // nodes is a giant binary string, its length is some product of 26, each
+                // 26 byte is compromised of 20 bytes of node id, 4 bytes of ip address and
+                // 2 bytes of port number
+                enc.emit_pair_with(b"nodes", |e| {
+                    let combined: Vec<u8> = self
+                        .nodes
+                        .iter()
+                        .map(|peer| {
+                            let node_id = &peer.id();
 
-                                    let octets = peer.end_point().ip().octets();
-                                    let port_in_be = peer.end_point().port().to_be_bytes();
+                            let octets = peer.end_point().ip().octets();
+                            let port_in_be = peer.end_point().port().to_be_bytes();
 
-                                    let mut arr = [0u8; 26];
-                                    let id = &mut arr[0..20];
-                                    id.copy_from_slice(&node_id.0);
+                            let mut arr = [0u8; 26];
+                            let id = &mut arr[0..20];
+                            id.copy_from_slice(&node_id.0);
 
-                                    let ip = &mut arr[20..24];
-                                    ip.copy_from_slice(&octets);
+                            let ip = &mut arr[20..24];
+                            ip.copy_from_slice(&octets);
 
-                                    let port = &mut arr[24..26];
-                                    port.copy_from_slice(&port_in_be);
+                            let port = &mut arr[24..26];
+                            port.copy_from_slice(&port_in_be);
 
-                                    arr
-                                })
-                                .flatten()
-                                .collect();
+                            arr
+                        })
+                        .flatten()
+                        .collect();
 
-                            e.emit_bytes(&combined)
-                        });
-                    }
-
-                    Ok(())
-                })
-            })
-        });
-
-        encoder
-            .get_output()
-            .expect("we know the keys upfront, this should never error")
-            .into_boxed_slice()
+                    e.emit_bytes(&combined)
+                });
+            }
+            Ok(())
+        })
+        .unwrap()
     }
 }
 
@@ -201,22 +182,25 @@ impl ToRawKrpc for FindNodeGetPeersResponse {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
+    use crate::{
+        message::{Krpc, KrpcBody},
+        types::TransactionId,
+    };
+
     use super::*;
 
     #[test]
     fn can_encode_has_peers_example() {
         use std::str;
 
-        let response = Builder::new(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
-        )
-        .with_token(Token::from_bytes(*&b"aoeusnth"))
-        .with_value(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893))
-        .with_value(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269))
-        .build();
+        let txn_id = TransactionId::from_bytes(*&b"aa");
+        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789"))
+            .with_token(Token::from_bytes(*&b"aoeusnth"))
+            .with_value(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893))
+            .with_value(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269))
+            .build();
 
-        let encoded = response.to_raw_krpc();
+        let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
         let encoded = str::from_utf8(&*encoded).unwrap();
 
         let expected = "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:axje.u6:idhtnmee1:t2:aa1:y1:re";
@@ -228,18 +212,16 @@ mod tests {
     fn can_encode_no_peers() {
         use std::str;
 
-        let response = Builder::new(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
-        )
-        .with_token(Token::from_bytes(*&b"aoeusnth"))
-        .with_node(NodeInfo::new(
-            NodeId::from_bytes(*&b"lmnopqrstuvxyz098765"),
-            SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
-        ))
-        .build();
+        let txn_id = TransactionId::from_bytes(*&b"aa");
+        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789"))
+            .with_token(Token::from_bytes(*&b"aoeusnth"))
+            .with_node(NodeInfo::new(
+                NodeId::from_bytes(*&b"lmnopqrstuvxyz098765"),
+                SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
+            ))
+            .build();
 
-        let encoded = response.to_raw_krpc();
+        let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
         let encoded = str::from_utf8(&*encoded).unwrap();
 
         let expected =

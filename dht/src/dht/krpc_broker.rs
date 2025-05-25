@@ -19,7 +19,7 @@ use tokio::{
 use tracing::{info, instrument, trace, warn};
 
 use crate::{
-    message::{Krpc, ParseKrpc, ToRawKrpc},
+    message::{Krpc, KrpcBody, ParseKrpc},
     our_error::{OurError, naur},
     types::{NodeInfo, TransactionId},
     utils::unix_timestmap_ms,
@@ -149,7 +149,7 @@ impl KrpcBroker {
         let socket = self.socket.clone();
 
         tokio::spawn(async move {
-            let buf = msg.to_raw_krpc();
+            let buf = msg.encode();
 
             socket.send_to(&buf, peer).await.unwrap();
         });
@@ -200,27 +200,19 @@ impl KrpcBroker {
 
     pub async fn reply(
         &self,
-        mut message: Krpc,
+        body: KrpcBody,
         node: &NodeInfo,
         txn_id: TransactionId,
         timeout: Duration,
     ) -> Result<Krpc, OurError> {
-        // TODO: eventually people should *not* be able to set txn id themselves, if it's a reply,
-        // then provide it explitly in this function as param, if it's query, it will be
-        // automatically generated
-        message.set_txn_id(txn_id);
+        let message = Krpc::new_with_body(txn_id, body);
         self.send_and_wait_timeout(message, node.end_point(), timeout).await
     }
 
-    pub async fn query<E: Routable>(
-        &self,
-        mut message: Krpc,
-        endpoint: &E,
-        timeout: Duration,
-    ) -> Result<Krpc, OurError> {
+    pub async fn query<E: Routable>(&self, body: KrpcBody, endpoint: &E, timeout: Duration) -> Result<Krpc, OurError> {
         let endpoint = endpoint.endpoint();
+        let message = Krpc::new_with_body(self.txn_id_generator.next().into(), body);
 
-        message.set_txn_id(self.txn_id_generator.next().into());
         self.send_and_wait_timeout(message, endpoint, timeout).await
     }
 }
