@@ -54,7 +54,7 @@ mod tests {
 
         let ping_response = PingAnnouncePeerResponse::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
         );
 
         let expected = "d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";

@@ -68,8 +68,8 @@ mod tests {
 
         let query = super::GetPeersQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            InfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
+            InfoHash::from_bytes(*&b"mnopqrstuvwxyz123456"),
         );
 
         let encoded = query.to_raw_krpc();

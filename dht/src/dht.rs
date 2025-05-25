@@ -123,7 +123,7 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
             let id_in_base64 =
                 prev_id.expect("if the public ip of last session matches this session, id should have been set");
             let id = base64_dec(id_in_base64);
-            Ok(NodeId::from_bytes_unchecked(&*id))
+            Ok(NodeId::from_bytes(&*id))
         } else {
             // IP changed, generate new ID
             let id = random_idv4(&public_ip, rand::rng().random::<u8>());
@@ -364,39 +364,5 @@ mod tests {
 
         drop(dht_eventloop);
         Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn find_peers() -> color_eyre::Result<()> {
-        todo!("Proabaly just stick it inside of the json_rpc server instead of doing it here");
-        // TEST_INIT.call_once(set_up_tracing);
-        //
-        // let external_ip = public_ip::addr_v4().await.unwrap();
-        //
-        // let dht = DhtV4::with_stable_id(
-        //     SocketAddrV4::from_str("0.0.0.0:44444").unwrap(),
-        //     external_ip,
-        //     vec![
-        //         // dht.tansmissionbt.com
-        //         "87.98.162.88:6881".parse().unwrap(),
-        //         // router.utorrent.com
-        //         "67.215.246.10:6881".parse().unwrap(),
-        //         // router.bittorrent.com, ironically that this almost never responds
-        //         "82.221.103.244:6881".parse().unwrap(),
-        //         // dht.aelitis.com
-        //         "174.129.43.152:6881".parse().unwrap(),
-        //     ],
-        // )
-        // .await?;
-        //
-        // // XXX: get_peers design is problematic, impl has been replaced with todo!(), see the
-        // // comment on the function itself for more info.
-        // //
-        // let info_hash = InfoHash::from_hex_str("233b78ca585fe0a8c9e8eb4bda03f52e8b6f554b");
-        //
-        // let handle = dht.handle();
-        // let peers = handle.get_peers(info_hash).await?;
-        // info!("peers {peers:?}");
-        // Ok(())
     }
 }

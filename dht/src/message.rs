@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::our_error::OurError;
@@ -32,19 +33,221 @@ pub trait ParseKrpc {
     fn parse(&self) -> Result<Krpc, OurError>;
 }
 
+fn extract_error_content(body: &Vec<BencodeItemView>, transaction_id: TransactionId) -> Result<KrpcError, OurError> {
+    let code = body.get(0).ok_or(OurError::DecodeError(eyre!(
+        "Error message has no first elem/error code"
+    )))?;
+
+    let message = body.get(1).ok_or(OurError::DecodeError(eyre!(
+        "Error message has no second elem/description"
+    )))?;
+
+    let BencodeItemView::Integer(code) = code else {
+        return Err(OurError::DecodeError(eyre!("First element is not an int")));
+    };
+
+    let BencodeItemView::ByteString(message) = message else {
+        return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
+    };
+    let message = str::from_utf8(message)
+        .map_err(|_e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+        .to_string();
+
+    let code: u32 = *code as u32;
+    Ok(KrpcError::new(transaction_id, code, message))
+}
+
+fn assert_len(bytes: &[u8], len: usize) -> Result<&[u8], OurError> {
+    if bytes.len() == len {
+        Ok(bytes)
+    } else {
+        Err(OurError::DecodeError(eyre!("Should be {len} long")))
+    }
+}
+
+fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<NodeId, OurError> {
+    let querier = argument
+        .remove(&b"id".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("query doesn't have an `id` key")))?;
+
+    let BencodeItemView::ByteString(querier) = querier else {
+        return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
+    };
+
+    let querier = assert_len(querier, 20)?;
+    Ok(NodeId::from_bytes(querier))
+}
+
+fn extract_ping_arguments(
+    argument: &mut BTreeMap<&[u8], BencodeItemView>,
+    transaction_id: TransactionId,
+) -> Result<PingQuery, OurError> {
+    let node_id = extract_node_id(argument)?;
+    let ping = PingQuery::new(transaction_id, node_id);
+    Ok(ping)
+}
+
+fn extract_find_node_arguments(
+    argument: &mut BTreeMap<&[u8], BencodeItemView>,
+    transaction_id: TransactionId,
+) -> Result<FindNodeQuery, OurError> {
+    let querier = extract_node_id(argument)?;
+
+    let target = argument
+        .remove(&b"target".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("Query message has no 'target' key")))?;
+    let BencodeItemView::ByteString(target) = target else {
+        return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
+    };
+
+    let find_node_request = FindNodeQuery::new(transaction_id, querier, NodeId::from_bytes(target));
+
+    Ok(find_node_request)
+}
+
+fn extract_get_peers_arguments(
+    argument: &mut BTreeMap<&[u8], BencodeItemView>,
+    transaction_id: TransactionId,
+) -> Result<GetPeersQuery, OurError> {
+    let querier = extract_node_id(argument)?;
+
+    let info_hash = argument
+        .remove(&b"info_hash".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("Query message has no 'info_hash' key")))?;
+
+    let BencodeItemView::ByteString(info_hash) = info_hash else {
+        return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
+    };
+
+    let get_peers = GetPeersQuery::new(transaction_id, querier, InfoHash::from_bytes(info_hash));
+
+    Ok(get_peers)
+}
+
+fn extract_announce_peer_arguments(
+    arguments: &mut BTreeMap<&[u8], BencodeItemView>,
+    transaction_id: TransactionId,
+) -> Result<AnnouncePeerQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
+
+    let implied_port = arguments.remove(&b"implied_port".as_slice());
+    let implied_port = match implied_port {
+        Some(BencodeItemView::Integer(i)) if i == 1 => true,
+        _ => false,
+    };
+
+    let port = arguments.remove(&b"port".as_slice());
+    let Some(BencodeItemView::Integer(port)) = port else {
+        return Err(OurError::DecodeError(eyre!("'port' key is not a number")));
+    };
+
+    let token = arguments
+        .remove(&b"token".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("Query message has no 'token' key")))?;
+    let BencodeItemView::ByteString(token) = token else {
+        return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
+    };
+    let token = Token::from_bytes(token);
+
+    // todo: look at the non compliant ones
+    let info_hash = arguments
+        .remove(&b"info_hash".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("Query message has no 'info_hash' key")))?;
+    let BencodeItemView::ByteString(info_hash) = info_hash else {
+        return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
+    };
+
+    let announce_peer = AnnouncePeerQuery::new(
+        transaction_id,
+        querier,
+        implied_port,
+        port as u16,
+        InfoHash::from_bytes(info_hash),
+        token,
+    );
+
+    Ok(announce_peer)
+}
+
+fn extract_nodes(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<NodeInfo>>, OurError> {
+    let compact_nodes = response.remove(&b"nodes".as_slice());
+
+    let Some(compact_nodes) = compact_nodes else {
+        return Ok(None);
+    };
+
+    let BencodeItemView::ByteString(nodes) = compact_nodes else {
+        return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
+    };
+
+    let contacts: Vec<_> = nodes
+        .chunks(26)
+        .filter_map(|info| {
+            if info.len() != 26 {
+                // TODO: log it?
+                return None;
+            }
+
+            let node_id = &info[0..20];
+            let contact = &info[20..26];
+
+            let node_id = NodeId::from_bytes(node_id);
+
+            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
+            let port = u16::from_be_bytes([contact[4], contact[5]]);
+            let contact = SocketAddrV4::new(ip, port);
+
+            Some(NodeInfo::new(node_id, contact))
+        })
+        .collect();
+
+    Ok(Some(contacts))
+}
+
+fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<SocketAddrV4>>, OurError> {
+    let values = response.remove(&b"values".as_slice());
+    let Some(values) = values else {
+        return Ok(None);
+    };
+
+    let BencodeItemView::List(values) = values else {
+        return Err(OurError::DecodeError(eyre!("'values' key is not a list")));
+    };
+
+    let contacts: Vec<_> = values
+        .iter()
+        .filter_map(|x| match x {
+            BencodeItemView::ByteString(s) => Some(s),
+            _ => None,
+        })
+        .map(|sock_addr| {
+            assert_eq!(sock_addr.len(), 6, "Socket address should be 6 bytes long");
+            let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
+            let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
+
+            SocketAddrV4::new(ip, port)
+        })
+        .collect();
+
+    Ok(Some(contacts))
+}
+
+fn extract_token(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Token>, OurError> {
+    let token = response.remove(&b"token".as_slice());
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let BencodeItemView::ByteString(token) = token else {
+        return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
+    };
+    let token = Token::from_bytes(token);
+    Ok(Some(token))
+}
+
 impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
     fn parse(&self) -> Result<Krpc, OurError> {
-        use std::str;
-
-        fn assert_len(bytes: &[u8], len: usize) -> Result<&[u8], OurError> {
-            if bytes.len() == len {
-                Ok(bytes)
-            } else {
-                Err(OurError::DecodeError(eyre!("Should be {len} long")))
-            }
-        }
-
         let mut decoder = Decoder::new(self);
         let message = decoder
             .next_object()
@@ -60,9 +263,9 @@ impl ParseKrpc for &[u8] {
 
         // we're only using it to validate the message structure
         dict.consume_all()
-            .map_err(|_e| OurError::DecodeError(eyre!("Message strucutre is invalid")))?;
+            .map_err(|_e| OurError::DecodeError(eyre!("Message structure is invalid")))?;
 
-        let (_remaining, parsed) =
+        let (_remaining, mut parsed) =
             parse_bencode_dict(self).map_err(|_e| OurError::DecodeError(eyre!("nom complained")))?;
 
         let message_type_indicator = parsed
@@ -83,153 +286,59 @@ impl ParseKrpc for &[u8] {
 
         if message_type == b"e" {
             // Error message
-            let code_and_message = parsed
+            let error_body = parsed
                 .get(b"e".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Error message has no 'e' key")))?;
-            let BencodeItemView::List(code_and_message) = code_and_message else {
+            let BencodeItemView::List(code_and_message) = error_body else {
                 return Err(OurError::DecodeError(eyre!("'e' key is not a list")));
             };
-            let code = code_and_message
-                .get(0)
-                .ok_or(OurError::DecodeError(eyre!("Error message has no first elem")))?;
-            let message = code_and_message
-                .get(1)
-                .ok_or(OurError::DecodeError(eyre!("Error message has no second elem")))?;
 
-            let BencodeItemView::Integer(code) = code else {
-                return Err(OurError::DecodeError(eyre!("First element is not an int")));
-            };
-
-            let BencodeItemView::ByteString(message) = message else {
-                return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
-            };
-            let message = str::from_utf8(message)
-                .map_err(|_e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
-                .to_string();
-            // todo: cast safely
-            let code: u32 = *code as u32;
-            return Ok(Krpc::ErrorResponse(KrpcError::new(transaction_id, code, message)));
+            Ok(Krpc::ErrorResponse(extract_error_content(
+                code_and_message,
+                transaction_id,
+            )?))
         } else if message_type == &b"q" {
             // queries
-            // pull out common fields
-            let query_type = parsed
-                .get(&b"q".as_slice())
-                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'q' key")))?;
-            let BencodeItemView::ByteString(query_type) = query_type else {
-                return Err(OurError::DecodeError(eyre!("'q' key is not a binary string")));
+
+            let query_type: Box<[u8]> = {
+                let query_type = parsed
+                    .get(&b"q".as_slice())
+                    .ok_or(OurError::DecodeError(eyre!("Query message has no 'q' key")))?;
+
+                match query_type {
+                    BencodeItemView::ByteString(query_type) => query_type.to_vec().into_boxed_slice(),
+                    _ => return Err(OurError::DecodeError(eyre!("'q' key is not a binary string"))),
+                }
             };
 
             let arguments = parsed
-                .get(&b"a".as_slice())
-                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'a' key")))?;
+                .get_mut(&b"a".as_slice())
+                .ok_or(OurError::DecodeError(eyre!("Query message has no 'a' key")))?;
             let BencodeItemView::Dictionary(arguments) = arguments else {
                 return Err(OurError::DecodeError(eyre!("'a' key is not a dict")));
             };
 
-            let querier = arguments
-                .get(&b"id".as_slice())
-                .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'id' key")))?;
-            let BencodeItemView::ByteString(querier) = querier else {
-                return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
-            };
-
-            let querier = assert_len(querier, 20)?;
-
-            if query_type == &b"ping" {
-                let ping = PingQuery::new(transaction_id, NodeId::from_bytes_unchecked(querier));
+            if &*query_type == b"ping" {
+                let ping = extract_ping_arguments(arguments, transaction_id)?;
                 return Ok(Krpc::PingQuery(ping));
-            } else if query_type == &b"find_node" {
-                let target = arguments
-                    .get(&b"target".as_slice())
-                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'target' key")))?;
-                let BencodeItemView::ByteString(target) = target else {
-                    return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
-                };
-                let target = assert_len(target, 20)?;
-
-                let find_node_request = FindNodeQuery::new(
-                    transaction_id,
-                    NodeId::from_bytes_unchecked(querier),
-                    NodeId::from_bytes_unchecked(target),
-                );
+            } else if &*query_type == b"find_node" {
+                let find_node_request = extract_find_node_arguments(arguments, transaction_id)?;
                 return Ok(Krpc::FindNodeQuery(find_node_request));
-            } else if query_type == &b"get_peers" {
-                let info_hash = arguments
-                    .get(&b"info_hash".as_slice())
-                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
-
-                let BencodeItemView::ByteString(info_hash) = info_hash else {
-                    return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
-                };
-
-                let info_hash = assert_len(info_hash, 20)?;
-
-                let get_peers = GetPeersQuery::new(
-                    transaction_id,
-                    NodeId::from_bytes_unchecked(querier),
-                    InfoHash::from_bytes_unchecked(info_hash),
-                );
-
-                return Ok(Krpc::GetPeersQuery(get_peers));
-            } else if query_type == &b"announce_peer" {
-                // TODO: some stupid clients might not send this
-                let implied_port = arguments
-                    .get(&b"implied_port".as_slice())
-                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'implied_port' key")))?;
-                let implied_port = match implied_port {
-                    BencodeItemView::Integer(i) => Some(i),
-                    _ => None,
-                };
-
-                // TODO: revisit this, the semantics seems wrong
-                let port = if implied_port.is_some() {
-                    let port = arguments
-                        .get(&b"port".as_slice())
-                        .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'port' key")))?;
-                    let BencodeItemView::Integer(port) = port else {
-                        return Err(OurError::DecodeError(eyre!("'port' key is not a binary string")));
-                    };
-                    // todo: cast safely
-                    Some(*port as u16)
-                } else {
-                    None
-                };
-
-                let token = arguments
-                    .get(&b"token".as_slice())
-                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'token' key")))?;
-                let BencodeItemView::ByteString(token) = token else {
-                    return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
-                };
-                let token = Token::from_bytes(token);
-
-                // todo: look at the non compliant ones
-                let info_hash = arguments
-                    .get(&b"info_hash".as_slice())
-                    .ok_or(OurError::DecodeError(eyre!("Qeury message has no 'info_hash' key")))?;
-                let BencodeItemView::ByteString(info_hash) = info_hash else {
-                    return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
-                };
-                let info_hash = assert_len(info_hash, 20)?;
-
-                let announce_peer = AnnouncePeerQuery::new(
-                    transaction_id,
-                    NodeId::from_bytes_unchecked(querier),
-                    port,
-                    InfoHash::from_bytes_unchecked(info_hash),
-                    token,
-                );
-
+            } else if &*query_type == b"get_peers" {
+                let find_node_request = extract_get_peers_arguments(arguments, transaction_id)?;
+                return Ok(Krpc::GetPeersQuery(find_node_request));
+            } else if &*query_type == b"announce_peer" {
+                let announce_peer = extract_announce_peer_arguments(arguments, transaction_id)?;
                 return Ok(Krpc::AnnouncePeerQuery(announce_peer));
             } else {
-                return Err(OurError::DecodeError(eyre!("Invalid message")));
+                return Err(OurError::DecodeError(eyre!("unknown query type")));
             }
         } else if message_type == &b"r" {
             // responses
             let body = parsed
-                .get(b"r".as_slice())
+                .remove(b"r".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Response message has no 'r' key")))?;
-            let BencodeItemView::Dictionary(response) = body else {
+            let BencodeItemView::Dictionary(mut response) = body else {
                 return Err(OurError::DecodeError(eyre!("'r' key is not a dict")));
             };
 
@@ -239,79 +348,17 @@ impl ParseKrpc for &[u8] {
             let BencodeItemView::ByteString(target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
-            let target_id = assert_len(&target_id, 20)?;
-            let target_id = NodeId::from_bytes_unchecked(target_id);
+            let target_id = NodeId::from_bytes(target_id);
 
             // if the message contains a "nodes", then try to parse it out
-            let nodes = match response.contains_key(b"nodes".as_slice()) {
-                true => {
-                    let nodes = response.get(b"nodes".as_slice()).unwrap();
-                    let BencodeItemView::ByteString(nodes) = nodes else {
-                        return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
-                    };
-
-                    // TODO: worry about when the length is a multiple of 26
-                    let contacts: Vec<_> = nodes
-                        .chunks(26)
-                        .map(|info| {
-                            let node_id = &info[0..20];
-                            let contact = &info[20..26];
-
-                            let node_id = NodeId::from_bytes_unchecked(node_id);
-
-                            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
-                            let port = u16::from_be_bytes([contact[4], contact[5]]);
-                            let contact = SocketAddrV4::new(ip, port);
-
-                            NodeInfo::new(node_id, contact)
-                        })
-                        .collect();
-
-                    Some(contacts)
-                }
-                false => None,
-            };
-
+            let nodes = extract_nodes(&mut response)?;
             // if the message contains a "values" key, then try to parse it out
-            let values = match response.get(b"values".as_slice()) {
-                Some(BencodeItemView::List(values)) => {
-                    let contacts: Vec<_> = values
-                        .iter()
-                        .filter_map(|x| match x {
-                            BencodeItemView::ByteString(s) => Some(s),
-                            _ => None,
-                        })
-                        .map(|sock_addr| {
-                            // TODO: worry about segfault later
-                            let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
-                            let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
-
-                            SocketAddrV4::new(ip, port)
-                        })
-                        .collect();
-
-                    Some(contacts)
-                }
-                _ => None,
-            };
-
+            let values = extract_peers(&mut response)?;
             // if the message contains a "token" key, then try to parse it out
-            let token = match response.contains_key(b"token".as_slice()) {
-                true => {
-                    // get_peers response
-                    let token = response.get(b"token".as_slice()).unwrap();
-                    let BencodeItemView::ByteString(token) = token else {
-                        return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
-                    };
-                    let token = Token::from_bytes(token);
-                    Some(token)
-                }
-                false => None,
-            };
+            let token = extract_token(&mut response)?;
 
             if nodes.is_none() && values.is_none() && token.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
-
                 let msg = PingAnnouncePeerResponse::new(transaction_id, target_id);
                 let msg = Krpc::PingAnnouncePeerResponse(msg);
                 return Ok(msg);
@@ -340,7 +387,7 @@ impl ParseKrpc for &[u8] {
             }
         } else {
             // invalid message
-            return Err(OurError::DecodeError(eyre!("Unkown message type")));
+            return Err(OurError::DecodeError(eyre!("Unknown message type")));
         }
     }
 }
@@ -464,8 +511,7 @@ impl Krpc {
         implied_port: bool,
         token: Token,
     ) -> Krpc {
-        let port = if implied_port { Some(port) } else { None };
-        let announce_peer = AnnouncePeerQuery::new(transaction_id, querying_id, port, info_hash, token);
+        let announce_peer = AnnouncePeerQuery::new(transaction_id, querying_id, implied_port, port, info_hash, token);
         Krpc::AnnouncePeerQuery(announce_peer)
     }
 
@@ -515,7 +561,7 @@ mod test {
         let deserialized = message.parse().unwrap();
         let expected = Krpc::new_ping_query(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
         );
         assert_eq!(deserialized, expected);
     }
@@ -528,8 +574,8 @@ mod test {
 
         let expected = Krpc::new_find_node_query(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
         );
 
         assert_eq!(deserialized, expected);
@@ -543,8 +589,8 @@ mod test {
 
         let expected = Krpc::new_get_peers_query(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            InfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
+            InfoHash::from_bytes(*&b"mnopqrstuvwxyz123456"),
         );
 
         // taken directly from the spec
@@ -552,15 +598,15 @@ mod test {
     }
 
     #[test]
-    fn can_parse_example_annouce_peers_query() {
+    fn can_parse_example_announce_peers_query() {
         let message =
                 b"d1:ad2:id20:abcdefghij012345678912:implied_porti1e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe" as &[u8];
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_announce_peer_query(
             TransactionId::from_bytes(*&b"aa"),
-            InfoHash::from_bytes_unchecked(&*b"mnopqrstuvwxyz123456"),
-            NodeId::from_bytes_unchecked(&*b"abcdefghij0123456789"),
+            InfoHash::from_bytes(&*b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(&*b"abcdefghij0123456789"),
             6881,
             true,
             Token::from_bytes(*&b"aoeusnth"),
@@ -577,7 +623,7 @@ mod test {
 
         let expected = Krpc::new_ping_response(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
         );
         assert_eq!(decoded, expected);
     }
@@ -591,7 +637,7 @@ mod test {
         let txn_id = TransactionId::from_bytes(&txn_id);
 
         let responding = hex::decode("23307bc01f5e7cc56ba66314b36e69246304f870").unwrap();
-        let responding = NodeId::from_bytes_unchecked(&responding);
+        let responding = NodeId::from_bytes(&responding);
 
         let res_token = hex::decode("3704f7737408c5fef0f96bca389e4100f972859d").unwrap();
         let res_token = Token::from_bytes(&res_token);
@@ -616,10 +662,10 @@ mod test {
         use find_node_get_peers_response::Builder;
         let expected = Builder::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"0123456789abcdefghij"),
+            NodeId::from_bytes(*&b"0123456789abcdefghij"),
         )
         .with_node(NodeInfo::new(
-            NodeId::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
             // TODO: place holder values
             SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
         ))

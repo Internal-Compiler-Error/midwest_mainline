@@ -16,16 +16,17 @@ impl AnnouncePeerQuery {
     pub fn new(
         transaction_id: TransactionId,
         ourself: NodeId,
-        port: Option<u16>,
+        implied_port: bool,
+        port: u16,
         info_hash: InfoHash,
         token: Token,
     ) -> Self {
         Self {
             transaction_id,
             querier: ourself,
-            implied_port: port.is_none(),
+            implied_port,
             info_hash,
-            port: port.unwrap_or(6881),
+            port,
             token,
         }
     }
@@ -95,9 +96,10 @@ mod tests {
 
         let announce = AnnouncePeerQuery::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
-            None,
-            InfoHash::from_bytes_unchecked(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
+            true,
+            6881u16,
+            InfoHash::from_bytes(*&b"mnopqrstuvwxyz123456"),
             Token::from_bytes(*&b"aoeusnth"),
         );
 

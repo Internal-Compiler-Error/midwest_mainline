@@ -27,7 +27,7 @@ impl Debug for NodeId {
 
 impl NodeId {
     /// Panics if the length is not exactly NODE_ID_LEN
-    pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() != NODE_ID_LEN {
             panic!("Node id must be exactly {NODE_ID_LEN} bytes got {} bytes", bytes.len());
         }
@@ -90,7 +90,7 @@ pub struct InfoHash(pub [u8; NODE_ID_LEN]);
 
 impl InfoHash {
     /// Panics if `bytes` is not 20 bytes in length
-    pub fn from_bytes_unchecked(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() != NODE_ID_LEN {
             panic!("Info hash must be exactly {NODE_ID_LEN} bytes");
         }
@@ -200,7 +200,7 @@ impl Routable for NodeInfo {
 
 impl From<NodeNoMetaInfo> for NodeInfo {
     fn from(value: NodeNoMetaInfo) -> Self {
-        let idd = NodeId::from_bytes_unchecked(&*value.id);
+        let idd = NodeId::from_bytes(&*value.id);
         // TODO: add err msg
         let ip: Ipv4Addr = value.ip_addr.parse().unwrap();
         let portt = value.port;

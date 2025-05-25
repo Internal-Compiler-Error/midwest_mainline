@@ -317,12 +317,14 @@ impl Router {
         }
     }
 
+    // TODO: introduce an inflight table to only allow one refresh operation per bucket at each
+    // time
     async fn refresh_bucket(&self, i: i32) {
         let mut conn = self.conn();
         let problematics = self.replacement_queue(i, &mut conn);
 
         let tasks = problematics.into_iter().map(|n| async move {
-            let id = NodeId::from_bytes_unchecked(&*n.id);
+            let id = NodeId::from_bytes(&*n.id);
             let ip: Ipv4Addr = n.ip_addr.parse().unwrap();
             let endpoint = SocketAddrV4::new(ip, n.port as u16);
             let target = NodeInfo::new(id, endpoint);

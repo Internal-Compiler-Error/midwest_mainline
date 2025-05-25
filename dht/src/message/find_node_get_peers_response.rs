@@ -209,7 +209,7 @@ mod tests {
 
         let response = Builder::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
         )
         .with_token(Token::from_bytes(*&b"aoeusnth"))
         .with_value(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893))
@@ -230,11 +230,11 @@ mod tests {
 
         let response = Builder::new(
             TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes_unchecked(*&b"abcdefghij0123456789"),
+            NodeId::from_bytes(*&b"abcdefghij0123456789"),
         )
         .with_token(Token::from_bytes(*&b"aoeusnth"))
         .with_node(NodeInfo::new(
-            NodeId::from_bytes_unchecked(*&b"lmnopqrstuvxyz098765"),
+            NodeId::from_bytes(*&b"lmnopqrstuvxyz098765"),
             SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
         ))
         .build();
