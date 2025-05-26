@@ -436,7 +436,6 @@ impl DhtHandle {
         Ok(self.swarm_peers(&info_hash))
     }
 
-    // TODO: port semantics is broken
     #[tracing::instrument(skip(self))]
     pub async fn announce_peers(
         &self,

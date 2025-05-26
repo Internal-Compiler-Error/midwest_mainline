@@ -91,9 +91,7 @@ pub struct InfoHash(pub [u8; NODE_ID_LEN]);
 impl InfoHash {
     /// Panics if `bytes` is not 20 bytes in length
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() != NODE_ID_LEN {
-            panic!("Info hash must be exactly {NODE_ID_LEN} bytes");
-        }
+        assert!(bytes.len() == NODE_ID_LEN);
 
         let mut arr = [0u8; NODE_ID_LEN];
         arr.copy_from_slice(bytes);
@@ -102,25 +100,6 @@ impl InfoHash {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
-    }
-
-    pub fn from_hex_str(str: &str) -> Self {
-        if str.len() != NODE_ID_LEN * 2 {
-            panic!("Info hash must be exactly {NODE_ID_LEN} bytes");
-        }
-        if !str.is_ascii() {
-            panic!("input has non ascii characters");
-        }
-
-        let mut arr = [0u8; NODE_ID_LEN];
-        let mut i = 0;
-        while i != str.len() {
-            let bytes = &str[i..i + 2];
-            arr[i >> 1] = u8::from_str_radix(bytes, 16).expect("input string must be consist of soley hex digits");
-            i <<= 1;
-        }
-
-        Self(arr)
     }
 }
 
@@ -211,10 +190,6 @@ impl From<NodeNoMetaInfo> for NodeInfo {
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct TransactionId(pub SmallVec<[u8; 2]>);
-
-// Only exists to have something you can use for the old ways of constructing messsages, should be
-// removed eventually
-pub const TXN_ID_PLACEHOLDER: TransactionId = TransactionId(SmallVec::from_const([u8::MAX, u8::MAX]));
 
 impl Debug for TransactionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

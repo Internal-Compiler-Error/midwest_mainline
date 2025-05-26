@@ -21,7 +21,6 @@ use krpc_broker::KrpcBroker;
 use rand::{Rng, RngCore};
 use router::Router;
 use std::{
-    env,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
@@ -146,7 +145,11 @@ impl DhtV4 {
     /// is correct and it's duty to make sure it's correct.
     ///
     /// The UdpSocket must be already binded to an ipv4 address
-    pub fn with_stable_id(listen_socket: UdpSocket, external_addr: Ipv4Addr) -> Result<Self, OurError> {
+    pub fn with_stable_id(
+        listen_socket: UdpSocket,
+        external_addr: Ipv4Addr,
+        database_url: &str,
+    ) -> Result<Self, OurError> {
         let local_addr = match listen_socket
             .local_addr()
             .expect("listen socket should already be binded per doc")
@@ -155,8 +158,6 @@ impl DhtV4 {
             _ => panic!("listen socket must be binded to ipv4"),
         };
 
-        // TODO: make this configurable
-        let database_url = env::var("DATABASE_URL").expect("No DATABASE_URL var");
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         let db = Pool::builder()
             .test_on_check_out(true)
@@ -291,6 +292,7 @@ mod tests {
     // use opentelemetry::global;
     // use rand::RngCore;
     use std::{
+        env,
         net::SocketAddrV4,
         str::FromStr,
         sync::{Arc, Once},
@@ -329,7 +331,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:44444").unwrap())
             .await
             .unwrap();
-        let dht = DhtV4::with_stable_id(socket, external_ip).unwrap();
+        let dht = DhtV4::with_stable_id(socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
 
         let dht = Arc::new(dht);
         let dhtt = Arc::clone(&dht);

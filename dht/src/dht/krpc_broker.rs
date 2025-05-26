@@ -74,7 +74,7 @@ impl KrpcBroker {
         let pending_responses = self.pending_responses.clone();
         let inbound_subscribers = self.inbound_subscribers.clone();
 
-        let socket_reader = async move {
+        let event_loop = async move {
             let mut buf = [0u8; 1500];
 
             loop {
@@ -117,7 +117,8 @@ impl KrpcBroker {
                             // see if we have a slot for this transaction id, if we do, that means one of the
                             // messages that we expect, otherwise the message is a query we need to handle
                             if let Some(sender) = pending_responses.lock().unwrap().remove(id) {
-                                // failing means we're no longer interested, which is ok
+                                // failing means the receiver has dropped, meaning they are no
+                                // longer interested in the message, not a bug
                                 let _ = sender.send((msg, socket_addr));
                             }
                         }
@@ -129,11 +130,10 @@ impl KrpcBroker {
             }
         };
         use tokio::task::Builder;
-        Builder::new().name("Message broker").spawn(socket_reader)
+        Builder::new().name("Message broker").spawn(event_loop)
     }
 
-    /// Tell the broker we should expect some messages
-    // TODO: maybe it should return Receiver<Option<(Krpc, SocketAddrV4)>
+    /// Subscribe to the reply with the provided transaction_id
     pub fn subscribe_one(&self, transaction_id: TransactionId) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
         let (tx, rx) = oneshot::channel();
 
@@ -145,12 +145,11 @@ impl KrpcBroker {
     }
 
     /// Send a message, fires up a new stask in background
-    fn send_msg(&self, msg: Krpc, peer: SocketAddrV4) {
+    fn send_msg_background(&self, msg: &Krpc, peer: SocketAddrV4) {
         let socket = self.socket.clone();
+        let buf = msg.encode();
 
         tokio::spawn(async move {
-            let buf = msg.encode();
-
             socket.send_to(&buf, peer).await.unwrap();
         });
     }
@@ -160,7 +159,7 @@ impl KrpcBroker {
         let sent_time = unix_timestmap_ms();
         let rx = {
             let rx = self.subscribe_one(message.transaction_id().clone());
-            self.send_msg(message.clone(), endpoint);
+            self.send_msg_background(&message, endpoint);
             rx
         };
         let (response, _addr) = rx.await.unwrap();
@@ -186,7 +185,8 @@ impl KrpcBroker {
                 trace!("operation timedout for {} timed out after {:?}", endpoint, time_out);
             })
             ?  // timeout error
-            ?; // send_and_wait related error
+            ? // send_and_wait related error
+            ;
         Ok(response)
     }
 

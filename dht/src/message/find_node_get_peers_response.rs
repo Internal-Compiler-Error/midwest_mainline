@@ -74,15 +74,6 @@ impl Builder {
 }
 
 impl FindNodeGetPeersResponse {
-    pub fn is_get_peer_success(&self) -> bool {
-        // TODO: do we need to care if the token exists?
-        !self.values.is_empty()
-    }
-
-    pub fn is_get_peer_defferred(&self) -> bool {
-        !self.is_get_peer_success()
-    }
-
     pub fn has_token(&self) -> bool {
         self.token.is_some()
     }

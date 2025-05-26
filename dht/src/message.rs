@@ -9,6 +9,7 @@ use bendy::encoding::{Encoder, SingleItemEncoder};
 use eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
+use tracing::{info, instrument};
 
 use crate::message::announce_peer_query::AnnouncePeerQuery;
 use crate::message::error::KrpcError;
@@ -70,16 +71,29 @@ fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<No
     Ok(NodeId::from_bytes(querier))
 }
 
-fn extract_ping_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PingQuery, OurError> {
-    let node_id = extract_node_id(argument)?;
+fn report_unused_keys<V>(dict: &BTreeMap<&[u8], V>, err_template: &'static str) {
+    if dict.len() != 0 {
+        let keys = dict
+            .keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect::<Vec<_>>()
+            .join(",");
+        info!("{err_template}: {keys}");
+    }
+}
+
+fn extract_ping(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PingQuery, OurError> {
+    let node_id = extract_node_id(arguments)?;
     let ping = PingQuery::new(node_id);
+
+    report_unused_keys(&arguments, "Ping query body has unused keys");
     Ok(ping)
 }
 
-fn extract_find_node_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<FindNodeQuery, OurError> {
-    let querier = extract_node_id(argument)?;
+fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<FindNodeQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
 
-    let target = argument
+    let target = arguments
         .remove(&b"target".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'target' key")))?;
     let BencodeItemView::ByteString(target) = target else {
@@ -88,13 +102,14 @@ fn extract_find_node_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) 
 
     let find_node_request = FindNodeQuery::new(querier, NodeId::from_bytes(target));
 
+    report_unused_keys(&arguments, "Find_node query body has unused keys");
     Ok(find_node_request)
 }
 
-fn extract_get_peers_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
-    let querier = extract_node_id(argument)?;
+fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
 
-    let info_hash = argument
+    let info_hash = arguments
         .remove(&b"info_hash".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'info_hash' key")))?;
 
@@ -104,12 +119,11 @@ fn extract_get_peers_arguments(argument: &mut BTreeMap<&[u8], BencodeItemView>) 
 
     let get_peers = GetPeersQuery::new(querier, InfoHash::from_bytes(info_hash));
 
+    report_unused_keys(&arguments, "Get_peers query body has unused keys");
     Ok(get_peers)
 }
 
-fn extract_announce_peer_arguments(
-    arguments: &mut BTreeMap<&[u8], BencodeItemView>,
-) -> Result<AnnouncePeerQuery, OurError> {
+fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<AnnouncePeerQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
     let implied_port = arguments.remove(&b"implied_port".as_slice());
@@ -147,6 +161,7 @@ fn extract_announce_peer_arguments(
         token,
     );
 
+    report_unused_keys(&arguments, "Announce_peer query body has unused keys");
     Ok(announce_peer)
 }
 
@@ -165,7 +180,7 @@ fn extract_nodes(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
         .chunks(26)
         .filter_map(|info| {
             if info.len() != 26 {
-                // TODO: log it?
+                info!("`nodes` string length is not a product of 26, {}", nodes.len());
                 return None;
             }
 
@@ -195,18 +210,24 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
         return Err(OurError::DecodeError(eyre!("'values' key is not a list")));
     };
 
-    let contacts: Vec<_> = values
+    let contacts: Vec<SocketAddrV4> = values
         .iter()
         .filter_map(|x| match x {
             BencodeItemView::ByteString(s) => Some(s),
-            _ => None,
+            _ => {
+                info!("Encoutered one element in `values` list that isn't a string");
+                None
+            }
         })
-        .map(|sock_addr| {
-            assert_eq!(sock_addr.len(), 6, "Socket address should be 6 bytes long");
+        .filter_map(|sock_addr| {
+            if sock_addr.len() != 6 {
+                info!("Encoutered one string in `values` list that isn't 6 bytes long");
+            }
+
             let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
             let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
 
-            SocketAddrV4::new(ip, port)
+            Some(SocketAddrV4::new(ip, port))
         })
         .collect();
 
@@ -228,60 +249,56 @@ fn extract_token(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
 
 impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
+    #[instrument(skip(self))]
     fn parse(&self) -> Result<Krpc, OurError> {
+        // Use bendy to validate the input is valid bencode message, extracting the fields is done
+        // with juicy_bencode instead
         let mut decoder = Decoder::new(self);
         let message = decoder
             .next_object()
             .map_err(|e| OurError::BendyDecodeError(e))?
-            .ok_or(OurError::DecodeError(eyre!("Error in decoding but different???")))?;
+            .ok_or(OurError::DecodeError(eyre!("Empty input")))?;
 
         let Object::Dict(mut dict) = message else {
-            // TODO: include the message in error reporting
-            //
-            // invalid message
             return Err(OurError::DecodeError(eyre!("Message is not a dict")));
         };
-
-        // we're only using it to validate the message structure
         dict.consume_all()
-            .map_err(|_e| OurError::DecodeError(eyre!("Message structure is invalid")))?;
+            .map_err(|e| OurError::DecodeError(eyre!("Message structure is invalid: {e}")))?;
 
-        let (_remaining, mut parsed) =
-            parse_bencode_dict(self).map_err(|_e| OurError::DecodeError(eyre!("nom complained")))?;
+        let (unused, mut parsed) =
+            parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained: {e}")))?;
+        assert!(unused.len() == 0);
 
         let message_type_indicator = parsed
-            .get(b"y".as_slice())
+            .remove(b"y".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message as no 'y' key")))?;
         let BencodeItemView::ByteString(message_type) = message_type_indicator else {
-            // invalid message
             return Err(OurError::DecodeError(eyre!("Message 'y' key is not a binary string")));
         };
 
         let transaction_id = parsed
-            .get(&b"t".as_slice())
+            .remove(&b"t".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message has no 't' key")))?;
         let BencodeItemView::ByteString(transaction_id) = transaction_id else {
             return Err(OurError::DecodeError(eyre!("Message 't' key is not a binary string")));
         };
-        let transaction_id = TransactionId::from_bytes(transaction_id);
+        let txn_id = TransactionId::from_bytes(transaction_id);
 
-        if message_type == b"e" {
+        let body = if message_type == b"e" {
             // Error message
             let error_body = parsed
-                .get(b"e".as_slice())
+                .remove(b"e".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Error message has no 'e' key")))?;
             let BencodeItemView::List(code_and_message) = error_body else {
                 return Err(OurError::DecodeError(eyre!("'e' key is not a list")));
             };
 
-            let body = KrpcBody::ErrorResponse(extract_error_content(code_and_message)?);
-            Ok(Krpc::new_with_body(transaction_id, body))
-        } else if message_type == &b"q" {
+            KrpcBody::ErrorResponse(extract_error_content(&code_and_message)?)
+        } else if message_type == b"q" {
             // queries
-
             let query_type: Box<[u8]> = {
                 let query_type = parsed
-                    .get(&b"q".as_slice())
+                    .remove(&b"q".as_slice())
                     .ok_or(OurError::DecodeError(eyre!("Query message has no 'q' key")))?;
 
                 match query_type {
@@ -291,28 +308,25 @@ impl ParseKrpc for &[u8] {
             };
 
             let arguments = parsed
-                .get_mut(&b"a".as_slice())
+                .remove(&b"a".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Query message has no 'a' key")))?;
-            let BencodeItemView::Dictionary(arguments) = arguments else {
+            let BencodeItemView::Dictionary(mut arguments) = arguments else {
                 return Err(OurError::DecodeError(eyre!("'a' key is not a dict")));
             };
 
             if &*query_type == b"ping" {
-                let body = KrpcBody::PingQuery(extract_ping_arguments(arguments)?);
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                KrpcBody::PingQuery(extract_ping(&mut arguments)?)
             } else if &*query_type == b"find_node" {
-                let body = KrpcBody::FindNodeQuery(extract_find_node_arguments(arguments)?);
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                KrpcBody::FindNodeQuery(extract_find_node(&mut arguments)?)
             } else if &*query_type == b"get_peers" {
-                let body = KrpcBody::GetPeersQuery(extract_get_peers_arguments(arguments)?);
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                KrpcBody::GetPeersQuery(extract_get_peers(&mut arguments)?)
             } else if &*query_type == b"announce_peer" {
-                let body = KrpcBody::AnnouncePeerQuery(extract_announce_peer_arguments(arguments)?);
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                KrpcBody::AnnouncePeerQuery(extract_announce_peer(&mut arguments)?)
             } else {
-                return Err(OurError::DecodeError(eyre!("unknown query type")));
+                let query_type = String::from_utf8_lossy(&*query_type);
+                return Err(OurError::DecodeError(eyre!("Unsupported query type: {query_type}")));
             }
-        } else if message_type == &b"r" {
+        } else if message_type == b"r" {
             // responses
             let body = parsed
                 .remove(b"r".as_slice())
@@ -322,7 +336,7 @@ impl ParseKrpc for &[u8] {
             };
 
             let id = response
-                .get(b"id".as_slice())
+                .remove(b"id".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Response message has no 'id' key")))?;
             let BencodeItemView::ByteString(target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
@@ -339,7 +353,7 @@ impl ParseKrpc for &[u8] {
             if nodes.is_none() && values.is_none() && token.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
                 let body = KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id));
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                return Ok(Krpc::new_with_body(txn_id, body));
             } else {
                 // otherwise it's response to get_peers or find_node
                 let builder = Builder::new(target_id);
@@ -359,14 +373,26 @@ impl ParseKrpc for &[u8] {
                     None => builder,
                 };
 
-                let msg = builder.build();
-                let body = KrpcBody::FindNodeGetPeersResponse(msg);
-                return Ok(Krpc::new_with_body(transaction_id, body));
+                KrpcBody::FindNodeGetPeersResponse(builder.build())
             }
         } else {
             // invalid message
-            return Err(OurError::DecodeError(eyre!("Unknown message type")));
+            let message_type = String::from_utf8_lossy(message_type);
+            return Err(OurError::DecodeError(eyre!("Unknown message type: {message_type}")));
+        };
+
+        let _ = parsed.remove(b"ip".as_slice()); // see https://bittorrent.org/beps/bep_0042.html
+        let _ = parsed.remove(b"v".as_slice()); // user agent string
+
+        if parsed.len() != 0 {
+            let keys = parsed
+                .keys()
+                .map(|k| String::from_utf8_lossy(k).into_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            info!("Message has unused fields at top level: {keys}");
         }
+        Ok(Krpc::new_with_body(txn_id, body))
     }
 }
 
@@ -709,7 +735,6 @@ mod test {
         let expected = Builder::new(NodeId::from_bytes(*&b"0123456789abcdefghij"))
             .with_node(NodeInfo::new(
                 NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
-                // TODO: place holder values
                 SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
             ))
             .build();
