@@ -34,7 +34,7 @@ nodes can ask us about our neighbors and gradually lead to the node that has the
 - [x] respond to get peers
 - [x] respond to announce
 - [x] respond to find node
-- [ ] expiration for hash table
+- [x] expiration for swarm table
 - [ ] ping and prune for routing table
 - [x] upload to <https://crates.io>
 
@@ -53,6 +53,8 @@ This library uses unstable tokio features for tracing, go see
 tokio's [docs](https://docs.rs/tokio/1.20.0/tokio/index.html#unstable-features).
 about using unstable features.
 
+# limitations
+- the behaviour is undefined if you mess with your system clock
 # TL;DR
 
 The library is still in beta, I am aware the interfaces are quite clunky
