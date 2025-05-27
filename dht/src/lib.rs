@@ -31,8 +31,8 @@
 //! - [x] respond to get peers
 //! - [x] respond to announce
 //! - [x] respond to find node
-//! - [ ] expiration for hash table
-//! - [ ] ping and prune for routing table
+//! - [x] expiration for hash table
+//! - [x] ping and prune for routing table
 //! - [x] upload to crate.io
 //!
 //! ## state of the development

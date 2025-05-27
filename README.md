@@ -35,7 +35,7 @@ nodes can ask us about our neighbors and gradually lead to the node that has the
 - [x] respond to announce
 - [x] respond to find node
 - [x] expiration for swarm table
-- [ ] ping and prune for routing table
+- [x] ping and prune for routing table
 - [x] upload to <https://crates.io>
 
 ## state of the development
