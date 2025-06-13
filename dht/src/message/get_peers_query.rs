@@ -6,20 +6,17 @@ use super::ToKrpcBody;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct GetPeersQuery {
-    querier: NodeId,
+    requestor: NodeId,
     info_hash: InfoHash,
 }
 
 impl GetPeersQuery {
-    pub fn new(ourself: NodeId, info_hash: InfoHash) -> Self {
-        Self {
-            querier: ourself,
-            info_hash,
-        }
+    pub fn new(requestor: NodeId, info_hash: InfoHash) -> Self {
+        Self { requestor, info_hash }
     }
 
-    pub fn querier(&self) -> &NodeId {
-        &self.querier
+    pub fn requestor(&self) -> &NodeId {
+        &self.requestor
     }
 
     pub fn info_hash(&self) -> &InfoHash {
@@ -31,7 +28,7 @@ impl ToKrpcBody for GetPeersQuery {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_unsorted_dict(|enc| {
-            enc.emit_pair(b"id", &self.querier)?;
+            enc.emit_pair(b"id", &self.requestor)?;
             enc.emit_pair(b"info_hash", &self.info_hash)
         })
         .unwrap()

@@ -6,24 +6,21 @@ use super::ToKrpcBody;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeQuery {
-    querier: NodeId,
+    requestor: NodeId,
     target: NodeId,
 }
 
 impl FindNodeQuery {
-    pub fn new(ourself: NodeId, target: NodeId) -> Self {
-        Self {
-            querier: ourself,
-            target,
-        }
+    pub fn new(requestor: NodeId, target: NodeId) -> Self {
+        Self { requestor, target }
     }
 
     pub fn target_id(&self) -> NodeId {
         self.target
     }
 
-    pub fn querier(&self) -> NodeId {
-        self.querier
+    pub fn requestor(&self) -> NodeId {
+        self.requestor
     }
 }
 
@@ -31,7 +28,7 @@ impl ToKrpcBody for FindNodeQuery {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_unsorted_dict(|enc| {
-            enc.emit_pair(b"id", &self.querier)?;
+            enc.emit_pair(b"id", &self.requestor)?;
             enc.emit_pair(b"target", &self.target)
         })
         .unwrap()
@@ -56,7 +53,7 @@ mod tests {
             let ourself = NodeId::from_bytes(*&b"abcdefghij0123456789");
             let target = NodeId::from_bytes(*&b"mnopqrstuvwxyz123456");
             FindNodeQuery {
-                querier: ourself,
+                requestor: ourself,
                 target,
             }
         };

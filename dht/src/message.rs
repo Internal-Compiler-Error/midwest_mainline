@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::our_error::OurError;
@@ -6,6 +6,7 @@ use crate::types::{NodeInfo, Token, TransactionId};
 use bendy::decoding::{Decoder, Object};
 
 use bendy::encoding::{Encoder, SingleItemEncoder};
+use bendy::value;
 use eyre::eyre;
 use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
@@ -443,8 +444,13 @@ impl KrpcBody {
 }
 
 impl Krpc {
-    // TODO: maybe allow it to take in a list of additional fields to encode
     pub fn encode(&self) -> Box<[u8]> {
+        self.encode_with_additional(&HashMap::new())
+    }
+
+    //
+    // TODO: maybe allow it to take in a list of additional fields to encode
+    pub fn encode_with_additional(&self, additional: &HashMap<&[u8], value::Value>) -> Box<[u8]> {
         let mut enc = Encoder::new();
 
         enc.emit_and_sort_dict(|enc| {
@@ -454,42 +460,49 @@ impl Krpc {
                 KrpcBody::AnnouncePeerQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "announce_peer")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
                 }
                 KrpcBody::FindNodeQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "find_node")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
                 }
                 KrpcBody::GetPeersQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "get_peers")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
                 }
                 KrpcBody::PingQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "ping")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))
+                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
                 }
 
                 KrpcBody::PingAnnouncePeerResponse(r) => {
                     enc.emit_pair(b"y", "r")?;
-                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))
+                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))?;
                 }
                 KrpcBody::FindNodeGetPeersResponse(r) => {
                     enc.emit_pair(b"y", "r")?;
-                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))
+                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))?;
                 }
                 KrpcBody::ErrorResponse(err) => {
                     enc.emit_pair(b"y", "e")?;
-                    enc.emit_pair_with(b"e", |e| Ok(err.encode_body(e)))
+                    enc.emit_pair_with(b"e", |e| Ok(err.encode_body(e)))?;
                 }
             }
+
+            for (k, v) in additional.iter() {
+                enc.emit_pair(k, v)?;
+            }
+
+            Ok(())
         })
         .unwrap();
 
         enc.get_output().unwrap().into_boxed_slice()
     }
+
     pub fn set_txn_id(&mut self, txn_id: TransactionId) {
         self.txn_id = txn_id;
     }
@@ -498,10 +511,10 @@ impl Krpc {
     pub fn node_id(&self) -> Option<NodeId> {
         // TODO: we really need to agree on whether to copy or share with node_id by default
         match &self.body {
-            KrpcBody::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.querier()),
-            KrpcBody::FindNodeQuery(find_node_query) => Some(find_node_query.querier()),
-            KrpcBody::GetPeersQuery(get_peers_query) => Some(*get_peers_query.querier()),
-            KrpcBody::PingQuery(ping_query) => Some(*ping_query.querier()),
+            KrpcBody::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.requestor()),
+            KrpcBody::FindNodeQuery(find_node_query) => Some(find_node_query.requestor()),
+            KrpcBody::GetPeersQuery(get_peers_query) => Some(*get_peers_query.requestor()),
+            KrpcBody::PingQuery(ping_query) => Some(*ping_query.requestor()),
 
             KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => {
                 Some(*ping_announce_peer_response.target_id())

@@ -172,7 +172,7 @@ impl DhtHandle {
         let peers = self.swarm_peers(query.info_hash());
         let token_pool = &self.token_generator;
 
-        let token = token_pool.token_for_node(query.querier());
+        let token = token_pool.token_for_node(query.requestor());
         if !peers.is_empty() {
             let res = ResBuilder::new(self.our_id.clone())
                 .with_token(token)
@@ -181,7 +181,7 @@ impl DhtHandle {
             KrpcBody::FindNodeGetPeersResponse(res)
         } else {
             // when we don't have peer info on an info hash, respond with the cloests nodes so the querier can ask them
-            let closest_eight: Vec<_> = self.router.find_closest(*query.querier()).into_iter().collect();
+            let closest_eight: Vec<_> = self.router.find_closest(*query.requestor()).into_iter().collect();
 
             let res = ResBuilder::new(self.our_id.clone())
                 .with_token(token)
@@ -196,7 +196,7 @@ impl DhtHandle {
         // see if the token is valid
         if !self
             .token_generator
-            .is_valid_token(announce.querier(), announce.token())
+            .is_valid_token(announce.requestor(), announce.token())
         {
             return KrpcBody::ErrorResponse(KrpcError::new_protocol());
         }

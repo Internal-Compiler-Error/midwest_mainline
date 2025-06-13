@@ -5,7 +5,7 @@ use crate::types::{InfoHash, NodeId, Token};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct AnnouncePeerQuery {
-    querier: NodeId,
+    requestor: NodeId,
     implied_port: bool,
     info_hash: InfoHash,
     port: u16,
@@ -13,9 +13,9 @@ pub struct AnnouncePeerQuery {
 }
 
 impl AnnouncePeerQuery {
-    pub fn new(ourself: NodeId, implied_port: bool, port: u16, info_hash: InfoHash, token: Token) -> Self {
+    pub fn new(requestor: NodeId, implied_port: bool, port: u16, info_hash: InfoHash, token: Token) -> Self {
         Self {
-            querier: ourself,
+            requestor,
             implied_port,
             info_hash,
             port,
@@ -27,8 +27,8 @@ impl AnnouncePeerQuery {
         &self.token
     }
 
-    pub fn querier(&self) -> &NodeId {
-        &self.querier
+    pub fn requestor(&self) -> &NodeId {
+        &self.requestor
     }
 
     pub fn implied_port(&self) -> bool {
@@ -48,7 +48,7 @@ impl ToKrpcBody for AnnouncePeerQuery {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_unsorted_dict(|enc| {
-            enc.emit_pair(b"id", &self.querier)?;
+            enc.emit_pair(b"id", &self.requestor)?;
             enc.emit_pair(b"token", &self.token)?;
             enc.emit_pair(b"implied_port", if self.implied_port { 1 } else { 0 })?;
             enc.emit_pair(b"info_hash", &self.info_hash)?;

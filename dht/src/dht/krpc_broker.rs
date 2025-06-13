@@ -1,11 +1,13 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use bendy::value;
 use diesel::{
     SqliteConnection,
     r2d2::{ConnectionManager, Pool},
@@ -41,6 +43,8 @@ pub struct KrpcBroker {
     /// a SPMC-esque queue, each readers can progress indepednelty
     inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<(Krpc, SocketAddrV4)>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
+
+    public_ip: Ipv4Addr,
 }
 
 pub trait Routable {
@@ -58,6 +62,7 @@ impl KrpcBroker {
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
+        public_ip: Ipv4Addr,
     ) -> KrpcBroker {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
@@ -65,6 +70,7 @@ impl KrpcBroker {
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
             txn_id_generator,
+            public_ip,
         }
     }
 
@@ -147,7 +153,8 @@ impl KrpcBroker {
     /// Send a message, fires up a new stask in background
     fn send_msg_background(&self, msg: &Krpc, peer: SocketAddrV4) {
         let socket = self.socket.clone();
-        let buf = msg.encode();
+        // TODO: send the "ip" field with the requester's ip
+        let buf = msg.encode_with_additional(&HashMap::new());
 
         tokio::spawn(async move {
             socket.send_to(&buf, peer).await.unwrap();

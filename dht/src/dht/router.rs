@@ -59,10 +59,10 @@ impl Router {
         }
 
         let node_id = match &message.body {
-            KrpcBody::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.querier(),
-            KrpcBody::FindNodeQuery(find_node_query) => find_node_query.querier(),
-            KrpcBody::GetPeersQuery(get_peers_query) => *get_peers_query.querier(),
-            KrpcBody::PingQuery(ping_query) => *ping_query.querier(),
+            KrpcBody::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.requestor(),
+            KrpcBody::FindNodeQuery(find_node_query) => find_node_query.requestor(),
+            KrpcBody::GetPeersQuery(get_peers_query) => *get_peers_query.requestor(),
+            KrpcBody::PingQuery(ping_query) => *ping_query.requestor(),
             KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
             KrpcBody::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
             KrpcBody::ErrorResponse(_) => unreachable!("errors should get early returned"),

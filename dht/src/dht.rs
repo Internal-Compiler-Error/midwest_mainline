@@ -167,7 +167,12 @@ impl DhtV4 {
 
         let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
 
-        let message_broker = KrpcBroker::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()).clone());
+        let message_broker = KrpcBroker::new(
+            listen_socket,
+            db.clone(),
+            Arc::new(TxnIdGenerator::new()).clone(),
+            external_addr,
+        );
 
         let router = Router::new(
             our_id,
