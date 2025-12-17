@@ -201,6 +201,7 @@ pub const TCPI_OPT_ECN: u32 = 8;
 pub const TCPI_OPT_ECN_SEEN: u32 = 16;
 pub const TCPI_OPT_SYN_DATA: u32 = 32;
 pub const TCPI_OPT_USEC_TS: u32 = 64;
+pub const TCPI_OPT_TFO_CHILD: u32 = 128;
 pub const TCP_MD5SIG_MAXKEYLEN: u32 = 80;
 pub const TCP_MD5SIG_FLAG_PREFIX: u32 = 1;
 pub const TCP_MD5SIG_FLAG_IFINDEX: u32 = 2;

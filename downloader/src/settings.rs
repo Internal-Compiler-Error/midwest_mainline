@@ -1,0 +1,1 @@
+const BLOCK_SIZE: usize = 16 * 1024; // 16 KiB
