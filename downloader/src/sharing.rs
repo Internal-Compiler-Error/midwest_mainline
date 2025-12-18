@@ -1,15 +1,37 @@
 use crate::Torrent;
-use anyhow::bail;
 use bitvec::prelude::*;
-use sha1::{Digest, Sha1};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::usize;
-use std::{collections::BTreeMap, fs::File};
-use tokio::sync::Notify;
-use tokio::sync::mpsc::Receiver;
-use tracing::{Value, error, warn};
+use std::{fs::File};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{oneshot};
+use tracing::{error, warn};
+
+#[derive(Debug)]
+pub enum FileCommands {
+    ReadPiece {
+        piece: u32,
+        res: oneshot::Sender<anyhow::Result<Box<[u8]>>>,
+    },
+    WritePiece {
+        piece: u32,
+        data: Box<[u8]>,
+        res: oneshot::Sender<anyhow::Result<()>>,
+    },
+    AllVerified {
+        res: oneshot::Sender<bool>,
+    },
+    RemainingBytes {
+        res: oneshot::Sender<usize>,
+    },
+    Verified {
+        res: oneshot::Sender<BitBox<u8>>,
+    },
+    VerifiedCnt {
+        res: oneshot::Sender<usize>,
+    }
+}
 
 pub struct SharedFile {
     pub torrent: Arc<Torrent>,
@@ -25,12 +47,123 @@ pub struct SharedFile {
     /// number of pieces that are verified
     pub verified_cnt: usize,
 
-    /// queue/channel of (piece idx, complete piece data) ready to be written to disk
-    pending_writes: Receiver<(u32, Box<[u8]>)>,
+    written: usize,
+
+    pending_ops: Receiver<FileCommands>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedFileHandle {
+    tx: Sender<FileCommands>,
+}
+
+impl SharedFileHandle {
+    pub async fn write_piece(&self, piece: u32, complete_piece: Box<[u8]>) -> anyhow::Result<()> {
+        let (syn, ack) = oneshot::channel();
+        self.tx
+            .send(FileCommands::WritePiece {
+                piece,
+                data: complete_piece,
+                res: syn,
+            })
+            .await;
+        let res = ack.await??;
+        Ok(res)
+    }
+
+    pub async fn read_piece(&self, piece: u32) -> anyhow::Result<Box<[u8]>> {
+        let (syn, ack) = oneshot::channel();
+
+        self.tx.send(FileCommands::ReadPiece { piece, res: syn }).await;
+        let res = ack.await??;
+        Ok(res)
+    }
+
+    pub async fn all_verified(&self) -> bool {
+        let (syn, ack) = oneshot::channel();
+
+        self.tx.send(FileCommands::AllVerified { res: syn }).await;
+        ack.await.unwrap()
+    }
+
+    pub async fn remaining_bytes(&self) -> usize {
+        let (syn, ack) = oneshot::channel();
+
+        self.tx.send(FileCommands::RemainingBytes { res: syn }).await;
+        ack.await.unwrap()
+    }
+
+    pub async fn verified(&self) -> BitBox<u8> {
+        let (syn, ack) = oneshot::channel();
+
+        self.tx.send(FileCommands::Verified { res: syn }).await;
+        ack.await.unwrap()
+    }
+
+    pub async fn verified_cnt(&self) -> usize {
+        let (syn, ack) = oneshot::channel();
+
+        self.tx.send(FileCommands::VerifiedCnt { res: syn }).await;
+        ack.await.unwrap()
+    }
+}
+
+async fn file_loop(mut f: SharedFile) {
+    while let Some(command) = f.pending_ops.recv().await {
+        match command {
+            FileCommands::ReadPiece { piece, res } => {
+                let has_block = f.verified.get(piece as usize);
+                if has_block.is_none() {
+                    todo!()
+                    // res.send(anyhow!("Don't have block"));
+                } else {
+                    let mut buf = vec![0u8; f.torrent.piece_size as usize];
+                    let mut read = 0;
+                    for (file, interval) in f.file_segments(piece) {
+                        let len = interval.len();
+                        let dst = &mut buf[read..read + len];
+                        file.read_exact_at(dst, interval.start as u64).unwrap();
+
+                        read += len;
+                    }
+
+                    res.send(Ok(buf.into_boxed_slice()));
+                }
+            }
+            FileCommands::WritePiece { piece, data, res } => {
+                let already_has = f.verified.get(piece as usize);
+                if already_has.is_none() {
+                    error!("a pending write has a piece out of bounds");
+                }
+                if *already_has.unwrap() {
+                    continue;
+                }
+
+                if !f.torrent.valid_piece(piece, &data) {
+                    warn!("a piece was received that failed to verify");
+                    continue;
+                }
+
+                res.send(f.write_piece(piece, data));
+            }
+            FileCommands::AllVerified { res } => {
+                res.send(f.all_verified());
+            }
+            FileCommands::RemainingBytes { res } => {
+                res.send(f.remaining_bytes());
+            },
+            FileCommands::Verified { res } => {
+                res.send(f.verified.clone());
+            },
+            FileCommands::VerifiedCnt { res } => {
+                res.send(f.verified_cnt);
+            }
+        }
+    }
 }
 
 impl SharedFile {
-    pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<(u32, Box<[u8]>)>) -> SharedFile {
+    pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<FileCommands>) -> SharedFile {
         let piece_count = torrent.pieces.len();
         let stupid = vec![false; piece_count as usize];
         let verified = BitBox::from_iter(stupid.iter());
@@ -53,32 +186,33 @@ impl SharedFile {
             verified,
 
             verified_cnt: 0,
-            pending_writes: queue,
+            pending_ops: queue,
+            written: 0,
         }
     }
 
-    pub fn flush_blocks(&mut self) -> anyhow::Result<()> {
-        while let Some((piece_idx, data)) = self.pending_writes.blocking_recv() {
-            let already_has = self.verified.get(piece_idx as usize);
-            if already_has.is_none() {
-                error!("a pending write has a piece out of bounds");
-            }
-            if *already_has.unwrap() {
-                continue;
-            }
+    // pub fn flush_blocks(&mut self) -> anyhow::Result<()> {
+    //     while let Some((piece_idx, data)) = self.pending_ops.blocking_recv() {
+    //         let already_has = self.verified.get(piece_idx as usize);
+    //         if already_has.is_none() {
+    //             error!("a pending write has a piece out of bounds");
+    //         }
+    //         if *already_has.unwrap() {
+    //             continue;
+    //         }
+    //
+    //         if !self.torrent.valid_piece(piece_idx, &data) {
+    //             warn!("a piece was received that failed to verify");
+    //             continue;
+    //         }
+    //
+    //         self.write_piece(piece_idx, data)?;
+    //     }
+    //
+    //     Ok(())
+    // }
 
-            if !self.valid_piece(piece_idx, &data) {
-                warn!("a piece was received that failed to verify");
-                continue;
-            }
-
-            self.write_piece(piece_idx, data)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn all_verified(&self) -> bool {
+    fn all_verified(&self) -> bool {
         self.verified.iter().all(|f| *f)
     }
 
@@ -115,11 +249,12 @@ impl SharedFile {
             written += size;
         }
 
+        self.written += written;
         Ok(())
     }
 
     /// Find the file(s) and their corresponding range that this piece should be written to
-    pub fn file_segments(&self, piece_idx: u32) -> Vec<(&File, Range<usize>)> {
+    fn file_segments(&self, piece_idx: u32) -> Vec<(&File, Range<usize>)> {
         let mut ret = vec![];
 
         // [piece_begin, piece_end) is where the data should go if all the files were to be
@@ -157,12 +292,6 @@ impl SharedFile {
         ret
     }
 
-    fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
-        let expected_hash = self.torrent.pieces[piece as usize];
-        let got = Sha1::digest(data);
-        &*got == &expected_hash
-    }
-
     pub fn verify_hash(&mut self, piece: u32) {
         let mut buf = vec![0u8; self.torrent.piece_size as usize];
         let mut wrote = 0;
@@ -182,7 +311,7 @@ impl SharedFile {
             wrote += local_len;
         }
 
-        let valid_piece = self.valid_piece(piece, &buf);
+        let valid_piece = self.torrent.valid_piece(piece, &buf);
 
         if valid_piece {
             self.verified.set(piece as usize, true);
@@ -192,10 +321,7 @@ impl SharedFile {
         }
     }
 
-    pub fn remaining_bytes(&self) -> usize {
-        // TODO: handle the last piece
-        let total: usize = self.torrent.total_size.try_into().unwrap();
-        let verified = self.torrent.piece_size as usize * self.verified_cnt;
-        total - verified
+    fn remaining_bytes(&self) -> usize {
+        (self.torrent.total_size - (self.written as u64)) as usize
     }
 }
