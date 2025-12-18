@@ -1,13 +1,20 @@
-use crate::Torrent;
+use crate::torrent::Torrent;
+use anyhow::anyhow;
 use bitvec::prelude::*;
+use std::fs::File;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::{fs::File};
-use anyhow::anyhow;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, warn};
+
+/// Storage statistics shared via watch channel
+#[derive(Clone, Copy, Debug)]
+pub struct StorageStats {
+    pub verified_count: usize,
+    pub remaining_bytes: usize,
+}
 
 #[derive(Debug)]
 pub enum FileCommands {
@@ -31,10 +38,11 @@ pub enum FileCommands {
     },
     VerifiedCnt {
         res: oneshot::Sender<usize>,
-    }
+    },
 }
 
-pub struct SharedFile {
+/// Manages file I/O operations for torrent pieces
+pub struct TorrentStorage {
     pub torrent: Arc<Torrent>,
     pub files: Vec<File>,
 
@@ -54,14 +62,18 @@ pub struct SharedFile {
 
     /// Notifies when a piece has been verified and written
     piece_completed_tx: Sender<u32>,
+
+    /// Watch channel to publish storage statistics
+    storage_stats_tx: watch::Sender<StorageStats>,
 }
 
+/// Handle for sending commands to TorrentStorage
 #[derive(Debug, Clone)]
-pub struct SharedFileHandle {
+pub struct TorrentStorageHandle {
     tx: Sender<FileCommands>,
 }
 
-impl SharedFileHandle {
+impl TorrentStorageHandle {
     pub async fn write_piece(&self, piece: u32, complete_piece: Box<[u8]>) -> anyhow::Result<()> {
         let (syn, ack) = oneshot::channel();
         self.tx
@@ -112,7 +124,7 @@ impl SharedFileHandle {
     }
 }
 
-pub async fn file_loop(mut f: SharedFile) {
+pub async fn file_loop(mut f: TorrentStorage) {
     while let Some(command) = f.pending_ops.recv().await {
         match command {
             FileCommands::ReadPiece { piece, res } => {
@@ -153,6 +165,13 @@ pub async fn file_loop(mut f: SharedFile) {
                     f.verified.set(piece as usize, true);
                     f.verified_cnt += 1;
 
+                    // Publish storage stats via watch channel
+                    let stats = StorageStats {
+                        verified_count: f.verified_cnt,
+                        remaining_bytes: f.remaining_bytes(),
+                    };
+                    let _ = f.storage_stats_tx.send(stats);
+
                     // Notify that this piece has been completed
                     let _ = f.piece_completed_tx.try_send(piece);
                 }
@@ -163,10 +182,10 @@ pub async fn file_loop(mut f: SharedFile) {
             }
             FileCommands::RemainingBytes { res } => {
                 res.send(f.remaining_bytes());
-            },
+            }
             FileCommands::Verified { res } => {
                 res.send(f.verified.clone());
-            },
+            }
             FileCommands::VerifiedCnt { res } => {
                 res.send(f.verified_cnt);
             }
@@ -174,17 +193,38 @@ pub async fn file_loop(mut f: SharedFile) {
     }
 }
 
-impl SharedFile {
-    pub fn file_and_handle(torrent: Arc<Torrent>, files: Vec<File>) -> (SharedFile, SharedFileHandle, Receiver<u32>) {
+impl TorrentStorage {
+    pub fn new_with_handle(
+        torrent: Arc<Torrent>,
+        files: Vec<File>,
+    ) -> (
+        TorrentStorage,
+        TorrentStorageHandle,
+        Receiver<u32>,
+        tokio::sync::watch::Receiver<StorageStats>,
+    ) {
         let (tx, rx) = mpsc::channel(1024);
         let (completion_tx, completion_rx) = mpsc::channel(1024);
-        let file = SharedFile::new(torrent.clone(), files, rx, completion_tx);
-        let handle = SharedFileHandle { tx };
 
-        (file, handle, completion_rx)
+        // Create watch channel for storage stats
+        let (storage_stats_tx, storage_stats_rx) = tokio::sync::watch::channel(StorageStats {
+            verified_count: 0,
+            remaining_bytes: torrent.total_size as usize,
+        });
+
+        let storage = TorrentStorage::new(torrent.clone(), files, rx, completion_tx, storage_stats_tx);
+        let handle = TorrentStorageHandle { tx };
+
+        (storage, handle, completion_rx, storage_stats_rx)
     }
 
-    pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<FileCommands>, piece_completed_tx: Sender<u32>) -> SharedFile {
+    fn new(
+        torrent: Arc<Torrent>,
+        files: Vec<File>,
+        queue: Receiver<FileCommands>,
+        piece_completed_tx: Sender<u32>,
+        storage_stats_tx: tokio::sync::watch::Sender<StorageStats>,
+    ) -> TorrentStorage {
         let piece_count = torrent.pieces.len();
         let stupid = vec![false; piece_count as usize];
         let verified = BitBox::from_iter(stupid.iter());
@@ -200,7 +240,7 @@ impl SharedFile {
             })
             .collect::<Vec<_>>();
 
-        SharedFile {
+        TorrentStorage {
             torrent,
             files,
             offsets,
@@ -210,29 +250,9 @@ impl SharedFile {
             pending_ops: queue,
             written: 0,
             piece_completed_tx,
+            storage_stats_tx,
         }
     }
-
-    // pub fn flush_blocks(&mut self) -> anyhow::Result<()> {
-    //     while let Some((piece_idx, data)) = self.pending_ops.blocking_recv() {
-    //         let already_has = self.verified.get(piece_idx as usize);
-    //         if already_has.is_none() {
-    //             error!("a pending write has a piece out of bounds");
-    //         }
-    //         if *already_has.unwrap() {
-    //             continue;
-    //         }
-    //
-    //         if !self.torrent.valid_piece(piece_idx, &data) {
-    //             warn!("a piece was received that failed to verify");
-    //             continue;
-    //         }
-    //
-    //         self.write_piece(piece_idx, data)?;
-    //     }
-    //
-    //     Ok(())
-    // }
 
     fn all_verified(&self) -> bool {
         self.verified.iter().all(|f| *f)
