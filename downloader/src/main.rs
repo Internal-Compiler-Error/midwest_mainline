@@ -1,5 +1,5 @@
 mod settings;
-mod sharing;
+mod storage;
 mod sys_tcp;
 
 use anyhow::{anyhow, bail};
@@ -13,7 +13,7 @@ use midwest_mainline::types::InfoHash;
 use rand::prelude::*;
 use reqwest::Client;
 use sha1::{Digest, Sha1};
-use sharing::SharedFileHandle;
+use storage::SharedFileHandle;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -43,8 +43,8 @@ use tokio_util::{
 };
 use url::form_urlencoded;
 
-use sharing::SharedFile;
-use crate::sharing::file_loop;
+use storage::SharedFile;
+use crate::storage::file_loop;
 
 trait Encode {
     fn encode(&self, buf: &mut [u8]);
@@ -777,10 +777,13 @@ struct PeerShare {
     announce: String,
 
     id: Arc<Identity>,
+
+    /// Receives notifications when pieces are completed
+    piece_completed_rx: tokio::sync::Mutex<Receiver<u32>>,
 }
 
 impl PeerShare {
-    pub fn new(torrent: Arc<Torrent>, sharing: SharedFileHandle, id: Arc<Identity>) -> PeerShare {
+    pub fn new(torrent: Arc<Torrent>, sharing: SharedFileHandle, piece_completed_rx: Receiver<u32>, id: Arc<Identity>) -> PeerShare {
         let announce = torrent.announce.clone();
         let announce_interval = Cell::new(Duration::from_secs(0));
 
@@ -791,6 +794,7 @@ impl PeerShare {
             announce_interval,
             announce,
             id,
+            piece_completed_rx: tokio::sync::Mutex::new(piece_completed_rx),
         }
     }
 
@@ -851,13 +855,10 @@ impl PeerShare {
     async fn download_loop(&self) {
         let mut want: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
         want.shuffle(&mut rand::rng());
-        let mut sleep = false;
+        let mut in_flight = std::collections::HashSet::new();
+        let mut completion_rx = self.piece_completed_rx.lock().await;
 
         loop {
-            if sleep {
-                time::sleep(Duration::from_millis(100)).await;
-            }
-
             if want.is_empty() {
                 break;
             }
@@ -866,15 +867,41 @@ impl PeerShare {
                 break;
             }
 
-            let piece = want.last().unwrap();
-            let best = choose(&self.peer_handles, *piece).await;
-            if best.is_none() {
-                sleep = true;
-                continue;
+            // Find a piece to request that's not already in-flight
+            let piece_to_request = want.iter()
+                .find(|&&p| !in_flight.contains(&p))
+                .copied();
+
+            if let Some(piece) = piece_to_request {
+                // We have a piece to request, select between requesting and receiving completions
+                tokio::select! {
+                    // Handle piece completions
+                    Some(completed_piece) = completion_rx.recv() => {
+                        in_flight.remove(&completed_piece);
+                        want.retain(|&p| p != completed_piece);
+                    }
+
+                    // Request a new piece
+                    _ = async {
+                        if let Some(peer) = choose(&self.peer_handles, piece).await {
+                            if peer.request_piece_from_peer(piece).await.is_ok() {
+                                in_flight.insert(piece);
+                            }
+                        } else {
+                            // No peer available, wait a bit
+                            time::sleep(Duration::from_millis(100)).await;
+                        }
+                    } => {}
+                }
             } else {
-                let best = best.unwrap();
-                best.request_piece_from_peer(*piece).await.unwrap();
-                sleep = false;
+                // All wanted pieces are in-flight, just wait for completions
+                if let Some(completed_piece) = completion_rx.recv().await {
+                    in_flight.remove(&completed_piece);
+                    want.retain(|&p| p != completed_piece);
+                } else {
+                    // Channel closed, break
+                    break;
+                }
             }
         }
     }
@@ -1011,10 +1038,10 @@ impl BtClient {
 
 
         let torrent = Arc::new(torrent);
-        let (file, handle) = SharedFile::file_and_handle(torrent.clone(), files);
+        let (file, handle, piece_completed_rx) = SharedFile::file_and_handle(torrent.clone(), files);
         tokio::spawn(file_loop(file));
 
-        let task = PeerShare::new(torrent.clone(), handle, self.id.clone());
+        let task = PeerShare::new(torrent.clone(), handle, piece_completed_rx, self.id.clone());
 
         self.tasks.insert(torrent.info_hash, task);
         Ok(())

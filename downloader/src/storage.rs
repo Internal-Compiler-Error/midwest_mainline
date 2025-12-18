@@ -51,6 +51,9 @@ pub struct SharedFile {
     written: usize,
 
     pending_ops: Receiver<FileCommands>,
+
+    /// Notifies when a piece has been verified and written
+    piece_completed_tx: Sender<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +147,16 @@ pub async fn file_loop(mut f: SharedFile) {
                     continue;
                 }
 
-                res.send(f.write_piece(piece, data));
+                let write_result = f.write_piece(piece, data);
+                if write_result.is_ok() {
+                    // Mark piece as verified and update count
+                    f.verified.set(piece as usize, true);
+                    f.verified_cnt += 1;
+
+                    // Notify that this piece has been completed
+                    let _ = f.piece_completed_tx.try_send(piece);
+                }
+                res.send(write_result);
             }
             FileCommands::AllVerified { res } => {
                 res.send(f.all_verified());
@@ -163,15 +175,16 @@ pub async fn file_loop(mut f: SharedFile) {
 }
 
 impl SharedFile {
-    pub fn file_and_handle(torrent: Arc<Torrent>, files: Vec<File>) -> (SharedFile, SharedFileHandle) {
+    pub fn file_and_handle(torrent: Arc<Torrent>, files: Vec<File>) -> (SharedFile, SharedFileHandle, Receiver<u32>) {
         let (tx, rx) = mpsc::channel(1024);
-        let file = SharedFile::new(torrent.clone(), files, rx);
+        let (completion_tx, completion_rx) = mpsc::channel(1024);
+        let file = SharedFile::new(torrent.clone(), files, rx, completion_tx);
         let handle = SharedFileHandle { tx };
 
-        (file, handle)
+        (file, handle, completion_rx)
     }
 
-    pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<FileCommands>) -> SharedFile {
+    pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<FileCommands>, piece_completed_tx: Sender<u32>) -> SharedFile {
         let piece_count = torrent.pieces.len();
         let stupid = vec![false; piece_count as usize];
         let verified = BitBox::from_iter(stupid.iter());
@@ -196,6 +209,7 @@ impl SharedFile {
             verified_cnt: 0,
             pending_ops: queue,
             written: 0,
+            piece_completed_tx,
         }
     }
 
