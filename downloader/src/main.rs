@@ -44,6 +44,7 @@ use tokio_util::{
 use url::form_urlencoded;
 
 use sharing::SharedFile;
+use crate::sharing::file_loop;
 
 trait Encode {
     fn encode(&self, buf: &mut [u8]);
@@ -567,20 +568,22 @@ impl PeerContext {
                     self.state.write().unwrap().they_have = bit_field.has;
                 }
                 BtMessage::Request(request) => {
-                    todo!()
-                    // if !self.sharing.verified(request.index) {
-                    //     return;
-                    // }
-                    //
-                    // let buf = self.load_block(&request).unwrap();
-                    //
-                    // let resp = BtMessage::Piece(Piece {
-                    //     index: request.index,
-                    //     begin: request.begin,
-                    //     length: buf.len() as u32,
-                    //     data: buf,
-                    // });
-                    // self.writer.feed(resp).await.unwrap();
+                    let data = self.sharing.read_piece(request.index).await;
+                    if data.is_err() {
+                        return;
+                    }
+
+                    let data = data.unwrap();
+                    let (head, tail) = data.split_at(request.begin as usize);
+                    let tail: Box<[u8]> = tail.into();
+
+                    let resp = BtMessage::Piece(Piece {
+                        index: request.index,
+                        begin: request.begin,
+                        length: (data.len() - request.begin as usize) as u32,
+                        data: tail,
+                    });
+                    self.writer.feed(resp).await.unwrap();
                 }
                 BtMessage::Piece(piece) => {
                     if !self.requested.contains_key(&Request {
@@ -1006,10 +1009,12 @@ impl BtClient {
             files.push(File::create(&file)?);
         }
 
-        let (syn, ack) = mpsc::channel(1024);
+
         let torrent = Arc::new(torrent);
-        let sharing = Arc::new(SharedFile::new(torrent.clone(), files, ack));
-        let task = PeerShare::new(torrent.clone(), sharing, self.id.clone());
+        let (file, handle) = SharedFile::file_and_handle(torrent.clone(), files);
+        tokio::spawn(file_loop(file));
+
+        let task = PeerShare::new(torrent.clone(), handle, self.id.clone());
 
         self.tasks.insert(torrent.info_hash, task);
         Ok(())

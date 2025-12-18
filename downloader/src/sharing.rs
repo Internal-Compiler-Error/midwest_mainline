@@ -4,8 +4,9 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::{fs::File};
+use anyhow::anyhow;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
 #[derive(Debug)]
@@ -108,14 +109,13 @@ impl SharedFileHandle {
     }
 }
 
-async fn file_loop(mut f: SharedFile) {
+pub async fn file_loop(mut f: SharedFile) {
     while let Some(command) = f.pending_ops.recv().await {
         match command {
             FileCommands::ReadPiece { piece, res } => {
                 let has_block = f.verified.get(piece as usize);
                 if has_block.is_none() {
-                    todo!()
-                    // res.send(anyhow!("Don't have block"));
+                    res.send(Err(anyhow!("Don't have block")));
                 } else {
                     let mut buf = vec![0u8; f.torrent.piece_size as usize];
                     let mut read = 0;
@@ -163,6 +163,14 @@ async fn file_loop(mut f: SharedFile) {
 }
 
 impl SharedFile {
+    pub fn file_and_handle(torrent: Arc<Torrent>, files: Vec<File>) -> (SharedFile, SharedFileHandle) {
+        let (tx, rx) = mpsc::channel(1024);
+        let file = SharedFile::new(torrent.clone(), files, rx);
+        let handle = SharedFileHandle { tx };
+
+        (file, handle)
+    }
+
     pub fn new(torrent: Arc<Torrent>, files: Vec<File>, queue: Receiver<FileCommands>) -> SharedFile {
         let piece_count = torrent.pieces.len();
         let stupid = vec![false; piece_count as usize];
