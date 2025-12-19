@@ -1,4 +1,5 @@
 mod wire;
+mod download;
 
 use futures::SinkExt;
 use futures::StreamExt;
@@ -10,21 +11,23 @@ use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 use std::{io, mem, sync::Arc};
+use std::cmp::Ordering;
+use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::watch;
-use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
+use derive_more::{PartialEq, Eq};
 
-use crate::storage::TorrentStorageHandle;
+use crate::storage::{TorrentStorage};
 use crate::sys_tcp;
 use crate::torrent::Torrent;
 
 use wire::{
-    BtDecoder, BtEncoder, BtMessage, BitField, Choke, Have, Interested, NotInterested, Piece,
-    Request, Unchoke, shake_hands,
+    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, NotInterested, Piece, Request, Unchoke,
+    shake_hands,
 };
 
 pub enum PeerCommands {
@@ -33,36 +36,7 @@ pub enum PeerCommands {
     RequestPieceFromPeer(u32),
 }
 
-pub async fn peer_loop(peer: PeerConnection) {
-    let PeerConnection {
-        mut commands,
-        torrent,
-        state,
-        reader,
-        writer,
-        sharing,
-        requested,
-        block_buf,
-        stat,
-        stats_tx,
-        connection_closed,
-    } = peer;
-
-    // Reconstruct peer without commands channel to avoid borrow conflicts
-    let mut peer = PeerConnection {
-        commands: tokio::sync::mpsc::channel(1).1, // Dummy receiver, not used
-        torrent,
-        state,
-        reader,
-        writer,
-        sharing,
-        requested,
-        block_buf,
-        stat,
-        stats_tx,
-        connection_closed,
-    };
-
+pub async fn peer_ev_loop(mut peer: PeerConnection) {
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -73,7 +47,7 @@ pub async fn peer_loop(peer: PeerConnection) {
             }
 
             // Handle commands from the peer handle
-            Some(command) = commands.recv() => {
+            Some(command) = peer.commands.recv() => {
                 match command {
                     PeerCommands::UnchokePeer => peer.unchoke_peer().await.unwrap(),
                     PeerCommands::ChokePeer => peer.choke_peer().await.unwrap(),
@@ -82,8 +56,8 @@ pub async fn peer_loop(peer: PeerConnection) {
             }
 
             // Process incoming BitTorrent protocol messages
-            _ = peer.process_message() => {
-                // Continue processing messages
+            Some(Ok(msg)) = peer.reader.next() => {
+                peer.process_message(msg).await
             }
 
             // Exit loop if all channels are closed
@@ -102,7 +76,7 @@ pub struct PeerConnection {
 
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
     writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
-    sharing: TorrentStorageHandle,
+    storage: Arc<TorrentStorage>,
 
     requested: BTreeMap<Request, Instant>,
 
@@ -171,7 +145,7 @@ impl PeerConnection {
         state: Arc<RwLock<PeerState>>,
         reader: FramedRead<OwnedReadHalf, BtDecoder>,
         writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
-        sharing: TorrentStorageHandle,
+        storage: Arc<TorrentStorage>,
         stats_tx: watch::Sender<PeerStatistics>,
     ) -> Self {
         let initial_stats = PeerStatistics {
@@ -189,7 +163,7 @@ impl PeerConnection {
             state,
             reader,
             writer,
-            sharing,
+            storage,
             requested: Default::default(),
             block_buf: BTreeMap::new(),
             stat: initial_stats,
@@ -256,7 +230,7 @@ impl PeerConnection {
 
     pub async fn send_bitfield(&mut self) -> io::Result<()> {
         let bit_field = BitField {
-            has: self.sharing.verified().await.as_raw_slice().into(),
+            has: self.storage.verified().as_raw_slice().into(),
         };
         self.writer.feed(BtMessage::BitField(bit_field)).await?;
 
@@ -299,7 +273,7 @@ impl PeerConnection {
 
         // Upper Confidence Bound
         let c = 1f64;
-        let t = self.sharing.verified_cnt().await as f64;
+        let t = self.storage.verified_cnt() as f64;
         let n_t = self.stat.picked_count as f64;
         self.stat.ucb = self.stat.mean_rx + c * (t.ln() / n_t).sqrt();
 
@@ -322,129 +296,133 @@ impl PeerConnection {
 
         // Write all complete pieces
         for (piece, data) in to_write {
-            let _ = self.sharing.write_piece(piece, data).await;
+            let _ = self.storage.write_piece(piece, data);
         }
 
         Ok(())
     }
 
     /// Reads and processes one incoming BitTorrent protocol message from this peer
-    pub async fn process_message(&mut self) {
-        if let Some(msg) = self.reader.next().await {
-            match msg.unwrap() {
-                BtMessage::KeepAlive(_) => return,
-                BtMessage::Choke(_) => self.state.write().unwrap().choked_us = true,
-                BtMessage::Unchoke(_) => self.state.write().unwrap().choked_us = false,
-                BtMessage::Interested(_) => self.state.write().unwrap().interested_us = true,
-                BtMessage::NotInterested(_) => self.state.write().unwrap().interested_us = false,
-                BtMessage::Have(have) => {
-                    let index = have.checked / 8;
-                    let offset = have.checked % 8;
+    pub async fn process_message(&mut self, msg: BtMessage) {
+        match msg {
+            BtMessage::KeepAlive(_) => return,
+            BtMessage::Choke(_) => self.state.write().unwrap().choked_us = true,
+            BtMessage::Unchoke(_) => self.state.write().unwrap().choked_us = false,
+            BtMessage::Interested(_) => self.state.write().unwrap().interested_us = true,
+            BtMessage::NotInterested(_) => self.state.write().unwrap().interested_us = false,
+            BtMessage::Have(have) => {
+                let index = have.checked / 8;
+                let offset = have.checked % 8;
 
-                    let flag = 1u8 << offset;
-                    self.state.write().unwrap().they_have[index as usize] |= flag;
+                let flag = 1u8 << offset;
+                self.state.write().unwrap().they_have[index as usize] |= flag;
+            }
+            BtMessage::BitField(bit_field) => {
+                self.state.write().unwrap().they_have = bit_field.has;
+            }
+            BtMessage::Request(request) => {
+                let data = self.storage.read_piece(request.index);
+                if data.is_err() {
+                    return;
                 }
-                BtMessage::BitField(bit_field) => {
-                    self.state.write().unwrap().they_have = bit_field.has;
-                }
-                BtMessage::Request(request) => {
-                    let data = self.sharing.read_piece(request.index).await;
-                    if data.is_err() {
-                        return;
-                    }
 
-                    let data = data.unwrap();
-                    let (head, tail) = data.split_at(request.begin as usize);
-                    let tail: Box<[u8]> = tail.into();
+                let data = data.unwrap();
+                let (head, tail) = data.split_at(request.begin as usize);
+                let tail: Box<[u8]> = tail.into();
 
-                    let resp = BtMessage::Piece(Piece {
-                        index: request.index,
-                        begin: request.begin,
-                        length: (data.len() - request.begin as usize) as u32,
-                        data: tail,
-                    });
-                    self.writer.feed(resp).await.unwrap();
-                }
-                BtMessage::Piece(piece) => {
-                    if !self.requested.contains_key(&Request {
+                let resp = BtMessage::Piece(Piece {
+                    index: request.index,
+                    begin: request.begin,
+                    length: (data.len() - request.begin as usize) as u32,
+                    data: tail,
+                });
+                self.writer.feed(resp).await.unwrap();
+            }
+            BtMessage::Piece(piece) => {
+                if !self.requested.contains_key(&Request {
+                    index: piece.index,
+                    begin: piece.begin,
+                    length: piece.length,
+                }) {
+                    // be wary of strangers sending data you didn't ask for, ignore them
+                    return;
+                } else {
+                    self.requested.remove(&Request {
                         index: piece.index,
                         begin: piece.begin,
                         length: piece.length,
-                    }) {
-                        // be wary of strangers sending data you didn't ask for, ignore them
-                        return;
-                    } else {
-                        self.requested.remove(&Request {
-                            index: piece.index,
-                            begin: piece.begin,
-                            length: piece.length,
-                        });
-                    }
-
-                    let (written, buf) = self.block_buf.entry(piece.index as usize).or_insert_with(|| {
-                        (
-                            0,
-                            vec![
-                                0u8;
-                                self.torrent
-                                    .nth_piece_size(piece.index)
-                                    .expect("people won't send us pieces with invalid index")
-                            ],
-                        )
                     });
-
-                    let length: usize = piece.length.try_into().unwrap();
-                    let begin: usize = piece.begin.try_into().unwrap();
-
-                    *written += length;
-                    buf[begin..begin + length].copy_from_slice(&piece.data);
-
-                    self.flush_blocks().await.unwrap();
                 }
-                BtMessage::Cancel(_cancel) => return,
-                BtMessage::Unknown(msg_type, _) => {
-                    tracing::warn!("Unsupported message type {msg_type}");
-                }
+
+                let (written, buf) = self.block_buf.entry(piece.index as usize).or_insert_with(|| {
+                    (
+                        0,
+                        vec![
+                            0u8;
+                            self.torrent
+                                .nth_piece_size(piece.index)
+                                .expect("people won't send us pieces with invalid index")
+                        ],
+                    )
+                });
+
+                let length: usize = piece.length.try_into().unwrap();
+                let begin: usize = piece.begin.try_into().unwrap();
+
+                *written += length;
+                buf[begin..begin + length].copy_from_slice(&piece.data);
+
+                self.flush_blocks().await.unwrap();
+            }
+            BtMessage::Cancel(_cancel) => return,
+            BtMessage::Unknown(msg_type, _) => {
+                tracing::warn!("Unsupported message type {msg_type}");
             }
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerHandle {
-    pub ctrl: Sender<PeerCommands>,
+     // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
+    id: [u8; 20],
+
+    #[eq(skip)]
+    ctrl: mpsc::Sender<PeerCommands>,
+
+    #[eq(skip)]
     pub state: Arc<RwLock<PeerState>>,
+
+    #[eq(skip)]
     pub stats_rx: watch::Receiver<PeerStatistics>,
 }
 
-impl PeerHandle {
-    pub fn new(
-        ctrl: Sender<PeerCommands>,
-        state: Arc<RwLock<PeerState>>,
-        stats_rx: watch::Receiver<PeerStatistics>,
-    ) -> Self {
-        PeerHandle {
-            ctrl,
-            state,
-            stats_rx,
-        }
+impl PartialOrd for PeerHandle {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.id.partial_cmp(&other.id)
     }
+}
+impl Ord for PeerHandle {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
 
+impl PeerHandle {
     pub async fn request_piece_from_peer(&self, piece: u32) -> anyhow::Result<()> {
         self.ctrl.send(PeerCommands::RequestPieceFromPeer(piece)).await?;
         Ok(())
     }
 }
 
-pub async fn create_peer_connection(
+pub async fn connect_peer(
     peer: std::net::SocketAddrV4,
-    info_hash: &InfoHash,
-    peer_id: &[u8; 20],
+    peer_id: [u8; 20],
     torrent: Arc<Torrent>,
-    storage: TorrentStorageHandle,
-) -> anyhow::Result<(PeerConnection, PeerHandle)> {
+    storage: Arc<TorrentStorage>,
+) -> anyhow::Result<PeerHandle> {
     let mut tcp = TcpStream::connect(peer).await?;
-    let _ = shake_hands(&mut tcp, info_hash, peer_id).await?;
+    let _ = shake_hands(&mut tcp, &torrent.info_hash, &peer_id).await?;
     let (reader, writer) = tcp.into_split();
     let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(1024);
 
@@ -478,7 +456,13 @@ pub async fn create_peer_connection(
         stats_tx,
     );
 
-    let handle = PeerHandle::new(commands_tx, state, stats_rx);
+    let handle = PeerHandle {
+        id: peer_id.clone(),
+        ctrl: commands_tx,
+        state,
+        stats_rx,
+    };
+    tokio::spawn(peer_ev_loop(peer));
 
-    Ok((peer, handle))
+    Ok(handle)
 }

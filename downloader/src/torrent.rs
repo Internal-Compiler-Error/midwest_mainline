@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::str;
 
 /// Represents a parsed torrent metadata file
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Torrent {
     /// List of tracker tiers, where each tier contains multiple tracker URLs
     /// Trackers in the same tier should be tried in parallel

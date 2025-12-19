@@ -18,6 +18,7 @@ url = "2.5.4"
 bendy = "0.4.0-beta.4"
 anyhow = "1.0.98"
 bitvec = "1.0.1"
+derive_more = { version = "2.1.0", features = ["full"] }
 
 [build-dependencies]
 bindgen = "0.72.0"
