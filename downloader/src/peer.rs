@@ -1,27 +1,26 @@
+pub mod download;
 mod wire;
-mod download;
 
+use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
 use futures::StreamExt;
-use midwest_mainline::types::InfoHash;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::mem::zeroed;
+use std::net::SocketAddrV4;
 use std::os::fd::AsRawFd;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 use std::{io, mem, sync::Arc};
-use std::cmp::Ordering;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use derive_more::{PartialEq, Eq};
 
-use crate::storage::{TorrentStorage};
+use crate::storage::TorrentStorage;
 use crate::sys_tcp;
 use crate::torrent::Torrent;
 
@@ -33,7 +32,10 @@ use wire::{
 pub enum PeerCommands {
     UnchokePeer,
     ChokePeer,
-    RequestPieceFromPeer(u32),
+    RequestDataFromPeer {
+        req: Request,
+        syn: oneshot::Sender<Box<[u8]>>,
+    },
 }
 
 pub async fn peer_ev_loop(mut peer: PeerConnection) {
@@ -51,7 +53,7 @@ pub async fn peer_ev_loop(mut peer: PeerConnection) {
                 match command {
                     PeerCommands::UnchokePeer => peer.unchoke_peer().await.unwrap(),
                     PeerCommands::ChokePeer => peer.choke_peer().await.unwrap(),
-                    PeerCommands::RequestPieceFromPeer(piece) => peer.request_piece_from_peer(piece).await.unwrap(),
+                    PeerCommands::RequestDataFromPeer{req, syn} => peer.request_data_from_peer(req, syn).await.unwrap(),
                 }
             }
 
@@ -74,14 +76,13 @@ pub struct PeerConnection {
 
     state: Arc<RwLock<PeerState>>,
 
+    remote_addr: SocketAddrV4,
+
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
     writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
     storage: Arc<TorrentStorage>,
 
-    requested: BTreeMap<Request, Instant>,
-
-    /// a place to hold blocks before they form a complete piece and ready to be written to disk
-    block_buf: BTreeMap<usize, (usize, Vec<u8>)>, // piece num -> (written, buffer)
+    requested: BTreeMap<Request, oneshot::Sender<Box<[u8]>>>,
 
     stat: PeerStatistics,
 
@@ -147,6 +148,7 @@ impl PeerConnection {
         writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
         storage: Arc<TorrentStorage>,
         stats_tx: watch::Sender<PeerStatistics>,
+        remote_addr: SocketAddrV4,
     ) -> Self {
         let initial_stats = PeerStatistics {
             tcp_info: unsafe { zeroed() },
@@ -165,10 +167,10 @@ impl PeerConnection {
             writer,
             storage,
             requested: Default::default(),
-            block_buf: BTreeMap::new(),
             stat: initial_stats,
             stats_tx,
             connection_closed: false,
+            remote_addr,
         }
     }
 
@@ -176,21 +178,19 @@ impl PeerConnection {
         Arc::clone(&self.state)
     }
 
-    pub fn prune_expired_reqs(&mut self) {
-        let now = Instant::now();
-        self.requested
-            .retain(|_k, v| now.duration_since(*v) <= Duration::from_secs(120));
-    }
+    //
+    // pub fn prune_expired_reqs(&mut self) {
+    //     let now = Instant::now();
+    //     self.requested
+    //         .retain(|_k, v| now.duration_since(*v) <= Duration::from_secs(120));
+    // }
 
-    pub async fn request_piece_from_peer(&mut self, piece: u32) -> io::Result<()> {
-        let req = Request {
-            index: piece,
-            begin: 0,
-            length: self.torrent.nth_piece_size(piece).unwrap() as u32,
-        };
-
-        self.prune_expired_reqs();
-        self.requested.insert(req, Instant::now());
+    pub async fn request_data_from_peer(
+        &mut self,
+        req: Request,
+        syn: oneshot::Sender<Box<[u8]>>,
+    ) -> anyhow::Result<()> {
+        self.requested.insert(req, syn);
         self.writer.feed(BtMessage::Request(req)).await?;
 
         Ok(())
@@ -281,27 +281,6 @@ impl PeerConnection {
         let _ = self.stats_tx.send(self.stat);
     }
 
-    pub async fn flush_blocks(&mut self) -> anyhow::Result<()> {
-        // Collect complete pieces to write
-        let mut to_write = vec![];
-        self.block_buf.retain(|piece, (written, buf)| {
-            let expected_size = self.torrent.nth_piece_size(*piece as u64).unwrap();
-            if expected_size == *written {
-                let data = mem::take(buf);
-                to_write.push((*piece as u32, data.into_boxed_slice()));
-                return false; // Remove from block_buf
-            }
-            return true; // Keep in block_buf
-        });
-
-        // Write all complete pieces
-        for (piece, data) in to_write {
-            let _ = self.storage.write_piece(piece, data);
-        }
-
-        Ok(())
-    }
-
     /// Reads and processes one incoming BitTorrent protocol message from this peer
     pub async fn process_message(&mut self, msg: BtMessage) {
         match msg {
@@ -346,33 +325,18 @@ impl PeerConnection {
                 }) {
                     // be wary of strangers sending data you didn't ask for, ignore them
                     return;
-                } else {
-                    self.requested.remove(&Request {
+                }
+
+                let syn = self
+                    .requested
+                    .remove(&Request {
                         index: piece.index,
                         begin: piece.begin,
                         length: piece.length,
-                    });
-                }
+                    })
+                    .unwrap();
 
-                let (written, buf) = self.block_buf.entry(piece.index as usize).or_insert_with(|| {
-                    (
-                        0,
-                        vec![
-                            0u8;
-                            self.torrent
-                                .nth_piece_size(piece.index)
-                                .expect("people won't send us pieces with invalid index")
-                        ],
-                    )
-                });
-
-                let length: usize = piece.length.try_into().unwrap();
-                let begin: usize = piece.begin.try_into().unwrap();
-
-                *written += length;
-                buf[begin..begin + length].copy_from_slice(&piece.data);
-
-                self.flush_blocks().await.unwrap();
+                let _ = syn.send(piece.data);
             }
             BtMessage::Cancel(_cancel) => return,
             BtMessage::Unknown(msg_type, _) => {
@@ -384,8 +348,10 @@ impl PeerConnection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerHandle {
-     // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
-    id: [u8; 20],
+    // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
+    pub id: [u8; 20],
+
+    pub remote_addr: SocketAddrV4,
 
     #[eq(skip)]
     ctrl: mpsc::Sender<PeerCommands>,
@@ -409,19 +375,22 @@ impl Ord for PeerHandle {
 }
 
 impl PeerHandle {
-    pub async fn request_piece_from_peer(&self, piece: u32) -> anyhow::Result<()> {
-        self.ctrl.send(PeerCommands::RequestPieceFromPeer(piece)).await?;
-        Ok(())
+    pub async fn request_data_from_peer(&self, req: Request) -> anyhow::Result<Box<[u8]>> {
+        let (syn, ack) = oneshot::channel();
+
+        self.ctrl.send(PeerCommands::RequestDataFromPeer { req, syn }).await?;
+        let data = ack.await?;
+        Ok(data)
     }
 }
 
 pub async fn connect_peer(
-    peer: std::net::SocketAddrV4,
+    remote_addr: SocketAddrV4,
     peer_id: [u8; 20],
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
 ) -> anyhow::Result<PeerHandle> {
-    let mut tcp = TcpStream::connect(peer).await?;
+    let mut tcp = TcpStream::connect(remote_addr).await?;
     let _ = shake_hands(&mut tcp, &torrent.info_hash, &peer_id).await?;
     let (reader, writer) = tcp.into_split();
     let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(1024);
@@ -454,6 +423,7 @@ pub async fn connect_peer(
         FramedWrite::new(writer, BtEncoder),
         storage,
         stats_tx,
+        remote_addr,
     );
 
     let handle = PeerHandle {
@@ -461,6 +431,7 @@ pub async fn connect_peer(
         ctrl: commands_tx,
         state,
         stats_rx,
+        remote_addr,
     };
     tokio::spawn(peer_ev_loop(peer));
 

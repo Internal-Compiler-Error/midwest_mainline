@@ -6,8 +6,9 @@ mod sys_tcp;
 mod torrent;
 
 use anyhow::bail;
-use futures::future::join_all;
 use futures::StreamExt;
+use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use juicy_bencode::BencodeItemView;
 use midwest_mainline::types::InfoHash;
 use rand::prelude::*;
@@ -16,18 +17,21 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::time::Duration;
 use std::{env, fs};
 use std::{fs::File, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, Interval, MissedTickBehavior};
+use tokio::time::{Instant, Sleep, sleep_until};
 use url::form_urlencoded;
 
+use crate::peer::PeerStatistics;
+use crate::peer::download::Download;
 use crate::storage::TorrentStorage;
-use peer::{connect_peer, PeerHandle};
-use torrent::{parse_torrent, Torrent};
+use peer::{PeerHandle, connect_peer};
+use torrent::{Torrent, parse_torrent};
 
 struct Identity {
     peer_id: [u8; 20],
@@ -39,7 +43,7 @@ struct Announcer {
     tracker_url: String,
     torrent: Arc<Torrent>,
     identity: Arc<Identity>,
-    interval: Interval,
+    next_ready: Instant,
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
     torrent_swarm_controller: TorrentSwarmController,
 }
@@ -56,16 +60,19 @@ impl Announcer {
             tracker_url,
             torrent,
             identity,
-            interval: interval(Duration::from_secs(10)),
+            next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
             torrent_swarm_controller,
         }
     }
 
+    /// The future resolves whenever the next round of announce is ready to be performed
+    fn ready(&self) -> Sleep {
+        sleep_until(self.next_ready)
+    }
+
     /// Perform a single announce and return the interval and discovered peers
-    async fn announce(
-        &mut self,
-    ) -> anyhow::Result<()> {
+    async fn announce(&mut self) -> anyhow::Result<Vec<SocketAddrV4>> {
         // URL-encode info_hash and peer_id
         let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.torrent.info_hash.0).collect();
         let peer_id_encoded: String = form_urlencoded::byte_serialize(&self.identity.peer_id).collect();
@@ -110,23 +117,21 @@ impl Announcer {
             }
         }
 
-        self.interval = tokio::time::interval(Duration::from_secs(*interval as u64));
-        self.interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        self.next_ready = Instant::now() + Duration::from_secs(*interval as u64);
 
-        self.torrent_swarm_controller.add_peer(peers).await;
-        Ok(())
+        // self.torrent_swarm_controller.add_peer(peers).await;
+        Ok(peers)
     }
 }
 
-async fn announcer_ev_loop(
-    mut announcer: Announcer,
-) -> anyhow::Result<()> {
-    loop {
-        announcer.interval.tick().await;
-        let _ = announcer.announce().await; // TODO: log on error
-    }
-}
-
+// async fn announcer_ev_loop(
+//     mut announcer: Announcer,
+// ) -> anyhow::Result<()> {
+//     loop {
+//         announcer.interval.tick().await;
+//         let _ = announcer.announce().await; // TODO: log on error
+//     }
+// }
 
 #[derive(Clone, Debug, Copy)]
 struct TorrentSwarmStats {
@@ -140,7 +145,8 @@ enum TorrentSwarmCommands {
     NewConnection(Vec<PeerHandle>),
 }
 
-struct TorrentSwarm {
+// TODO: move this into peer mod so it doesn't need to be pub
+pub struct TorrentSwarm {
     peer_handles: Vec<PeerHandle>,
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
@@ -150,7 +156,8 @@ struct TorrentSwarm {
     pending_ops: mpsc::Receiver<TorrentSwarmCommands>,
     loopback_thing: mpsc::Sender<TorrentSwarmCommands>,
 
-    announcers: Vec<JoinHandle<anyhow::Result<()>>>,
+    // announcers: Vec<JoinHandle<anyhow::Result<()>>>,
+    announcers: Vec<Announcer>,
 
     stat: TorrentSwarmStats,
     stat_snapshot_syn: watch::Sender<TorrentSwarmStats>,
@@ -174,11 +181,7 @@ impl TorrentSwarmController {
 }
 
 impl TorrentSwarm {
-    pub fn new(
-        torrent: Arc<Torrent>,
-        storage: Arc<TorrentStorage>,
-        id: Arc<Identity>,
-    ) -> TorrentSwarm {
+    pub fn new(torrent: Arc<Torrent>, storage: Arc<TorrentStorage>, id: Arc<Identity>) -> TorrentSwarm {
         // Create shared peer handles
         let peer_handles = Vec::<PeerHandle>::new();
 
@@ -190,13 +193,10 @@ impl TorrentSwarm {
         };
         let (stat_syn, stat_ack) = watch::channel(stat);
 
-
         // TODO: incomplete
         let (syn, ack) = mpsc::channel(100);
 
-        let controller = TorrentSwarmController {
-            tx: syn.clone(),
-        };
+        let controller = TorrentSwarmController { tx: syn.clone() };
 
         // Create announcer with access to peer handles and storage stats
         // For now, use the primary tracker (first tracker in first tier)
@@ -205,17 +205,10 @@ impl TorrentSwarm {
             .primary_tracker()
             .expect("torrent must have at least one tracker")
             .to_string();
-        let announcer = Announcer::new(
-            tracker_url,
-            torrent.clone(),
-            id.clone(),
-            stat_ack,
-            controller,
-        );
+        let announcer = Announcer::new(tracker_url, torrent.clone(), id.clone(), stat_ack, controller);
 
         // Spawn the announcer loop
-        let announcers = vec![tokio::spawn(announcer_ev_loop(announcer))];
-
+        // let announcers = vec![tokio::spawn(announcer_ev_loop(announcer))];
 
         TorrentSwarm {
             peer_handles,
@@ -224,7 +217,7 @@ impl TorrentSwarm {
             id,
             pending_ops: ack,
             loopback_thing: syn,
-            announcers,
+            announcers: vec![announcer],
             stat,
             stat_snapshot_syn: stat_syn,
         }
@@ -246,91 +239,152 @@ impl TorrentSwarm {
                     let storage = self.storage.clone();
 
                     tokio::spawn(async move {
-                        let peer = connect_peer(
-                            p,
-                            peer_id,
-                            torrent,
-                            storage,
-                        ).await.unwrap();
+                        let peer = connect_peer(p, peer_id, torrent, storage).await.unwrap();
                         remote.add_peer_connection(vec![peer]).await;
                     });
                 }
             }
-        TorrentSwarmCommands::NewConnection(connection) => {
-            self.peer_handles.extend(connection);
-            self.peer_handles.sort_unstable();
-            self.peer_handles.dedup();
-            todo!("inform the download task")
+            TorrentSwarmCommands::NewConnection(connection) => {
+                self.peer_handles.extend(connection);
+                self.peer_handles.sort_unstable();
+                self.peer_handles.dedup();
+                todo!("inform the download task")
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn work_loop(&mut self) {
+        let (new_connection_tx, mut new_connection_rx) = mpsc::channel(200);
+
+        let download = Download::new(self);
+        let mut download = pin!(download.download_loop());
+        let mut download_done = false;
+
+        loop {
+            // TODO: support multiple announcers
+            let announcer_ready = self.announcers[0].ready();
+            tokio::select! {
+                _ = announcer_ready => {
+                    let new_peers = self.announcers[0].announce().await.unwrap();
+
+                    // successful connections are pushed to the new_connection_rx channel
+                    let _ = tokio::spawn(try_connect(self.id.clone(), self.storage.clone(), self.torrent.clone(), new_peers, new_connection_tx.clone())).await;
+                },
+                Some(connection) = new_connection_rx.recv() => {
+                    let insertion_idx = self.peer_handles.partition_point(|p| p < &connection);
+                    if insertion_idx == self.peer_handles.len() || self.peer_handles[insertion_idx] != connection {
+                        self.peer_handles.insert(insertion_idx, connection);
+                    }
+                },
+                _ = &mut download, if !download_done => {
+                    download_done = true;
+                }
+            }
         }
     }
 
-    Ok(())
+    fn choose(&self, piece: u32) -> Option<PeerHandle> {
+        // Read all peer stats from watch receivers (non-blocking)
+        let candidates: Vec<(PeerHandle, PeerStatistics)> = self
+            .peer_handles
+            .iter()
+            .filter_map(|h| {
+                let state = h.state.read().unwrap();
+                if !state.ready() || !state.they_have(piece) {
+                    return None;
+                }
+                let stat = *h.stats_rx.borrow();
+                Some((h.clone(), stat))
+            })
+            .collect();
+
+        // Select best peer by UCB
+        candidates
+            .into_iter()
+            .max_by(|(_, a), (_, b)| a.ucb.total_cmp(&b.ucb))
+            .map(|(handle, _)| handle)
+    }
 }
 
+async fn try_connect(
+    id: Arc<Identity>,
+    storage: Arc<TorrentStorage>,
+    torrent: Arc<Torrent>,
+    newly_discovered: Vec<SocketAddrV4>,
+    new_connction_tx: mpsc::Sender<PeerHandle>,
+) {
+    let work = FuturesUnordered::new();
+    for new_peer in newly_discovered {
+        work.push(connect_peer(
+            new_peer.clone(),
+            id.peer_id,
+            torrent.clone(),
+            storage.clone(),
+        ));
+    }
 
-async fn work_loop(&mut self) {
-    // tokio::select! {
-    // _ = self.download_loop() => {},
-    // Some(peers) = self.discovered_peers_rx.recv().await {
-    //
-    // },
-    // }
+    let new_peers: Vec<_> = work.collect().await;
+    for new_peer in new_peers.into_iter().filter_map(Result::ok) {
+        let _ = new_connction_tx.send(new_peer).await;
+    }
 }
 
-async fn download_loop(&self) {
-    // let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
-    // missing_pieces.shuffle(&mut rand::rng());
-    // let mut in_flight = HashSet::new();
-    // let mut completion_rx = self.piece_completed_rx.lock().await;
-    //
-    // loop {
-    //     if missing_pieces.is_empty() {
-    //         break;
-    //     }
-    //
-    //     if self.storage.all_verified() {
-    //         break;
-    //     }
-    //
-    //     // Find a piece to request that's not already in-flight
-    //     let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
-    //
-    //     if let Some(piece) = piece_to_request {
-    //         // We have a piece to request, select between requesting and receiving completions
-    //         tokio::select! {
-    //             // Handle piece completions
-    //             Some(completed_piece) = completion_rx.recv() => {
-    //                 in_flight.remove(&completed_piece);
-    //                 missing_pieces.retain(|&p| p != completed_piece);
-    //             }
-    //
-    //             // Request a new piece
-    //             _ = async {
-    //                 let peer_handles = self.peer_handles.read().await;
-    //                 if let Some(peer) = choose(&peer_handles, piece).await {
-    //                     drop(peer_handles); // Release lock before awaiting
-    //                     if peer.request_piece_from_peer(piece).await.is_ok() {
-    //                         in_flight.insert(piece);
-    //                     }
-    //                 } else {
-    //                     // No peer available, wait a bit
-    //                     time::sleep(Duration::from_millis(100)).await;
-    //                 }
-    //             } => {}
-    //         }
-    //     } else {
-    //         // All wanted pieces are in-flight, just wait for completions
-    //         if let Some(completed_piece) = completion_rx.recv().await {
-    //             in_flight.remove(&completed_piece);
-    //             missing_pieces.retain(|&p| p != completed_piece);
-    //         } else {
-    //             // Channel closed, break
-    //             break;
-    //         }
-    //     }
-    // }
-}
-}
+// async fn download_loop(&self) {
+// let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
+// missing_pieces.shuffle(&mut rand::rng());
+// let mut in_flight = HashSet::new();
+// let mut completion_rx = self.piece_completed_rx.lock().await;
+//
+// loop {
+//     if missing_pieces.is_empty() {
+//         break;
+//     }
+//
+//     if self.storage.all_verified() {
+//         break;
+//     }
+//
+//     // Find a piece to request that's not already in-flight
+//     let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
+//
+//     if let Some(piece) = piece_to_request {
+//         // We have a piece to request, select between requesting and receiving completions
+//         tokio::select! {
+//             // Handle piece completions
+//             Some(completed_piece) = completion_rx.recv() => {
+//                 in_flight.remove(&completed_piece);
+//                 missing_pieces.retain(|&p| p != completed_piece);
+//             }
+//
+//             // Request a new piece
+//             _ = async {
+//                 let peer_handles = self.peer_handles.read().await;
+//                 if let Some(peer) = choose(&peer_handles, piece).await {
+//                     drop(peer_handles); // Release lock before awaiting
+//                     if peer.request_piece_from_peer(piece).await.is_ok() {
+//                         in_flight.insert(piece);
+//                     }
+//                 } else {
+//                     // No peer available, wait a bit
+//                     time::sleep(Duration::from_millis(100)).await;
+//                 }
+//             } => {}
+//         }
+//     } else {
+//         // All wanted pieces are in-flight, just wait for completions
+//         if let Some(completed_piece) = completion_rx.recv().await {
+//             in_flight.remove(&completed_piece);
+//             missing_pieces.retain(|&p| p != completed_piece);
+//         } else {
+//             // Channel closed, break
+//             break;
+//         }
+//     }
+// }
+// }
+
 struct BtClient {
     id: Arc<Identity>,
     swarms: HashMap<InfoHash, TorrentSwarm>,
@@ -356,31 +410,26 @@ impl BtClient {
         }
 
         let torrent = Arc::new(torrent);
-        let storage =
-            TorrentStorage::new(torrent.clone(), files);
+        let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let task = TorrentSwarm::new(
-            torrent.clone(),
-            storage,
-            self.id.clone(),
-        );
+        let task = TorrentSwarm::new(torrent.clone(), storage, self.id.clone());
 
         self.swarms.insert(torrent.info_hash, task);
         Ok(())
     }
 
     async fn work(&mut self) -> anyhow::Result<()> {
-        let mut vec = vec![];
-        for (info_hash, share) in self.swarms.iter_mut() {
-            vec.push(share.work_loop());
-        }
+        // let mut vec = vec![];
+        // for (info_hash, share) in self.swarms.iter_mut() {
+        // vec.push(share.work_loop());
+        // }
 
         // for handle in vec {
         //     handle.await;
         // }
 
-        join_all(vec).await;
+        // join_all(vec).await;
         Ok(())
     }
 }

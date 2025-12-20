@@ -1,197 +1,171 @@
-use crate::peer::{PeerHandle, PeerStatistics, peer_ev_loop};
+use crate::TorrentSwarm;
+use crate::peer::PeerHandle;
+use crate::peer::wire::Request;
+use crate::settings::BLOCK_SIZE;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
+use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use rand::seq::SliceRandom;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time;
+use tokio::sync::Notify;
+use tokio::time::sleep;
 
-enum Commands {
-    NewPeers(Vec<PeerHandle>),
-    PieceCompleted(u32),
-    RequestPiece(u32),
-    Die,
-}
-
-struct DownloadInner {
-    commands: mpsc::Receiver<Commands>,
-
+pub struct Download<'a> {
+    torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
-    peers: Vec<PeerHandle>,
-
-    inflight: HashSet<u32>,
-    missing: Vec<u32>,
-
     max_inflight: usize,
+    torrent_swarm: &'a TorrentSwarm,
 }
 
-impl DownloadInner {
-    pub async fn ev_loop(mut self) {
-        self.missing.shuffle(&mut rand::rng());
-
-        loop {}
-        while let Some(command) = self.commands.recv().await {
-            self.process_command(command).await;
-        }
-    }
-
-    async fn request_more(&mut self) {
-        while self.inflight.len() < self.max_inflight {
-            if let Some(piece_to_request) = self.missing.pop() {
-                self.request_piece(piece_to_request).await;
-            }
-        }
-    }
-
-    async fn process_command(&mut self, command: Commands) {
-        match command {
-            Commands::NewPeers(peers) => {
-                self.peers.extend(peers);
-                self.peers.sort_unstable();
-                self.peers.dedup()
-            }
-            Commands::PieceCompleted(piece) => {
-                self.inflight.remove(&piece);
-                self.missing.retain(|&x| x != piece); // make a data structure that supports efficient random sampling and deletion if this is slow
-            }
-            Commands::RequestPiece(piece) => {
-                self.request_piece(piece).await;
-            }
-            Commands::Die => {
-                self.commands.close();
-            }
-        }
-    }
-
-    async fn request_piece(&mut self, piece: u32) {
-        if let Some(peer) = choose(&self.peers, piece) {
-            if peer.request_piece_from_peer(piece).await.is_ok() {
-                self.inflight.insert(piece);
-            }
-        } else {
-            // No peer available
+impl<'a> Download<'a> {
+    pub fn new(torrent_swarm: &'a TorrentSwarm) -> Download<'a> {
+        Self {
+            torrent: torrent_swarm.torrent.clone(),
+            storage: torrent_swarm.storage.clone(),
+            max_inflight: 100, // TODO: should be configurable
+            torrent_swarm,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Download {
-    inner: mpsc::Sender<Commands>,
-}
+impl Download<'_> {
+    // pub fn new(torrent_swarm: &'_ TorrentSwarm) -> Download<'_> {
+    //     Self {
+    //         torrent: torrent_swarm.torrent.clone(),
+    //         storage: torrent_swarm.storage.clone(),
+    //         max_inflight: 100, // TODO: should be configurable
+    //         torrent_swarm,
+    //     }
+    // }
 
-impl Download {
-    pub fn new(storage: Arc<TorrentStorage>, torrent: Arc<Torrent>, peers: Vec<PeerHandle>) -> Self {
-        let (syn, ack) = mpsc::channel(100);
-        let inner = DownloadInner {
-            commands: ack,
-            storage,
-            peers,
-            inflight: Default::default(),
-            missing: vec![],
-            max_inflight: 0,
-        };
+    pub async fn download_loop(&self) {
+        let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
+        missing_pieces.shuffle(&mut rand::rng());
+        let mut in_flight = HashSet::new();
 
-        tokio::spawn(inner.ev_loop());
-        Self { inner: syn }
-    }
-
-    pub async fn new_peers(&self, peers: Vec<PeerHandle>) {
-        self.inner
-            .send(Commands::NewPeers(peers))
-            .await
-            .expect("it's not dead yet");
-    }
-
-    pub async fn piece_completed(&self, piece: u32) {
-        self.inner
-            .send(Commands::PieceCompleted(piece))
-            .await
-            .expect("it's not dead yet");
-    }
-
-    pub fn dead(&self) -> bool {
-        self.inner.is_closed()
-    }
-}
-
-impl Drop for Download {
-    fn drop(&mut self) {
-        let _ = self.inner.try_send(Commands::Die);
-    }
-}
-
-// async fn download_loop(&self) {
-//     let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
-//     missing_pieces.shuffle(&mut rand::rng());
-//     let mut in_flight = HashSet::new();
-//     let mut completion_rx = self.piece_completed_rx.lock().await;
-//
-//     loop {
-//         if missing_pieces.is_empty() {
-//             break;
-//         }
-//
-//         if self.storage.all_verified() {
-//             break;
-//         }
-//
-//         // Find a piece to request that's not already in-flight
-//         let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
-//
-//         if let Some(piece) = piece_to_request {
-//             // We have a piece to request, select between requesting and receiving completions
-//             tokio::select! {
-//                 // Handle piece completions
-//                 Some(completed_piece) = completion_rx.recv() => {
-//                     in_flight.remove(&completed_piece);
-//                     missing_pieces.retain(|&p| p != completed_piece);
-//                 }
-//
-//                 // Request a new piece
-//                 _ = async {
-//                     let peer_handles = self.peer_handles.read().await;
-//                     if let Some(peer) = choose(&peer_handles, piece) {
-//                         drop(peer_handles); // Release lock before awaiting
-//                         if peer.request_piece_from_peer(piece).await.is_ok() {
-//                             in_flight.insert(piece);
-//                         }
-//                     } else {
-//                         // No peer available, wait a bit
-//                         time::sleep(Duration::from_millis(100)).await;
-//                     }
-//                 } => {}
-//             }
-//         } else {
-//             // All wanted pieces are in-flight, just wait for completions
-//             if let Some(completed_piece) = completion_rx.recv().await {
-//                 in_flight.remove(&completed_piece);
-//                 missing_pieces.retain(|&p| p != completed_piece);
-//             } else {
-//                 // Channel closed, break
-//                 break;
-//             }
-//         }
-//     }
-// }
-fn choose(peers: &Vec<PeerHandle>, piece: u32) -> Option<PeerHandle> {
-    // Read all peer stats from watch receivers (non-blocking)
-    let candidates: Vec<(PeerHandle, PeerStatistics)> = peers
-        .iter()
-        .filter_map(|h| {
-            let state = h.state.read().unwrap();
-            if !state.ready() || !state.they_have(piece) {
-                return None;
+        let mut work = FuturesUnordered::new();
+        let unblocked = Notify::new();
+        unblocked.notify_one();
+        loop {
+            if missing_pieces.is_empty() {
+                break;
             }
-            let stat = *h.stats_rx.borrow();
-            Some((h.clone(), stat))
-        })
-        .collect();
 
-    // Select best peer by UCB
-    candidates
-        .into_iter()
-        .max_by(|(_, a), (_, b)| a.ucb.total_cmp(&b.ucb))
-        .map(|(handle, _)| handle)
+            if self.storage.all_verified() {
+                break;
+            }
+
+            tokio::select! {
+                Some(piece) = work.next() => {
+                    in_flight.remove(&piece);
+                    missing_pieces.retain(|missing| *missing != piece);
+
+                    if in_flight.len() <= self.max_inflight {
+                        unblocked.notify_one();
+                    }
+                }
+                // TODO: suprious wakeups?
+                _ = unblocked.notified() => {
+                    let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
+                    let Some(piece) = piece_to_request else {
+                        continue;
+                    };
+
+                    if let Some(peer) = self.torrent_swarm.choose(piece) {
+                        in_flight.insert(piece);
+                        work.push(async move {
+                            let piece = piece;
+                            self.download_piece(piece, peer).await.expect("Oh this is wrong for sure, download can absolutely fail");
+                            piece
+
+                        });
+                    } else {
+
+                        sleep(Duration::from_millis(100)).await;
+                        unblocked.notify_one();
+                    }
+                }
+
+            // // Find a piece to request that's not already in-flight
+            // let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
+            //
+            // if let Some(piece) = piece_to_request {
+            //     if let Some(peer) = self.torrent_swarm.choose(piece) {
+            //         in_flight.insert(piece);
+            //         work.push(async move {
+            //             let piece = piece;
+            //             // let unblocked = unblocked.clone();
+            //             self.download_piece(piece, peer).await;
+            //             piece
+            //             // in_flight.remove(&piece);
+            //             // missing_pieces.retain(|missing| *missing != piece);
+            //         });
+            //     } else {
+            //         // No peer available, wait a bit
+            //         time::sleep(Duration::from_millis(100)).await;
+            //     }
+            }
+        }
+    }
+
+    async fn download_piece(&self, piece: u32, peer: PeerHandle) -> anyhow::Result<()> {
+        // if self.inflight.contains(&piece) {
+        //     return Err(bail!("requested piece is already in flight"));
+        // }
+
+        let mut buf = vec![0u8; self.torrent.piece_size as usize];
+        let disjoint_sections = buf.chunks_mut(BLOCK_SIZE).enumerate();
+
+        let mut download_blocks = vec![];
+        for (idx, section) in disjoint_sections {
+            let idx = idx as u32;
+            let peer = peer.clone();
+            download_blocks.push(async move {
+                self.download_block(
+                    Request {
+                        index: idx,
+                        begin: idx * self.torrent.piece_size,
+                        length: section.len() as u32,
+                    },
+                    peer,
+                    section,
+                )
+                .await
+                .expect("implement retries?");
+            });
+        }
+
+        // TODO: need to ensure they all succeeded
+        let _: () = join_all(download_blocks).await.into_iter().collect();
+        self.storage.write_piece(piece, buf.into_boxed_slice())?;
+
+        Ok(())
+    }
+
+    async fn download_block(&self, req: Request, peer: PeerHandle, buffer: &mut [u8]) -> anyhow::Result<()> {
+        let data = peer.request_data_from_peer(req).await?;
+        // let (written, buf) = self.block_buf.entry(req.index as usize).or_insert_with(|| {
+        //     (
+        //         0,
+        //         vec![
+        //             0u8;
+        //             self.torrent
+        //                 .nth_piece_size(req.index)
+        //                 .expect("people won't send us pieces with invalid index")
+        //         ],
+        //     )
+        // });
+
+        // let length: usize = req.length.try_into().unwrap();
+        // let begin: usize = req.begin.try_into().unwrap();
+
+        // *written += length;
+        // buf[begin..begin + length].copy_from_slice(&data);
+        buffer.copy_from_slice(&data);
+
+        Ok(())
+    }
 }
