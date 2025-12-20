@@ -1,7 +1,7 @@
 use crate::defs::Identity;
-use crate::peer::download::{Download, DownloadEvent};
-use crate::peer::wire::{shake_hands, BitField, BtDecoder, BtEncoder, Piece};
-use crate::peer::{peer_ev_loop, PeerConnection, PeerEvent, PeerHandle, PeerState, PeerStatistics};
+use crate::download::{Download, DownloadEvent};
+use crate::wire::{shake_hands, BitField, BtDecoder, BtEncoder, Piece};
+use crate::peer::{peer_ev_loop, PeerEvent, PeerHandle, PeerState, PeerStatistics};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use anyhow::bail;
@@ -439,59 +439,7 @@ impl TorrentSwarm {
         async move {
             let mut tcp = TcpStream::connect(remote_addr).await?;
             let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id).await?;
-            let (reader, writer) = tcp.into_split();
-            let (commands_tx, commands_rx) = mpsc::channel(1024);
-
-            // Create watch channel for this peer's statistics
-            let initial_stats = PeerStatistics {
-                tcp_info: unsafe { zeroed() },
-                mean_rx: 0.0,
-                mean_rx_cnt: 0,
-                mean_rx_last_checked: std::time::Instant::now(),
-                ucb: 0.0,
-                picked_count: 0,
-            };
-            let (stats_tx, stats_rx) = watch::channel(initial_stats);
-
-            let state = Arc::new(RwLock::new(PeerState {
-                they_have: vec![0u8; torrent.pieces.len()].into(),
-                choked_us: false,
-                choked_them: false,
-                interested_them: false,
-                interested_us: false,
-                requested: BTreeMap::new(),
-            }));
-
-            let peer = PeerConnection {
-                commands: commands_rx,
-                events: event_tx,
-                state: state.clone(),
-                remote_addr,
-                reader: FramedRead::new(reader, BtDecoder),
-                writer: FramedWrite::new(writer, BtEncoder),
-                requested: Default::default(),
-                stat: PeerStatistics {
-                tcp_info: unsafe { zeroed() },
-                mean_rx: 0.0,
-                mean_rx_cnt: 0,
-                mean_rx_last_checked: std::time::Instant::now(),
-                ucb: 0.0,
-                picked_count: 0,
-            },
-
-                torrent_stat: stat_snapshot_rx,
-                stats_tx,
-            };
-
-            let handle = PeerHandle {
-                id: handshake.peer_id,
-                peer_tx: commands_tx,
-                state,
-                stats: stats_rx,
-                remote_addr,
-            };
-            tokio::spawn(peer_ev_loop(peer));
-
+            let handle = PeerHandle::new(tcp, handshake.peer_id, event_tx, stat_snapshot_rx, &torrent); 
             Ok(handle)
         }
     }

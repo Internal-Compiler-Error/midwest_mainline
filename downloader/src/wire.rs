@@ -159,7 +159,7 @@ impl Encode for Extended<'_> {
     }
 }
 
-pub(super) enum BtMessage {
+pub(crate) enum BtMessage {
     KeepAlive(KeepAlive),
     Choke(Choke),
     Unchoke(Unchoke),
@@ -173,7 +173,7 @@ pub(super) enum BtMessage {
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
 
-pub(super) struct BtEncoder;
+pub(crate) struct BtEncoder;
 
 impl Encoder<BtMessage> for BtEncoder {
     type Error = io::Error;
@@ -198,7 +198,7 @@ impl Encoder<BtMessage> for BtEncoder {
     }
 }
 
-pub(super) struct BtDecoder;
+pub(crate) struct BtDecoder;
 
 impl Decoder for BtDecoder {
     type Item = BtMessage;
@@ -267,7 +267,7 @@ impl Decoder for BtDecoder {
     }
 }
 
-pub(super) struct Handshake {
+pub(crate) struct Handshake {
     pub extensions: [u8; 8],
     pub info_hash: InfoHash,
     pub peer_id: [u8; 20],
@@ -275,7 +275,7 @@ pub(super) struct Handshake {
 
 pub const HANDSHAKE: &'static [u8] = b"\x13BitTorrent protocol";
 
-pub(super) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<Handshake> {
+pub(crate) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<Handshake> {
     let extensions = [0u8; 8];
 
     let mut buf = vec![];

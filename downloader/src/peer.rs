@@ -1,30 +1,26 @@
-pub mod download;
-pub mod torrent_swarm;
-mod wire;
-
 use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
 use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::mem::zeroed;
-use std::net::SocketAddrV4;
-use std::os::fd::{AsRawFd};
+use std::net::{SocketAddr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 use std::{io, mem, sync::Arc};
+use bitvec::boxed::BitBox;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use crate::sys_tcp;
-
-use wire::{
-    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, NotInterested, Piece, Request, Unchoke,
-};
-use crate::peer::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
+use crate::torrent::Torrent;
+use crate::wire::{shake_hands, BitField, BtDecoder, BtEncoder, BtMessage, Choke, Handshake, Have, Interested, NotInterested, Piece, Request, Unchoke};
+use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
 
 pub enum PeerCommands {
     UnchokePeer,
@@ -83,7 +79,7 @@ pub async fn peer_ev_loop(mut peer: PeerConnection) {
 }
 
 /// Represents an active connection to a peer in the BitTorrent network
-pub struct PeerConnection {
+struct PeerConnection {
     commands: Receiver<PeerCommands>,
     // we never ask for anything from the torrent swarm, only posting events, they handle want to do with
     // us using the channel above
@@ -345,7 +341,7 @@ pub struct PeerHandle {
     pub state: Arc<RwLock<PeerState>>,
 
     #[eq(skip)]
-    stats: watch::Receiver<PeerStatistics>,
+    pub(crate) stats: watch::Receiver<PeerStatistics>,
 }
 
 impl PartialOrd for PeerHandle {
@@ -360,6 +356,67 @@ impl Ord for PeerHandle {
 }
 
 impl PeerHandle {
+    pub fn new(tcp_stream: TcpStream, remote_peer_id: [u8; 20], event_tx: mpsc::Sender<TorrentSwarmCommand>, torrent_status: watch::Receiver<TorrentSwarmStats>, torrent: &Torrent) -> Self {
+        // let mut tcp = TcpStream::connect(remote_addr).await?;
+        // let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id).await?;
+        let remote_addr = tcp_stream.peer_addr().unwrap();
+        let SocketAddr::V4(remote_addr) = remote_addr else {
+            panic!("we only support ipv4");
+        };
+        let (reader, writer) = tcp_stream.into_split();
+        let (commands_tx, commands_rx) = mpsc::channel(1024);
+
+        // Create watch channel for this peer's statistics
+        let initial_stats = PeerStatistics {
+            tcp_info: unsafe { zeroed() },
+            mean_rx: 0.0,
+            mean_rx_cnt: 0,
+            mean_rx_last_checked: Instant::now(),
+            ucb: 0.0,
+            picked_count: 0,
+        };
+        let (stats_tx, stats_rx) = watch::channel(initial_stats);
+
+        let state = Arc::new(RwLock::new(PeerState {
+            they_have: vec![0u8; torrent.pieces.len()].into(),
+            choked_us: false,
+            choked_them: false,
+            interested_them: false,
+            interested_us: false,
+            requested: BTreeMap::new(),
+        }));
+
+        let peer = PeerConnection {
+            commands: commands_rx,
+            events: event_tx,
+            state: state.clone(),
+            remote_addr,
+            reader: FramedRead::new(reader, BtDecoder),
+            writer: FramedWrite::new(writer, BtEncoder),
+            requested: Default::default(),
+            stat: PeerStatistics {
+                tcp_info: unsafe { zeroed() },
+                mean_rx: 0.0,
+                mean_rx_cnt: 0,
+                mean_rx_last_checked: std::time::Instant::now(),
+                ucb: 0.0,
+                picked_count: 0,
+            },
+            torrent_stat: torrent_status,
+            stats_tx,
+        };
+
+        tokio::spawn(peer_ev_loop(peer));
+
+        Self {
+            id: remote_peer_id,
+            peer_tx: commands_tx,
+            state,
+            stats: stats_rx,
+            remote_addr,
+        }
+    }
+
     pub async fn request_data_from_peer(&self, req: Request) -> anyhow::Result<Box<[u8]>> {
         let (syn, ack) = oneshot::channel();
 

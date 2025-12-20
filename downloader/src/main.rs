@@ -5,6 +5,9 @@ mod storage;
 mod sys_tcp;
 mod torrent;
 mod bt_client;
+mod wire;
+pub mod download;
+pub mod torrent_swarm;
 
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;

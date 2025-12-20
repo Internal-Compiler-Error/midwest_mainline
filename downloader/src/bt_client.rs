@@ -8,7 +8,7 @@ use midwest_mainline::types::InfoHash;
 use crate::defs::Identity;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::peer::torrent_swarm::TorrentSwarm;
+use crate::torrent_swarm::TorrentSwarm;
 
 pub struct BtClient {
     id: Arc<Identity>,

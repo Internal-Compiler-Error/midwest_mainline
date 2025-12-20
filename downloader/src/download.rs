@@ -1,6 +1,6 @@
-use crate::peer::torrent_swarm::TorrentSwarm;
+use crate::torrent_swarm::TorrentSwarm;
 use crate::peer::PeerHandle;
-use crate::peer::wire::Request;
+use crate::wire::Request;
 use crate::settings::BLOCK_SIZE;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
