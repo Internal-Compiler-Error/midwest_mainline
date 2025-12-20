@@ -45,7 +45,6 @@ struct Announcer {
     identity: Arc<Identity>,
     next_ready: Instant,
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
-    torrent_swarm_controller: TorrentSwarmController,
 }
 
 impl Announcer {
@@ -54,7 +53,6 @@ impl Announcer {
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        torrent_swarm_controller: TorrentSwarmController,
     ) -> Self {
         Announcer {
             tracker_url,
@@ -62,7 +60,6 @@ impl Announcer {
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
-            torrent_swarm_controller,
         }
     }
 
@@ -124,25 +121,11 @@ impl Announcer {
     }
 }
 
-// async fn announcer_ev_loop(
-//     mut announcer: Announcer,
-// ) -> anyhow::Result<()> {
-//     loop {
-//         announcer.interval.tick().await;
-//         let _ = announcer.announce().await; // TODO: log on error
-//     }
-// }
-
 #[derive(Clone, Debug, Copy)]
 struct TorrentSwarmStats {
     pub uploaded: usize,
     pub downloaded: usize,
     pub left: usize,
-}
-
-enum TorrentSwarmCommands {
-    NewPeers(Vec<SocketAddrV4>),
-    NewConnection(Vec<PeerHandle>),
 }
 
 // TODO: move this into peer mod so it doesn't need to be pub
@@ -153,31 +136,10 @@ pub struct TorrentSwarm {
 
     id: Arc<Identity>,
 
-    pending_ops: mpsc::Receiver<TorrentSwarmCommands>,
-    loopback_thing: mpsc::Sender<TorrentSwarmCommands>,
-
-    // announcers: Vec<JoinHandle<anyhow::Result<()>>>,
     announcers: Vec<Announcer>,
 
     stat: TorrentSwarmStats,
     stat_snapshot_syn: watch::Sender<TorrentSwarmStats>,
-}
-
-#[derive(Debug, Clone)]
-struct TorrentSwarmController {
-    tx: mpsc::Sender<TorrentSwarmCommands>,
-}
-
-impl TorrentSwarmController {
-    pub async fn add_peer_connection(&self, peer: Vec<PeerHandle>) -> anyhow::Result<()> {
-        self.tx.send(TorrentSwarmCommands::NewConnection(peer)).await?;
-        Ok(())
-    }
-
-    pub async fn add_peer(&self, peer: Vec<SocketAddrV4>) -> anyhow::Result<()> {
-        self.tx.send(TorrentSwarmCommands::NewPeers(peer)).await?;
-        Ok(())
-    }
 }
 
 impl TorrentSwarm {
@@ -193,11 +155,6 @@ impl TorrentSwarm {
         };
         let (stat_syn, stat_ack) = watch::channel(stat);
 
-        // TODO: incomplete
-        let (syn, ack) = mpsc::channel(100);
-
-        let controller = TorrentSwarmController { tx: syn.clone() };
-
         // Create announcer with access to peer handles and storage stats
         // For now, use the primary tracker (first tracker in first tier)
         // TODO: Support multiple trackers from announce_tiers
@@ -205,7 +162,7 @@ impl TorrentSwarm {
             .primary_tracker()
             .expect("torrent must have at least one tracker")
             .to_string();
-        let announcer = Announcer::new(tracker_url, torrent.clone(), id.clone(), stat_ack, controller);
+        let announcer = Announcer::new(tracker_url, torrent.clone(), id.clone(), stat_ack);
 
         // Spawn the announcer loop
         // let announcers = vec![tokio::spawn(announcer_ev_loop(announcer))];
@@ -215,44 +172,10 @@ impl TorrentSwarm {
             torrent,
             storage,
             id,
-            pending_ops: ack,
-            loopback_thing: syn,
             announcers: vec![announcer],
             stat,
             stat_snapshot_syn: stat_syn,
         }
-    }
-
-    pub fn make_remote(&self) -> TorrentSwarmController {
-        TorrentSwarmController {
-            tx: self.loopback_thing.clone(),
-        }
-    }
-
-    async fn process_command(&mut self, command: TorrentSwarmCommands) -> anyhow::Result<()> {
-        match command {
-            TorrentSwarmCommands::NewPeers(peers) => {
-                for p in peers {
-                    let remote = self.make_remote();
-                    let peer_id = self.id.peer_id.clone();
-                    let torrent = self.torrent.clone();
-                    let storage = self.storage.clone();
-
-                    tokio::spawn(async move {
-                        let peer = connect_peer(p, peer_id, torrent, storage).await.unwrap();
-                        remote.add_peer_connection(vec![peer]).await;
-                    });
-                }
-            }
-            TorrentSwarmCommands::NewConnection(connection) => {
-                self.peer_handles.extend(connection);
-                self.peer_handles.sort_unstable();
-                self.peer_handles.dedup();
-                todo!("inform the download task")
-            }
-        }
-
-        Ok(())
     }
 
     async fn work_loop(&mut self) {
