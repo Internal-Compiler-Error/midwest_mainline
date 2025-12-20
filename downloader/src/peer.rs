@@ -1,4 +1,5 @@
 pub mod download;
+pub mod torrent_swarm;
 mod wire;
 
 use derive_more::{Eq, PartialEq};
@@ -31,11 +32,15 @@ use wire::{
 
 pub enum PeerCommands {
     UnchokePeer,
+    #[allow(dead_code)]
     ChokePeer,
+    FancyPeer,
     RequestDataFromPeer {
         req: Request,
         syn: oneshot::Sender<Box<[u8]>>,
     },
+    WeHave(u32),
+    BitField,
 }
 
 pub async fn peer_ev_loop(mut peer: PeerConnection) {
@@ -53,7 +58,10 @@ pub async fn peer_ev_loop(mut peer: PeerConnection) {
                 match command {
                     PeerCommands::UnchokePeer => peer.unchoke_peer().await.unwrap(),
                     PeerCommands::ChokePeer => peer.choke_peer().await.unwrap(),
-                    PeerCommands::RequestDataFromPeer{req, syn} => peer.request_data_from_peer(req, syn).await.unwrap(),
+                    PeerCommands::RequestDataFromPeer{req,syn} => peer.request_data_from_peer(req,syn).await.unwrap(),
+                    PeerCommands::FancyPeer => peer.fancy_peer().await.unwrap(),
+                    PeerCommands::WeHave(piece) => peer.we_have(piece).await.unwrap(),
+                    PeerCommands::BitField => peer.send_bitfield().await.unwrap(),
                 }
             }
 
@@ -72,12 +80,10 @@ pub async fn peer_ev_loop(mut peer: PeerConnection) {
 pub struct PeerConnection {
     commands: Receiver<PeerCommands>,
 
-    torrent: Arc<Torrent>,
-
+    // torrent: Arc<Torrent>,
     state: Arc<RwLock<PeerState>>,
 
-    remote_addr: SocketAddrV4,
-
+    // remote_addr: SocketAddrV4,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
     writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
     storage: Arc<TorrentStorage>,
@@ -88,9 +94,8 @@ pub struct PeerConnection {
 
     /// Watch channel to publish statistics updates
     stats_tx: watch::Sender<PeerStatistics>,
-
-    /// if the connection is closed, then the peer should be disposed off when able
-    connection_closed: bool,
+    ///// if the connection is closed, then the peer should be disposed off when able
+    // connection_closed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -140,15 +145,15 @@ pub struct PeerStatistics {
 }
 
 impl PeerConnection {
-    pub fn new(
+    fn new(
         commands: Receiver<PeerCommands>,
-        torrent: Arc<Torrent>,
+        // torrent: Arc<Torrent>,
         state: Arc<RwLock<PeerState>>,
         reader: FramedRead<OwnedReadHalf, BtDecoder>,
         writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
         storage: Arc<TorrentStorage>,
         stats_tx: watch::Sender<PeerStatistics>,
-        remote_addr: SocketAddrV4,
+        // remote_addr: SocketAddrV4,
     ) -> Self {
         let initial_stats = PeerStatistics {
             tcp_info: unsafe { zeroed() },
@@ -161,7 +166,7 @@ impl PeerConnection {
 
         PeerConnection {
             commands,
-            torrent,
+            // torrent,
             state,
             reader,
             writer,
@@ -169,8 +174,8 @@ impl PeerConnection {
             requested: Default::default(),
             stat: initial_stats,
             stats_tx,
-            connection_closed: false,
-            remote_addr,
+            // connection_closed: false,
+            // remote_addr,
         }
     }
 
@@ -191,14 +196,14 @@ impl PeerConnection {
         syn: oneshot::Sender<Box<[u8]>>,
     ) -> anyhow::Result<()> {
         self.requested.insert(req, syn);
-        self.writer.feed(BtMessage::Request(req)).await?;
+        self.writer.send(BtMessage::Request(req)).await?;
 
         Ok(())
     }
 
     pub async fn unchoke_peer(&mut self) -> io::Result<()> {
         let unchoke = Unchoke;
-        self.writer.feed(BtMessage::Unchoke(unchoke)).await?;
+        self.writer.send(BtMessage::Unchoke(unchoke)).await?;
         self.state.write().unwrap().choked_them = false;
 
         Ok(())
@@ -206,7 +211,7 @@ impl PeerConnection {
 
     pub async fn choke_peer(&mut self) -> io::Result<()> {
         let choke = Choke;
-        self.writer.feed(BtMessage::Choke(choke)).await?;
+        self.writer.send(BtMessage::Choke(choke)).await?;
         self.state.write().unwrap().choked_them = true;
 
         Ok(())
@@ -214,7 +219,7 @@ impl PeerConnection {
 
     pub async fn fancy_peer(&mut self) -> io::Result<()> {
         let interested = Interested;
-        self.writer.feed(BtMessage::Interested(interested)).await?;
+        self.writer.send(BtMessage::Interested(interested)).await?;
         self.state.write().unwrap().interested_them = true;
 
         Ok(())
@@ -222,7 +227,7 @@ impl PeerConnection {
 
     pub async fn unfancy_peer(&mut self) -> io::Result<()> {
         let not_interested = NotInterested;
-        self.writer.feed(BtMessage::NotInterested(not_interested)).await?;
+        self.writer.send(BtMessage::NotInterested(not_interested)).await?;
         self.state.write().unwrap().interested_them = false;
 
         Ok(())
@@ -232,20 +237,16 @@ impl PeerConnection {
         let bit_field = BitField {
             has: self.storage.verified().as_raw_slice().into(),
         };
-        self.writer.feed(BtMessage::BitField(bit_field)).await?;
+        self.writer.send(BtMessage::BitField(bit_field)).await?;
 
         Ok(())
     }
 
     pub async fn we_have(&mut self, index: u32) -> io::Result<()> {
         let have = Have { checked: index };
-        self.writer.feed(BtMessage::Have(have)).await?;
+        self.writer.send(BtMessage::Have(have)).await?;
 
         Ok(())
-    }
-
-    pub async fn flush_outbound(&mut self) -> io::Result<()> {
-        self.writer.flush().await
     }
 
     pub async fn update_stat(&mut self) {
@@ -287,7 +288,10 @@ impl PeerConnection {
             BtMessage::KeepAlive(_) => return,
             BtMessage::Choke(_) => self.state.write().unwrap().choked_us = true,
             BtMessage::Unchoke(_) => self.state.write().unwrap().choked_us = false,
-            BtMessage::Interested(_) => self.state.write().unwrap().interested_us = true,
+            BtMessage::Interested(_) => {
+                self.state.write().unwrap().interested_us = true;
+                let _ = self.unchoke_peer().await;
+            }
             BtMessage::NotInterested(_) => self.state.write().unwrap().interested_us = false,
             BtMessage::Have(have) => {
                 let index = have.checked / 8;
@@ -306,7 +310,7 @@ impl PeerConnection {
                 }
 
                 let data = data.unwrap();
-                let (head, tail) = data.split_at(request.begin as usize);
+                let (_head, tail) = data.split_at(request.begin as usize);
                 let tail: Box<[u8]> = tail.into();
 
                 let resp = BtMessage::Piece(Piece {
@@ -315,7 +319,7 @@ impl PeerConnection {
                     length: (data.len() - request.begin as usize) as u32,
                     data: tail,
                 });
-                self.writer.feed(resp).await.unwrap();
+                self.writer.send(resp).await.unwrap();
             }
             BtMessage::Piece(piece) => {
                 if !self.requested.contains_key(&Request {
@@ -382,6 +386,26 @@ impl PeerHandle {
         let data = ack.await?;
         Ok(data)
     }
+
+    pub async fn fancy_peer(&self) -> anyhow::Result<()> {
+        self.ctrl.send(PeerCommands::FancyPeer).await?;
+        Ok(())
+    }
+
+    pub async fn we_have(&self, piece: u32) -> anyhow::Result<()> {
+        self.ctrl.send(PeerCommands::WeHave(piece)).await?;
+        Ok(())
+    }
+
+    pub async fn bit_field(&self) -> anyhow::Result<()> {
+        self.ctrl.send(PeerCommands::BitField).await?;
+        Ok(())
+    }
+
+    pub async fn unchoke_peer(&self) -> anyhow::Result<()> {
+        self.ctrl.send(PeerCommands::UnchokePeer).await?;
+        Ok(())
+    }
 }
 
 pub async fn connect_peer(
@@ -417,13 +441,13 @@ pub async fn connect_peer(
 
     let peer = PeerConnection::new(
         commands_rx,
-        torrent,
+        // torrent,
         state.clone(),
         FramedRead::new(reader, BtDecoder),
         FramedWrite::new(writer, BtEncoder),
         storage,
         stats_tx,
-        remote_addr,
+        // remote_addr,
     );
 
     let handle = PeerHandle {
