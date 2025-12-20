@@ -13,6 +13,11 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 
+pub enum DownloadEvent {
+    PieceCompleted(u32),
+}
+
+
 pub struct Download<'a> {
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
@@ -45,7 +50,7 @@ impl Download<'_> {
                 break;
             }
 
-            if self.storage.all_verified() {
+            if self.torrent_swarm.all_verified() {
                 break;
             }
 
@@ -59,7 +64,7 @@ impl Download<'_> {
                     if in_flight.len() <= self.max_inflight {
                         unblocked.notify_one();
                     }
-                    let _ = peer.we_have(piece).await;
+                    let _ = peer.send_we_have(piece).await;
                 }
                 // TODO: suprious wakeups?
                 _ = unblocked.notified() => {

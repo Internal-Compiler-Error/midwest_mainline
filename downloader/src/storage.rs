@@ -6,16 +6,16 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, RwLock};
 
-/// Storage statistics shared via watch channel
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct StorageStats {
-    pub remaining_bytes: usize,
-
-    /// which pieces have been verified, if a piece is verified, it also implies it has been written
-    pub verified: BitBox<u8>,
-
-    written: usize,
-}
+///// Storage statistics shared via watch channel
+// #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+// struct StorageStats {
+//     pub remaining_bytes: usize,
+//
+//     /// which pieces have been verified, if a piece is verified, it also implies it has been written
+//     // pub verified: BitBox<u8>,
+//
+//     written: usize,
+// }
 
 
 /// Manages file I/O operations for torrent pieces
@@ -28,7 +28,7 @@ pub struct TorrentStorage {
     /// giant file
     offsets: Vec<usize>,
 
-    stat: RwLock<StorageStats>,
+    // stat: RwLock<StorageStats>,
 }
 
 
@@ -37,10 +37,6 @@ impl TorrentStorage {
         torrent: Arc<Torrent>,
         files: Vec<File>,
     ) -> TorrentStorage {
-        let piece_count = torrent.pieces.len();
-        let verified = vec![false; piece_count];
-        let verified = BitBox::from_iter(verified.iter());
-
         // prefix sum
         let offsets = files
             .iter()
@@ -52,31 +48,31 @@ impl TorrentStorage {
             })
             .collect::<Vec<_>>();
 
-        let internal_state = StorageStats {
-            remaining_bytes: 0,
-            verified,
-            written: 0,
-        };
+        // let internal_state = StorageStats {
+        //     remaining_bytes: 0,
+        //     // verified,
+        //     written: 0,
+        // };
 
         TorrentStorage {
             torrent,
             files,
             offsets,
-            stat: RwLock::new(internal_state),
+            // stat: RwLock::new(internal_state),
         }
     }
 
-    pub fn verified(&self) -> BitBox<u8> {
-        self.stat.read().expect("lock poisoning is dumb").verified.clone()
-    }
-
-    pub fn all_verified(&self) -> bool {
-        self.stat.read().expect("lock poisoning is dumb").verified.iter().all(|v| *v)
-    }
-
-    pub fn verified_cnt(&self) -> usize {
-        self.stat.read().expect("lock poisoning is dumb").verified.count_ones()
-    }
+    // pub fn verified(&self) -> BitBox<u8> {
+    //     self.stat.read().expect("lock poisoning is dumb").verified.clone()
+    // }
+    //
+    // pub fn all_verified(&self) -> bool {
+    //     self.stat.read().expect("lock poisoning is dumb").verified.iter().all(|v| *v)
+    // }
+    //
+    // pub fn verified_cnt(&self) -> usize {
+    //     self.stat.read().expect("lock poisoning is dumb").verified.count_ones()
+    // }
 
     fn files_responsible(&self, piece: u32) -> Range<usize> {
         // TODO: last piece has a different size
@@ -102,14 +98,14 @@ impl TorrentStorage {
             file.write_all_at(&complete_piece[written..size], range.start.try_into().unwrap())?;
             written += size;
         }
-        if !self.verify_hash(piece) {
-            panic!("Disk content is inconsistent");
-        }
+        // if !self.verify_hash(piece) {
+        //     panic!("Disk content is inconsistent");
+        // }
 
         {
-            let mut stat = self.stat.write().expect("lock poisoning is dumb");
-            stat.written += written;
-            stat.remaining_bytes = (self.torrent.total_size - (stat.written as u64)) as usize
+            // let mut stat = self.stat.write().expect("lock poisoning is dumb");
+            // stat.written += written;
+            // stat.remaining_bytes = (self.torrent.total_size - (stat.written as u64)) as usize
 
         }
 
@@ -117,23 +113,36 @@ impl TorrentStorage {
     }
 
     pub fn read_piece(&self, piece: u32) -> anyhow::Result<Box<[u8]>> {
-        let stat = self.stat.read().expect("lock poisoning is stupid");
-        let has_block = stat.verified.get(piece as usize);
-        if has_block.is_none() {
-            Err(anyhow!("Don't have piece"))
-        } else {
-            let mut buf = vec![0u8; self.torrent.piece_size as usize];
-            let mut read = 0;
-            for (file, interval) in self.file_segments(piece) {
-                let len = interval.len();
-                let dst = &mut buf[read..read + len];
-                file.read_exact_at(dst, interval.start as u64).unwrap();
+        // let stat = self.stat.read().expect("lock poisoning is stupid");
+        // let has_block = stat.verified.get(piece as usize);
 
-                read += len;
-            }
+        let mut buf = vec![0u8; self.torrent.piece_size as usize];
+        let mut read = 0;
+        for (file, interval) in self.file_segments(piece) {
+            let len = interval.len();
+            let dst = &mut buf[read..read + len];
+            file.read_exact_at(dst, interval.start as u64).unwrap();
 
-            Ok(buf.into_boxed_slice())
+            read += len;
         }
+
+        Ok(buf.into_boxed_slice())
+        //
+        // if has_block.is_none() {
+        //     Err(anyhow!("Don't have piece"))
+        // } else {
+        //     let mut buf = vec![0u8; self.torrent.piece_size as usize];
+        //     let mut read = 0;
+        //     for (file, interval) in self.file_segments(piece) {
+        //         let len = interval.len();
+        //         let dst = &mut buf[read..read + len];
+        //         file.read_exact_at(dst, interval.start as u64).unwrap();
+        //
+        //         read += len;
+        //     }
+        //
+        //     Ok(buf.into_boxed_slice())
+        // }
     }
 
     /// Find the file(s) and their corresponding range that this piece should be written to
@@ -175,27 +184,4 @@ impl TorrentStorage {
         ret
     }
 
-    fn verify_hash(&self, piece: u32) -> bool {
-        let mut buf = vec![0u8; self.torrent.piece_size as usize];
-        let mut wrote = 0;
-
-        let segments = self.file_segments(piece);
-        for (file, range) in segments {
-            let local_off = range.start;
-            let local_len = range.end - range.start;
-
-            if wrote + local_len > buf.len() {
-                panic!("wrote more than piece length");
-            }
-
-            let dst_slice = &mut buf[wrote..wrote + local_len];
-            file.read_exact_at(dst_slice, local_off as u64).unwrap();
-
-            wrote += local_len;
-        }
-
-        let valid_piece = self.torrent.valid_piece(piece, &buf);
-        self.stat.write().unwrap().verified.set(piece as usize, true);
-        valid_piece
-    }
 }

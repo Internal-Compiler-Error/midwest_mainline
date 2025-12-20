@@ -275,14 +275,14 @@ pub(super) struct Handshake {
 
 pub const HANDSHAKE: &'static [u8] = b"\x13BitTorrent protocol";
 
-pub(super) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, peer_id: &[u8; 20]) -> io::Result<Handshake> {
+pub(super) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<Handshake> {
     let extensions = [0u8; 8];
 
     let mut buf = vec![];
     buf.extend_from_slice(HANDSHAKE);
     buf.extend_from_slice(&extensions);
     buf.extend_from_slice(info_hash.as_bytes());
-    buf.extend_from_slice(peer_id);
+    buf.extend_from_slice(local_id);
 
     peer.write_all(&*buf).await?;
 
@@ -290,7 +290,7 @@ pub(super) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, peer
     peer.read_exact(&mut buf).await?;
 
     // header, info_hash, and peer_id must match
-    if read_buf[..20] != *HANDSHAKE || read_buf[28..48] != info_hash.0 || read_buf[48..68] != *peer_id {
+    if read_buf[..20] != *HANDSHAKE || read_buf[28..48] != info_hash.0 || read_buf[48..68] != *local_id {
         peer.shutdown().await?;
         return Err(io::Error::new(ErrorKind::Other, "handshake info didn't match"));
     }
