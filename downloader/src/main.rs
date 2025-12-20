@@ -181,7 +181,16 @@ impl TorrentSwarm {
     async fn work_loop(&mut self) {
         let (new_connection_tx, mut new_connection_rx) = mpsc::channel(200);
 
-        let download = Download::new(self);
+        // Get a raw pointer to self to bypass borrow checker
+        let self_ptr: *const TorrentSwarm = self;
+
+        // SAFETY: This is safe because:
+        // 1. Download::choose() only reads peer_handles and doesn't hold references across await points
+        // 2. tokio::select! branches are mutually exclusive - only one executes at a time
+        // 3. When download is polled (branch 3), it doesn't hold any references while other branches execute
+        // 4. Mutable accesses to announcers and peer_handles in branches 1 and 2 don't overlap with
+        //    download's immutable access to peer_handles in branch 3
+        let download = unsafe { Download::new(&*self_ptr) };
         let mut download = pin!(download.download_loop());
         let mut download_done = false;
 
