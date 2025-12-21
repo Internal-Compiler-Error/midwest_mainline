@@ -7,6 +7,7 @@ use crate::wire::{BitField, Piece, shake_hands};
 use anyhow::{self, bail};
 use bitvec::boxed::BitBox;
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use juicy_bencode::BencodeItemView;
 use rand::Rng;
 use reqwest::Client;
@@ -32,7 +33,7 @@ use derive_more::{Eq, PartialEq};
 /// Handles announcements to a single tracker server
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpAnnouncer {
-    tracker_url: String,
+    tracker: Url,
     torrent: Arc<Torrent>,
 
     #[eq(skip)]
@@ -49,13 +50,15 @@ struct HttpAnnouncer {
 
 impl HttpAnnouncer {
     fn new(
-        tracker_url: String,
+        tracker: Url,
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
     ) -> Self {
+        debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
+
         HttpAnnouncer {
-            tracker_url,
+            tracker,
             torrent,
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
@@ -79,7 +82,7 @@ impl HttpAnnouncer {
         // Build the announce URL
         let url = format!(
             "{tracker_url}?info_hash={info_hash}&peer_id={peer_id}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1",
-            tracker_url = self.tracker_url,
+            tracker_url = self.tracker,
             info_hash = info_hash_encoded,
             peer_id = peer_id_encoded,
             port = self.identity.serving.port(),
@@ -126,7 +129,7 @@ impl HttpAnnouncer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 struct UdpAnnouncer {
-    tracker_url: String,
+    tracker: Url,
     torrent: Arc<Torrent>,
 
     #[eq(skip)]
@@ -161,20 +164,23 @@ enum Event {
 
 #[allow(dead_code)]
 impl UdpAnnouncer {
-    // fn new(
-    //     tracker_url: String,
-    //     torrent: Arc<Torrent>,
-    //     identity: Arc<Identity>,
-    //     swarm_stat: watch::Receiver<TorrentSwarmStats>,
-    // ) -> Self {
-    //     UdpAnnouncer {
-    //         tracker_url,
-    //         torrent,
-    //         identity,
-    //         next_ready: Instant::now() + Duration::from_millis(10),
-    //         swarm_stat,
-    //     }
-    // }
+    fn new(
+        tracker_url: Url,
+        torrent: Arc<Torrent>,
+        identity: Arc<Identity>,
+        swarm_stat: watch::Receiver<TorrentSwarmStats>,
+    ) -> Self {
+        debug_assert!(tracker_url.scheme() == "udp");
+        UdpAnnouncer {
+            tracker: tracker_url,
+            torrent,
+            identity,
+            next_ready: Instant::now() + Duration::from_millis(10),
+            swarm_stat,
+            connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
+                              // haven't done anything
+        }
+    }
 
     /// The future resolves whenever the next round of announce is ready to be performed
     fn ready(&self) -> Sleep {
@@ -182,10 +188,7 @@ impl UdpAnnouncer {
     }
 
     async fn resolve(&self) -> io::Result<SocketAddr> {
-        let url = Url::parse(&self.tracker_url).expect("validation should be done in new()");
-        debug_assert!(url.scheme() == "udp");
-
-        let mut addresses = lookup_host(url.host_str().expect("validation should be done in new()")).await?;
+        let mut addresses = lookup_host(self.tracker.host_str().expect("validation should be done in new()")).await?;
 
         Ok(addresses.next().unwrap())
     }
@@ -415,7 +418,8 @@ pub struct TorrentSwarm {
 
     id: Arc<Identity>,
 
-    announcers: Vec<HttpAnnouncer>,
+    http_announcers: Vec<HttpAnnouncer>,
+    udp_announcers: Vec<UdpAnnouncer>,
 
     inbound_msgs: mpsc::Receiver<TorrentSwarmCommand>,
     /// we keep a sender so we can clone it and give it to objects that generate on run time who need it
@@ -445,14 +449,18 @@ impl TorrentSwarm {
         };
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
-        // Create announcer with access to peer handles and storage stats
-        // For now, use the primary tracker (first tracker in first tier)
-        // TODO: Support multiple trackers from announce_tiers
-        let tracker_url = torrent
-            .primary_tracker()
-            .expect("torrent must have at least one tracker")
-            .to_string();
-        let announcer = HttpAnnouncer::new(tracker_url, torrent.clone(), id.clone(), stat_rx.clone());
+        let trackers = torrent.all_trackers();
+        let trackers = trackers.into_iter().map(|s| Url::parse(&s)).filter_map(Result::ok);
+
+        let http_announcers: Vec<_> = trackers
+            .clone()
+            .filter(|t| t.scheme() == "http" || t.scheme() == "https")
+            .map(|t| HttpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone()))
+            .collect();
+        let udp_announcers: Vec<_> = trackers
+            .filter(|t| t.scheme() == "udp")
+            .map(|t| UdpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone()))
+            .collect();
 
         let (command_tx, command_rx) = mpsc::channel(512);
 
@@ -461,7 +469,8 @@ impl TorrentSwarm {
             torrent,
             storage,
             id,
-            announcers: vec![announcer],
+            http_announcers: http_announcers,
+            udp_announcers: udp_announcers,
             stat,
             stat_snapshot_tx: stat_tx,
             stat_snapshot_rx: stat_rx,
@@ -495,6 +504,15 @@ impl TorrentSwarm {
 
         let mut aggregate_ticker = interval(Duration::from_mins(5));
 
+        let mut announcer_timers = FuturesOrdered::new();
+        for (idx, announcer) in self.http_announcers.iter().enumerate() {
+            let ready = announcer.ready();
+            announcer_timers.push_back(async move {
+                ready.await;
+                idx
+            });
+        }
+
         // Get a raw pointer to self to bypass borrow checker
         let self_ptr: *const TorrentSwarm = &self;
 
@@ -510,13 +528,13 @@ impl TorrentSwarm {
 
         loop {
             // TODO: support multiple announcers
-            let announcer_ready = self.announcers[0].ready();
+            let announcer_ready = self.http_announcers[0].ready();
             tokio::select! {
                 _ = aggregate_ticker.tick() => {
                     self.aggregate_peer_stats();
                 }
                 _ = announcer_ready => {
-                    let mut new_peers = self.announcers[0].announce().await.unwrap();
+                    let mut new_peers = self.http_announcers[0].announce().await.unwrap();
 
                     // don't needlessly connect to peers we already have
                     self.peer_handles.sort_unstable();
