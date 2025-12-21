@@ -19,6 +19,8 @@ bendy = "0.4.0-beta.4"
 anyhow = "1.0.98"
 bitvec = "1.0.1"
 derive_more = { version = "2.1.0", features = ["full"] }
+crc32c = "0.6.0"
+zerocopy = { version = "0.8.31", features = ["derive"] }
 
 [build-dependencies]
 bindgen = "0.72.0"

@@ -1,28 +1,24 @@
+use crate::torrent::Torrent;
+use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
+use crate::wire::{
+    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, NotInterested, Piece, Request, Unchoke,
+};
 use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
 use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::mem::zeroed;
+use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
-use std::os::fd::AsRawFd;
-use std::sync::RwLock;
-use std::time::Duration;
 use std::time::Instant;
-use std::{io, mem, sync::Arc};
-use bitvec::boxed::BitBox;
+use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use crate::sys_tcp;
-use crate::torrent::Torrent;
-use crate::wire::{shake_hands, BitField, BtDecoder, BtEncoder, BtMessage, Choke, Handshake, Have, Interested, NotInterested, Piece, Request, Unchoke};
-use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
 
-pub enum PeerCommands {
+enum PeerCommands {
     UnchokePeer,
     #[allow(dead_code)]
     ChokePeer,
@@ -34,303 +30,16 @@ pub enum PeerCommands {
     SendWeHave(u32),
     BitField(BitField),
     SendData(Piece),
-    UpdateStats { verified: usize },
 }
 
 pub enum PeerEvent {
     Requested(Request),
-    UpdateStatsReady,
-}
-
-pub async fn peer_ev_loop(mut peer: PeerConnection) {
-    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        tokio::select! {
-            // Handle periodic stats updates
-            _ = stats_interval.tick() => {
-                peer.emit_event(PeerEvent::UpdateStatsReady).await;
-            }
-
-            // Handle commands from the peer handle
-            Some(command) = peer.commands.recv() => {
-                // TODO: at least don't send the data when they're not interested or we've choked them or something
-                match command {
-                    PeerCommands::UnchokePeer => peer.unchoke_peer().await.unwrap(),
-                    PeerCommands::ChokePeer => peer.choke_peer().await.unwrap(),
-                    PeerCommands::RequestDataFromPeer{req,syn} => peer.request_data_from_peer(req,syn).await.unwrap(),
-                    PeerCommands::FancyPeer => peer.fancy_peer().await.unwrap(),
-                    PeerCommands::SendWeHave(piece) => peer.send_we_have(piece).await.unwrap(),
-                    PeerCommands::BitField(bitfield) => peer.send_bitfield(bitfield).await.unwrap(),
-                    PeerCommands::SendData(piece) => peer.send_data(piece).await.unwrap(),
-                    PeerCommands::UpdateStats{verified} => peer.update_stat(verified),
-                }
-            }
-
-            // Process incoming BitTorrent protocol messages
-            Some(Ok(msg)) = peer.reader.next() => {
-                peer.process_message(msg).await
-            }
-
-            // Exit loop if all channels are closed
-            else => break,
-        }
-    }
-}
-
-/// Represents an active connection to a peer in the BitTorrent network
-struct PeerConnection {
-    commands: Receiver<PeerCommands>,
-    // we never ask for anything from the torrent swarm, only posting events, they handle want to do with
-    // us using the channel above
-    events: mpsc::Sender<TorrentSwarmCommand>,
-
-    // torrent: Arc<Torrent>,
-    state: Arc<RwLock<PeerState>>,
-
-    remote_addr: SocketAddrV4,
-    reader: FramedRead<OwnedReadHalf, BtDecoder>,
-    writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
-
-    requested: BTreeMap<Request, oneshot::Sender<Box<[u8]>>>,
-
-    stat: PeerStatistics,
-
-    torrent_stat: watch::Receiver<TorrentSwarmStats>,
-
-    /// Watch channel to publish statistics updates
-    stats_tx: watch::Sender<PeerStatistics>,
-    ///// if the connection is closed, then the peer should be disposed off when able
-    // connection_closed: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct PeerState {
-    they_have: Box<[u8]>,
-
-    /// We choked the peer, i.e. we won't send data until we unchoke them
-    pub choked_them: bool,
-
-    /// The peer choked us, i.e. they won't send data until they unchoke us
-    pub choked_us: bool,
-
-    /// We are interested in them, i.e. they have something we want
-    pub interested_them: bool,
-
-    /// They are interested in us, i.e. they want something from us
-    pub interested_us: bool,
-
-    requested: BTreeMap<Request, Instant>,
-}
-
-impl PeerState {
-    pub fn they_have(&self, piece: u32) -> bool {
-        let index = piece / 8;
-        let offset = piece % 8;
-
-        let flag = 1u8 << offset;
-        (self.they_have[index as usize] & flag) != 0
-    }
-
-    /// Is the peer ready for more requests?
-    pub fn ready(&self) -> bool {
-        self.requested.len() <= 500 && !self.choked_us
-    }
-}
-
-#[derive(Clone, Debug, Copy)]
-pub struct PeerStatistics {
-    pub tcp_info: sys_tcp::tcp_info,
-    pub mean_rx: f64,
-    pub mean_rx_cnt: usize,
-    pub mean_rx_last_checked: Instant,
-
-    /// upper confidence bound
-    pub ucb: f64,
-    pub picked_count: usize,
-}
-
-impl PeerConnection {
-    async fn emit_event(&mut self, event: PeerEvent) {
-        self.events.send(TorrentSwarmCommand::ProcessPeerEvent {
-            from: self.remote_addr,
-            event: event,
-        }).await.unwrap();
-    }
-
-    pub async fn request_data_from_peer(
-        &mut self,
-        req: Request,
-        syn: oneshot::Sender<Box<[u8]>>,
-    ) -> anyhow::Result<()> {
-        self.requested.insert(req, syn);
-        self.writer.send(BtMessage::Request(req)).await?;
-
-        Ok(())
-    }
-
-    pub async fn unchoke_peer(&mut self) -> io::Result<()> {
-        let unchoke = Unchoke;
-        self.writer.send(BtMessage::Unchoke(unchoke)).await?;
-        self.state.write().unwrap().choked_them = false;
-
-        Ok(())
-    }
-
-    pub async fn choke_peer(&mut self) -> io::Result<()> {
-        let choke = Choke;
-        self.writer.send(BtMessage::Choke(choke)).await?;
-        self.state.write().unwrap().choked_them = true;
-
-        Ok(())
-    }
-
-    pub async fn fancy_peer(&mut self) -> io::Result<()> {
-        let interested = Interested;
-        self.writer.send(BtMessage::Interested(interested)).await?;
-        self.state.write().unwrap().interested_them = true;
-
-        Ok(())
-    }
-
-    pub async fn unfancy_peer(&mut self) -> io::Result<()> {
-        let not_interested = NotInterested;
-        self.writer.send(BtMessage::NotInterested(not_interested)).await?;
-        self.state.write().unwrap().interested_them = false;
-
-        Ok(())
-    }
-
-    pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
-        self.writer.send(BtMessage::BitField(bit_field)).await?;
-        Ok(())
-    }
-
-    pub async fn send_we_have(&mut self, index: u32) -> io::Result<()> {
-        let connection_state = {
-            self.state.read().unwrap().clone()
-        };
-        if !connection_state.interested_us || connection_state.choked_them {
-            return Ok(());
-        }
-
-        let have = Have { checked: index };
-        self.writer.send(BtMessage::Have(have)).await?;
-
-        Ok(())
-    }
-
-
-    pub async fn send_data(&mut self, piece: Piece) -> anyhow::Result<()> {
-        self.writer.send(BtMessage::Piece(piece)).await?;
-        Ok(())
-    }
-
-    async fn process_command(&mut self, command: PeerCommands) {
-        match command {
-            PeerCommands::UnchokePeer => self.unchoke_peer().await.unwrap(),
-            PeerCommands::ChokePeer => self.choke_peer().await.unwrap(),
-            PeerCommands::RequestDataFromPeer{req,syn} => self.request_data_from_peer(req,syn).await.unwrap(),
-            PeerCommands::FancyPeer => self.fancy_peer().await.unwrap(),
-            PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await.unwrap(),
-            PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
-            PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
-            PeerCommands::UpdateStats{verified} => self.update_stat(verified),
-        }
-    }
-
-    pub async fn process_message(&mut self, msg: BtMessage) {
-        match msg {
-            BtMessage::KeepAlive(_) => return,
-            BtMessage::Choke(_) => self.state.write().unwrap().choked_us = true,
-            BtMessage::Unchoke(_) => self.state.write().unwrap().choked_us = false,
-            BtMessage::Interested(_) => {
-                self.state.write().unwrap().interested_us = true;
-                let _ = self.unchoke_peer().await;
-            }
-            BtMessage::NotInterested(_) => self.state.write().unwrap().interested_us = false,
-            BtMessage::Have(have) => {
-                let index = have.checked / 8;
-                let offset = have.checked % 8;
-
-                let flag = 1u8 << offset;
-                self.state.write().unwrap().they_have[index as usize] |= flag;
-            }
-            BtMessage::BitField(bit_field) => {
-                self.state.write().unwrap().they_have = bit_field.has;
-            }
-            BtMessage::Request(request) => {
-                self.events.send(TorrentSwarmCommand::ProcessPeerEvent {
-                    from: self.remote_addr,
-                    event: PeerEvent::Requested(request),
-                }).await.expect("They kill us and not the other way around, TorrentSwarm outlives us");
-            }
-            BtMessage::Piece(piece) => {
-                if !self.requested.contains_key(&Request {
-                    index: piece.index,
-                    begin: piece.begin,
-                    length: piece.length,
-                }) {
-                    // be wary of strangers sending data you didn't ask for, ignore them
-                    return;
-                }
-
-                let syn = self
-                    .requested
-                    .remove(&Request {
-                        index: piece.index,
-                        begin: piece.begin,
-                        length: piece.length,
-                    })
-                    .unwrap();
-
-                let _ = syn.send(piece.data);
-            }
-            BtMessage::Cancel(_cancel) => return,
-            BtMessage::Unknown(msg_type, _) => {
-                tracing::warn!("Unsupported message type {msg_type}");
-            }
-        }
-    }
-    pub fn update_stat(&mut self, verified_cnt: usize) {
-        if Instant::now().duration_since(self.stat.mean_rx_last_checked) < Duration::from_secs(1) {
-            return;
-        }
-
-        let fd = self.writer.get_ref().as_ref().as_raw_fd();
-
-        unsafe {
-            let mut len = mem::size_of::<sys_tcp::tcp_info>() as libc::socklen_t;
-            libc::getsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_INFO,
-                &mut self.stat.tcp_info as *mut _ as *mut libc::c_void,
-                &mut len,
-            );
-        };
-
-        // online average update formula
-        self.stat.mean_rx_cnt += 1;
-        self.stat.mean_rx = self.stat.mean_rx
-            + (self.stat.tcp_info.tcpi_delivery_rate as f64 - self.stat.mean_rx) / self.stat.mean_rx_cnt as f64;
-        self.stat.mean_rx_last_checked = Instant::now();
-
-        // Upper Confidence Bound
-        let c = 1f64;
-        let t = verified_cnt as f64;
-        let n_t = self.stat.picked_count as f64;
-        self.stat.ucb = self.stat.mean_rx + c * (t.ln() / n_t).sqrt();
-
-        // Publish updated statistics via watch channel
-        let _ = self.stats_tx.send(self.stat);
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerHandle {
     // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
-    pub id: [u8; 20],
+    pub remote_peer_id: [u8; 20],
 
     pub remote_addr: SocketAddrV4,
 
@@ -338,7 +47,7 @@ pub struct PeerHandle {
     peer_tx: mpsc::Sender<PeerCommands>,
 
     #[eq(skip)]
-    pub state: Arc<RwLock<PeerState>>,
+    state: watch::Receiver<PeerState>,
 
     #[eq(skip)]
     pub(crate) stats: watch::Receiver<PeerStatistics>,
@@ -346,7 +55,7 @@ pub struct PeerHandle {
 
 impl PartialOrd for PeerHandle {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.id.partial_cmp(&other.id)
+        self.remote_peer_id.partial_cmp(&other.remote_peer_id)
     }
 }
 impl Ord for PeerHandle {
@@ -356,9 +65,13 @@ impl Ord for PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn new(tcp_stream: TcpStream, remote_peer_id: [u8; 20], event_tx: mpsc::Sender<TorrentSwarmCommand>, torrent_status: watch::Receiver<TorrentSwarmStats>, torrent: &Torrent) -> Self {
-        // let mut tcp = TcpStream::connect(remote_addr).await?;
-        // let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id).await?;
+    pub fn new(
+        tcp_stream: TcpStream,
+        remote_peer_id: [u8; 20],
+        event_tx: mpsc::Sender<TorrentSwarmCommand>,
+        torrent_status: watch::Receiver<TorrentSwarmStats>,
+        torrent: &Torrent,
+    ) -> Self {
         let remote_addr = tcp_stream.peer_addr().unwrap();
         let SocketAddr::V4(remote_addr) = remote_addr else {
             panic!("we only support ipv4");
@@ -367,52 +80,43 @@ impl PeerHandle {
         let (commands_tx, commands_rx) = mpsc::channel(1024);
 
         // Create watch channel for this peer's statistics
-        let initial_stats = PeerStatistics {
-            tcp_info: unsafe { zeroed() },
-            mean_rx: 0.0,
-            mean_rx_cnt: 0,
-            mean_rx_last_checked: Instant::now(),
-            ucb: 0.0,
-            picked_count: 0,
-        };
+        let initial_stats = PeerStatistics::default();
         let (stats_tx, stats_rx) = watch::channel(initial_stats);
 
-        let state = Arc::new(RwLock::new(PeerState {
+        let state = PeerState {
             they_have: vec![0u8; torrent.pieces.len()].into(),
             choked_us: false,
             choked_them: false,
             interested_them: false,
             interested_us: false,
-            requested: BTreeMap::new(),
-        }));
+        };
+        let (state_tx, state_rx) = watch::channel(state.clone());
 
         let peer = PeerConnection {
             commands: commands_rx,
             events: event_tx,
+
             state: state.clone(),
+            state_tx,
+
             remote_addr,
             reader: FramedRead::new(reader, BtDecoder),
             writer: FramedWrite::new(writer, BtEncoder),
             requested: Default::default(),
-            stat: PeerStatistics {
-                tcp_info: unsafe { zeroed() },
-                mean_rx: 0.0,
-                mean_rx_cnt: 0,
-                mean_rx_last_checked: std::time::Instant::now(),
-                ucb: 0.0,
-                picked_count: 0,
-            },
-            torrent_stat: torrent_status,
+
+            stats: Default::default(),
             stats_tx,
+
+            torrent_stat: torrent_status,
         };
 
         tokio::spawn(peer_ev_loop(peer));
 
         Self {
-            id: remote_peer_id,
+            remote_peer_id,
             peer_tx: commands_tx,
-            state,
             stats: stats_rx,
+            state: state_rx.clone(),
             remote_addr,
         }
     }
@@ -420,7 +124,9 @@ impl PeerHandle {
     pub async fn request_data_from_peer(&self, req: Request) -> anyhow::Result<Box<[u8]>> {
         let (syn, ack) = oneshot::channel();
 
-        self.peer_tx.send(PeerCommands::RequestDataFromPeer { req, syn }).await?;
+        self.peer_tx
+            .send(PeerCommands::RequestDataFromPeer { req, syn })
+            .await?;
         let data = ack.await?;
         Ok(data)
     }
@@ -450,9 +156,301 @@ impl PeerHandle {
         Ok(())
     }
 
-    pub async fn update_stats(&mut self, verified_cnt: usize) -> anyhow::Result<()> {
-        let _ = self.peer_tx.send(PeerCommands::UpdateStats { verified: verified_cnt }).await?;
-        Ok(())
+    pub fn state(&self) -> PeerState {
+        self.state.borrow().clone()
+    }
+
+    pub fn stats(&self) -> PeerStatistics {
+        self.stats.borrow().clone()
+    }
+
+    pub fn ready(&self) -> bool {
+        self.state().ready()
     }
 }
 
+/// Represents an active connection to a peer in the BitTorrent network
+#[derive(Debug)]
+struct PeerConnection {
+    commands: Receiver<PeerCommands>,
+    // we never ask for anything from the torrent swarm, only posting events, they handle want to do with
+    // us using the channel above
+    events: mpsc::Sender<TorrentSwarmCommand>,
+
+    state: PeerState,
+    state_tx: watch::Sender<PeerState>,
+
+    remote_addr: SocketAddrV4,
+    reader: FramedRead<OwnedReadHalf, BtDecoder>,
+    writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
+
+    requested: BTreeMap<Request, (oneshot::Sender<Box<[u8]>>, Instant)>,
+
+    torrent_stat: watch::Receiver<TorrentSwarmStats>,
+
+    stats: PeerStatistics,
+    stats_tx: watch::Sender<PeerStatistics>,
+    ///// if the connection is closed, then the peer should be disposed off when able
+    // connection_closed: bool,
+}
+
+async fn peer_ev_loop(mut peer: PeerConnection) {
+    loop {
+        tokio::select! {
+            // Handle commands from the peer handle
+            Some(command) = peer.commands.recv() => { peer.process_command(command).await; }
+
+            // Process incoming BitTorrent protocol messages
+            Some(Ok(msg)) = peer.reader.next() => { peer.process_message(msg).await }
+
+            // Exit loop if all channels are closed
+            else => break,
+        }
+    }
+}
+
+impl PeerConnection {
+    async fn emit_event(&mut self, event: PeerEvent) {
+        self.events
+            .send(TorrentSwarmCommand::ProcessPeerEvent {
+                from: self.remote_addr,
+                event: event,
+            })
+            .await
+            .unwrap();
+    }
+
+    pub async fn request_data_from_peer(
+        &mut self,
+        req: Request,
+        syn: oneshot::Sender<Box<[u8]>>,
+    ) -> anyhow::Result<()> {
+        self.stats.picked_count += 1;
+        self.publish_stat();
+
+        self.requested.insert(req, (syn, Instant::now()));
+        self.writer.send(BtMessage::Request(req)).await?;
+
+        Ok(())
+    }
+
+    pub async fn unchoke_peer(&mut self) -> io::Result<()> {
+        let unchoke = Unchoke;
+        self.writer.send(BtMessage::Unchoke(unchoke)).await?;
+        self.state.choked_them = false;
+
+        Ok(())
+    }
+
+    pub async fn choke_peer(&mut self) -> io::Result<()> {
+        let choke = Choke;
+        self.writer.send(BtMessage::Choke(choke)).await?;
+        self.state.choked_them = true;
+
+        Ok(())
+    }
+
+    pub async fn fancy_peer(&mut self) -> io::Result<()> {
+        let interested = Interested;
+        self.writer.send(BtMessage::Interested(interested)).await?;
+        self.state.interested_them = true;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn unfancy_peer(&mut self) -> io::Result<()> {
+        let not_interested = NotInterested;
+        self.writer.send(BtMessage::NotInterested(not_interested)).await?;
+        self.state.interested_them = false;
+
+        Ok(())
+    }
+
+    pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
+        self.writer.send(BtMessage::BitField(bit_field)).await?;
+        Ok(())
+    }
+
+    pub async fn send_we_have(&mut self, index: u32) -> io::Result<()> {
+        let connection_state = { self.state.clone() };
+        if !connection_state.interested_us || connection_state.choked_them {
+            return Ok(());
+        }
+
+        let have = Have { checked: index };
+        self.writer.send(BtMessage::Have(have)).await?;
+
+        Ok(())
+    }
+
+    pub async fn send_data(&mut self, piece: Piece) -> anyhow::Result<()> {
+        let length = piece.length.clone();
+        self.writer.send(BtMessage::Piece(piece)).await?;
+        self.stats.sent += length as usize;
+        self.publish_stat();
+
+        Ok(())
+    }
+
+    async fn process_command(&mut self, command: PeerCommands) {
+        match command {
+            PeerCommands::UnchokePeer => self.unchoke_peer().await.unwrap(),
+            PeerCommands::ChokePeer => self.choke_peer().await.unwrap(),
+            PeerCommands::RequestDataFromPeer { req, syn } => self.request_data_from_peer(req, syn).await.unwrap(),
+            PeerCommands::FancyPeer => self.fancy_peer().await.unwrap(),
+            PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await.unwrap(),
+            PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
+            PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
+        }
+    }
+
+    pub async fn process_message(&mut self, msg: BtMessage) {
+        match msg {
+            BtMessage::KeepAlive(_) => return,
+            BtMessage::Choke(_) => self.state.choked_us = true,
+            BtMessage::Unchoke(_) => self.state.choked_us = false,
+            BtMessage::Interested(_) => {
+                self.state.interested_us = true;
+                let _ = self.unchoke_peer().await;
+            }
+            BtMessage::NotInterested(_) => self.state.interested_us = false,
+            BtMessage::Have(have) => {
+                let index = have.checked / 8;
+                let offset = have.checked % 8;
+
+                let flag = 1u8 << offset;
+                self.state.they_have[index as usize] |= flag;
+            }
+            BtMessage::BitField(bit_field) => {
+                self.state.they_have = bit_field.has;
+            }
+            BtMessage::Request(request) => {
+                self.events
+                    .send(TorrentSwarmCommand::ProcessPeerEvent {
+                        from: self.remote_addr,
+                        event: PeerEvent::Requested(request),
+                    })
+                    .await
+                    .expect("They kill us and not the other way around, TorrentSwarm outlives us");
+            }
+            BtMessage::Piece(piece) => {
+                if !self.requested.contains_key(&Request {
+                    index: piece.index,
+                    begin: piece.begin,
+                    length: piece.length,
+                }) {
+                    // be wary of strangers sending data you didn't ask for, ignore them
+                    return;
+                }
+
+                let (syn, requested_time) = self
+                    .requested
+                    .remove(&Request {
+                        index: piece.index,
+                        begin: piece.begin,
+                        length: piece.length,
+                    })
+                    .unwrap();
+
+                self.stats.received += piece.length as usize;
+
+                let speed = (piece.length as f64) / (Instant::now() - requested_time).as_secs_f64();
+                self.update_speed_estimation(speed);
+                self.publish_stat();
+                let _ = syn.send(piece.data);
+            }
+            BtMessage::Cancel(_cancel) => return,
+            BtMessage::Unknown(msg_type, _) => {
+                tracing::warn!("Unsupported message type {msg_type}");
+            }
+        }
+        let _ = self.state_tx.send(self.state.clone());
+    }
+
+    fn publish_stat(&self) {
+        // TODO: don't only publish every .5 second or something
+        let _ = self.stats_tx.send(self.stats);
+    }
+
+    fn update_speed_estimation(&mut self, sampled_speed: f64) {
+        // online average update formula
+        self.stats.mean_rx_cnt += 1;
+        self.stats.mean_rx = self.stats.mean_rx + (sampled_speed - self.stats.mean_rx) / self.stats.mean_rx_cnt as f64;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerState {
+    // TODO: it's only used when selecting peers, probably shouldn't be here
+    they_have: Box<[u8]>,
+
+    /// We choked the peer, i.e. we won't send data until we unchoke them
+    pub choked_them: bool,
+
+    /// The peer choked us, i.e. they won't send data until they unchoke us
+    pub choked_us: bool,
+
+    /// We are interested in them, i.e. they have something we want
+    pub interested_them: bool,
+
+    /// They are interested in us, i.e. they want something from us
+    pub interested_us: bool,
+}
+
+impl PeerState {
+    pub fn they_have(&self, piece: u32) -> bool {
+        let index = piece / 8;
+        let offset = piece % 8;
+
+        let flag = 1u8 << offset;
+        (self.they_have[index as usize] & flag) != 0
+    }
+
+    /// Is the peer ready for more requests?
+    pub fn ready(&self) -> bool {
+        !self.choked_us
+    }
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Default)]
+pub struct PeerStatistics {
+    /// Number of bytes we've sent to the peer
+    pub sent: usize,
+
+    /// Number of bytes we've received from the peer
+    pub received: usize,
+
+    /// Mean download speed from this peer
+    pub mean_rx: f64,
+
+    /// how many times have the download speed been sampled, mostly used in online averaging
+    /// calculation
+    pub mean_rx_cnt: usize,
+
+    /// how many times this peer has been chosen to request a piece
+    pub picked_count: usize,
+}
+
+impl PeerStatistics {
+    /// Calculate the peer's download's upper confidence bound based on how many pieces have been
+    /// requested
+    pub fn rx_speed_ucb(&self, total_piece_requested: usize) -> f64 {
+        // Upper Confidence Bound
+        let c = 1f64;
+        let t = total_piece_requested as f64;
+        let n_t = self.picked_count as f64;
+        self.mean_rx + c * (t.ln() / n_t).sqrt()
+    }
+
+    // In UCB, when an arm hasn't been played yet, it should be picked first, instead of doing an
+    // if check every time we choose a peer, we just assign infinite score to peers who haven't
+    // been requested yet
+    pub fn score(&self, total_piece_requested: usize) -> f64 {
+        if self.picked_count == 0 {
+            f64::INFINITY
+        } else {
+            self.rx_speed_ucb(total_piece_requested)
+        }
+    }
+}

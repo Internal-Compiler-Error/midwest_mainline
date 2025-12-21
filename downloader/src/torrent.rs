@@ -87,9 +87,11 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
 
     if let Some(BencodeItemView::List(announce_list)) = torrent.remove(b"announce-list".as_slice()) {
         // Parse announce-list: list of lists of strings
-        while let Some(BencodeItemView::List(tier)) = announce_list.iter().next() {
+        let mut announce_list = announce_list.iter();
+        while let Some(BencodeItemView::List(tier)) = announce_list.next() {
             let mut tier_urls = Vec::new();
-            while let Some(BencodeItemView::ByteString(url)) = tier.iter().next() {
+            let mut tier = tier.iter();
+            while let Some(BencodeItemView::ByteString(url)) = tier.next() {
                 if let Ok(url_str) = String::from_utf8(url.to_vec()) {
                     tier_urls.push(url_str);
                 }
@@ -116,7 +118,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     let mut root = PathBuf::new();
     // TODO: make this configurable
     root.push("./");
-    root.push(str::from_utf8(name).unwrap());
+    root.push(str::from_utf8(name)?);
 
     let BencodeItemView::Integer(piece_len) = info.remove(b"piece length".as_slice()).unwrap() else {
         bail!("piece length needs to be an integer");
@@ -134,7 +136,8 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     if let Some(BencodeItemView::Integer(length)) = info.remove(b"length".as_slice()) {
         files.push((length as u32, root));
     } else if let Some(BencodeItemView::List(file_lists)) = info.remove(b"files".as_slice()) {
-        while let Some(BencodeItemView::Dictionary(entries)) = file_lists.iter().next() {
+        let mut file_lists = file_lists.iter();
+        while let Some(BencodeItemView::Dictionary(entries)) = file_lists.next() {
             let BencodeItemView::Integer(length) = entries.get(b"length".as_slice()).unwrap() else {
                 bail!("file length needs to be an integer");
             };
@@ -142,8 +145,9 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
                 bail!("file path needs to be a list");
             };
             let mut f = root.clone();
-            while let Some(BencodeItemView::ByteString(p)) = paths.iter().next() {
-                f.push(str::from_utf8(p).unwrap());
+            let mut paths = paths.iter();
+            while let Some(BencodeItemView::ByteString(p)) = paths.next() {
+                f.push(str::from_utf8(p)?);
             }
 
             files.push((*length as u32, f));
@@ -152,7 +156,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
 
     let pieces = pieces.chunks(20).map(|e| e.try_into().unwrap()).collect();
     let total_size = files.iter().map(|(len, _f)| *len as u64).sum();
-    let piece_len: u64 = piece_len.try_into().unwrap();
+    let piece_len: u64 = piece_len.try_into()?;
     let last_piece_len = total_size % piece_len;
 
     Ok(Torrent {
@@ -161,7 +165,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         pieces,
         total_size,
         files,
-        last_piece_size: last_piece_len.try_into().unwrap(),
+        last_piece_size: last_piece_len.try_into()?,
         info_hash: hash,
     })
 }
@@ -186,4 +190,18 @@ fn compute_info_hash(input: &[u8]) -> InfoHash {
     }
 
     panic!("torrent metadata must contain 'info' key")
+}
+
+#[cfg(test)]
+mod test {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        let file = fs::read("./test.torrent").unwrap();
+        let torrent = parse_torrent(&file).unwrap();
+        println!("{:#?}", torrent);
+    }
 }

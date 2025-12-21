@@ -173,6 +173,7 @@ pub(crate) enum BtMessage {
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct BtEncoder;
 
 impl Encoder<BtMessage> for BtEncoder {
@@ -198,6 +199,7 @@ impl Encoder<BtMessage> for BtEncoder {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct BtDecoder;
 
 impl Decoder for BtDecoder {
@@ -275,7 +277,11 @@ pub(crate) struct Handshake {
 
 pub const HANDSHAKE: &'static [u8] = b"\x13BitTorrent protocol";
 
-pub(crate) async fn shake_hands(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<Handshake> {
+pub(crate) async fn shake_hands(
+    peer: &mut TcpStream,
+    info_hash: &InfoHash,
+    local_id: &[u8; 20],
+) -> io::Result<Handshake> {
     let extensions = [0u8; 8];
 
     let mut buf = vec![];

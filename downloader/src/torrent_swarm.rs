@@ -1,53 +1,60 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
-use crate::wire::{shake_hands, BitField, BtDecoder, BtEncoder, Piece};
-use crate::peer::{peer_ev_loop, PeerEvent, PeerHandle, PeerState, PeerStatistics};
+use crate::peer::{PeerEvent, PeerHandle, PeerStatistics};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use anyhow::bail;
+use crate::wire::{BitField, Piece, shake_hands};
+use anyhow::{self, bail};
 use bitvec::boxed::BitBox;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use juicy_bencode::BencodeItemView;
+use rand::Rng;
 use reqwest::Client;
-use std::collections::BTreeMap;
-use std::mem::zeroed;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::any::Any;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
-use std::sync::{Arc, RwLock};
+use std::slice::from_raw_parts;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::io;
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{interval, sleep_until, Instant, Sleep};
-use tokio_util::codec::{FramedRead, FramedWrite};
-use url::form_urlencoded;
+use tokio::time::{Instant, Sleep, interval, sleep_until};
+use url::{Url, form_urlencoded};
+use zerocopy::network_endian::{I32, I64, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use derive_more::{PartialEq, Eq};
 use futures::future::join_all;
+
+#[allow(unused_imports)]
+use derive_more::{Eq, PartialEq};
 
 /// Handles announcements to a single tracker server
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Announcer {
+struct HttpAnnouncer {
     tracker_url: String,
     torrent: Arc<Torrent>,
 
-    #[eq(skip)] identity: Arc<Identity>,
-    #[eq(skip)] next_ready: Instant,
-    #[eq(skip)] swarm_stat: watch::Receiver<TorrentSwarmStats>,
+    #[eq(skip)]
+    identity: Arc<Identity>,
+    #[eq(skip)]
+    next_ready: Instant,
+    #[eq(skip)]
+    swarm_stat: watch::Receiver<TorrentSwarmStats>,
 }
 
-enum AnnouncerEvent {
-    DiscoveredPeers(Vec<SocketAddrV4>)
-}
+// enum AnnouncerEvent {
+//     DiscoveredPeers(Vec<SocketAddrV4>),
+// }
 
-impl Announcer {
+impl HttpAnnouncer {
     fn new(
         tracker_url: String,
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
     ) -> Self {
-        Announcer {
+        HttpAnnouncer {
             tracker_url,
             torrent,
             identity,
@@ -85,16 +92,20 @@ impl Announcer {
         let client = Client::new();
         let response = client.get(&url).send().await?;
         let bytes = response.bytes().await?;
+        let bytes: &[u8] = &bytes;
 
         // Parse the bencoded response
-        let (_, dict) = juicy_bencode::parse_bencode_dict(&mut bytes.as_ref()).unwrap();
+        let parsed = juicy_bencode::parse_bencode_dict(bytes);
+        let Ok((_remaining, mut dict)) = parsed else {
+            bail!("invalid bencoded content returned");
+        };
 
         let mut peers = vec![];
-        let Some(BencodeItemView::Integer(interval)) = dict.get(b"interval".as_slice()) else {
+        let Some(BencodeItemView::Integer(interval)) = dict.remove(b"interval".as_slice()) else {
             bail!("response interval must be a number");
         };
 
-        if let Some(BencodeItemView::ByteString(peer_bytes)) = dict.get(b"peers".as_slice()) {
+        if let Some(BencodeItemView::ByteString(peer_bytes)) = dict.remove(b"peers".as_slice()) {
             // Each peer is 6 bytes: 4 bytes IP, 2 bytes port
             for chunk in peer_bytes.chunks(6) {
                 if chunk.len() != 6 {
@@ -107,7 +118,241 @@ impl Announcer {
             }
         }
 
-        self.next_ready = Instant::now() + Duration::from_secs(*interval as u64);
+        self.next_ready = Instant::now() + Duration::from_secs(interval as u64);
+        Ok(peers)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct UdpAnnouncer {
+    tracker_url: String,
+    torrent: Arc<Torrent>,
+
+    #[eq(skip)]
+    identity: Arc<Identity>,
+    #[eq(skip)]
+    next_ready: Instant,
+    #[eq(skip)]
+    swarm_stat: watch::Receiver<TorrentSwarmStats>,
+
+    connection_id: i64,
+}
+
+#[repr(i32)]
+enum Action {
+    Connect = 0,
+    Announce = 1,
+    #[allow(dead_code)]
+    Scrape = 2,
+    Error = 3,
+}
+
+#[repr(i32)]
+enum Event {
+    None = 0,
+    #[allow(dead_code)]
+    Completed = 1,
+    #[allow(dead_code)]
+    Started = 2,
+    #[allow(dead_code)]
+    Stopped = 3,
+}
+
+#[allow(dead_code)]
+impl UdpAnnouncer {
+    // fn new(
+    //     tracker_url: String,
+    //     torrent: Arc<Torrent>,
+    //     identity: Arc<Identity>,
+    //     swarm_stat: watch::Receiver<TorrentSwarmStats>,
+    // ) -> Self {
+    //     UdpAnnouncer {
+    //         tracker_url,
+    //         torrent,
+    //         identity,
+    //         next_ready: Instant::now() + Duration::from_millis(10),
+    //         swarm_stat,
+    //     }
+    // }
+
+    /// The future resolves whenever the next round of announce is ready to be performed
+    fn ready(&self) -> Sleep {
+        sleep_until(self.next_ready)
+    }
+
+    async fn resolve(&self) -> io::Result<SocketAddr> {
+        let url = Url::parse(&self.tracker_url).expect("validation should be done in new()");
+        debug_assert!(url.scheme() == "udp");
+
+        let mut addresses = lookup_host(url.host_str().expect("validation should be done in new()")).await?;
+
+        Ok(addresses.next().unwrap())
+    }
+
+    async fn connect(&mut self, socket: UdpSocket) -> anyhow::Result<()> {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
+        #[repr(C)]
+        struct Connect {
+            connection_id: I64,
+            action: I32,
+            transaction_id: I32,
+        }
+
+        let mut rng = rand::rng();
+        let transaction_id = rng.random::<i32>();
+
+        let connect = Connect {
+            connection_id: 0x41727101980.into(),
+            action: (Action::Connect as i32).into(),
+            transaction_id: transaction_id.into(),
+        };
+
+        socket.send(connect.as_bytes()).await?;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
+        #[repr(C)]
+        struct Response {
+            action: I32,
+            transaction_id: I32,
+            connection_id: I64,
+        }
+        let mut response = Response::default();
+
+        socket.recv(response.as_mut_bytes()).await?;
+
+        self.connection_id = response.connection_id.into();
+
+        let action: i32 = response.action.into();
+        let txn_id: i32 = response.transaction_id.into();
+
+        if transaction_id != txn_id {
+            bail!("tracker transaction id didn't match our transaction_id");
+        }
+        if action == Action::Error as i32 {
+            bail!("server errored on connect");
+        }
+        if action != 0 {
+            bail!("server responsed with an action different than connection whilst we attempted to connect");
+        }
+
+        Ok(())
+    }
+
+    /// Perform a single announce and return the interval and discovered peers
+    async fn announce(&mut self, socket: UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
+        #[repr(C)]
+        struct Announce {
+            connection_id: I64,
+            action: I32,
+            transaction_id: I32,
+            info_hash: [u8; 20],
+            peer_id: [u8; 20],
+            downloaded: I64,
+            left: I64,
+            uploaded: I64,
+            event: I32,
+            ip: U32,
+            key: U32,
+            num_want: I32,
+            port: U16,
+            extensions: U16,
+        }
+
+        let transaction_id = rand::rng().random::<i32>();
+        let key = rand::rng().random::<u32>();
+
+        let swarm_stat = { self.swarm_stat.borrow().clone() };
+        let downloaded: i64 = swarm_stat.downloaded.try_into().unwrap();
+        let uploaded: i64 = swarm_stat.uploaded.try_into().unwrap();
+        let left: i64 = swarm_stat.left.try_into().unwrap();
+
+        let announce = Announce {
+            connection_id: self.connection_id.into(),
+            action: (Action::Announce as i32).into(),
+            transaction_id: transaction_id.into(),
+            info_hash: self.torrent.info_hash.0,
+            peer_id: self.identity.peer_id,
+            downloaded: downloaded.into(),
+            left: left.into(),
+            uploaded: uploaded.into(),
+            event: (Event::None as i32).into(),
+            ip: 0.into(), // i.e. let the tracker infer from the source packet
+            key: key.into(),
+            num_want: (-1).into(), // -1 is the default
+            port: self.identity.serving.port().into(),
+            extensions: 0.into(), // bitfield, i.e. 0 means no extensions
+        };
+        socket.send(announce.as_bytes()).await?;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, Default, KnownLayout)]
+        #[repr(C)]
+        struct AnnounceResponseHeader {
+            action: I32,
+            transaction_id: I32,
+            interval: I32, // in seconds
+            leechers: I32,
+            seeders: I32,
+        }
+
+        #[derive(PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+        #[repr(C)]
+        struct AnnounceResponse {
+            header: AnnounceResponseHeader,
+            peers: [Peer],
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout)]
+        #[repr(C)]
+        struct Peer {
+            ip: I32,
+            port: U16,
+        }
+
+        impl From<Peer> for SocketAddrV4 {
+            fn from(value: Peer) -> SocketAddrV4 {
+                let ip = Ipv4Addr::from_octets(value.ip.as_bytes().try_into().unwrap());
+                let port = u16::from_be_bytes(value.port.as_bytes().try_into().unwrap());
+                SocketAddrV4::new(ip, port)
+            }
+        }
+
+        let mut buf = [0u8; 1500];
+        let read_size = socket.recv(&mut buf).await?;
+        let buf = &buf[..read_size];
+
+        // construct the response from raw bytes
+        let header_size = size_of::<AnnounceResponseHeader>();
+        let header =
+            AnnounceResponseHeader::ref_from_bytes(&buf[..header_size]).expect("header alignment should be good");
+
+        let peer_size = size_of::<Peer>();
+        let peer_bytes = buf.len() - header_size;
+        if peer_bytes % peer_size != 0 {
+            bail!("trailing content is a multiple of peer size");
+        }
+        let peers = <[Peer]>::ref_from_bytes(&buf[..header_size]).expect("shit should work");
+
+        // verify the response is valid
+        let action: i32 = header.action.into();
+        if action == Action::Error as i32 {
+            bail!("server errored on connect");
+        }
+        if action != Action::Announce as i32 {
+            bail!("server responsed with an action different than connection whilst we attempted to announce");
+        }
+
+        let txn_id = header.transaction_id.into();
+        if transaction_id != txn_id {
+            bail!("tracker transaction id didn't match our transaction id");
+        }
+
+        // use the response
+
+        // why the type casting insanity? because the protocol in their infinite wisdom decided using signed for interval was a good idea
+        self.next_ready = Instant::now() + Duration::from_secs(i32::from(header.interval).try_into().unwrap());
+        let peers: Vec<SocketAddrV4> = peers.iter().copied().map(SocketAddrV4::from).collect();
         Ok(peers)
     }
 }
@@ -123,6 +368,8 @@ pub struct TorrentSwarmStats {
     /// indexed by piece number, indicates which pieces have been verified, note it also implies we
     /// have a piece if it's verified
     pub verified: BitBox<u8>,
+
+    pub completed: bool,
 }
 
 impl TorrentSwarmStats {
@@ -133,7 +380,6 @@ impl TorrentSwarmStats {
     fn all_verified(&self) -> bool {
         self.verified.iter().all(|v| *v)
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -142,15 +388,18 @@ pub struct TorrentSwarmHandle {
 }
 
 impl TorrentSwarmHandle {
-    pub async fn add_initialized_peer(&self, peer: PeerHandle)  {
-        let _ = self.tx.send(TorrentSwarmCommand::SelfCommand(
-            TorrentSwarmSelfCommand::HandleNewPeerConnection(peer),
-        )).await;
+    pub async fn add_initialized_peer(&self, peer: PeerHandle) {
+        let _ = self
+            .tx
+            .send(TorrentSwarmCommand::SelfCommand(
+                TorrentSwarmSelfCommand::HandleNewPeerConnection(peer),
+            ))
+            .await;
     }
 }
 
 pub enum TorrentSwarmCommand {
-    ProcessPeerEvent{ from: SocketAddrV4, event: PeerEvent },
+    ProcessPeerEvent { from: SocketAddrV4, event: PeerEvent },
     ProcessDownloadEvent(DownloadEvent),
     SelfCommand(TorrentSwarmSelfCommand),
 }
@@ -159,7 +408,6 @@ enum TorrentSwarmSelfCommand {
     HandleNewPeerConnection(PeerHandle),
 }
 
-// TODO: move this into peer mod so it doesn't need to be pub
 pub struct TorrentSwarm {
     peer_handles: Vec<PeerHandle>,
     torrent: Arc<Torrent>,
@@ -167,14 +415,14 @@ pub struct TorrentSwarm {
 
     id: Arc<Identity>,
 
-    announcers: Vec<Announcer>,
+    announcers: Vec<HttpAnnouncer>,
 
     inbound_msgs: mpsc::Receiver<TorrentSwarmCommand>,
     /// we keep a sender so we can clone it and give it to objects that generate on run time who need it
     outbound_msgs: mpsc::Sender<TorrentSwarmCommand>,
 
     stat: TorrentSwarmStats,
-   stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
+    stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
     stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 }
 
@@ -193,6 +441,7 @@ impl TorrentSwarm {
             left: torrent.total_size as usize,
             written: 0,
             verified,
+            completed: false,
         };
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
@@ -203,7 +452,7 @@ impl TorrentSwarm {
             .primary_tracker()
             .expect("torrent must have at least one tracker")
             .to_string();
-        let announcer = Announcer::new(tracker_url, torrent.clone(), id.clone(), stat_rx.clone());
+        let announcer = HttpAnnouncer::new(tracker_url, torrent.clone(), id.clone(), stat_rx.clone());
 
         let (command_tx, command_rx) = mpsc::channel(512);
 
@@ -226,12 +475,12 @@ impl TorrentSwarm {
         let mut downloaded = 0;
         for p in self.peer_handles.iter() {
             let snapshot = p.stats.borrow();
-            uploaded += snapshot.tcp_info.tcpi_bytes_sent;
-            downloaded += snapshot.tcp_info.tcpi_bytes_received;
+            uploaded += snapshot.sent;
+            downloaded += snapshot.received;
         }
 
-        self.stat.downloaded = downloaded;
-        self.stat.uploaded = uploaded;
+        self.stat.downloaded = downloaded as u64;
+        self.stat.uploaded = uploaded as u64;
         let _ = self.stat_snapshot_tx.send(self.stat.clone());
     }
 
@@ -302,26 +551,25 @@ impl TorrentSwarm {
         }
     }
 
-    pub fn choose(&self, piece: u32) -> Option<PeerHandle> {
-        // Read all peer stats from watch receivers (non-blocking)
-        let candidates: Vec<(PeerHandle, PeerStatistics)> = self
+    pub fn best_peer(&self, piece: u32, total_piece_requested: usize) -> Option<PeerHandle> {
+        let candidates: Vec<_> = self
             .peer_handles
             .iter()
-            .filter_map(|h| {
-                let state = h.state.read().unwrap();
-                if !state.ready() || !state.they_have(piece) {
-                    return None;
-                }
-                let stat = *h.stats.borrow();
-                Some((h.clone(), stat))
+            .filter(|p| {
+                let state = p.state();
+                state.ready() && state.they_have(piece)
+            })
+            .map(|h| {
+                let stat = h.stats().score(total_piece_requested);
+                (h, stat)
             })
             .collect();
 
         // Select best peer by UCB
         candidates
             .into_iter()
-            .max_by(|(_, a), (_, b)| a.ucb.total_cmp(&b.ucb))
-            .map(|(handle, _)| handle)
+            .max_by(|(_, lscore), (_, rscore)| lscore.total_cmp(rscore))
+            .map(|(handle, _)| handle.clone())
     }
 
     async fn process_command(&mut self, command: TorrentSwarmCommand) {
@@ -350,19 +598,11 @@ impl TorrentSwarm {
                     length: (data.len() - request.begin as usize) as u32,
                     data: tail,
                 };
-                let peer_idx =  self.peer_handles.binary_search_by(|h| {
-                    h.remote_addr.cmp(&from)
-                }).expect("Only us remove peers, how could it be gone");
-                self.peer_handles[peer_idx].send_data(resp).await;
-            },
-            PeerEvent::UpdateStatsReady => {
-                let peer_idx =  self.peer_handles.binary_search_by(|h| {
-                    h.remote_addr.cmp(&from)
-                }).expect("Only us remove peers, how could it be gone");
-
-                // TODO: TorrentSwarm should just contain all these sorts of stats instead of letting storage manage itself
-                let verified_count = self.verified_cnt();
-                self.peer_handles[peer_idx].update_stats(verified_count).await;
+                let peer_idx = self
+                    .peer_handles
+                    .binary_search_by(|h| h.remote_addr.cmp(&from))
+                    .expect("Only us remove peers, how could it be gone");
+                let _ = self.peer_handles[peer_idx].send_data(resp).await;
             }
         }
     }
@@ -371,9 +611,14 @@ impl TorrentSwarm {
         match event {
             DownloadEvent::PieceCompleted(piece) => {
                 let valid = self.verify_hash(piece);
-                if !valid { return; }
+                if !valid {
+                    return;
+                }
 
-                self.stat.written += (self.torrent.nth_piece_size(piece).expect("we control download task, it's not malicious"));
+                self.stat.written += self
+                    .torrent
+                    .nth_piece_size(piece)
+                    .expect("we control download task, it's not malicious");
                 self.stat.left = self.torrent.total_size as usize - self.stat.written;
 
                 let mut work = vec![];
@@ -389,17 +634,17 @@ impl TorrentSwarm {
     }
 
     async fn process_self_commands(&mut self, command: TorrentSwarmSelfCommand) {
-       match command {
-           TorrentSwarmSelfCommand::HandleNewPeerConnection(peer)  => {
-               // TODO: they shouldnt need to be dedup twice since a well formed peer connection only comes back
-               //       when we dont have it
-               self.peer_handles.sort_unstable();
-               let insertion_idx = self.peer_handles.partition_point(|p| p < &peer);
-               if insertion_idx == self.peer_handles.len() || self.peer_handles[insertion_idx] != peer {
-                   self.peer_handles.insert(insertion_idx, peer);
-               }
-           }
-       }
+        match command {
+            TorrentSwarmSelfCommand::HandleNewPeerConnection(peer) => {
+                // TODO: they shouldnt need to be dedup twice since a well formed peer connection only comes back
+                //       when we dont have it
+                self.peer_handles.sort_unstable();
+                let insertion_idx = self.peer_handles.partition_point(|p| p < &peer);
+                if insertion_idx == self.peer_handles.len() || self.peer_handles[insertion_idx] != peer {
+                    self.peer_handles.insert(insertion_idx, peer);
+                }
+            }
+        }
     }
 
     pub fn verified_cnt(&self) -> usize {
@@ -409,7 +654,6 @@ impl TorrentSwarm {
     pub fn all_verified(&self) -> bool {
         self.stat.all_verified()
     }
-
 
     fn verify_hash(&mut self, piece: u32) -> bool {
         let written_data = self.storage.read_piece(piece).unwrap();
@@ -435,11 +679,10 @@ impl TorrentSwarm {
         let event_tx = self.outbound_msgs.clone();
         let stat_snapshot_rx = self.stat_snapshot_rx.clone();
 
-
         async move {
             let mut tcp = TcpStream::connect(remote_addr).await?;
             let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id).await?;
-            let handle = PeerHandle::new(tcp, handshake.peer_id, event_tx, stat_snapshot_rx, &torrent); 
+            let handle = PeerHandle::new(tcp, handshake.peer_id, event_tx, stat_snapshot_rx, &torrent);
             Ok(handle)
         }
     }
@@ -449,9 +692,7 @@ impl TorrentSwarm {
         // be spawned as a task to not block others
         let has = Box::from(self.stat.verified.clone().as_raw_slice());
         async move {
-            peer.bit_field(BitField {
-                has
-            }).await.unwrap();
+            peer.bit_field(BitField { has }).await.unwrap();
             peer.unchoke_peer().await.unwrap();
             peer.fancy_peer().await.unwrap();
 
@@ -459,29 +700,3 @@ impl TorrentSwarm {
         }
     }
 }
-
-// async fn try_connect(
-//     id: Arc<Identity>,
-//     storage: Arc<TorrentStorage>,
-//     torrent: Arc<Torrent>,
-//     newly_discovered: Vec<SocketAddrV4>,
-//     new_connction_tx: mpsc::Sender<PeerHandle>,
-// ) {
-//     let work = FuturesUnordered::new();
-//     for new_peer in newly_discovered {
-//         work.push(connect_peer(
-//             new_peer.clone(),
-//             id.peer_id,
-//             torrent.clone(),
-//             storage.clone(),
-//         ));
-//     }
-//
-//     let new_peers: Vec<_> = work.collect().await;
-//     for new_peer in new_peers.into_iter().filter_map(Result::ok) {
-//         new_peer.bit_field().await.unwrap();
-//         new_peer.unchoke_peer().await.unwrap();
-//         new_peer.fancy_peer().await.unwrap();
-//         let _ = new_connction_tx.send(new_peer).await;
-//     }
-// }

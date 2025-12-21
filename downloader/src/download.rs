@@ -1,9 +1,9 @@
-use crate::torrent_swarm::TorrentSwarm;
 use crate::peer::PeerHandle;
-use crate::wire::Request;
 use crate::settings::BLOCK_SIZE;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
+use crate::torrent_swarm::TorrentSwarm;
+use crate::wire::Request;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::prelude::*;
@@ -16,7 +16,6 @@ use tokio::time::sleep;
 pub enum DownloadEvent {
     PieceCompleted(u32),
 }
-
 
 pub struct Download<'a> {
     torrent: Arc<Torrent>,
@@ -38,6 +37,8 @@ impl<'a> Download<'a> {
 
 impl Download<'_> {
     pub async fn download_loop(&self) {
+        // the number of pieces downloaded *in* this session, already download pieces don't count
+        let mut downloaded = 0;
         let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
         missing_pieces.shuffle(&mut rand::rng());
         let mut in_flight = HashSet::new();
@@ -73,12 +74,13 @@ impl Download<'_> {
                         continue;
                     };
 
-                    if let Some(peer) = self.torrent_swarm.choose(piece) {
+                    if let Some(peer) = self.torrent_swarm.best_peer(piece, downloaded) {
                         in_flight.insert(piece);
 
                         piece_completed.push(async move {
                             let piece = piece;
                             self.download_piece(piece, peer.clone()).await.expect("Oh this is wrong for sure, download can absolutely fail");
+                            downloaded += 1;
 
                             (peer, piece)
                         });
