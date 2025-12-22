@@ -191,7 +191,7 @@ impl HttpAnnouncer {
                         .await;
                 }
                 Err(e) => {
-                    tracing::error!("{e}");
+                    tracing::error!("{:?}", e);
                     // TODO: use exponential backoff
                     self.next_ready = Instant::now() + Duration::from_mins(1);
                 }
@@ -217,7 +217,7 @@ struct UdpAnnouncer {
 
     // TODO: Maybe this should be a weak sender?
     #[eq(skip)]
-    swarm: TorrentSwarmHandle,
+    event: mpsc::Sender<TorrentSwarmCommand>,
 }
 
 #[repr(i32)]
@@ -247,7 +247,7 @@ impl UdpAnnouncer {
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        swarm: TorrentSwarmHandle,
+        event: mpsc::Sender<TorrentSwarmCommand>,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
         UdpAnnouncer {
@@ -258,7 +258,7 @@ impl UdpAnnouncer {
             swarm_stat,
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
             // haven't done anything
-            swarm,
+            event,
         }
     }
 
@@ -275,7 +275,7 @@ impl UdpAnnouncer {
         info!("Resolving {}", query);
         let addresses: Vec<_> = lookup_host(&query)
             .await
-            .inspect_err(|e| info!("{e}"))
+            .inspect_err(|e| info!("{:?}", e))
             .with_context(|| format!("Failed to resolve {}", &query))?
             .collect();
 
@@ -294,6 +294,17 @@ impl UdpAnnouncer {
 
     #[tracing::instrument(skip(self))]
     async fn connect(&mut self, socket: &mut UdpSocket) -> anyhow::Result<()> {
+        macro_rules! udp_log {
+            ($level:ident, $fmt:literal $(, $args:expr)* $(,)?) => {
+                $level!(
+                    "Tracker [{}] on {}: {}",
+                    self.tracker,
+                    socket.peer_addr().unwrap(),
+                    format_args!($fmt $(, $args)*)
+                )
+            };
+        }
+
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
         struct Connect {
@@ -310,7 +321,7 @@ impl UdpAnnouncer {
             transaction_id: transaction_id.into(),
         };
 
-        info!("Sending tracker connect to tracker [{}]", self.tracker);
+        udp_log!(info, "Sending tracker connect to tracker");
         socket.send(connect.as_bytes()).await.with_context(|| {
             format!(
                 "Failed to send connect packet to tracker [{}] on {}",
@@ -339,26 +350,33 @@ impl UdpAnnouncer {
         let txn_id: i32 = response.transaction_id.into();
 
         if transaction_id != txn_id {
-            info!("tracker transaction id didn't match our transaction_id");
             bail!("tracker transaction id didn't match our transaction_id");
         }
         if action == Action::Error as i32 {
-            info!("server errored on connect");
             bail!("server errored on connect");
         }
         if action != 0 {
-            info!("server responsed with an action different than connection whilst we attempted to connect");
             bail!("server responsed with an action different than connection whilst we attempted to connect");
         }
 
-        info!("Connect success!");
-
+        udp_log!(info, "Connection success");
         Ok(())
     }
 
     /// Perform a single announce and return the interval and discovered peers
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     async fn announce(&mut self, socket: &mut UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
+        macro_rules! udp_log {
+            ($level:ident, $fmt:literal $(, $args:expr)* $(,)?) => {
+                $level!(
+                    "Tracker [{}] on {}: {}",
+                    self.tracker,
+                    socket.peer_addr().unwrap(),
+                    format_args!($fmt $(, $args)*)
+                )
+            };
+        }
+
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
         struct Announce {
@@ -487,17 +505,13 @@ impl UdpAnnouncer {
         // why the type casting insanity? because the protocol in their infinite wisdom decided using signed for interval was a good idea
         self.next_ready = Instant::now() + Duration::from_secs(i32::from(header.interval).try_into().unwrap());
         let peers: Vec<SocketAddrV4> = peers.iter().copied().map(SocketAddrV4::from).collect();
-        info!("Announce success! Got: {:?}", &peers);
+        udp_log!(info, "Announce success, got {:?}", &peers);
         Ok(peers)
     }
 
     #[tracing::instrument(skip(self))]
     async fn ev_loop(mut self) -> anyhow::Result<()> {
-        let tracker_addr = self
-            .resolve_v4()
-            .await
-            .with_context(|| format!("Failed to resolve {}", self.tracker))
-            .inspect_err(|e| warn!("{e}"))?;
+        let tracker_addr = self.resolve_v4().await.inspect_err(|e| warn!("{:?}", e))?;
 
         let Some(tracker_addr) = tracker_addr else {
             bail!("Tracker [{}] has no ipv4", self.tracker);
@@ -510,17 +524,16 @@ impl UdpAnnouncer {
         let mut socket = UdpSocket::bind(our_socket)
             .await
             .with_context(|| format!("Failed bind to 0.0.0.0 as an udp socket"))
-            .inspect_err(|e| warn!("{e}"))?;
+            .inspect_err(|e| warn!("{:?}", e))?;
 
         info!("\"Connecting\" to {}", tracker_addr);
         socket
             .connect(tracker_addr)
             .await
-            .inspect_err(|e| warn!("{e}"))
             .with_context(|| format!("Failed to connect to addr: {}", tracker_addr))
-            .inspect_err(|e| warn!("{e}"))?;
+            .inspect_err(|e| warn!("{:?}", e))?;
 
-        self.connect(&mut socket).await.inspect_err(|e| warn!("{e}"))?;
+        self.connect(&mut socket).await.inspect_err(|e| warn!("{:?}", e))?;
 
         loop {
             self.ready().await;
@@ -530,7 +543,13 @@ impl UdpAnnouncer {
                 .await
                 .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
 
-            self.swarm.handle_discovered_peers(peers).await;
+            // TODO: should we send events directly or use the handle
+            let _ = self
+                .event
+                .send(TorrentSwarmCommand::ProcessAnnounceEvent(
+                    AnnouncerEvent::DiscoveredPeers(peers),
+                ))
+                .await;
         }
     }
 }
@@ -666,7 +685,7 @@ impl TorrentSwarm {
             .collect();
         let udp_announcers: Vec<_> = trackers
             .filter(|t| t.scheme() == "udp")
-            .map(|t| UdpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone()))
+            .map(|t| UdpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone(), command_tx.clone()))
             .collect();
 
         TorrentSwarm {
@@ -738,6 +757,7 @@ impl TorrentSwarm {
                     self.aggregate_peer_stats();
                 }
                 _ = &mut download, if !download_done => {
+                    info!("download ended with");
                     download_done = true;
                 },
                 Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
@@ -746,6 +766,12 @@ impl TorrentSwarm {
     }
 
     pub fn best_peer(&self, piece: u32, total_piece_requested: usize) -> Option<PeerHandle> {
+        info!(
+            "Active peers: {}, pending peers: {}",
+            self.active_peers.len(),
+            self.pending_peers.len()
+        );
+
         let candidates: Vec<_> = self
             .active_peers
             .iter()

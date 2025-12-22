@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::sleep;
+use tracing::info;
 
 pub enum DownloadEvent {
     PieceCompleted(u32),
@@ -36,6 +37,7 @@ impl<'a> Download<'a> {
 }
 
 impl Download<'_> {
+    #[tracing::instrument(skip(self))]
     pub async fn download_loop(&self) {
         // the number of pieces downloaded *in* this session, already download pieces don't count
         let mut downloaded = 0;
@@ -57,6 +59,7 @@ impl Download<'_> {
 
             tokio::select! {
                 Some((peer, piece)) = piece_completed.next() => {
+                    info!("piece {} is completed", piece);
                     let peer: PeerHandle = peer;
 
                     in_flight.remove(&piece);
@@ -79,6 +82,7 @@ impl Download<'_> {
 
                         piece_completed.push(async move {
                             let piece = piece;
+                            info!("Started downloading piece {}", piece);
                             self.download_piece(piece, peer.clone()).await.expect("Oh this is wrong for sure, download can absolutely fail");
                             downloaded += 1;
 
@@ -86,7 +90,7 @@ impl Download<'_> {
                         });
 
                     } else {
-
+                        info!("No available peers, sleep for 100ms");
                         sleep(Duration::from_millis(100)).await;
                         unblocked.notify_one();
                     }

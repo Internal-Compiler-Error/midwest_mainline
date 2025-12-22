@@ -17,10 +17,12 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tracing::info;
 
 use derive_more::{Display, Error};
 
 /// It's not great that this is pub(crate) instead of fully private
+#[derive(Debug)]
 pub(crate) enum PeerCommands {
     UnchokePeer,
     #[allow(dead_code)]
@@ -338,7 +340,9 @@ impl PeerConnection {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn process_command(&mut self, command: PeerCommands) {
+        info!("Handling one {:?} command", command);
         match command {
             PeerCommands::UnchokePeer => self.unchoke_peer().await.unwrap(),
             PeerCommands::ChokePeer => self.choke_peer().await.unwrap(),
@@ -350,7 +354,9 @@ impl PeerConnection {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn process_message(&mut self, msg: BtMessage) {
+        info!("Handling one {:?} BitTorrent message", msg);
         match msg {
             BtMessage::KeepAlive(_) => return,
             BtMessage::Choke(_) => self.state.choked_us = true,
