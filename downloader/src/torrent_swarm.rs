@@ -22,7 +22,7 @@ use tokio::io;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, Sleep, interval, sleep, sleep_until};
-use tracing::info;
+use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -215,8 +215,9 @@ struct UdpAnnouncer {
 
     connection_id: i64,
 
+    // TODO: Maybe this should be a weak sender?
     #[eq(skip)]
-    resolved_and_binded: bool,
+    swarm: TorrentSwarmHandle,
 }
 
 #[repr(i32)]
@@ -246,6 +247,7 @@ impl UdpAnnouncer {
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
+        swarm: TorrentSwarmHandle,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
         UdpAnnouncer {
@@ -256,7 +258,7 @@ impl UdpAnnouncer {
             swarm_stat,
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
             // haven't done anything
-            resolved_and_binded: false,
+            swarm,
         }
     }
 
@@ -265,14 +267,32 @@ impl UdpAnnouncer {
         sleep_until(self.next_ready)
     }
 
-    #[tracing::instrument]
-    async fn resolve(&self) -> io::Result<SocketAddr> {
-        let mut addresses = lookup_host(self.tracker.host_str().expect("validation should be done in new()")).await?;
+    #[tracing::instrument(skip(self))]
+    async fn resolve_v4(&self) -> anyhow::Result<Option<SocketAddr>> {
+        let host_name = self.tracker.host_str().unwrap();
+        let host_port = self.tracker.port().unwrap();
+        let query = format!("{}:{}", host_name, host_port);
+        info!("Resolving {}", query);
+        let addresses: Vec<_> = lookup_host(&query)
+            .await
+            .inspect_err(|e| info!("{e}"))
+            .with_context(|| format!("Failed to resolve {}", &query))?
+            .collect();
 
-        Ok(addresses.next().unwrap())
+        info!("Looking up {} came back with {:?}", query, &addresses);
+
+        let mut addresses: Vec<_> = addresses
+            .into_iter()
+            .filter_map(|a| match a {
+                SocketAddr::V4(_) => Some(a),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+
+        Ok(addresses.pop())
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     async fn connect(&mut self, socket: &mut UdpSocket) -> anyhow::Result<()> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
@@ -290,7 +310,14 @@ impl UdpAnnouncer {
             transaction_id: transaction_id.into(),
         };
 
-        socket.send(connect.as_bytes()).await?;
+        info!("Sending tracker connect to tracker [{}]", self.tracker);
+        socket.send(connect.as_bytes()).await.with_context(|| {
+            format!(
+                "Failed to send connect packet to tracker [{}] on {}",
+                self.tracker,
+                socket.peer_addr().expect("Socket is already connected when passed")
+            )
+        })?;
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
@@ -301,7 +328,10 @@ impl UdpAnnouncer {
         }
         let mut response = Response::default();
 
-        socket.recv(response.as_mut_bytes()).await?;
+        socket
+            .recv(response.as_mut_bytes())
+            .await
+            .with_context(|| format!("Invalid response from tracker [{}]", self.tracker))?;
 
         self.connection_id = response.connection_id.into();
 
@@ -320,6 +350,8 @@ impl UdpAnnouncer {
             info!("server responsed with an action different than connection whilst we attempted to connect");
             bail!("server responsed with an action different than connection whilst we attempted to connect");
         }
+
+        info!("Connect success!");
 
         Ok(())
     }
@@ -370,7 +402,13 @@ impl UdpAnnouncer {
             port: self.identity.serving.port().into(),
             extensions: 0.into(), // bitfield, i.e. 0 means no extensions
         };
-        socket.send(announce.as_bytes()).await?;
+        socket.send(announce.as_bytes()).await.with_context(|| {
+            format!(
+                "Failed to send announce packet to tracker [{}] on {}",
+                self.tracker,
+                socket.peer_addr().expect("Socket is connected")
+            )
+        })?;
 
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, Default, KnownLayout, Unaligned,
@@ -409,7 +447,13 @@ impl UdpAnnouncer {
         }
 
         let mut buf = [0u8; 1500];
-        let read_size = socket.recv(&mut buf).await?;
+        let read_size = socket.recv(&mut buf).await.with_context(|| {
+            format!(
+                "Failed to read announce response packet to tracker [{}] on {}",
+                self.tracker,
+                socket.peer_addr().expect("Socket is connected")
+            )
+        })?;
         let buf = &buf[..read_size];
 
         // construct the response from raw bytes
@@ -443,21 +487,50 @@ impl UdpAnnouncer {
         // why the type casting insanity? because the protocol in their infinite wisdom decided using signed for interval was a good idea
         self.next_ready = Instant::now() + Duration::from_secs(i32::from(header.interval).try_into().unwrap());
         let peers: Vec<SocketAddrV4> = peers.iter().copied().map(SocketAddrV4::from).collect();
+        info!("Announce success! Got: {:?}", &peers);
         Ok(peers)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn ev_loop(mut self) -> anyhow::Result<()> {
-        let tracker_addr = self.resolve().await?;
-        let our_socket = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
-        let mut socket = UdpSocket::bind(our_socket).await?;
-        socket.connect(tracker_addr).await?;
+        let tracker_addr = self
+            .resolve_v4()
+            .await
+            .with_context(|| format!("Failed to resolve {}", self.tracker))
+            .inspect_err(|e| warn!("{e}"))?;
 
-        self.connect(&mut socket).await?;
+        let Some(tracker_addr) = tracker_addr else {
+            bail!("Tracker [{}] has no ipv4", self.tracker);
+        };
+
+        info!("Tracker [{}] resolved as {}", self.tracker, tracker_addr);
+
+        let our_socket = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
+        info!("Binding to socket");
+        let mut socket = UdpSocket::bind(our_socket)
+            .await
+            .with_context(|| format!("Failed bind to 0.0.0.0 as an udp socket"))
+            .inspect_err(|e| warn!("{e}"))?;
+
+        info!("\"Connecting\" to {}", tracker_addr);
+        socket
+            .connect(tracker_addr)
+            .await
+            .inspect_err(|e| warn!("{e}"))
+            .with_context(|| format!("Failed to connect to addr: {}", tracker_addr))
+            .inspect_err(|e| warn!("{e}"))?;
+
+        self.connect(&mut socket).await.inspect_err(|e| warn!("{e}"))?;
 
         loop {
             self.ready().await;
-            self.announce(&mut socket).await?; // TODO: should retry instead of stopping at first
-            // failure
+            // TODO: should retry instead of stopping at first failure
+            let peers = self
+                .announce(&mut socket)
+                .await
+                .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
+
+            self.swarm.handle_discovered_peers(peers).await;
         }
     }
 }
@@ -649,10 +722,10 @@ impl TorrentSwarm {
         let mut download_done = false;
 
         // TODO: probably store the join handles so they can be aborted when necessary
-        let http_announcers = mem::take(&mut self.http_announcers);
-        for http_announcer in http_announcers {
-            tokio::spawn(http_announcer.ev_loop());
-        }
+        // let http_announcers = mem::take(&mut self.http_announcers);
+        // for http_announcer in http_announcers {
+        //     tokio::spawn(http_announcer.ev_loop());
+        // }
 
         let udp_announcers = mem::take(&mut self.udp_announcers);
         for udp_announcer in udp_announcers {
