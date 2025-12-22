@@ -4,11 +4,11 @@ use crate::peer::{PeerCommands, PeerEvent, PeerHandle, PeerStatistics};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::wire::{BitField, BtMessage, Piece, shake_hands};
-use anyhow::{self, bail};
+use anyhow::{self, Context, bail};
 use bitvec::boxed::BitBox;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use juicy_bencode::BencodeItemView;
+use juicy_bencode::{BencodeDictDisplay, BencodeItemView};
 use rand::Rng;
 use reqwest::Client;
 use std::any::Any;
@@ -22,6 +22,7 @@ use tokio::io;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, Sleep, interval, sleep, sleep_until};
+use tracing::info;
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -77,8 +78,9 @@ impl HttpAnnouncer {
     }
 
     /// Perform a single announce and return the interval and discovered peers
+    #[tracing::instrument(skip(self))]
     async fn announce(&mut self) -> anyhow::Result<Vec<SocketAddrV4>> {
-        // URL-encode info_hash and peer_id
+        // percent encode info_hash and peer_id
         let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.torrent.info_hash.0).collect();
         let peer_id_encoded: String = form_urlencoded::byte_serialize(&self.identity.peer_id).collect();
 
@@ -96,21 +98,66 @@ impl HttpAnnouncer {
             left = swarm_stat.left,
         );
 
+        // fn percent_encode(bytes: &[u8]) -> String {
+        //     bytes.iter().map(|b| format!("%{:02X}", b)).collect()
+        // }
+
+        // debug_assert!(percent_encode(&self.torrent.info_hash.0).len() == 60);
+
+        // let mut url = self.tracker.clone();
+        // url.query_pairs_mut()
+        //     .encoding_override(None)
+        //     .append_pair("info_hash", &percent_encode(&self.torrent.info_hash.0))
+        //     // .append_pair("info_hash", &info_hash_encoded)
+        //     // .append_pair("peer_id", &peer_id_encoded)
+        //     .append_pair("peer_id", &percent_encode(&self.identity.peer_id))
+        //     .append_pair("port", &self.identity.serving.port().to_string())
+        //     .append_pair("uploaded", &swarm_stat.uploaded.to_string())
+        //     .append_pair("downloaded", &swarm_stat.downloaded.to_string())
+        //     .append_pair("left", &swarm_stat.left.to_string())
+        //     .append_pair("compact", &1.to_string());
+        let url = Url::parse(&url).unwrap();
+
+        info!("Annoucing to {url}");
+
         // Send the GET request
         let client = Client::new();
-        let response = client.get(&url).send().await?;
-        let bytes = response.bytes().await?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to send http announce to {}", self.tracker))?;
+        info!("Tracker [{}] responded with {}", self.tracker, response.status());
+
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("Failed to read the full range of bytes from {}", self.tracker))?;
         let bytes: &[u8] = &bytes;
+
+        info!(
+            "Tracker [{}] responded with {}",
+            self.tracker,
+            &String::from_utf8_lossy(bytes)
+        );
 
         // Parse the bencoded response
         let parsed = juicy_bencode::parse_bencode_dict(bytes);
         let Ok((_remaining, mut dict)) = parsed else {
-            bail!("invalid bencoded content returned");
+            bail!("Tracker [{}] responded with invalid bencoded content", self.tracker);
         };
+        info!(
+            "Parsed bencode from tracker [{}] as {}",
+            self.tracker,
+            BencodeDictDisplay(&dict)
+        );
 
         let mut peers = vec![];
         let Some(BencodeItemView::Integer(interval)) = dict.remove(b"interval".as_slice()) else {
-            bail!("response interval must be a number");
+            bail!(
+                "Tracker [{}] responed with an non-integer as its announce interval",
+                self.tracker
+            );
         };
 
         if let Some(BencodeItemView::ByteString(peer_bytes)) = dict.remove(b"peers".as_slice()) {
@@ -218,17 +265,14 @@ impl UdpAnnouncer {
         sleep_until(self.next_ready)
     }
 
+    #[tracing::instrument]
     async fn resolve(&self) -> io::Result<SocketAddr> {
         let mut addresses = lookup_host(self.tracker.host_str().expect("validation should be done in new()")).await?;
 
         Ok(addresses.next().unwrap())
     }
 
-    fn rand_transcaction_id(&self) -> i32 {
-        let mut rng = rand::rng();
-        rng.random::<i32>()
-    }
-
+    #[tracing::instrument]
     async fn connect(&mut self, socket: &mut UdpSocket) -> anyhow::Result<()> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
@@ -265,12 +309,15 @@ impl UdpAnnouncer {
         let txn_id: i32 = response.transaction_id.into();
 
         if transaction_id != txn_id {
+            info!("tracker transaction id didn't match our transaction_id");
             bail!("tracker transaction id didn't match our transaction_id");
         }
         if action == Action::Error as i32 {
+            info!("server errored on connect");
             bail!("server errored on connect");
         }
         if action != 0 {
+            info!("server responsed with an action different than connection whilst we attempted to connect");
             bail!("server responsed with an action different than connection whilst we attempted to connect");
         }
 
@@ -278,6 +325,7 @@ impl UdpAnnouncer {
     }
 
     /// Perform a single announce and return the interval and discovered peers
+    #[tracing::instrument]
     async fn announce(&mut self, socket: &mut UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
