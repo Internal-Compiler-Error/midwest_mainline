@@ -21,6 +21,9 @@ bitvec = "1.0.1"
 derive_more = { version = "2.1.0", features = ["full"] }
 crc32c = "0.6.0"
 zerocopy = { version = "0.8.31", features = ["derive"] }
+# log = "0.4.29"
+# pretty_env_logger = "0.5.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [build-dependencies]
 bindgen = "0.72.0"

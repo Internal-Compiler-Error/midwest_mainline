@@ -1,9 +1,9 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
-use crate::peer::{PeerEvent, PeerHandle, PeerStatistics};
+use crate::peer::{PeerCommands, PeerEvent, PeerHandle, PeerStatistics};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::wire::{BitField, Piece, shake_hands};
+use crate::wire::{BitField, BtMessage, Piece, shake_hands};
 use anyhow::{self, bail};
 use bitvec::boxed::BitBox;
 use futures::StreamExt;
@@ -12,6 +12,7 @@ use juicy_bencode::BencodeItemView;
 use rand::Rng;
 use reqwest::Client;
 use std::any::Any;
+use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
 use std::slice::from_raw_parts;
@@ -20,10 +21,10 @@ use std::time::Duration;
 use tokio::io;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, Sleep, interval, sleep_until};
+use tokio::time::{Instant, Sleep, interval, sleep, sleep_until};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use futures::future::join_all;
 
@@ -42,11 +43,13 @@ struct HttpAnnouncer {
     next_ready: Instant,
     #[eq(skip)]
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
+    #[eq(skip)]
+    events: mpsc::Sender<TorrentSwarmCommand>,
 }
 
-// enum AnnouncerEvent {
-//     DiscoveredPeers(Vec<SocketAddrV4>),
-// }
+pub enum AnnouncerEvent {
+    DiscoveredPeers(Vec<SocketAddrV4>),
+}
 
 impl HttpAnnouncer {
     fn new(
@@ -54,6 +57,7 @@ impl HttpAnnouncer {
         torrent: Arc<Torrent>,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
+        events: mpsc::Sender<TorrentSwarmCommand>,
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
 
@@ -63,6 +67,7 @@ impl HttpAnnouncer {
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
+            events,
         }
     }
 
@@ -124,6 +129,28 @@ impl HttpAnnouncer {
         self.next_ready = Instant::now() + Duration::from_secs(interval as u64);
         Ok(peers)
     }
+
+    async fn ev_loop(mut self) {
+        // TODO: make a way for it to die gracefully
+        loop {
+            self.ready().await;
+            match self.announce().await {
+                Ok(result) => {
+                    let _ = self
+                        .events
+                        .send(TorrentSwarmCommand::ProcessAnnounceEvent(
+                            AnnouncerEvent::DiscoveredPeers(result),
+                        ))
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("{e}");
+                    // TODO: use exponential backoff
+                    self.next_ready = Instant::now() + Duration::from_mins(1);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +167,9 @@ struct UdpAnnouncer {
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
 
     connection_id: i64,
+
+    #[eq(skip)]
+    resolved_and_binded: bool,
 }
 
 #[repr(i32)]
@@ -178,7 +208,8 @@ impl UdpAnnouncer {
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
-                              // haven't done anything
+            // haven't done anything
+            resolved_and_binded: false,
         }
     }
 
@@ -193,7 +224,12 @@ impl UdpAnnouncer {
         Ok(addresses.next().unwrap())
     }
 
-    async fn connect(&mut self, socket: UdpSocket) -> anyhow::Result<()> {
+    fn rand_transcaction_id(&self) -> i32 {
+        let mut rng = rand::rng();
+        rng.random::<i32>()
+    }
+
+    async fn connect(&mut self, socket: &mut UdpSocket) -> anyhow::Result<()> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
         struct Connect {
@@ -202,8 +238,7 @@ impl UdpAnnouncer {
             transaction_id: I32,
         }
 
-        let mut rng = rand::rng();
-        let transaction_id = rng.random::<i32>();
+        let transaction_id = rand::rng().random::<i32>();
 
         let connect = Connect {
             connection_id: 0x41727101980.into(),
@@ -243,7 +278,7 @@ impl UdpAnnouncer {
     }
 
     /// Perform a single announce and return the interval and discovered peers
-    async fn announce(&mut self, socket: UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
+    async fn announce(&mut self, socket: &mut UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable)]
         #[repr(C)]
         struct Announce {
@@ -289,7 +324,9 @@ impl UdpAnnouncer {
         };
         socket.send(announce.as_bytes()).await?;
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, Default, KnownLayout)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, Default, KnownLayout, Unaligned,
+        )]
         #[repr(C)]
         struct AnnounceResponseHeader {
             action: I32,
@@ -299,14 +336,16 @@ impl UdpAnnouncer {
             seeders: I32,
         }
 
-        #[derive(PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+        #[derive(PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
         #[repr(C)]
         struct AnnounceResponse {
             header: AnnounceResponseHeader,
             peers: [Peer],
         }
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned,
+        )]
         #[repr(C)]
         struct Peer {
             ip: I32,
@@ -335,7 +374,7 @@ impl UdpAnnouncer {
         if peer_bytes % peer_size != 0 {
             bail!("trailing content is a multiple of peer size");
         }
-        let peers = <[Peer]>::ref_from_bytes(&buf[..header_size]).expect("shit should work");
+        let peers = <[Peer]>::ref_from_bytes(&buf[header_size..]).expect("shit should work");
 
         // verify the response is valid
         let action: i32 = header.action.into();
@@ -357,6 +396,21 @@ impl UdpAnnouncer {
         self.next_ready = Instant::now() + Duration::from_secs(i32::from(header.interval).try_into().unwrap());
         let peers: Vec<SocketAddrV4> = peers.iter().copied().map(SocketAddrV4::from).collect();
         Ok(peers)
+    }
+
+    async fn ev_loop(mut self) -> anyhow::Result<()> {
+        let tracker_addr = self.resolve().await?;
+        let our_socket = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
+        let mut socket = UdpSocket::bind(our_socket).await?;
+        socket.connect(tracker_addr).await?;
+
+        self.connect(&mut socket).await?;
+
+        loop {
+            self.ready().await;
+            self.announce(&mut socket).await?; // TODO: should retry instead of stopping at first
+            // failure
+        }
     }
 }
 
@@ -399,20 +453,33 @@ impl TorrentSwarmHandle {
             ))
             .await;
     }
+
+    pub async fn handle_discovered_peers(&self, peers: Vec<SocketAddrV4>) {
+        let _ = self
+            .tx
+            .send(TorrentSwarmCommand::SelfCommand(
+                TorrentSwarmSelfCommand::HandleNewDiscoveredPeers(peers),
+            ))
+            .await;
+    }
 }
 
 pub enum TorrentSwarmCommand {
     ProcessPeerEvent { from: SocketAddrV4, event: PeerEvent },
     ProcessDownloadEvent(DownloadEvent),
+    ProcessAnnounceEvent(AnnouncerEvent),
     SelfCommand(TorrentSwarmSelfCommand),
 }
 
 enum TorrentSwarmSelfCommand {
     HandleNewPeerConnection(PeerHandle),
+    HandleNewDiscoveredPeers(Vec<SocketAddrV4>),
 }
 
 pub struct TorrentSwarm {
-    peer_handles: Vec<PeerHandle>,
+    active_peers: Vec<PeerHandle>,
+    pending_peers: Vec<PendingPeer>,
+
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
 
@@ -430,11 +497,28 @@ pub struct TorrentSwarm {
     stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPeer {
+    pub socket_addr: SocketAddrV4,
+    /// It's possible that we would have completed a piece *after* we've started to connect and sent a bitfield but *before* the connection is established
+    /// they need to be informed
+    pub pending_messages: Vec<u32>,
+}
+
+impl PartialOrd for PendingPeer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for PendingPeer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.socket_addr.cmp(&other.socket_addr)
+    }
+}
+
 impl TorrentSwarm {
     pub fn new(torrent: Arc<Torrent>, storage: Arc<TorrentStorage>, id: Arc<Identity>) -> TorrentSwarm {
-        // Create shared peer handles
-        let peer_handles = Vec::<PeerHandle>::new();
-
         let verified = vec![false; torrent.pieces.len()];
         let verified = BitBox::from_iter(verified.iter());
         // TODO: this only works for fresh downloads
@@ -452,20 +536,21 @@ impl TorrentSwarm {
         let trackers = torrent.all_trackers();
         let trackers = trackers.into_iter().map(|s| Url::parse(&s)).filter_map(Result::ok);
 
+        let (command_tx, command_rx) = mpsc::channel(512);
+
         let http_announcers: Vec<_> = trackers
             .clone()
             .filter(|t| t.scheme() == "http" || t.scheme() == "https")
-            .map(|t| HttpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone()))
+            .map(|t| HttpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone(), command_tx.clone()))
             .collect();
         let udp_announcers: Vec<_> = trackers
             .filter(|t| t.scheme() == "udp")
             .map(|t| UdpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone()))
             .collect();
 
-        let (command_tx, command_rx) = mpsc::channel(512);
-
         TorrentSwarm {
-            peer_handles,
+            active_peers: vec![],
+            pending_peers: vec![],
             torrent,
             storage,
             id,
@@ -482,7 +567,7 @@ impl TorrentSwarm {
     pub fn aggregate_peer_stats(&mut self) {
         let mut uploaded = 0;
         let mut downloaded = 0;
-        for p in self.peer_handles.iter() {
+        for p in self.active_peers.iter() {
             let snapshot = p.stats.borrow();
             uploaded += snapshot.sent;
             downloaded += snapshot.received;
@@ -500,18 +585,7 @@ impl TorrentSwarm {
     }
 
     pub(crate) async fn work_loop(mut self) {
-        let self_handle = self.make_handle();
-
-        let mut aggregate_ticker = interval(Duration::from_mins(5));
-
-        let mut announcer_timers = FuturesOrdered::new();
-        for (idx, announcer) in self.http_announcers.iter().enumerate() {
-            let ready = announcer.ready();
-            announcer_timers.push_back(async move {
-                ready.await;
-                idx
-            });
-        }
+        let mut aggregate_ticker = interval(Duration::from_mins(1));
 
         // Get a raw pointer to self to bypass borrow checker
         let self_ptr: *const TorrentSwarm = &self;
@@ -526,41 +600,22 @@ impl TorrentSwarm {
         let mut download = pin!(download.download_loop());
         let mut download_done = false;
 
+        // TODO: probably store the join handles so they can be aborted when necessary
+        let http_announcers = mem::take(&mut self.http_announcers);
+        for http_announcer in http_announcers {
+            tokio::spawn(http_announcer.ev_loop());
+        }
+
+        let udp_announcers = mem::take(&mut self.udp_announcers);
+        for udp_announcer in udp_announcers {
+            tokio::spawn(udp_announcer.ev_loop());
+        }
+
         loop {
-            // TODO: support multiple announcers
-            let announcer_ready = self.http_announcers[0].ready();
             tokio::select! {
                 _ = aggregate_ticker.tick() => {
                     self.aggregate_peer_stats();
                 }
-                _ = announcer_ready => {
-                    let mut new_peers = self.http_announcers[0].announce().await.unwrap();
-
-                    // don't needlessly connect to peers we already have
-                    self.peer_handles.sort_unstable();
-                    new_peers.retain(|p|{
-                        self.peer_handles.binary_search_by(|h| h.remote_addr.cmp(p)).is_err()
-                    });
-
-                    for new_peer in new_peers {
-                        let self_handle = self_handle.clone();
-                        let has = Box::from(self.stat.verified.clone().as_raw_slice());
-                        let bit_field = BitField { has };
-
-                        let connect_peer = self.connect_peer(new_peer);
-                        let _ = tokio::spawn(async move {
-                            let handle = connect_peer.await?;
-
-                            handle.bit_field(bit_field).await.unwrap();
-                            handle.unchoke_peer().await.unwrap();
-                            handle.fancy_peer().await.unwrap();
-
-
-                            self_handle.add_initialized_peer(handle).await;
-                            anyhow::Ok(())
-                        });
-                    }
-                },
                 _ = &mut download, if !download_done => {
                     download_done = true;
                 },
@@ -571,7 +626,7 @@ impl TorrentSwarm {
 
     pub fn best_peer(&self, piece: u32, total_piece_requested: usize) -> Option<PeerHandle> {
         let candidates: Vec<_> = self
-            .peer_handles
+            .active_peers
             .iter()
             .filter(|p| {
                 let state = p.state();
@@ -594,7 +649,46 @@ impl TorrentSwarm {
         match command {
             TorrentSwarmCommand::ProcessPeerEvent { from, event } => self.process_peer_event(from, event).await,
             TorrentSwarmCommand::ProcessDownloadEvent(e) => self.process_download_event(e).await,
-            TorrentSwarmCommand::SelfCommand(command) => self.process_self_commands(command).await,
+            TorrentSwarmCommand::ProcessAnnounceEvent(e) => self.process_announce_event(e).await,
+            TorrentSwarmCommand::SelfCommand(command) => {
+                let _ = self.process_self_commands(command).await;
+            }
+        };
+    }
+
+    async fn process_announce_event(&mut self, event: AnnouncerEvent) {
+        match event {
+            AnnouncerEvent::DiscoveredPeers(mut socket_addr_v4s) => {
+                // remove all the peers we already have
+                socket_addr_v4s.retain(|s| {
+                    self.active_peers
+                        .binary_search_by_key(s, |handle| handle.remote_addr)
+                        .is_err()
+                });
+
+                let mut pending_peers: Vec<_> = socket_addr_v4s
+                    .into_iter()
+                    .map(|p| PendingPeer {
+                        socket_addr: p,
+                        pending_messages: vec![],
+                    })
+                    .collect();
+
+                for peer in &pending_peers {
+                    let moi = self.make_handle();
+
+                    let connect = self.connect_peer(peer.socket_addr.clone());
+                    tokio::spawn(async move {
+                        let connection = connect.await?;
+                        moi.add_initialized_peer(connection).await;
+
+                        anyhow::Ok(())
+                    });
+                }
+
+                self.pending_peers.append(&mut pending_peers);
+                self.pending_peers.sort_unstable();
+            }
         }
     }
 
@@ -617,10 +711,10 @@ impl TorrentSwarm {
                     data: tail,
                 };
                 let peer_idx = self
-                    .peer_handles
+                    .active_peers
                     .binary_search_by(|h| h.remote_addr.cmp(&from))
                     .expect("Only us remove peers, how could it be gone");
-                let _ = self.peer_handles[peer_idx].send_data(resp).await;
+                let _ = self.active_peers[peer_idx].send_data(resp).await;
             }
         }
     }
@@ -640,29 +734,105 @@ impl TorrentSwarm {
                 self.stat.left = self.torrent.total_size as usize - self.stat.written;
 
                 let mut work = vec![];
-                for p in self.peer_handles.iter() {
+                for p in self.active_peers.iter() {
                     work.push(async move {
                         let _ = p.send_we_have(piece).await;
                     })
                 }
 
+                for p in &mut self.pending_peers {
+                    p.pending_messages.push(piece);
+                }
+
+                // TODO: maybe we should just spawn each tasks?
                 join_all(work).await;
             }
         }
     }
 
-    async fn process_self_commands(&mut self, command: TorrentSwarmSelfCommand) {
+    async fn process_self_commands(&mut self, command: TorrentSwarmSelfCommand) -> anyhow::Result<()> {
         match command {
             TorrentSwarmSelfCommand::HandleNewPeerConnection(peer) => {
                 // TODO: they shouldnt need to be dedup twice since a well formed peer connection only comes back
                 //       when we dont have it
-                self.peer_handles.sort_unstable();
-                let insertion_idx = self.peer_handles.partition_point(|p| p < &peer);
-                if insertion_idx == self.peer_handles.len() || self.peer_handles[insertion_idx] != peer {
-                    self.peer_handles.insert(insertion_idx, peer);
+                self.active_peers.sort_unstable();
+                let insertion_idx = self.active_peers.partition_point(|p| p < &peer);
+                if insertion_idx == self.active_peers.len() || self.active_peers[insertion_idx] != peer {
+                    // very important, not async, this ensures once
+                    self.initialize_peer(&peer)?;
+                    let remote_addr = peer.remote_addr;
+                    let peer_idx = self
+                        .pending_peers
+                        .binary_search_by_key(&remote_addr, |p| p.socket_addr)
+                        .expect("a connection can only be made when it has been placed onto the pending list");
+                    let pending_peer = self.pending_peers.remove(peer_idx);
+                    let readied_peer = peer.clone();
+
+                    tokio::spawn(async move {
+                        // From tokio's doc on sync::mpsc::Sender::send:
+                        // ---
+                        // This channel uses a queue to ensure that calls to send and reserve
+                        // complete in the order they were requested. Cancelling a call to send
+                        // makes you lose your place in the queue.
+                        // ---
+                        //
+                        // We need this so even if the peer is placed onto the active list before
+                        // all the messages have been drained, calls for any send_we_have will
+                        // complete *after* we've sent all the messages below.
+                        let permits = readied_peer
+                            .peer_tx
+                            .reserve_many(pending_peer.pending_messages.len())
+                            .await
+                            .expect("Read the comments above, solving this case is too complicated, if this encourtered in the real world, then we should just refactor peer connection instead");
+
+                        debug_assert!(permits.len() == pending_peer.pending_messages.len());
+
+                        for (piece, permit) in pending_peer.pending_messages.into_iter().zip(permits) {
+                            // it's very important that this is *not* async, as the TorrentSwarm
+                            // processes events one by one, all the messages will have been sent
+                            // before any other messages (FUCK is this actually
+                            // true???????????????????)
+                            permit.send(PeerCommands::SendWeHave(piece));
+                        }
+                    });
+
+                    self.active_peers.insert(insertion_idx, peer);
                 }
             }
+            TorrentSwarmSelfCommand::HandleNewDiscoveredPeers(mut socket_addr_v4s) => {
+                // remove all the peers we already have
+                socket_addr_v4s.retain(|s| {
+                    self.active_peers
+                        .binary_search_by_key(s, |handle| handle.remote_addr)
+                        .is_err()
+                });
+
+                let mut pending_peers: Vec<_> = socket_addr_v4s
+                    .into_iter()
+                    .map(|p| PendingPeer {
+                        socket_addr: p,
+                        pending_messages: vec![],
+                    })
+                    .collect();
+
+                for peer in &pending_peers {
+                    let moi = self.make_handle();
+
+                    let connect = self.connect_peer(peer.socket_addr.clone());
+                    tokio::spawn(async move {
+                        let connection = connect.await?;
+                        moi.add_initialized_peer(connection).await;
+
+                        anyhow::Ok(())
+                    });
+                }
+
+                self.pending_peers.append(&mut pending_peers);
+                self.pending_peers.sort_unstable();
+            }
         }
+
+        Ok(())
     }
 
     pub fn verified_cnt(&self) -> usize {
@@ -705,16 +875,13 @@ impl TorrentSwarm {
         }
     }
 
-    pub fn initialize_peer(&self, peer: PeerHandle) -> impl Future<Output = anyhow::Result<()>> + use<> {
-        // the connection between us and the peer can be bad, so we want the future to be able to
-        // be spawned as a task to not block others
+    fn initialize_peer(&self, peer: &PeerHandle) -> anyhow::Result<()> {
         let has = Box::from(self.stat.verified.clone().as_raw_slice());
-        async move {
-            peer.bit_field(BitField { has }).await.unwrap();
-            peer.unchoke_peer().await.unwrap();
-            peer.fancy_peer().await.unwrap();
 
-            Ok(())
-        }
+        peer.try_bitfield(BitField { has })?;
+        peer.try_unchoke_peer()?;
+        peer.try_fancy_peer()?;
+
+        Ok(())
     }
 }

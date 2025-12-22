@@ -18,7 +18,10 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-enum PeerCommands {
+use derive_more::{Display, Error};
+
+/// It's not great that this is pub(crate) instead of fully private
+pub(crate) enum PeerCommands {
     UnchokePeer,
     #[allow(dead_code)]
     ChokePeer,
@@ -36,6 +39,11 @@ pub enum PeerEvent {
     Requested(Request),
 }
 
+// TODO: Should refactor the design so that a peer connection and handle can be constructed even
+// when the TCP stream is not yet established, so we can queue up messages before the connection is
+// establlished. This is needed as we can have piece completion messages can need to be sent but
+// the connection isn't established yet.
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerHandle {
     // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
@@ -44,7 +52,7 @@ pub struct PeerHandle {
     pub remote_addr: SocketAddrV4,
 
     #[eq(skip)]
-    peer_tx: mpsc::Sender<PeerCommands>,
+    pub(crate) peer_tx: mpsc::Sender<PeerCommands>,
 
     #[eq(skip)]
     state: watch::Receiver<PeerState>,
@@ -52,6 +60,9 @@ pub struct PeerHandle {
     #[eq(skip)]
     pub(crate) stats: watch::Receiver<PeerStatistics>,
 }
+
+#[derive(Debug, Clone, Copy, Display, Error)]
+pub struct PeerDied;
 
 impl PartialOrd for PeerHandle {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -121,6 +132,7 @@ impl PeerHandle {
         }
     }
 
+    // TODO: this one probably has a more complicated error scenario
     pub async fn request_data_from_peer(&self, req: Request) -> anyhow::Result<Box<[u8]>> {
         let (syn, ack) = oneshot::channel();
 
@@ -131,28 +143,61 @@ impl PeerHandle {
         Ok(data)
     }
 
-    pub async fn fancy_peer(&self) -> anyhow::Result<()> {
-        self.peer_tx.send(PeerCommands::FancyPeer).await?;
+    pub async fn fancy_peer(&self) -> Result<(), PeerDied> {
+        self.peer_tx.send(PeerCommands::FancyPeer).await.map_err(|_| PeerDied)?;
         Ok(())
     }
 
-    pub async fn send_we_have(&self, piece: u32) -> anyhow::Result<()> {
-        self.peer_tx.send(PeerCommands::SendWeHave(piece)).await?;
+    pub fn try_fancy_peer(&self) -> Result<(), PeerDied> {
+        self.peer_tx.try_send(PeerCommands::FancyPeer).map_err(|_| PeerDied)?;
         Ok(())
     }
 
-    pub async fn bit_field(&self, bit_field: BitField) -> anyhow::Result<()> {
-        self.peer_tx.send(PeerCommands::BitField(bit_field)).await?;
+    /// Tell the peer that we now have a particular piece, note as with all functions on the
+    /// handle, this only sends a message to the message channel linking the peer, the completion
+    /// of this funciton doesn't mean the message has been copied to kernel network buffer
+    pub async fn send_we_have(&self, piece: u32) -> Result<(), PeerDied> {
+        self.peer_tx
+            .send(PeerCommands::SendWeHave(piece))
+            .await
+            .map_err(|_| PeerDied)?;
         Ok(())
     }
 
-    pub async fn unchoke_peer(&self) -> anyhow::Result<()> {
-        self.peer_tx.send(PeerCommands::UnchokePeer).await?;
+    pub async fn bit_field(&self, bit_field: BitField) -> Result<(), PeerDied> {
+        self.peer_tx
+            .send(PeerCommands::BitField(bit_field))
+            .await
+            .map_err(|_| PeerDied)?;
         Ok(())
     }
 
-    pub async fn send_data(&self, piece: Piece) -> anyhow::Result<()> {
-        self.peer_tx.send(PeerCommands::SendData(piece)).await?;
+    /// Try to send the bitfield message without blocking/awaiting
+    pub fn try_bitfield(&self, bit_field: BitField) -> Result<(), PeerDied> {
+        self.peer_tx
+            .try_send(PeerCommands::BitField(bit_field))
+            .map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    pub async fn unchoke_peer(&self) -> Result<(), PeerDied> {
+        self.peer_tx
+            .send(PeerCommands::UnchokePeer)
+            .await
+            .map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    pub fn try_unchoke_peer(&self) -> Result<(), PeerDied> {
+        self.peer_tx.try_send(PeerCommands::UnchokePeer).map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    pub async fn send_data(&self, piece: Piece) -> Result<(), PeerDied> {
+        self.peer_tx
+            .send(PeerCommands::SendData(piece))
+            .await
+            .map_err(|_| PeerDied)?;
         Ok(())
     }
 
@@ -340,7 +385,8 @@ impl PeerConnection {
                     begin: piece.begin,
                     length: piece.length,
                 }) {
-                    // be wary of strangers sending data you didn't ask for, ignore them
+                    let _ = self.writer.close().await;
+                    // TODO: let the handle know in someway
                     return;
                 }
 

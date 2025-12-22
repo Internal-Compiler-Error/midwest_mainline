@@ -27,6 +27,7 @@ macro_rules! u32s_to_be_bytes {
     };
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct KeepAlive;
 impl Encode for KeepAlive {
     fn encode(&self, buf: &mut [u8]) {
@@ -34,6 +35,7 @@ impl Encode for KeepAlive {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Choke;
 impl Encode for Choke {
     fn encode(&self, buf: &mut [u8]) {
@@ -43,6 +45,7 @@ impl Encode for Choke {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Unchoke;
 impl Encode for Unchoke {
     fn encode(&self, buf: &mut [u8]) {
@@ -52,6 +55,7 @@ impl Encode for Unchoke {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Interested;
 impl Encode for Interested {
     fn encode(&self, buf: &mut [u8]) {
@@ -61,6 +65,7 @@ impl Encode for Interested {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct NotInterested;
 impl Encode for NotInterested {
     fn encode(&self, buf: &mut [u8]) {
@@ -70,6 +75,7 @@ impl Encode for NotInterested {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Have {
     pub checked: u32,
 }
@@ -84,6 +90,7 @@ impl Encode for Have {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BitField {
     pub has: Box<[u8]>,
 }
@@ -98,7 +105,7 @@ impl Encode for BitField {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct Request {
     pub index: u32,
     pub begin: u32,
@@ -115,6 +122,7 @@ impl Encode for Request {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
@@ -132,6 +140,7 @@ impl Encode for Piece {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct Cancel {
     pub index: u32,
     pub begin: u32,
@@ -148,17 +157,19 @@ impl Encode for Cancel {
     }
 }
 
+#[allow(dead_code)]
 pub struct Extended<'a> {
     pub inner: BencodeItemView<'a>,
 }
 
+#[allow(dead_code, unused)]
 impl Encode for Extended<'_> {
-    #[allow(unused)]
     fn encode(&self, buf: &mut [u8]) {
         todo!()
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BtMessage {
     KeepAlive(KeepAlive),
     Choke(Choke),

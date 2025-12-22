@@ -18,6 +18,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use torrent::parse_torrent;
 
+use std::fmt;
+use std::path::Path;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::{
+    FmtContext,
+    format::{FormatEvent, FormatFields},
+};
+use tracing_subscriber::{EnvFilter, Registry};
+
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     let mut rng = rand::rng();
     let r = rand & 0x07;
@@ -45,6 +54,11 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // init_tracing();
+    let format = tracing_subscriber::fmt().without_time().pretty().init();
+
+    // tracing_subscriber::fmt().event_format(format).init();
+
     let args = env::args().collect::<Vec<_>>();
 
     let meta_file = PathBuf::from(&args[1]);
