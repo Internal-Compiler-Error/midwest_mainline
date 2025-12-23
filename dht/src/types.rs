@@ -6,6 +6,7 @@ use std::{
     fmt::Debug,
     net::{Ipv4Addr, SocketAddrV4},
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{dht::krpc_broker::Routable, models::NodeNoMetaInfo, utils::base64_enc};
 
@@ -85,7 +86,8 @@ impl ToBencode for NodeId {
 //     }
 // }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Hash, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout)]
+#[repr(C, packed)]
 pub struct InfoHash(pub [u8; NODE_ID_LEN]);
 
 impl InfoHash {

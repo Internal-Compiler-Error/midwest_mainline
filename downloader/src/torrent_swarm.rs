@@ -12,6 +12,7 @@ use juicy_bencode::{BencodeDictDisplay, BencodeItemView};
 use rand::Rng;
 use reqwest::Client;
 use std::any::Any;
+use std::fmt::format;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
@@ -806,7 +807,7 @@ impl TorrentSwarm {
     async fn process_announce_event(&mut self, event: AnnouncerEvent) {
         match event {
             AnnouncerEvent::DiscoveredPeers(mut socket_addr_v4s) => {
-                // remove all the peers we already have
+                // only keep the peers that we're not already connected
                 socket_addr_v4s.retain(|s| {
                     self.active_peers
                         .binary_search_by_key(s, |handle| handle.remote_addr)
@@ -825,8 +826,11 @@ impl TorrentSwarm {
                     let moi = self.make_handle();
 
                     let connect = self.connect_peer(peer.socket_addr.clone());
+                    let peer_addr = peer.socket_addr;
                     tokio::spawn(async move {
-                        let connection = connect.await?;
+                        let connection = connect
+                            .await
+                            .inspect_err(|e| info!("Failed to connect to peer on {}, error {:?}", peer_addr, e))?;
                         moi.add_initialized_peer(connection).await;
 
                         anyhow::Ok(())
@@ -900,6 +904,8 @@ impl TorrentSwarm {
     async fn process_self_commands(&mut self, command: TorrentSwarmSelfCommand) -> anyhow::Result<()> {
         match command {
             TorrentSwarmSelfCommand::HandleNewPeerConnection(peer) => {
+                info!("New peer established");
+
                 // TODO: they shouldnt need to be dedup twice since a well formed peer connection only comes back
                 //       when we dont have it
                 self.active_peers.sort_unstable();
@@ -968,6 +974,7 @@ impl TorrentSwarm {
                     let connect = self.connect_peer(peer.socket_addr.clone());
                     tokio::spawn(async move {
                         let connection = connect.await?;
+                        info!("Connection to peer success");
                         moi.add_initialized_peer(connection).await;
 
                         anyhow::Ok(())
@@ -1015,8 +1022,14 @@ impl TorrentSwarm {
         let stat_snapshot_rx = self.stat_snapshot_rx.clone();
 
         async move {
-            let mut tcp = TcpStream::connect(remote_addr).await?;
-            let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id).await?;
+            let mut tcp = TcpStream::connect(remote_addr)
+                .await
+                .with_context(|| format!("Failed to established tcp stream with {}", remote_addr))?;
+            let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id)
+                .await
+                .with_context(|| format!("Failed to complete handshake with {}", remote_addr))?;
+            info!("Peer connection to {} established", remote_addr);
+
             let handle = PeerHandle::new(tcp, handshake.peer_id, event_tx, stat_snapshot_rx, &torrent);
             Ok(handle)
         }

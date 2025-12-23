@@ -5,10 +5,19 @@ use std::io::ErrorKind;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio_util::io::read_buf;
 use tokio_util::{
     bytes::Buf,
     codec::{Decoder, Encoder},
 };
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
+use zerocopy::Unaligned;
 
 pub trait Encode {
     fn encode(&self, buf: &mut [u8]);
@@ -280,14 +289,19 @@ impl Decoder for BtDecoder {
     }
 }
 
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned)]
+#[repr(C, packed)]
 pub(crate) struct Handshake {
+    #[allow(dead_code)]
     pub extensions: [u8; 8],
     pub info_hash: InfoHash,
     pub peer_id: [u8; 20],
 }
 
-pub const HANDSHAKE: &'static [u8] = b"\x13BitTorrent protocol";
+// pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
+pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
 
+#[tracing::instrument(skip(peer))]
 pub(crate) async fn shake_hands(
     peer: &mut TcpStream,
     info_hash: &InfoHash,
@@ -296,25 +310,50 @@ pub(crate) async fn shake_hands(
     let extensions = [0u8; 8];
 
     let mut buf = vec![];
-    buf.extend_from_slice(HANDSHAKE);
+    buf.extend_from_slice(HANDSHAKE_STR);
     buf.extend_from_slice(&extensions);
     buf.extend_from_slice(info_hash.as_bytes());
     buf.extend_from_slice(local_id);
 
+    debug_assert!(buf.len() == 68);
     peer.write_all(&*buf).await?;
 
-    let read_buf = [0u8; 68];
-    peer.read_exact(&mut buf).await?;
+    let mut read_buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
+    let Ok(_) = peer.read_exact(&mut read_buf).await else {
+        let str = String::from_utf8_lossy(&buf);
+        info!("Peer didn't send enough bytes? {:?} {}", buf, str);
+        return Err(io::Error::new(ErrorKind::Other, "Early EOF???????"));
+    };
 
-    // header, info_hash, and peer_id must match
-    if read_buf[..20] != *HANDSHAKE || read_buf[28..48] != info_hash.0 || read_buf[48..68] != *local_id {
+    // let read = peer.read(&mut read_buf).await?;
+    // if read == 0 {
+    //     return Err(io::Error::new(ErrorKind::Other, "EOF"));
+    // } else {
+    //     debug!("{:?}", read_buf);
+    // }
+    // Forgive me, networking gods
+    //
+    if read_buf[..HANDSHAKE_STR.len()] != *HANDSHAKE_STR {
+        warn!(
+            "protocol initiation string didn't match, expected {:?}, got {:?} from {}",
+            HANDSHAKE_STR,
+            &read_buf[..HANDSHAKE_STR.len()],
+            peer.peer_addr().unwrap(),
+        );
         peer.shutdown().await?;
-        return Err(io::Error::new(ErrorKind::Other, "handshake info didn't match"));
+        return Err(io::Error::new(ErrorKind::Other, "protocol string didn't match"));
     }
 
-    Ok(Handshake {
-        extensions: read_buf[20..28].try_into().unwrap(),
-        info_hash: InfoHash(read_buf[28..48].try_into().unwrap()),
-        peer_id: read_buf[48..68].try_into().unwrap(),
-    })
+    let handshake = Handshake::ref_from_bytes(&read_buf[HANDSHAKE_STR.len()..]).expect("shit should work");
+
+    if &handshake.info_hash != info_hash {
+        warn!(
+            "handshake info hash didn't match, expected {:?}, got {:?}",
+            info_hash, handshake.info_hash,
+        );
+        peer.shutdown().await?;
+        return Err(io::Error::new(ErrorKind::Other, "handshake hash info didn't match"));
+    }
+
+    Ok(handshake.clone())
 }

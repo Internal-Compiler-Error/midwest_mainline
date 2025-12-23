@@ -39,6 +39,7 @@ base64 = "0.22.1"
 eyre = "0.6.12"
 diesel = { version = "2.2.10", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2" ] }
 libsqlite3-sys = { version = ">=0.17.2, <0.34.0", features = ["bundled"] }
+zerocopy = { version = "0.8.31", features = ["derive"] }
 
 [dev-dependencies]
 color-eyre = "0.6"

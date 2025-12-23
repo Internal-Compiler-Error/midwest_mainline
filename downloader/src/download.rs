@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, trace};
 
 pub enum DownloadEvent {
     PieceCompleted(u32),
@@ -90,8 +90,8 @@ impl Download<'_> {
                         });
 
                     } else {
-                        info!("No available peers, sleep for 100ms");
-                        sleep(Duration::from_millis(100)).await;
+                        trace!("No available peers, sleep for 1000ms");
+                        sleep(Duration::from_millis(1000)).await;
                         unblocked.notify_one();
                     }
                 }

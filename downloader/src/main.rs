@@ -19,15 +19,6 @@ use std::str::FromStr;
 use torrent::parse_torrent;
 use tracing::level_filters::LevelFilter;
 
-use std::fmt;
-use std::path::Path;
-use tracing::{Event, Subscriber};
-use tracing_subscriber::fmt::{
-    FmtContext,
-    format::{FormatEvent, FormatFields},
-};
-use tracing_subscriber::{EnvFilter, Registry};
-
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     let mut rng = rand::rng();
     let r = rand & 0x07;
