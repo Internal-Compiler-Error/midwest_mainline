@@ -904,6 +904,9 @@ impl TorrentSwarm {
     async fn process_self_commands(&mut self, command: TorrentSwarmSelfCommand) -> anyhow::Result<()> {
         match command {
             TorrentSwarmSelfCommand::HandleNewPeerConnection(peer) => {
+                // NOTE:Most of below is beyond stupid, if we got here, it means the tcp stream has
+                // already been established, so we can queue up the bitfields with no problems.
+                // Then we can immediately put it to the active peers list
                 info!("New peer established");
 
                 // TODO: they shouldnt need to be dedup twice since a well formed peer connection only comes back
