@@ -31,7 +31,7 @@ use std::{
 use tokio::task::Builder as TskBuilder;
 use tracing::{Instrument, error, info, info_span, trace, warn};
 
-use super::{KrpcBroker, router::Router};
+use super::{KrpcClient, router::Router};
 
 // TODO: make these configurable some day
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -46,14 +46,14 @@ pub struct DhtHandle {
     conn: Pool<ConnectionManager<SqliteConnection>>,
 
     token_generator: TokenGenerator,
-    message_broker: KrpcBroker,
+    krpc_client: KrpcClient,
 }
 
 impl DhtHandle {
     pub(crate) fn new(
         id: NodeId,
         router: Router,
-        message_broker: KrpcBroker,
+        krpc_client: KrpcClient,
         swarms: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
         let mut rng = rand::rng();
@@ -64,13 +64,13 @@ impl DhtHandle {
             token_generator: TokenGenerator::new(seed),
             our_id: id,
             router,
-            message_broker,
+            krpc_client,
         }
     }
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(self: Arc<Self>) {
-        let rx = self.message_broker.subscribe_inbound();
+        let rx = self.krpc_client.subscribe_inbound();
         let rx = ReceiverStream::new(rx);
         let mut requests = rx.filter(|(msg, _)| !msg.is_error() && !msg.is_response());
 
@@ -88,7 +88,7 @@ impl DhtHandle {
                     let node_info =
                         NodeInfo::new(inbound_msg.node_id().expect("non qeuries are filtered"), socket_addr);
                     let _ = this
-                        .message_broker
+                        .krpc_client
                         .reply(response, &node_info, txn_id, Duration::MAX)
                         .await
                         .inspect_err(|e| error!("{e}"));
@@ -258,7 +258,7 @@ impl DhtHandle {
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
         let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.our_id));
 
-        let response = self.message_broker.query(ping_msg, &peer, REQ_TIMEOUT).await?;
+        let response = self.krpc_client.query(ping_msg, &peer, REQ_TIMEOUT).await?;
 
         return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
             Ok(*response.target_id())
@@ -362,7 +362,7 @@ impl DhtHandle {
         let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.our_id, target));
 
         // send the message and await for a response
-        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.krpc_client.query(query, &dest, REQ_TIMEOUT).await?;
         let body = response.body;
 
         if let KrpcBody::FindNodeGetPeersResponse(find_node_response) = body {
@@ -453,7 +453,7 @@ impl DhtHandle {
             token,
         ));
 
-        let response = self.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;
+        let response = self.krpc_client.query(query, &recipient, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
@@ -475,7 +475,7 @@ impl DhtHandle {
         let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.our_id.clone(), info_hash));
 
         // send the message and await for a response
-        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.krpc_client.query(query, &dest, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::ErrorResponse(response) => {

@@ -25,14 +25,14 @@ use crate::{
 };
 
 use super::dht_handle::REQ_TIMEOUT;
-use super::krpc_broker::KrpcBroker;
+use super::krpc_broker::KrpcClient;
 
 #[derive(Debug, Clone)]
 /// A Router will tell you who are the closest nodes that we know
 pub struct Router {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
-    message_broker: KrpcBroker,
+    message_broker: KrpcClient,
     bucket_size: usize,
     inbound_messages: Arc<Mutex<Option<mpsc::Receiver<(Krpc, SocketAddrV4)>>>>,
 }
@@ -40,7 +40,7 @@ pub struct Router {
 impl Router {
     pub fn new(
         id: NodeId,
-        message_broker: KrpcBroker,
+        message_broker: KrpcClient,
         table: Pool<ConnectionManager<SqliteConnection>>,
         inbound_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
     ) -> Router {

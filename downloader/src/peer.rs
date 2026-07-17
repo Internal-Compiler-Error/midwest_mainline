@@ -37,10 +37,6 @@ pub(crate) enum PeerCommands {
     SendData(Piece),
 }
 
-pub enum PeerEvent {
-    Requested(Request),
-}
-
 // TODO: Should refactor the design so that a peer connection and handle can be constructed even
 // when the TCP stream is not yet established, so we can queue up messages before the connection is
 // establlished. This is needed as we can have piece completion messages can need to be sent but

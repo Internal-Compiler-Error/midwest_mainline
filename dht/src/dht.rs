@@ -17,7 +17,7 @@ use diesel::{
 };
 use tracing::info;
 
-use krpc_broker::KrpcBroker;
+use krpc_broker::KrpcClient;
 use rand::{Rng, RngCore};
 use router::Router;
 use std::{
@@ -33,7 +33,7 @@ use txn_id_generator::TxnIdGenerator;
 #[allow(dead_code)]
 pub struct DhtV4 {
     server: Arc<DhtHandle>,
-    message_broker: KrpcBroker,
+    message_broker: KrpcClient,
     router: Router,
     addr: SocketAddrV4,
 }
@@ -167,7 +167,7 @@ impl DhtV4 {
 
         let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
 
-        let message_broker = KrpcBroker::new(
+        let message_broker = KrpcClient::new(
             listen_socket,
             db.clone(),
             Arc::new(TxnIdGenerator::new()).clone(),

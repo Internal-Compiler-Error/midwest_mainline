@@ -16,6 +16,6 @@ impl TxnIdGenerator {
     }
 
     pub fn next(&self) -> u32 {
-        self.next_id.fetch_add(1, Ordering::SeqCst)
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 }

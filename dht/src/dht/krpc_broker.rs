@@ -33,9 +33,9 @@ use super::{TxnIdGenerator, router::update_last_sent};
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
 /// so the client and await the response.
 #[derive(Debug, Clone)]
-pub struct KrpcBroker {
-    /// a map to keep track of the responses we await from the client
-    pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
+pub struct KrpcClient {
+    /// all requests that we haven't gotten a response yet, keyed by the transaction_id
+    pending_requests: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
 
     socket: Arc<UdpSocket>,
     txn_id_generator: Arc<TxnIdGenerator>,
@@ -57,15 +57,15 @@ impl Routable for SocketAddrV4 {
     }
 }
 
-impl KrpcBroker {
+impl KrpcClient {
     pub fn new(
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
         public_ip: Ipv4Addr,
-    ) -> KrpcBroker {
+    ) -> KrpcClient {
         Self {
-            pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             socket: Arc::new(socket),
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
@@ -77,7 +77,7 @@ impl KrpcBroker {
     #[instrument(skip_all)]
     pub async fn run(&self) -> io::Result<JoinHandle<()>> {
         let socket = self.socket.clone();
-        let pending_responses = self.pending_responses.clone();
+        let pending_responses = self.pending_requests.clone();
         let inbound_subscribers = self.inbound_subscribers.clone();
 
         let event_loop = async move {
@@ -143,7 +143,7 @@ impl KrpcBroker {
     pub fn subscribe_one(&self, transaction_id: TransactionId) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
         let (tx, rx) = oneshot::channel();
 
-        let mut guard = self.pending_responses.lock().unwrap();
+        let mut guard = self.pending_requests.lock().unwrap();
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
         let _ = guard.insert(transaction_id, tx);
