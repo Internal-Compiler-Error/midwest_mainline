@@ -274,16 +274,12 @@ impl DhtHandle {
             return vec![node];
         }
 
-        let mut queried: HashSet<NodeInfo> = HashSet::new();
-
         // find the closest nodes that we know
         let mut closest = self.router.find_closest(target);
-        let mut querying = closest.clone();
-        for node in closest.iter() {
-            queried.insert(*node);
-        }
+        // ids we've already sent a query to; consulted and updated every round
+        let mut queried: HashSet<NodeId> = HashSet::new();
+        let mut querying: Vec<NodeInfo> = vec![];
 
-        let mut prev_distance = MAX_DIST;
         let mut round = 0;
         loop {
             info!("round {round} of finding {target:?}");
@@ -296,20 +292,37 @@ impl DhtHandle {
             }
             round += 1;
 
-            let returned_nodes = querying
+            // this round: the unqueried known nodes closest to the target
+            querying.clear();
+            querying.extend(
+                closest
+                    .iter()
+                    .filter(|n| !queried.contains(&n.id()))
+                    .take(CONCURRENT_REQS),
+            );
+            if querying.is_empty() {
+                info!("asked every known node, returning with {} closest nodes", closest.len());
+                return closest;
+            }
+            for node in &querying {
+                queried.insert(node.id());
+            }
+
+            let round_results = querying
                 .iter()
-                .map(|node| node.end_point())
-                .map(|ip| self.send_find_nodes_rpc(ip, target))
+                .map(|node| async move { (node.id(), self.send_find_nodes_rpc(node.end_point(), target).await) })
                 .collect::<Vec<_>>();
+            let round_results = join_all(round_results).await;
 
-            let returned_nodes = join_all(returned_nodes).await;
-
-            // filter out the ones that resulted in failure, such as due to time out
-            let mut returned_nodes: Vec<_> = returned_nodes
-                .into_iter()
-                .filter_map(|node| node.ok())
-                .flatten() // combine the "branched out" closests nodes together
-                .collect();
+            let mut returned_nodes = vec![];
+            for (node_id, result) in round_results {
+                match result {
+                    Ok(nodes) => returned_nodes.extend(nodes),
+                    // timeouts and the like: record the failure so repeated ones get the
+                    // node evicted
+                    Err(_) => self.router.mark_failed(&node_id),
+                }
+            }
 
             // the node we reached to might be dead already, which will return as a timeout
             if returned_nodes.is_empty() {
@@ -322,29 +335,14 @@ impl DhtHandle {
 
             // it's possible that some of the nodes returned are actually the node we're looking for
             // so we check for that and return it if it's the case
-            let target_node = returned_nodes.iter().find(|node| node.id() == target);
-            if target_node.is_some() {
-                return vec![*target_node.unwrap()];
+            if let Some(target_node) = returned_nodes.iter().find(|node| node.id() == target) {
+                return vec![*target_node];
             }
 
-            let next_round_dist = returned_nodes.iter().map(|n| n.id().dist(&target)).min().unwrap();
-
             closest.append(&mut returned_nodes);
-            // TODO: while individually each request has been deduped, it's possible after
-            // combining, there are duplicates again, but sorting again seems kinda wasteful
+            closest.sort_unstable_by(|l, r| l.id().0.cmp(&r.id().0));
+            closest.dedup_by(|l, r| l.id() == r.id());
             closest.sort_unstable_by(|lhs, rhs| cmp_resp(&lhs.id(), &rhs.id(), &target));
-
-            querying.clear();
-            querying.extend(
-                closest
-                    .iter()
-                    .take_while(|n| {
-                        let dist = self.our_id.dist(&n.id());
-                        dist <= prev_distance
-                    })
-                    .take(CONCURRENT_REQS),
-            );
-            prev_distance = min(prev_distance, next_round_dist);
 
             // another round we go!
         }

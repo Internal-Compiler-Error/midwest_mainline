@@ -357,6 +357,20 @@ impl Router {
             .inspect_err(|e| error!("{e}"));
     }
 
+    /// Record a failed RPC to a known node; enough of these lands it on the replacement
+    /// queue (see `replacement_queue`), which is how dead nodes get evicted.
+    pub fn mark_failed(&self, nodee: &NodeId) {
+        use crate::schema::node::dsl::*;
+
+        let idd = nodee.0.to_vec();
+        let mut conn = self.conn();
+        let _ = diesel::update(node)
+            .filter(id.eq(idd))
+            .set(failed_requests.eq(failed_requests + 1))
+            .execute(&mut conn)
+            .inspect_err(|e| error!("{e}"));
+    }
+
     fn mark_as_dead(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
 
@@ -473,6 +487,34 @@ mod tests {
         let closest = router.find_closest(id_with_first_byte(0xFF));
         let ids: Vec<NodeId> = closest.iter().map(|n| n.id()).collect();
         assert_eq!(ids, vec![a, b, c], "must be ordered by xor distance to the target");
+    }
+
+    #[tokio::test]
+    async fn failed_queries_increment_and_good_news_resets() {
+        use crate::schema::node::dsl::*;
+
+        let router = test_router(NodeId([0x00; 20])).await;
+        let a = id_with_first_byte(0xF0);
+        router.add(a, addr(1));
+
+        router.mark_failed(&a);
+        router.mark_failed(&a);
+
+        let mut conn = router.table.get().unwrap();
+        let failed: i32 = node
+            .filter(id.eq(a.0.to_vec()))
+            .select(failed_requests)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(failed, 2, "each failed RPC must increment the counter");
+
+        router.marks_as_good(&a, &mut conn);
+        let failed: i32 = node
+            .filter(id.eq(a.0.to_vec()))
+            .select(failed_requests)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(failed, 0, "hearing from the node resets the counter");
     }
 
     #[tokio::test]
