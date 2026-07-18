@@ -152,21 +152,20 @@ impl Router {
 
         let mut conn = self.conn();
 
-        let target_idx = self.index(&self.id);
+        let target_idx = self.index(&target);
         let mut closest = self.closest_in_bucket(&target, target_idx, total.into(), &mut conn);
 
         let mut offset = 1;
         let mut remaining: u16 = total.saturating_sub(closest.len().try_into().expect("we spcified the limit"));
         loop {
             // if got we wanted, or both sides are out of bounds, then there's no more we can do
-            if remaining == 0 || (target_idx - offset < 0 && target_idx + offset >= 256) {
+            if remaining == 0 || (target_idx - offset < 0 && target_idx + offset >= 160) {
                 break;
             }
 
-            // favours the nodes closer to us, i.e buckets with larger index, I have no theory on
-            // why this might be better
+            // favours the nodes closer to the target, i.e buckets with larger index
             let right_bucket = target_idx + offset;
-            if remaining != 0 && right_bucket < 256 {
+            if remaining != 0 && right_bucket < 160 {
                 let mut additional = self.closest_in_bucket(&target, right_bucket, remaining.into(), &mut conn);
                 remaining = remaining.saturating_sub(additional.len().try_into().expect("we spcified the limit"));
                 closest.append(&mut additional);
@@ -182,12 +181,7 @@ impl Router {
             offset += 1;
         }
 
-        closest.sort_unstable_by(|a, b| {
-            let a_dist = &self.id.dist(&a.id());
-            let b_dist = &self.id.dist(&b.id());
-
-            a_dist.cmp(b_dist)
-        });
+        closest.sort_unstable_by(|a, b| types::cmp_resp(&a.id(), &b.id(), &target));
 
         closest
     }
@@ -403,4 +397,103 @@ pub fn update_last_sent(nodee: &NodeId, sent_timestamp: i64, conn: &mut SqliteCo
         .filter(id.eq(idd))
         .execute(conn)
         .inspect_err(|e| error!("{e}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dht::SensibleOptions;
+    use crate::dht::txn_id_generator::TxnIdGenerator;
+    use tokio::net::UdpSocket;
+
+    /// A Router over a single-connection in-memory sqlite pool (max_size 1 so every
+    /// checkout shares the same in-memory database), with the same connection
+    /// customizer as production (the custom `xor()` SQL function lives there).
+    async fn test_router(our_id: NodeId) -> Router {
+        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(SensibleOptions))
+            .build(manager)
+            .unwrap();
+
+        let mut conn = pool.get().unwrap();
+        diesel::sql_query(
+            "CREATE TABLE node (
+                id BLOB PRIMARY KEY,
+                bucket INTEGER NOT NULL,
+                last_contacted BIGINT NOT NULL,
+                ip_addr TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                failed_requests INTEGER NOT NULL,
+                removed BOOLEAN NOT NULL,
+                last_sent BIGINT,
+                added BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&mut *conn)
+        .unwrap();
+
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let broker = KrpcBroker::new(
+            socket,
+            pool.clone(),
+            Arc::new(TxnIdGenerator::new()),
+            Ipv4Addr::LOCALHOST,
+        );
+        let (_tx, rx) = mpsc::channel(1);
+        Router::new(our_id, broker, pool, rx)
+    }
+
+    fn id_with_first_byte(b: u8) -> NodeId {
+        let mut id = [0u8; 20];
+        id[0] = b;
+        NodeId(id)
+    }
+
+    fn addr(i: u8) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, i), 6881)
+    }
+
+    #[tokio::test]
+    async fn find_closest_orders_by_distance_to_the_target_not_to_us() {
+        let router = test_router(NodeId([0x00; 20])).await;
+
+        // distances to target [0xFF..]: a=0x0F, b=0xF0, c=0xFE  ->  a < b < c
+        // distances to us [0x00..]:     c=0x01, b=0x0F, a=0xF0  ->  c < b < a
+        let a = id_with_first_byte(0xF0);
+        let b = id_with_first_byte(0x0F);
+        let c = id_with_first_byte(0x01);
+        router.add(a, addr(1));
+        router.add(b, addr(2));
+        router.add(c, addr(3));
+
+        let closest = router.find_closest(id_with_first_byte(0xFF));
+        let ids: Vec<NodeId> = closest.iter().map(|n| n.id()).collect();
+        assert_eq!(ids, vec![a, b, c], "must be ordered by xor distance to the target");
+    }
+
+    #[tokio::test]
+    async fn find_closest_scans_outwards_from_the_targets_bucket() {
+        let router = test_router(NodeId([0x00; 20])).await;
+
+        // put two nodes *near the target* (high first byte) and six near us (low first
+        // byte); the eight closest to the target must include both high nodes, even
+        // though they are the farthest from us
+        let near_target = [0xF0u8, 0xE0];
+        for (i, b) in near_target.iter().enumerate() {
+            router.add(id_with_first_byte(*b), addr(i as u8));
+        }
+        for i in 0..6u8 {
+            router.add(id_with_first_byte(i + 1), addr(10 + i));
+        }
+
+        let closest = router.find_closest(id_with_first_byte(0xFF));
+        let ids: Vec<NodeId> = closest.iter().map(|n| n.id()).collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(ids[0], id_with_first_byte(0xF0));
+        assert_eq!(ids[1], id_with_first_byte(0xE0));
+    }
 }

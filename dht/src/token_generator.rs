@@ -1,11 +1,12 @@
 use std::{
+    net::Ipv4Addr,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use sha3::{Digest, Sha3_256};
 
-use crate::types::{NodeId, Token};
+use crate::types::Token;
 
 pub const TOKEN_EXPIRATION_TIME: Duration = Duration::from_secs(60 * 5);
 
@@ -23,23 +24,23 @@ impl TokenGenInner {
         }
     }
 
-    fn gen_token_with_state(state: u128, node: &NodeId) -> Token {
-        // token generation strategy is simply use SHA3 as a PRNG, with `<state> || <node_id>` as
-        // the input, `||` is the concatination operator here
+    fn gen_token_with_state(state: u128, ip: &Ipv4Addr) -> Token {
+        // tokens bind to the requester's IP (BEP 5): a host may only announce with a
+        // token that was issued to its own address
         let mut hasher = Sha3_256::new();
         hasher.update(state.to_be_bytes());
-        hasher.update(node.as_bytes());
+        hasher.update(ip.octets());
 
         let digest = hasher.finalize();
         Token::from_bytes(digest.as_slice())
     }
 
     /// See as the moment of calling, is the token correct?
-    pub fn token_acceptable(&self, node: &NodeId, token: &Token) -> bool {
+    pub fn token_acceptable(&self, ip: &Ipv4Addr, token: &Token) -> bool {
         // we accept the current token and one token before it, similar to the 10 min window in the
         // official spec
-        let previous = Self::gen_token_with_state(self.state - 1, node);
-        let current = self.generate_token(node);
+        let previous = Self::gen_token_with_state(self.state - 1, ip);
+        let current = self.generate_token(ip);
 
         token == &current || token == &previous
     }
@@ -53,8 +54,8 @@ impl TokenGenInner {
         self.last_update = Instant::now();
     }
 
-    fn generate_token(&self, node: &NodeId) -> Token {
-        Self::gen_token_with_state(self.state, node)
+    fn generate_token(&self, ip: &Ipv4Addr) -> Token {
+        Self::gen_token_with_state(self.state, ip)
     }
 }
 
@@ -71,12 +72,12 @@ impl TokenGenerator {
         }
     }
 
-    /// Generate the current token for the node
-    pub(crate) fn token_for_node(&self, node: &NodeId) -> Token {
+    /// Generate the current token for the IP
+    pub(crate) fn token_for_ip(&self, ip: &Ipv4Addr) -> Token {
         {
             let inner = self.inner.read().unwrap();
             if !inner.needs_advancing() {
-                return inner.generate_token(node);
+                return inner.generate_token(ip);
             }
         }
 
@@ -85,10 +86,42 @@ impl TokenGenerator {
             inner.advance();
         }
 
-        inner.generate_token(node)
+        inner.generate_token(ip)
     }
 
-    pub(crate) fn is_valid_token(&self, node: &NodeId, token: &Token) -> bool {
-        self.inner.read().unwrap().token_acceptable(node, token)
+    pub(crate) fn is_valid_token(&self, ip: &Ipv4Addr, token: &Token) -> bool {
+        self.inner.read().unwrap().token_acceptable(ip, token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_bind_to_the_requesters_ip() {
+        let tokens = TokenGenerator::new(42);
+        let a: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        let b: Ipv4Addr = "5.6.7.8".parse().unwrap();
+
+        let token = tokens.token_for_ip(&a);
+        assert!(tokens.is_valid_token(&a, &token));
+        assert!(
+            !tokens.is_valid_token(&b, &token),
+            "a token must not validate from another IP"
+        );
+    }
+
+    #[test]
+    fn previous_state_token_stays_valid_exactly_one_rotation() {
+        let tokens = TokenGenerator::new(42);
+        let a: Ipv4Addr = "1.2.3.4".parse().unwrap();
+
+        let old = tokens.token_for_ip(&a);
+        tokens.inner.write().unwrap().advance();
+        assert!(tokens.is_valid_token(&a, &old), "current-1 must still be accepted");
+
+        tokens.inner.write().unwrap().advance();
+        assert!(!tokens.is_valid_token(&a, &old), "current-2 must be rejected");
     }
 }

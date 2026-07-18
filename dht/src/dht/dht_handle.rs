@@ -172,7 +172,7 @@ impl DhtHandle {
         let peers = self.swarm_peers(query.info_hash());
         let token_pool = &self.token_generator;
 
-        let token = token_pool.token_for_node(query.requestor());
+        let token = token_pool.token_for_ip(origin.ip());
         if !peers.is_empty() {
             let res = ResBuilder::new(self.our_id.clone())
                 .with_token(token)
@@ -180,8 +180,10 @@ impl DhtHandle {
                 .build();
             KrpcBody::FindNodeGetPeersResponse(res)
         } else {
-            // when we don't have peer info on an info hash, respond with the cloests nodes so the querier can ask them
-            let closest_eight: Vec<_> = self.router.find_closest(*query.requestor()).into_iter().collect();
+            // when we don't have peer info on an info hash, respond with the closest nodes
+            // we know *to that info hash* so the querier can iterate towards it
+            let target = NodeId(query.info_hash().0);
+            let closest_eight: Vec<_> = self.router.find_closest(target).into_iter().collect();
 
             let res = ResBuilder::new(self.our_id.clone())
                 .with_token(token)
@@ -193,11 +195,8 @@ impl DhtHandle {
 
     #[tracing::instrument(skip(self))]
     fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> KrpcBody {
-        // see if the token is valid
-        if !self
-            .token_generator
-            .is_valid_token(announce.requestor(), announce.token())
-        {
+        // the token must have been issued to this IP address (BEP 5)
+        if !self.token_generator.is_valid_token(origin.ip(), announce.token()) {
             return KrpcBody::ErrorResponse(KrpcError::new_protocol());
         }
 

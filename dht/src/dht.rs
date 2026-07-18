@@ -39,7 +39,7 @@ pub struct DhtV4 {
 }
 
 #[derive(Debug)]
-struct SensibleOptions;
+pub(crate) struct SensibleOptions;
 
 impl CustomizeConnection<SqliteConnection, r2d2::Error> for SensibleOptions {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), r2d2::Error> {
