@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
+use std::net::SocketAddrV4;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{net::SocketAddrV4, usize};
 
 use diesel::r2d2::PooledConnection;
 use diesel::{

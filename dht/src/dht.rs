@@ -277,7 +277,7 @@ impl DhtV4 {
 
         join_set
             .build_task()
-            .name(&*format!("DHT server"))
+            .name("DHT server")
             .spawn(self.server.clone().run())
             .unwrap();
 

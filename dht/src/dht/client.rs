@@ -4,7 +4,7 @@
 
 use futures::future::join_all;
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -133,7 +133,7 @@ impl DhtClient {
             }
 
             closest.append(&mut returned_nodes);
-            closest.sort_unstable_by(|l, r| l.id().0.cmp(&r.id().0));
+            closest.sort_unstable_by_key(|n| n.id().0);
             closest.dedup_by(|l, r| l.id() == r.id());
             closest.sort_unstable_by(|lhs, rhs| cmp_resp(&lhs.id(), &rhs.id(), &target));
 
@@ -225,7 +225,7 @@ impl DhtClient {
             }
 
             closest.append(&mut returned_nodes);
-            closest.sort_unstable_by(|l, r| l.id().0.cmp(&r.id().0));
+            closest.sort_unstable_by_key(|n| n.id().0);
             closest.dedup_by(|l, r| l.id() == r.id());
             closest.sort_unstable_by(|l, r| cmp_resp(&l.id(), &r.id(), &target));
         }
@@ -249,7 +249,7 @@ impl DhtClient {
     ) -> Result<(), OurError> {
         // 6881 is a default port when implied_port is used
         let query = KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
-            self.state.our_id.clone(),
+            self.state.our_id,
             port.is_none(),
             port.unwrap_or(6881),
             info_hash,
@@ -274,7 +274,7 @@ impl DhtClient {
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {
         // construct the message to query our friends
-        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id.clone(), info_hash));
+        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash));
 
         // send the message and await for a response
         let response = self.state.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
@@ -317,7 +317,7 @@ mod tests {
     use diesel::SqliteConnection;
     use diesel::connection::SimpleConnection;
     use diesel::r2d2::{ConnectionManager, Pool};
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
 
     fn test_pool(ddl: &str) -> Pool<ConnectionManager<SqliteConnection>> {

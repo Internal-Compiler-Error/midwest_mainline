@@ -76,7 +76,7 @@ impl DhtServer {
 
     #[tracing::instrument(skip(self))]
     fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> KrpcBody {
-        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id.clone()))
+        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
     }
 
     #[tracing::instrument(skip(self))]
@@ -85,16 +85,14 @@ impl DhtServer {
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
-        return if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
-            let res = ResBuilder::new(self.state.our_id)
-                .with_node(closest_eight[0].clone())
-                .build();
+        if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
+            let res = ResBuilder::new(self.state.our_id).with_node(closest_eight[0]).build();
             KrpcBody::FindNodeGetPeersResponse(res)
         } else {
             let stupid: Vec<_> = closest_eight.into_iter().collect();
             let res = ResBuilder::new(self.state.our_id).with_nodes(&stupid).build();
             KrpcBody::FindNodeGetPeersResponse(res)
-        };
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -104,7 +102,7 @@ impl DhtServer {
 
         let token = token_pool.token_for_ip(origin.ip());
         if !peers.is_empty() {
-            let res = ResBuilder::new(self.state.our_id.clone())
+            let res = ResBuilder::new(self.state.our_id)
                 .with_token(token)
                 .with_values(&*peers)
                 .build();
@@ -115,7 +113,7 @@ impl DhtServer {
             let target = NodeId(query.info_hash().0);
             let closest_eight: Vec<_> = self.state.router.find_closest(target).into_iter().collect();
 
-            let res = ResBuilder::new(self.state.our_id.clone())
+            let res = ResBuilder::new(self.state.our_id)
                 .with_token(token)
                 .with_nodes(&closest_eight)
                 .build();
@@ -143,7 +141,7 @@ impl DhtServer {
         let mut conn = self.state.conn.get().unwrap();
         let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, &mut conn).inspect_err(|e| warn!("{e}"));
 
-        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id.clone()))
+        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
     }
 
     fn add_peers_to_db(

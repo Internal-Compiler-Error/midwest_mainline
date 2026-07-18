@@ -73,7 +73,7 @@ fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<No
 }
 
 fn report_unused_keys<V>(dict: &BTreeMap<&[u8], V>, err_template: &'static str) {
-    if dict.len() != 0 {
+    if !dict.is_empty() {
         let keys = dict
             .keys()
             .map(|k| String::from_utf8_lossy(k).into_owned())
@@ -391,7 +391,7 @@ impl ParseKrpc for &[u8] {
         let _ = parsed.remove(b"ip".as_slice()); // see https://bittorrent.org/beps/bep_0042.html
         let _ = parsed.remove(b"v".as_slice()); // user agent string
 
-        if parsed.len() != 0 {
+        if !parsed.is_empty() {
             let keys = parsed
                 .keys()
                 .map(|k| String::from_utf8_lossy(k).into_owned())
@@ -424,28 +424,24 @@ pub enum KrpcBody {
 
 impl KrpcBody {
     pub fn is_response(&self) -> bool {
-        match self {
-            KrpcBody::PingAnnouncePeerResponse(_) => true,
-            KrpcBody::FindNodeGetPeersResponse(_) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            KrpcBody::PingAnnouncePeerResponse(_) | KrpcBody::FindNodeGetPeersResponse(_)
+        )
     }
 
     pub fn is_error(&self) -> bool {
-        match self {
-            KrpcBody::ErrorResponse(_) => true,
-            _ => false,
-        }
+        matches!(self, KrpcBody::ErrorResponse(_))
     }
 
     pub fn is_query(&self) -> bool {
-        match self {
-            KrpcBody::PingQuery(_) => true,
-            KrpcBody::FindNodeQuery(_) => true,
-            KrpcBody::GetPeersQuery(_) => true,
-            KrpcBody::AnnouncePeerQuery(_) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            KrpcBody::PingQuery(_)
+                | KrpcBody::FindNodeQuery(_)
+                | KrpcBody::GetPeersQuery(_)
+                | KrpcBody::AnnouncePeerQuery(_)
+        )
     }
 }
 
@@ -610,31 +606,28 @@ impl Krpc {
     pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
-            body: KrpcBody::ErrorResponse(KrpcError::new(201 as u32, "A Generic Error Occurred".to_string())),
+            body: KrpcBody::ErrorResponse(KrpcError::new(201, "A Generic Error Occurred".to_string())),
         }
     }
 
     pub fn new_standard_server_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
-            body: KrpcBody::ErrorResponse(KrpcError::new(202 as u32, "A Server Error Occurred".to_string())),
+            body: KrpcBody::ErrorResponse(KrpcError::new(202, "A Server Error Occurred".to_string())),
         }
     }
 
     pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
-            body: KrpcBody::ErrorResponse(KrpcError::new(203 as u32, "A Protocol Error Occurred".to_string())),
+            body: KrpcBody::ErrorResponse(KrpcError::new(203, "A Protocol Error Occurred".to_string())),
         }
     }
 
     pub fn new_unsupported_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
-            body: KrpcBody::ErrorResponse(KrpcError::new(
-                204 as u32,
-                "A Unsupported Method Error Occurred".to_string(),
-            )),
+            body: KrpcBody::ErrorResponse(KrpcError::new(204, "A Unsupported Method Error Occurred".to_string())),
         }
     }
 }
