@@ -11,11 +11,25 @@ pub struct TxnIdGenerator {
 impl TxnIdGenerator {
     pub fn new() -> Self {
         TxnIdGenerator {
-            next_id: AtomicU32::new(0),
+            // random start so in-flight transaction ids aren't trivially predictable
+            // from outside; uniqueness within the process comes from the increment
+            next_id: AtomicU32::new(rand::random()),
         }
     }
 
     pub fn next(&self) -> u32 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generators_do_not_share_a_predictable_sequence() {
+        let a = TxnIdGenerator::new();
+        let b = TxnIdGenerator::new();
+        assert_ne!(a.next(), b.next(), "same-seed generators would make ids predictable");
     }
 }

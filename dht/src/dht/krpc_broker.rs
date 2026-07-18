@@ -34,8 +34,9 @@ use super::{TxnIdGenerator, router::update_last_sent};
 /// so the client and await the response.
 #[derive(Debug, Clone)]
 pub struct KrpcBroker {
-    /// a map to keep track of the responses we await from the client
-    pending_responses: Arc<Mutex<HashMap<TransactionId, oneshot::Sender<(Krpc, SocketAddrV4)>>>>,
+    /// a map to keep track of the responses we await from the client; the address is the
+    /// endpoint we queried, so responses from anywhere else are ignored
+    pending_responses: Arc<Mutex<HashMap<TransactionId, (SocketAddrV4, oneshot::Sender<(Krpc, SocketAddrV4)>)>>>,
 
     socket: Arc<UdpSocket>,
     txn_id_generator: Arc<TxnIdGenerator>,
@@ -130,10 +131,19 @@ impl KrpcBroker {
                         {
                             // see if we have a slot for this transaction id, if we do, that means one of the
                             // messages that we expect, otherwise the message is a query we need to handle
-                            if let Some(sender) = pending_responses.lock().unwrap().remove(id) {
-                                // failing means the receiver has dropped, meaning they are no
-                                // longer interested in the message, not a bug
-                                let _ = sender.send((msg, socket_addr));
+                            let entry = pending_responses.lock().unwrap().remove(id);
+                            if let Some((expected, sender)) = entry {
+                                if expected == socket_addr {
+                                    // failing means the receiver has dropped, meaning they are no
+                                    // longer interested in the message, not a bug
+                                    let _ = sender.send((msg, socket_addr));
+                                } else {
+                                    warn!(
+                                        "ignoring response for a pending transaction from the wrong address: expected {expected}, got {socket_addr}"
+                                    );
+                                    // the genuine response may still arrive; keep the slot
+                                    pending_responses.lock().unwrap().insert(id.clone(), (expected, sender));
+                                }
                             }
                         }
                     }
@@ -148,13 +158,18 @@ impl KrpcBroker {
     }
 
     /// Subscribe to the reply with the provided transaction_id
-    pub fn subscribe_one(&self, transaction_id: TransactionId) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
+    /// Subscribe to the reply with the provided transaction_id, expected from `endpoint`
+    pub fn subscribe_one(
+        &self,
+        transaction_id: TransactionId,
+        endpoint: SocketAddrV4,
+    ) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
         let (tx, rx) = oneshot::channel();
 
         let mut guard = self.pending_responses.lock().unwrap();
         // it's possible that the response never came and we a new request is now using the same
         // transaction id
-        let _ = guard.insert(transaction_id, tx);
+        let _ = guard.insert(transaction_id, (endpoint, tx));
         rx
     }
 
@@ -175,7 +190,7 @@ impl KrpcBroker {
     async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddrV4) -> Result<Krpc, OurError> {
         let sent_time = unix_timestmap_ms();
         let rx = {
-            let rx = self.subscribe_one(message.transaction_id().clone());
+            let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
             self.send_msg_background(&message, endpoint);
             rx
         };
@@ -281,5 +296,44 @@ mod tests {
             broker.pending_responses.lock().unwrap().is_empty(),
             "a timed-out query must not leak its pending_requests entry"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_from_the_wrong_address_are_ignored() {
+        let broker = test_broker().await;
+        broker.run().await.unwrap();
+
+        let legit = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let SocketAddr::V4(legit_addr) = legit.local_addr().unwrap() else {
+            unreachable!("bound to an ipv4 address");
+        };
+        let spoofer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+
+        let txn = TransactionId::from_bytes(&[42]);
+        let mut rx = broker.subscribe_one(txn.clone(), legit_addr);
+        let broker_addr = broker.socket.local_addr().unwrap();
+
+        let pkt = Krpc::new_with_body(
+            txn,
+            KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(NodeId([3u8; 20]))),
+        )
+        .encode();
+
+        // a packet with the right transaction id but from the wrong address: ignored
+        spoofer.send_to(&pkt, broker_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a response from the wrong address must not be delivered"
+        );
+
+        // the same packet from the queried address: delivered
+        legit.send_to(&pkt, broker_addr).await.unwrap();
+        let (_msg, from) = timeout(Duration::from_secs(1), &mut rx).await.unwrap().unwrap();
+        assert_eq!(from, legit_addr);
     }
 }
