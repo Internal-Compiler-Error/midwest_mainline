@@ -198,14 +198,13 @@ impl KrpcBroker {
         endpoint: SocketAddrV4,
         time_out: Duration,
     ) -> Result<Krpc, OurError> {
-        let response = timeout(time_out, self.send_and_wait(message, endpoint))
-            .await
-            .inspect_err(|_e| {
-                trace!("operation timedout for {} timed out after {:?}", endpoint, time_out);
-            })
-            ?  // timeout error
-            ? // send_and_wait related error
-            ;
+        let txn_id = message.transaction_id().clone();
+        let result = timeout(time_out, self.send_and_wait(message, endpoint)).await;
+        if result.is_err() {
+            // timed out: free the pending slot so dead endpoints don't leak entries forever
+            self.pending_responses.lock().unwrap().remove(&txn_id);
+        }
+        let response = result??;
         Ok(response)
     }
 
@@ -217,15 +216,12 @@ impl KrpcBroker {
         rx
     }
 
-    pub async fn reply(
-        &self,
-        body: KrpcBody,
-        node: &NodeInfo,
-        txn_id: TransactionId,
-        timeout: Duration,
-    ) -> Result<Krpc, OurError> {
+    /// Send a response to a query. Fire-and-forget: responses to responses are not a
+    /// thing in KRPC, so there is nothing to wait for (and waiting leaked a task per
+    /// inbound query).
+    pub fn reply(&self, body: KrpcBody, node: &NodeInfo, txn_id: TransactionId) {
         let message = Krpc::new_with_body(txn_id, body);
-        self.send_and_wait_timeout(message, node.end_point(), timeout).await
+        self.send_msg_background(&message, node.end_point());
     }
 
     pub async fn query<E: Routable>(&self, body: KrpcBody, endpoint: &E, timeout: Duration) -> Result<Krpc, OurError> {
@@ -233,5 +229,57 @@ impl KrpcBroker {
         let message = Krpc::new_with_body(self.txn_id_generator.next().into(), body);
 
         self.send_and_wait_timeout(message, endpoint, timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dht::SensibleOptions;
+    use crate::dht::txn_id_generator::TxnIdGenerator;
+    use crate::message::ping_announce_peer_response::PingAnnouncePeerResponse;
+    use crate::message::ping_query::PingQuery;
+    use crate::types::NodeId;
+
+    async fn test_broker() -> KrpcBroker {
+        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(SensibleOptions))
+            .build(manager)
+            .unwrap();
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        KrpcBroker::new(socket, pool, Arc::new(TxnIdGenerator::new()), Ipv4Addr::LOCALHOST)
+    }
+
+    #[tokio::test]
+    async fn reply_does_not_wait_for_a_response() {
+        let broker = test_broker().await;
+        let node = NodeInfo::new(NodeId([1u8; 20]), SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
+        let body = KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(NodeId([2u8; 20])));
+
+        // nothing listens on the other end, and a response never gets one anyway: this
+        // must return immediately instead of waiting forever
+        timeout(Duration::from_secs(1), async {
+            broker.reply(body, &node, TransactionId::from_bytes(&[7]));
+        })
+        .await
+        .expect("reply must not wait for a response to the response");
+    }
+
+    #[tokio::test]
+    async fn timed_out_query_frees_its_pending_slot() {
+        let broker = test_broker().await;
+        let body = KrpcBody::PingQuery(PingQuery::new(NodeId([1u8; 20])));
+        let dead = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+
+        let result = broker.query(body, &dead, Duration::from_millis(50)).await;
+        assert!(result.is_err());
+        assert!(
+            broker.pending_responses.lock().unwrap().is_empty(),
+            "a timed-out query must not leak its pending_requests entry"
+        );
     }
 }

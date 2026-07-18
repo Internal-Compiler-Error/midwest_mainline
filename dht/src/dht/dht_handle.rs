@@ -87,11 +87,7 @@ impl DhtHandle {
                     let txn_id = inbound_msg.transaction_id().clone();
                     let node_info =
                         NodeInfo::new(inbound_msg.node_id().expect("non qeuries are filtered"), socket_addr);
-                    let _ = this
-                        .message_broker
-                        .reply(response, &node_info, txn_id, Duration::MAX)
-                        .await
-                        .inspect_err(|e| error!("{e}"));
+                    this.message_broker.reply(response, &node_info, txn_id);
                     trace!("response sending for {socket_addr}");
                 }
                 .instrument(info_span!("handle_requests")),
