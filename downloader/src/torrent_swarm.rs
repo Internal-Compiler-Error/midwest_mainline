@@ -8,7 +8,7 @@ use anyhow::{self, Context, bail};
 use bitvec::boxed::BitBox;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use juicy_bencode::{BencodeDictDisplay, BencodeItemView};
+use juicy_bencode::BencodeItemView;
 use rand::Rng;
 use reqwest::Client;
 use std::any::Any;
@@ -148,9 +148,8 @@ impl HttpAnnouncer {
             bail!("Tracker [{}] responded with invalid bencoded content", self.tracker);
         };
         info!(
-            "Parsed bencode from tracker [{}] as {}",
-            self.tracker,
-            BencodeDictDisplay(&dict)
+            "Parsed bencode from tracker [{}] as {:?}",
+            self.tracker, &dict
         );
 
         let mut peers = vec![];
