@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::r2d2::PooledConnection;
@@ -53,22 +53,15 @@ pub struct RoutingTable {
     /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
     /// table fresh. Revisit if the table ever outgrows this.
     bucket_size: usize,
-    inbound_messages: Arc<Mutex<Option<mpsc::Receiver<(Krpc, SocketAddrV4)>>>>,
 }
 
 impl RoutingTable {
-    pub fn new(
-        id: NodeId,
-        rpc_manager: RpcManager,
-        table: Pool<ConnectionManager<SqliteConnection>>,
-        inbound_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
-    ) -> RoutingTable {
+    pub fn new(id: NodeId, rpc_manager: RpcManager, table: Pool<ConnectionManager<SqliteConnection>>) -> RoutingTable {
         RoutingTable {
             id,
             table,
             rpc_manager,
             bucket_size: 1024, // TODO: make this configurable in the future
-            inbound_messages: Arc::new(Mutex::new(Some(inbound_messages))),
         }
     }
 
@@ -102,16 +95,9 @@ impl RoutingTable {
         }
     }
 
-    /// keep listening for all incoming responses and update our table
-    pub async fn run(&self) {
-        let mut inbound = {
-            self.inbound_messages
-                .lock()
-                .unwrap()
-                .take()
-                .expect("run for RoutingTable is only called once")
-        };
-
+    /// keep listening for all incoming responses and update our table; the inbox is the
+    /// caller's subscription to the broker's inbound queue
+    pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddrV4)>) {
         loop {
             tokio::select! {
                 maybe_msg = inbound.recv() => {
@@ -476,8 +462,7 @@ mod tests {
             Arc::new(TxnIdGenerator::new()),
             Ipv4Addr::LOCALHOST,
         );
-        let (_tx, rx) = mpsc::channel(1);
-        RoutingTable::new(our_id, broker, pool, rx)
+        RoutingTable::new(our_id, broker, pool)
     }
 
     fn id_with_first_byte(b: u8) -> NodeId {

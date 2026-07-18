@@ -417,8 +417,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
         );
         broker.run().await.unwrap();
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool, rx);
+        let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool);
         routing_table.add(NodeId([0xAA; 20]), addr_a);
 
         let state = Arc::new(SharedState::new(our_id, routing_table, broker, swarm_pool));

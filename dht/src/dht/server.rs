@@ -35,18 +35,18 @@ impl DhtServer {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn run(self: Arc<Self>) {
+    pub(crate) async fn run(&self) {
         let rx = self.state.rpc_manager.subscribe_inbound();
         let rx = ReceiverStream::new(rx);
         let mut requests = rx.filter(|(msg, _)| !msg.is_error() && !msg.is_response());
 
         // respond to messages, as fast as possible
         while let Some((inbound_msg, socket_addr)) = requests.next().await {
+            // the server is a cheap handle (one refcount on the shared state), so each
+            // response task just gets its own clone
             let this = self.clone();
             let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
                 async move {
-                    let this = &*this;
-
                     trace!("Handling request from {socket_addr}");
                     let response = this.generate_response(&inbound_msg.body, socket_addr);
 

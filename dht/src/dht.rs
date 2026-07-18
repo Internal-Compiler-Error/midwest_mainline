@@ -36,8 +36,8 @@ use txn_id_generator::TxnIdGenerator;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct DhtSession {
-    client: Arc<DhtClient>,
-    server: Arc<DhtServer>,
+    client: DhtClient,
+    server: DhtServer,
     rpc_manager: RpcManager,
     routing_table: RoutingTable,
     addr: SocketAddrV4,
@@ -199,7 +199,7 @@ impl DhtSession {
             external_addr,
         );
 
-        let routing_table = RoutingTable::new(our_id, rpc_manager.clone(), db.clone(), rpc_manager.subscribe_inbound());
+        let routing_table = RoutingTable::new(our_id, rpc_manager.clone(), db.clone());
 
         let state = Arc::new(SharedState::new(
             our_id,
@@ -209,10 +209,10 @@ impl DhtSession {
         ));
 
         let dht = DhtSession {
-            client: Arc::new(DhtClient::new(state.clone())),
-            server: Arc::new(DhtServer::new(state)),
+            client: DhtClient::new(state.clone()),
+            server: DhtServer::new(state),
             rpc_manager,
-            routing_table: routing_table.clone(),
+            routing_table,
             addr: local_addr,
         };
 
@@ -226,7 +226,7 @@ impl DhtSession {
             bootstrap_join_set
                 .build_task()
                 .name(&*format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(self.handle().clone(), contact))
+                .spawn(Self::bootstrap_from(self.handle(), contact))
                 .unwrap();
         }
 
@@ -264,16 +264,18 @@ impl DhtSession {
             .unwrap();
 
         let routing_table = self.routing_table.clone();
+        let router_inbox = self.rpc_manager.subscribe_inbound();
         join_set
             .build_task()
             .name("RoutingTable")
-            .spawn(async move { routing_table.clone().run().await })
+            .spawn(async move { routing_table.run(router_inbox).await })
             .unwrap();
 
+        let server = self.server.clone();
         join_set
             .build_task()
             .name("DHT server")
-            .spawn(self.server.clone().run())
+            .spawn(async move { server.run().await })
             .unwrap();
 
         join_set.join_all().await;
@@ -285,7 +287,7 @@ impl DhtSession {
     ///
     /// This is subject to change in the future.
     #[tracing::instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtClient>, endpoint: SocketAddrV4) -> Result<(), OurError> {
+    async fn bootstrap_from(dht: DhtClient, endpoint: SocketAddrV4) -> Result<(), OurError> {
         let our_id = dht.our_id();
 
         info!("bootstrapping with {endpoint}");
@@ -299,9 +301,8 @@ impl DhtSession {
         Ok(())
     }
 
-    /// Returns a handle to the lookup client. In the future the server will support some
-    /// APIs to allow you to query about its state
-    pub fn handle(&self) -> Arc<DhtClient> {
+    /// Returns a cheap handle to the lookup client; cloning is a single refcount bump
+    pub fn handle(&self) -> DhtClient {
         self.client.clone()
     }
 }
