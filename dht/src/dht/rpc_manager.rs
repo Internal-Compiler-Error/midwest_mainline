@@ -27,13 +27,13 @@ use crate::{
     utils::unix_timestmap_ms,
 };
 
-use super::{TxnIdGenerator, router::update_last_sent};
+use super::{TxnIdGenerator, routing_table::update_last_sent};
 
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
 /// so the client and await the response.
 #[derive(Debug, Clone)]
-pub struct KrpcBroker {
+pub struct RpcManager {
     /// a map to keep track of the responses we await from the client; the address is the
     /// endpoint we queried, so responses from anywhere else are ignored
     pending_responses: Arc<Mutex<HashMap<TransactionId, (SocketAddrV4, oneshot::Sender<(Krpc, SocketAddrV4)>)>>>,
@@ -58,13 +58,13 @@ impl Routable for SocketAddrV4 {
     }
 }
 
-impl KrpcBroker {
+impl RpcManager {
     pub fn new(
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
         public_ip: Ipv4Addr,
-    ) -> KrpcBroker {
+    ) -> RpcManager {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             socket: Arc::new(socket),
@@ -277,7 +277,7 @@ mod tests {
     use crate::message::ping_query::PingQuery;
     use crate::types::NodeId;
 
-    async fn test_broker() -> KrpcBroker {
+    async fn test_broker() -> RpcManager {
         let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
         let pool = Pool::builder()
             .max_size(1)
@@ -287,7 +287,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        KrpcBroker::new(socket, pool, Arc::new(TxnIdGenerator::new()), Ipv4Addr::LOCALHOST)
+        RpcManager::new(socket, pool, Arc::new(TxnIdGenerator::new()), Ipv4Addr::LOCALHOST)
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 pub mod client;
-pub mod krpc_broker;
-pub mod router;
+pub mod routing_table;
+pub mod rpc_manager;
 pub(crate) mod server;
 pub(crate) mod state;
 mod txn_id_generator;
@@ -21,9 +21,9 @@ use diesel::{
 };
 use tracing::info;
 
-use krpc_broker::KrpcBroker;
 use rand::{Rng, RngCore};
-use router::Router;
+use routing_table::RoutingTable;
+use rpc_manager::RpcManager;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
@@ -35,11 +35,11 @@ use txn_id_generator::TxnIdGenerator;
 /// tasks required to make DHT alive
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct DhtV4 {
+pub struct DhtSession {
     client: Arc<DhtClient>,
     server: Arc<DhtServer>,
-    message_broker: KrpcBroker,
-    router: Router,
+    rpc_manager: RpcManager,
+    routing_table: RoutingTable,
     addr: SocketAddrV4,
 }
 
@@ -149,7 +149,7 @@ fn recompute_buckets(our_id: &NodeId, conn: &mut SqliteConnection) -> Result<(),
         let Some(node_id) = NodeId::try_from_bytes(&raw) else {
             continue;
         };
-        let b = router::bucket_index(our_id, &node_id);
+        let b = routing_table::bucket_index(our_id, &node_id);
         diesel::update(node.filter(id.eq(&raw)))
             .set(bucket.eq(b))
             .execute(conn)?;
@@ -164,7 +164,7 @@ fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<Node
     Ok(id)
 }
 
-impl DhtV4 {
+impl DhtSession {
     /// Create a new DHT service, if the external_addr matches what was used last time, then reuse
     /// the previous identity, otherwise adopt a new id. Note there is no way to verify the external IP address
     /// is correct and it's duty to make sure it's correct.
@@ -192,32 +192,27 @@ impl DhtV4 {
 
         let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
 
-        let message_broker = KrpcBroker::new(
+        let rpc_manager = RpcManager::new(
             listen_socket,
             db.clone(),
             Arc::new(TxnIdGenerator::new()).clone(),
             external_addr,
         );
 
-        let router = Router::new(
-            our_id,
-            message_broker.clone(),
-            db.clone(),
-            message_broker.subscribe_inbound(),
-        );
+        let routing_table = RoutingTable::new(our_id, rpc_manager.clone(), db.clone(), rpc_manager.subscribe_inbound());
 
         let state = Arc::new(SharedState::new(
             our_id,
-            router.clone(),
-            message_broker.clone(),
+            routing_table.clone(),
+            rpc_manager.clone(),
             db.clone(),
         ));
 
-        let dht = DhtV4 {
+        let dht = DhtSession {
             client: Arc::new(DhtClient::new(state.clone())),
             server: Arc::new(DhtServer::new(state)),
-            message_broker,
-            router: router.clone(),
+            rpc_manager,
+            routing_table: routing_table.clone(),
             addr: local_addr,
         };
 
@@ -243,7 +238,7 @@ impl DhtV4 {
     }
 
     pub fn node_count(&self) -> usize {
-        self.router.node_count()
+        self.routing_table.node_count()
     }
 
     pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
@@ -259,20 +254,20 @@ impl DhtV4 {
     pub async fn run(&self) {
         let mut join_set = JoinSet::new();
 
-        let krpc_broker = self.message_broker.clone();
+        let rpc_manager = self.rpc_manager.clone();
         join_set
             .build_task()
             .name(&*format!("message broker for {}", self.addr))
             .spawn(async move {
-                let _ = krpc_broker.run().await;
+                let _ = rpc_manager.run().await;
             })
             .unwrap();
 
-        let router = self.router.clone();
+        let routing_table = self.routing_table.clone();
         join_set
             .build_task()
-            .name("Router")
-            .spawn(async move { router.clone().run().await })
+            .name("RoutingTable")
+            .spawn(async move { routing_table.clone().run().await })
             .unwrap();
 
         join_set
@@ -314,7 +309,7 @@ impl DhtV4 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dht::DhtV4,
+        dht::DhtSession,
         // types::{InfoHash /* , NodeId */},
     };
     // use opentelemetry::global;
@@ -360,7 +355,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:44444").unwrap())
             .await
             .unwrap();
-        let dht = DhtV4::with_stable_id(socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
+        let dht = DhtSession::with_stable_id(socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
 
         let dht = Arc::new(dht);
         let dhtt = Arc::clone(&dht);
@@ -370,9 +365,9 @@ mod tests {
         dht.bootstrap(vec![
             // dht.tansmissionbt.com
             "87.98.162.88:6881".parse().unwrap(),
-            // router.utorrent.com
+            // routing_table.utorrent.com
             "67.215.246.10:6881".parse().unwrap(),
-            // router.bittorrent.com, ironically that this almost never responds
+            // routing_table.bittorrent.com, ironically that this almost never responds
             "82.221.103.244:8991".parse().unwrap(),
             // dht.aelitis.com
             "174.129.43.152:6881".parse().unwrap(),
@@ -401,7 +396,7 @@ mod tests {
 #[cfg(test)]
 mod recompute_tests {
     use super::{SensibleOptions, resume_identity};
-    use crate::dht::router::bucket_index;
+    use crate::dht::routing_table::bucket_index;
     use crate::schema::node::dsl as node_dsl;
     use crate::types::NodeId;
     use crate::utils::{base64_enc, db_put};
@@ -442,7 +437,7 @@ mod recompute_tests {
         // a node whose bucket was computed against that old identity
         let peer_node = NodeId([0xF0; 20]);
         diesel::insert_into(node_dsl::node)
-            .values(crate::models::Node {
+            .values(crate::models::NodeRow {
                 id: peer_node.0.to_vec(),
                 bucket: bucket_index(&NodeId([0; 20]), &peer_node),
                 last_contacted: 0,

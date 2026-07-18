@@ -8,8 +8,8 @@ use rand::Rng;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use crate::dht::krpc_broker::KrpcBroker;
-use crate::dht::router::Router;
+use crate::dht::routing_table::RoutingTable;
+use crate::dht::rpc_manager::RpcManager;
 use crate::schema::{peer, swarm};
 use crate::token_generator::TokenGenerator;
 use crate::types::{InfoHash, NodeId};
@@ -21,25 +21,25 @@ pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 pub(crate) struct SharedState {
     pub(crate) our_id: NodeId,
-    pub(crate) router: Router,
+    pub(crate) routing_table: RoutingTable,
     pub(crate) conn: Pool<ConnectionManager<SqliteConnection>>,
     pub(crate) token_generator: TokenGenerator,
-    pub(crate) message_broker: KrpcBroker,
+    pub(crate) rpc_manager: RpcManager,
 }
 
 impl SharedState {
     pub(crate) fn new(
         our_id: NodeId,
-        router: Router,
-        message_broker: KrpcBroker,
+        routing_table: RoutingTable,
+        rpc_manager: RpcManager,
         conn: Pool<ConnectionManager<SqliteConnection>>,
     ) -> Self {
         Self {
             our_id,
-            router,
+            routing_table,
             conn,
             token_generator: TokenGenerator::new(rand::rng().random()),
-            message_broker,
+            rpc_manager,
         }
     }
 

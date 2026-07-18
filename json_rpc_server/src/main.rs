@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use axum::{Json, Router, extract::State, routing::post};
 use futures::future::join_all;
-use midwest_mainline::{dht::DhtV4, types::NodeId};
+use midwest_mainline::{dht::DhtSession, types::NodeId};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -90,7 +90,7 @@ async fn bootstrap_nodes() -> Vec<SocketAddrV4> {
 
 /// Randomly generates a node_id and send a find_node, used to populate the DHT
 #[instrument(skip(dht))]
-pub async fn populate_random(dht: &DhtV4) {
+pub async fn populate_random(dht: &DhtSession) {
     let node_id = {
         let mut rng = rand::rng();
         let node_id: [u8; 20] = rng.random();
@@ -121,7 +121,7 @@ fn set_up_tracing() {
 
 #[derive(Clone)]
 struct AppState {
-    pub dht: Arc<DhtV4>,
+    pub dht: Arc<DhtSession>,
 }
 
 #[tokio::main]
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 
     let external_ip = public_ip::addr_v4().await.unwrap();
     let dht_socket = UdpSocket::bind("0.0.0.0:44444".parse::<SocketAddr>()?).await?;
-    let dht = DhtV4::with_stable_id(dht_socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
+    let dht = DhtSession::with_stable_id(dht_socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
 
     let mut event_loops = JoinSet::new();
 

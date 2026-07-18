@@ -46,7 +46,7 @@ impl DhtClient {
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
         let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.state.our_id));
 
-        let response = self.state.message_broker.query(ping_msg, &peer, REQ_TIMEOUT).await?;
+        let response = self.state.rpc_manager.query(ping_msg, &peer, REQ_TIMEOUT).await?;
 
         return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
             Ok(*response.target_id())
@@ -63,12 +63,12 @@ impl DhtClient {
         // error per se, it's still desirable to deliver these information to the caller somehow
 
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self.state.router).find_exact(&target) {
+        if let Some(node) = (&self.state.routing_table).find_exact(&target) {
             return vec![node];
         }
 
         // find the closest nodes that we know
-        let mut closest = self.state.router.find_closest(target);
+        let mut closest = self.state.routing_table.find_closest(target);
         // ids we've already sent a query to; consulted and updated every round
         let mut queried: HashSet<NodeId> = HashSet::new();
         let mut querying: Vec<NodeInfo> = vec![];
@@ -113,7 +113,7 @@ impl DhtClient {
                     Ok(nodes) => returned_nodes.extend(nodes),
                     // timeouts and the like: record the failure so repeated ones get the
                     // node evicted
-                    Err(_) => self.state.router.mark_failed(&node_id),
+                    Err(_) => self.state.routing_table.mark_failed(&node_id),
                 }
             }
 
@@ -148,7 +148,7 @@ impl DhtClient {
         let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.state.our_id, target));
 
         // send the message and await for a response
-        let response = self.state.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
         let body = response.body;
 
         if let KrpcBody::FindNodeGetPeersResponse(find_node_response) = body {
@@ -179,7 +179,7 @@ impl DhtClient {
         // iterative lookup: query the closest-known nodes, follow their `nodes` referrals
         // towards the info hash, and harvest peers and tokens along the way
         let target = NodeId(info_hash.0);
-        let mut closest = self.state.router.find_closest(target);
+        let mut closest = self.state.routing_table.find_closest(target);
         let mut queried: HashSet<NodeId> = HashSet::new();
         let mut peers: Vec<SocketAddrV4> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
@@ -220,7 +220,7 @@ impl DhtClient {
                         }
                         returned_nodes.extend(nodes);
                     }
-                    Err(_) => self.state.router.mark_failed(&node.id()),
+                    Err(_) => self.state.routing_table.mark_failed(&node.id()),
                 }
             }
 
@@ -256,7 +256,7 @@ impl DhtClient {
             token,
         ));
 
-        let response = self.state.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;
+        let response = self.state.rpc_manager.query(query, &recipient, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
@@ -277,7 +277,7 @@ impl DhtClient {
         let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash));
 
         // send the message and await for a response
-        let response = self.state.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::ErrorResponse(response) => {
@@ -309,8 +309,8 @@ impl DhtClient {
 mod tests {
     use super::*;
     use crate::dht::SensibleOptions;
-    use crate::dht::krpc_broker::KrpcBroker;
-    use crate::dht::router::Router;
+    use crate::dht::routing_table::RoutingTable;
+    use crate::dht::rpc_manager::RpcManager;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::message::find_node_get_peers_response::Builder as ResBuilder;
     use crate::message::{Krpc, ParseKrpc};
@@ -410,7 +410,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = KrpcBroker::new(
+        let broker = RpcManager::new(
             socket,
             router_pool.clone(),
             Arc::new(TxnIdGenerator::new()),
@@ -418,10 +418,10 @@ mod tests {
         );
         broker.run().await.unwrap();
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let router = Router::new(our_id, broker.clone(), router_pool, rx);
-        router.add(NodeId([0xAA; 20]), addr_a);
+        let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool, rx);
+        routing_table.add(NodeId([0xAA; 20]), addr_a);
 
-        let state = Arc::new(SharedState::new(our_id, router, broker, swarm_pool));
+        let state = Arc::new(SharedState::new(our_id, routing_table, broker, swarm_pool));
         let client = DhtClient::new(state);
 
         let result = client.get_peers(InfoHash([0xFF; 20])).await.unwrap();

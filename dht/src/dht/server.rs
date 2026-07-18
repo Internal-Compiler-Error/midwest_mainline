@@ -36,7 +36,7 @@ impl DhtServer {
 
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(self: Arc<Self>) {
-        let rx = self.state.message_broker.subscribe_inbound();
+        let rx = self.state.rpc_manager.subscribe_inbound();
         let rx = ReceiverStream::new(rx);
         let mut requests = rx.filter(|(msg, _)| !msg.is_error() && !msg.is_response());
 
@@ -53,7 +53,7 @@ impl DhtServer {
                     let txn_id = inbound_msg.transaction_id().clone();
                     let node_info =
                         NodeInfo::new(inbound_msg.node_id().expect("non qeuries are filtered"), socket_addr);
-                    this.state.message_broker.reply(response, &node_info, txn_id);
+                    this.state.rpc_manager.reply(response, &node_info, txn_id);
                     trace!("response sending for {socket_addr}");
                 }
                 .instrument(info_span!("handle_requests")),
@@ -81,7 +81,7 @@ impl DhtServer {
 
     #[tracing::instrument(skip(self))]
     fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> KrpcBody {
-        let table = &self.state.router;
+        let table = &self.state.routing_table;
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
@@ -111,7 +111,7 @@ impl DhtServer {
             // when we don't have peer info on an info hash, respond with the closest nodes
             // we know *to that info hash* so the querier can iterate towards it
             let target = NodeId(query.info_hash().0);
-            let closest_eight: Vec<_> = self.state.router.find_closest(target).into_iter().collect();
+            let closest_eight: Vec<_> = self.state.routing_table.find_closest(target).into_iter().collect();
 
             let res = ResBuilder::new(self.state.our_id)
                 .with_token(token)

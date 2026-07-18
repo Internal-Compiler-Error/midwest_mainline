@@ -60,35 +60,37 @@ about using unstable features.
 The library is still in beta, I am aware the interfaces are quite clunky
 
 ``` rust
-use std::io;
-use midwest_mainline::dht_service;
-use midwest_mainline::dht_service::DhtV4;
+use midwest_mainline::dht::DhtSession;
+use std::env;
 use std::net::SocketAddrV4;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_ip = public_ip::addr_v4().await.unwrap();
-    let dht = DhtV4::bootstrap_with_random_id(
-                    SocketAddrV4::from_str("0.0.0.0:51413").unwrap(),
-                    external_ip,
-                    vec![
-                    // dht.tansmissionbt.com
-                    "87.98.162.88:6881".parse().unwrap(),
-                    // router.utorrent.com
-                    "67.215.246.10:6881".parse().unwrap(),
-                    // router.bittorrent.com, ironically that this almost never responds
-                    "82.221.103.244:6881".parse().unwrap(),
-                    // dht.aelitis.com
-                    "174.129.43.152:6881".parse().unwrap(),
-                ],
-        ).await?;
-    let client = dht.client();
+    let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:51413")?).await?;
+    let dht = Arc::new(DhtSession::with_stable_id(socket, external_ip, &env::var("DATABASE_URL")?)?);
 
-    // make sure this is alive
-    tokio::spawn(dht.run());
+    let _event_loop = tokio::spawn({
+        let dht = Arc::clone(&dht);
+        async move { dht.run().await }
+    });
 
-    // now you can do hackerman things with the client
+    dht.bootstrap(vec![
+        // dht.tansmissionbt.com
+        "87.98.162.88:6881".parse()?,
+        // router.utorrent.com
+        "67.215.246.10:6881".parse()?,
+        // router.bittorrent.com, ironically that this almost never responds
+        "82.221.103.244:8991".parse()?,
+        // dht.aelitis.com
+        "174.129.43.152:6881".parse()?,
+    ])
+    .await?;
+
+    // now you can do hackerman things with dht.handle()
 
     Ok(())
 }

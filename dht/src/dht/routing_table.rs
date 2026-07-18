@@ -24,7 +24,7 @@ use crate::{
     types::{self, NodeId, NodeInfo},
 };
 
-use super::krpc_broker::KrpcBroker;
+use super::rpc_manager::RpcManager;
 use super::state::REQ_TIMEOUT;
 
 /// Which of the 160 buckets `target` falls into, relative to `our_id`.
@@ -43,11 +43,11 @@ pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
 }
 
 #[derive(Debug, Clone)]
-/// A Router will tell you who are the closest nodes that we know
-pub struct Router {
+/// A RoutingTable will tell you who are the closest nodes that we know
+pub struct RoutingTable {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
-    message_broker: KrpcBroker,
+    rpc_manager: RpcManager,
     /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
     /// We keep 160 flat buckets of 1024 and let `find_closest` gather across buckets;
     /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
@@ -56,17 +56,17 @@ pub struct Router {
     inbound_messages: Arc<Mutex<Option<mpsc::Receiver<(Krpc, SocketAddrV4)>>>>,
 }
 
-impl Router {
+impl RoutingTable {
     pub fn new(
         id: NodeId,
-        message_broker: KrpcBroker,
+        rpc_manager: RpcManager,
         table: Pool<ConnectionManager<SqliteConnection>>,
         inbound_messages: mpsc::Receiver<(Krpc, SocketAddrV4)>,
-    ) -> Router {
-        Router {
+    ) -> RoutingTable {
+        RoutingTable {
             id,
             table,
-            message_broker,
+            rpc_manager,
             bucket_size: 1024, // TODO: make this configurable in the future
             inbound_messages: Arc::new(Mutex::new(Some(inbound_messages))),
         }
@@ -109,7 +109,7 @@ impl Router {
                 .lock()
                 .unwrap()
                 .take()
-                .expect("run for Router is only called once")
+                .expect("run for RoutingTable is only called once")
         };
 
         loop {
@@ -286,7 +286,7 @@ impl Router {
     }
 
     /// Find the list of "problematic" nodes that if not responded, should be removed
-    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<crate::models::Node> {
+    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<crate::models::NodeRow> {
         use crate::schema::node::dsl::*;
 
         fn cutoff() -> i64 {
@@ -299,7 +299,7 @@ impl Router {
             .filter(failed_requests.ge(3)) // TODO: make this configurable
             .filter(last_sent.le(cutoff()))
             .order(last_contacted.desc())
-            .select(crate::models::Node::as_select())
+            .select(crate::models::NodeRow::as_select())
             .get_results(conn)
             .unwrap()
     }
@@ -313,7 +313,7 @@ impl Router {
             update_last_sent(&target.id(), unix_timestmap_ms(), &mut conn);
         }
 
-        let response = self.message_broker.query(ping_msg, target, REQ_TIMEOUT).await;
+        let response = self.rpc_manager.query(ping_msg, target, REQ_TIMEOUT).await;
         let mut conn = self.conn();
         match response {
             Ok(_) => self.marks_as_good(&target.id(), &mut conn),
@@ -406,7 +406,7 @@ impl Router {
 
         let index = self.index(&nodee.id());
         let _ = insert_into(node)
-            .values(crate::models::Node {
+            .values(crate::models::NodeRow {
                 id: nodee.id().0.to_vec(),
                 bucket: index,
                 last_contacted: unix_timestmap_ms(),
@@ -439,10 +439,10 @@ mod tests {
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use tokio::net::UdpSocket;
 
-    /// A Router over a single-connection in-memory sqlite pool (max_size 1 so every
+    /// A RoutingTable over a single-connection in-memory sqlite pool (max_size 1 so every
     /// checkout shares the same in-memory database), with the same connection
     /// customizer as production (the custom `xor()` SQL function lives there).
-    async fn test_router(our_id: NodeId) -> Router {
+    async fn test_routing_table(our_id: NodeId) -> RoutingTable {
         let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
         let pool = Pool::builder()
             .max_size(1)
@@ -470,14 +470,14 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = KrpcBroker::new(
+        let broker = RpcManager::new(
             socket,
             pool.clone(),
             Arc::new(TxnIdGenerator::new()),
             Ipv4Addr::LOCALHOST,
         );
         let (_tx, rx) = mpsc::channel(1);
-        Router::new(our_id, broker, pool, rx)
+        RoutingTable::new(our_id, broker, pool, rx)
     }
 
     fn id_with_first_byte(b: u8) -> NodeId {
@@ -492,18 +492,18 @@ mod tests {
 
     #[tokio::test]
     async fn find_closest_orders_by_distance_to_the_target_not_to_us() {
-        let router = test_router(NodeId([0x00; 20])).await;
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
 
         // distances to target [0xFF..]: a=0x0F, b=0xF0, c=0xFE  ->  a < b < c
         // distances to us [0x00..]:     c=0x01, b=0x0F, a=0xF0  ->  c < b < a
         let a = id_with_first_byte(0xF0);
         let b = id_with_first_byte(0x0F);
         let c = id_with_first_byte(0x01);
-        router.add(a, addr(1));
-        router.add(b, addr(2));
-        router.add(c, addr(3));
+        routing_table.add(a, addr(1));
+        routing_table.add(b, addr(2));
+        routing_table.add(c, addr(3));
 
-        let closest = router.find_closest(id_with_first_byte(0xFF));
+        let closest = routing_table.find_closest(id_with_first_byte(0xFF));
         let ids: Vec<NodeId> = closest.iter().map(|n| n.id()).collect();
         assert_eq!(ids, vec![a, b, c], "must be ordered by xor distance to the target");
     }
@@ -512,14 +512,14 @@ mod tests {
     async fn failed_queries_increment_and_good_news_resets() {
         use crate::schema::node::dsl::*;
 
-        let router = test_router(NodeId([0x00; 20])).await;
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
         let a = id_with_first_byte(0xF0);
-        router.add(a, addr(1));
+        routing_table.add(a, addr(1));
 
-        router.mark_failed(&a);
-        router.mark_failed(&a);
+        routing_table.mark_failed(&a);
+        routing_table.mark_failed(&a);
 
-        let mut conn = router.table.get().unwrap();
+        let mut conn = routing_table.table.get().unwrap();
         let failed: i32 = node
             .filter(id.eq(a.0.to_vec()))
             .select(failed_requests)
@@ -527,7 +527,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed, 2, "each failed RPC must increment the counter");
 
-        router.marks_as_good(&a, &mut conn);
+        routing_table.marks_as_good(&a, &mut conn);
         let failed: i32 = node
             .filter(id.eq(a.0.to_vec()))
             .select(failed_requests)
@@ -538,20 +538,20 @@ mod tests {
 
     #[tokio::test]
     async fn find_closest_scans_outwards_from_the_targets_bucket() {
-        let router = test_router(NodeId([0x00; 20])).await;
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
 
         // put two nodes *near the target* (high first byte) and six near us (low first
         // byte); the eight closest to the target must include both high nodes, even
         // though they are the farthest from us
         let near_target = [0xF0u8, 0xE0];
         for (i, b) in near_target.iter().enumerate() {
-            router.add(id_with_first_byte(*b), addr(i as u8));
+            routing_table.add(id_with_first_byte(*b), addr(i as u8));
         }
         for i in 0..6u8 {
-            router.add(id_with_first_byte(i + 1), addr(10 + i));
+            routing_table.add(id_with_first_byte(i + 1), addr(10 + i));
         }
 
-        let closest = router.find_closest(id_with_first_byte(0xFF));
+        let closest = routing_table.find_closest(id_with_first_byte(0xFF));
         let ids: Vec<NodeId> = closest.iter().map(|n| n.id()).collect();
         assert_eq!(ids.len(), 8);
         assert_eq!(ids[0], id_with_first_byte(0xF0));

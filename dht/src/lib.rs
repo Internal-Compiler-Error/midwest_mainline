@@ -50,7 +50,7 @@
 //! The library is still in beta, I am aware the interfaces are quite clunky
 //!
 //! ```no_run
-//! use midwest_mainline::dht::DhtV4;
+//! use midwest_mainline::dht::DhtSession;
 //! use std::env;
 //! use std::net::SocketAddrV4;
 //! use std::str::FromStr;
@@ -61,7 +61,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let external_ip = public_ip::addr_v4().await.unwrap();
 //!     let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:51413")?).await?;
-//!     let dht = Arc::new(DhtV4::with_stable_id(socket, external_ip, &env::var("DATABASE_URL")?)?);
+//!     let dht = Arc::new(DhtSession::with_stable_id(socket, external_ip, &env::var("DATABASE_URL")?)?);
 //!
 //!     let _event_loop = tokio::spawn({
 //!         let dht = Arc::clone(&dht);
@@ -71,9 +71,9 @@
 //!     dht.bootstrap(vec![
 //!         // dht.tansmissionbt.com
 //!         "87.98.162.88:6881".parse()?,
-//!         // router.utorrent.com
+//!         // routing_table.utorrent.com
 //!         "67.215.246.10:6881".parse()?,
-//!         // router.bittorrent.com, ironically that this almost never responds
+//!         // routing_table.bittorrent.com, ironically that this almost never responds
 //!         "82.221.103.244:8991".parse()?,
 //!         // dht.aelitis.com
 //!         "174.129.43.152:6881".parse()?,
