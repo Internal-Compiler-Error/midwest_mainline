@@ -38,9 +38,4 @@ diesel::table! {
 
 diesel::joinable!(peer -> swarm (swarm));
 
-diesel::allow_tables_to_appear_in_same_query!(
-    misc,
-    node,
-    peer,
-    swarm,
-);
+diesel::allow_tables_to_appear_in_same_query!(misc, node, peer, swarm,);

@@ -1,53 +1,23 @@
-use crate::message::error::KrpcError;
-use crate::message::ping_announce_peer_response::PingAnnouncePeerResponse;
-use crate::schema::*;
-use crate::token_generator::TokenGenerator;
-use crate::types::{MAX_DIST, cmp_resp};
-use crate::utils::unix_timestmap_ms;
-use crate::{
-    message::{
-        KrpcBody, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
-        get_peers_query::GetPeersQuery, ping_query::PingQuery,
-    },
-    our_error::{OurError, naur},
-    types::{InfoHash, NodeId, NodeInfo, Token},
-};
-use diesel::insert_into;
-use diesel::r2d2::{Pool, PooledConnection};
-use diesel::{prelude::*, r2d2::ConnectionManager};
+//! The client half of the DHT: iterative lookups (find_node, get_peers), ping, and
+//! announce_peer, using the shared state. Clone it freely, everything it touches is
+//! shared.
+
 use futures::future::join_all;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+use tracing::{info, warn};
 
-use crate::message::find_node_get_peers_response::Builder as ResBuilder;
-use rand::prelude::*;
-use std::cmp::min;
-use std::{
-    collections::HashSet,
-    net::{Ipv4Addr, SocketAddrV4},
-    sync::Arc,
-    time::Duration,
+use crate::dht::state::{REQ_TIMEOUT, SharedState};
+use crate::message::{
+    KrpcBody, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
+    ping_query::PingQuery,
 };
-use tokio::task::Builder as TskBuilder;
-use tracing::{Instrument, error, info, info_span, trace, warn};
+use crate::our_error::{OurError, naur};
+use crate::types::{InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 
-use super::{KrpcBroker, router::Router};
-
-// TODO: make these configurable some day
-pub const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUNDS_LIMIT: i32 = 8;
 const CONCURRENT_REQS: usize = 3;
-
-#[derive(Debug)]
-pub struct DhtHandle {
-    pub(crate) our_id: NodeId,
-    pub(crate) router: Router,
-
-    conn: Pool<ConnectionManager<SqliteConnection>>,
-
-    token_generator: TokenGenerator,
-    message_broker: KrpcBroker,
-}
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
 #[derive(Debug)]
@@ -58,212 +28,25 @@ pub struct GetPeersResult {
     pub announce_candidates: Vec<(NodeInfo, Token)>,
 }
 
-impl DhtHandle {
-    pub(crate) fn new(
-        id: NodeId,
-        router: Router,
-        message_broker: KrpcBroker,
-        swarms: Pool<ConnectionManager<SqliteConnection>>,
-    ) -> Self {
-        let mut rng = rand::rng();
-        let seed: u128 = rng.random();
+#[derive(Debug, Clone)]
+pub struct DhtClient {
+    state: Arc<SharedState>,
+}
 
-        Self {
-            conn: swarms,
-            token_generator: TokenGenerator::new(seed),
-            our_id: id,
-            router,
-            message_broker,
-        }
+impl DhtClient {
+    pub(crate) fn new(state: Arc<SharedState>) -> Self {
+        Self { state }
     }
 
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn run(self: Arc<Self>) {
-        let rx = self.message_broker.subscribe_inbound();
-        let rx = ReceiverStream::new(rx);
-        let mut requests = rx.filter(|(msg, _)| !msg.is_error() && !msg.is_response());
-
-        // respond to messages, as fast as possible
-        while let Some((inbound_msg, socket_addr)) = requests.next().await {
-            let this = self.clone();
-            let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
-                async move {
-                    let this = &*this;
-
-                    trace!("Handling request from {socket_addr}");
-                    let response = this.generate_response(&inbound_msg.body, socket_addr);
-
-                    let txn_id = inbound_msg.transaction_id().clone();
-                    let node_info =
-                        NodeInfo::new(inbound_msg.node_id().expect("non qeuries are filtered"), socket_addr);
-                    this.message_broker.reply(response, &node_info, txn_id);
-                    trace!("response sending for {socket_addr}");
-                }
-                .instrument(info_span!("handle_requests")),
-            );
-        }
+    pub fn our_id(&self) -> NodeId {
+        self.state.our_id
     }
-
-    /**************************************   SERVER SECTION   *********************************************/
-
-    #[tracing::instrument(skip(self))]
-    fn generate_response(&self, request: &KrpcBody, from: SocketAddrV4) -> KrpcBody {
-        assert!(request.is_query());
-
-        match request {
-            KrpcBody::PingQuery(ping) => self.generate_ping_response(ping, from),
-            KrpcBody::FindNodeQuery(find_node) => self.generate_find_node_response(find_node, from),
-            KrpcBody::AnnouncePeerQuery(announce_peer) => self.generate_announce_peer_response(announce_peer, from),
-            KrpcBody::GetPeersQuery(get_peers) => self.generate_get_peers_response(get_peers, from),
-            _ => unreachable!("caught by assert"),
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> KrpcBody {
-        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.our_id.clone()))
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> KrpcBody {
-        let table = &self.router;
-        let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
-
-        // if we have an exact match, it will be the first element in the vector
-        return if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
-            let res = ResBuilder::new(self.our_id).with_node(closest_eight[0].clone()).build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        } else {
-            let stupid: Vec<_> = closest_eight.into_iter().collect();
-            let res = ResBuilder::new(self.our_id).with_nodes(&stupid).build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        };
-    }
-
-    fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<SocketAddrV4> {
-        // peers are considered expired 45 minutes after their announce (BEP 5's suggested
-        // lifetime); the cap keeps get_peers responses comfortably inside a datagram
-        fn cutoff() -> i64 {
-            let forty_five_minutes_ms = 45 * 60 * 1000;
-            unix_timestmap_ms() - forty_five_minutes_ms
-        }
-
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-
-        let peers = peer::table
-            .inner_join(swarm::table.on(peer::swarm.eq(swarm::info_hash)))
-            .filter(swarm::info_hash.eq(&info_hash.0))
-            .filter(peer::last_announced.ge(cutoff()))
-            .select((peer::ip_addr, peer::port))
-            .limit(50)
-            .load::<(String, i32)>(&mut conn)
-            .unwrap();
-        let peers: Vec<SocketAddrV4> = peers
-            .into_iter()
-            .map(|(ip, port)| {
-                assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
-
-                let ip: Ipv4Addr = ip.parse().expect(&format!(
-                    "invalid ip string representation got into the database: {}",
-                    ip
-                ));
-                SocketAddrV4::new(ip, port as u16)
-            })
-            .collect();
-        peers
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> KrpcBody {
-        let peers = self.swarm_peers(query.info_hash());
-        let token_pool = &self.token_generator;
-
-        let token = token_pool.token_for_ip(origin.ip());
-        if !peers.is_empty() {
-            let res = ResBuilder::new(self.our_id.clone())
-                .with_token(token)
-                .with_values(&*peers)
-                .build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        } else {
-            // when we don't have peer info on an info hash, respond with the closest nodes
-            // we know *to that info hash* so the querier can iterate towards it
-            let target = NodeId(query.info_hash().0);
-            let closest_eight: Vec<_> = self.router.find_closest(target).into_iter().collect();
-
-            let res = ResBuilder::new(self.our_id.clone())
-                .with_token(token)
-                .with_nodes(&closest_eight)
-                .build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> KrpcBody {
-        // the token must have been issued to this IP address (BEP 5)
-        if !self.token_generator.is_valid_token(origin.ip(), announce.token()) {
-            return KrpcBody::ErrorResponse(KrpcError::new_protocol());
-        }
-
-        // generate the correct peer contact according to the implied port argument, the port
-        // argument is ignored if the implied port is not 0 and we use the origin port instead
-        let peer_contact = {
-            if !announce.implied_port() {
-                SocketAddrV4::new(*origin.ip(), announce.port())
-            } else {
-                origin
-            }
-        };
-
-        let mut conn = self.conn.get().unwrap();
-        let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, &mut conn).inspect_err(|e| warn!("{e}"));
-
-        KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.our_id.clone()))
-    }
-
-    fn add_peers_to_db(
-        info_hash: &InfoHash,
-        peer_contact: SocketAddrV4,
-        conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
-    ) -> Result<usize, diesel::result::Error> {
-        // the ensure that the swarm bit should probably be a separate function
-        conn.transaction(|conn| {
-            let info_hash = info_hash.as_bytes().to_vec();
-            let _ = insert_into(swarm::table)
-                .values(swarm::info_hash.eq(&info_hash))
-                .on_conflict_do_nothing()
-                .execute(conn)
-                .inspect_err(|e| error!("{e}"))?;
-
-            let now = unix_timestmap_ms();
-            insert_into(peer::table)
-                .values(
-                    // NOTE: this comes in the host native endianness, but it should be fine as long as the db
-                    // file is not transferred between computers
-                    (
-                        peer::ip_addr.eq(peer_contact.ip().to_string()),
-                        peer::port.eq(peer_contact.port() as i32),
-                        peer::swarm.eq(info_hash),
-                        peer::last_announced.eq(now),
-                    ),
-                )
-                .on_conflict((peer::ip_addr, peer::port, peer::swarm))
-                .do_update()
-                .set(peer::last_announced.eq(now))
-                .execute(conn)
-                .inspect_err(|e| warn!("{e}"))
-        })
-    }
-    /**************************************   CLIENT SECTION   *********************************************/
-
-    // TODO: need a function to send with timeout, unsubscribe and clean up when timeout expires
 
     #[tracing::instrument(skip(self))]
     pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
-        let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.our_id));
+        let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.state.our_id));
 
-        let response = self.message_broker.query(ping_msg, &peer, REQ_TIMEOUT).await?;
+        let response = self.state.message_broker.query(ping_msg, &peer, REQ_TIMEOUT).await?;
 
         return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
             Ok(*response.target_id())
@@ -280,12 +63,12 @@ impl DhtHandle {
         // error per se, it's still desirable to deliver these information to the caller somehow
 
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self).router.find_exact(&target) {
+        if let Some(node) = (&self.state.router).find_exact(&target) {
             return vec![node];
         }
 
         // find the closest nodes that we know
-        let mut closest = self.router.find_closest(target);
+        let mut closest = self.state.router.find_closest(target);
         // ids we've already sent a query to; consulted and updated every round
         let mut queried: HashSet<NodeId> = HashSet::new();
         let mut querying: Vec<NodeInfo> = vec![];
@@ -330,7 +113,7 @@ impl DhtHandle {
                     Ok(nodes) => returned_nodes.extend(nodes),
                     // timeouts and the like: record the failure so repeated ones get the
                     // node evicted
-                    Err(_) => self.router.mark_failed(&node_id),
+                    Err(_) => self.state.router.mark_failed(&node_id),
                 }
             }
 
@@ -362,10 +145,10 @@ impl DhtHandle {
     #[tracing::instrument(skip(self))]
     async fn send_find_nodes_rpc(&self, dest: SocketAddrV4, target: NodeId) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
-        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.our_id, target));
+        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.state.our_id, target));
 
         // send the message and await for a response
-        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.state.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
         let body = response.body;
 
         if let KrpcBody::FindNodeGetPeersResponse(find_node_response) = body {
@@ -375,8 +158,9 @@ impl DhtHandle {
             nodes.sort_unstable();
             nodes.dedup();
 
-            Result::Ok(nodes)
+            Ok(nodes)
         } else {
+            warn!("Did not get a find node response, got {:?}", body);
             Err(naur!("Did not get a find node response"))
         }
     }
@@ -384,7 +168,7 @@ impl DhtHandle {
     #[tracing::instrument(skip(self))]
     pub async fn get_peers(&self, info_hash: InfoHash) -> Result<GetPeersResult, OurError> {
         // peers others announced *to us* are served from the local store immediately
-        let known_peers = self.swarm_peers(&info_hash);
+        let known_peers = self.state.swarm_peers(&info_hash);
         if !known_peers.is_empty() {
             return Ok(GetPeersResult {
                 peers: known_peers,
@@ -395,7 +179,7 @@ impl DhtHandle {
         // iterative lookup: query the closest-known nodes, follow their `nodes` referrals
         // towards the info hash, and harvest peers and tokens along the way
         let target = NodeId(info_hash.0);
-        let mut closest = self.router.find_closest(target);
+        let mut closest = self.state.router.find_closest(target);
         let mut queried: HashSet<NodeId> = HashSet::new();
         let mut peers: Vec<SocketAddrV4> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
@@ -436,7 +220,7 @@ impl DhtHandle {
                         }
                         returned_nodes.extend(nodes);
                     }
-                    Err(_) => self.router.mark_failed(&node.id()),
+                    Err(_) => self.state.router.mark_failed(&node.id()),
                 }
             }
 
@@ -465,14 +249,14 @@ impl DhtHandle {
     ) -> Result<(), OurError> {
         // 6881 is a default port when implied_port is used
         let query = KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
-            self.our_id.clone(),
+            self.state.our_id.clone(),
             port.is_none(),
             port.unwrap_or(6881),
             info_hash,
             token,
         ));
 
-        let response = self.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;
+        let response = self.state.message_broker.query(query, &recipient, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
@@ -489,12 +273,11 @@ impl DhtHandle {
         dest: SocketAddrV4,
         info_hash: InfoHash,
     ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {
-        trace!("Asking {:?} for peers", dest);
         // construct the message to query our friends
-        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.our_id.clone(), info_hash));
+        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id.clone(), info_hash));
 
         // send the message and await for a response
-        let response = self.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
+        let response = self.state.message_broker.query(query, &dest, REQ_TIMEOUT).await?;
 
         return match response.body {
             KrpcBody::ErrorResponse(response) => {
@@ -526,10 +309,14 @@ impl DhtHandle {
 mod tests {
     use super::*;
     use crate::dht::SensibleOptions;
+    use crate::dht::krpc_broker::KrpcBroker;
+    use crate::dht::router::Router;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::message::find_node_get_peers_response::Builder as ResBuilder;
     use crate::message::{Krpc, ParseKrpc};
+    use diesel::SqliteConnection;
     use diesel::connection::SimpleConnection;
+    use diesel::r2d2::{ConnectionManager, Pool};
     use std::net::SocketAddr;
     use tokio::net::UdpSocket;
 
@@ -594,7 +381,7 @@ mod tests {
         );
         tokio::spawn(fake_dht_node(socket_a, body_a));
 
-        // our handle, with node A as the entire routing table
+        // our client, with node A as the entire routing table
         let router_pool = test_pool(
             "CREATE TABLE node (
                 id BLOB PRIMARY KEY,
@@ -633,9 +420,11 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let router = Router::new(our_id, broker.clone(), router_pool, rx);
         router.add(NodeId([0xAA; 20]), addr_a);
-        let handle = DhtHandle::new(our_id, router, broker, swarm_pool);
 
-        let result = handle.get_peers(InfoHash([0xFF; 20])).await.unwrap();
+        let state = Arc::new(SharedState::new(our_id, router, broker, swarm_pool));
+        let client = DhtClient::new(state);
+
+        let result = client.get_peers(InfoHash([0xFF; 20])).await.unwrap();
 
         assert_eq!(result.peers, vec![peer_x], "the referral must be followed to B");
         assert!(

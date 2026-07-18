@@ -1,10 +1,14 @@
-pub mod dht_handle;
+pub mod client;
 pub mod krpc_broker;
 pub mod router;
+pub(crate) mod server;
+pub(crate) mod state;
 mod txn_id_generator;
 
 use crate::{
-    dht::dht_handle::DhtHandle,
+    dht::client::DhtClient,
+    dht::server::DhtServer,
+    dht::state::SharedState,
     our_error::OurError,
     types::{InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
     utils::{base64_dec, base64_enc, db_get, db_put},
@@ -32,7 +36,8 @@ use txn_id_generator::TxnIdGenerator;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct DhtV4 {
-    server: Arc<DhtHandle>,
+    client: Arc<DhtClient>,
+    server: Arc<DhtServer>,
     message_broker: KrpcBroker,
     router: Router,
     addr: SocketAddrV4,
@@ -201,7 +206,7 @@ impl DhtV4 {
             message_broker.subscribe_inbound(),
         );
 
-        let server = Arc::new(DhtHandle::new(
+        let state = Arc::new(SharedState::new(
             our_id,
             router.clone(),
             message_broker.clone(),
@@ -209,7 +214,8 @@ impl DhtV4 {
         ));
 
         let dht = DhtV4 {
-            server: server.clone(),
+            client: Arc::new(DhtClient::new(state.clone())),
+            server: Arc::new(DhtServer::new(state)),
             message_broker,
             router: router.clone(),
             addr: local_addr,
@@ -241,11 +247,11 @@ impl DhtV4 {
     }
 
     pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
-        self.server.find_node(target).await
+        self.client.find_node(target).await
     }
 
-    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<dht_handle::GetPeersResult, OurError> {
-        self.server.get_peers(info_hash).await
+    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<client::GetPeersResult, OurError> {
+        self.client.get_peers(info_hash).await
     }
 
     /// Keep the DHT running so you can use the clients and servers, usually you put spawn this
@@ -284,8 +290,8 @@ impl DhtV4 {
     ///
     /// This is subject to change in the future.
     #[tracing::instrument(skip_all)]
-    async fn bootstrap_from(dht: Arc<DhtHandle>, endpoint: SocketAddrV4) -> Result<(), OurError> {
-        let our_id = dht.our_id.clone();
+    async fn bootstrap_from(dht: Arc<DhtClient>, endpoint: SocketAddrV4) -> Result<(), OurError> {
+        let our_id = dht.our_id();
 
         info!("bootstrapping with {endpoint}");
 
@@ -298,10 +304,10 @@ impl DhtV4 {
         Ok(())
     }
 
-    /// Returns a handle to the server, currently there is no public API for the server. In the
-    /// the sever will support some APIs to allow you to query about its state
-    pub fn handle(&self) -> Arc<DhtHandle> {
-        self.server.clone()
+    /// Returns a handle to the lookup client. In the future the server will support some
+    /// APIs to allow you to query about its state
+    pub fn handle(&self) -> Arc<DhtClient> {
+        self.client.clone()
     }
 }
 

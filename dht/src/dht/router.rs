@@ -24,8 +24,8 @@ use crate::{
     types::{self, NodeId, NodeInfo},
 };
 
-use super::dht_handle::REQ_TIMEOUT;
 use super::krpc_broker::KrpcBroker;
+use super::state::REQ_TIMEOUT;
 
 /// Which of the 160 buckets `target` falls into, relative to `our_id`.
 pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
