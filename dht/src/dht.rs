@@ -224,11 +224,8 @@ impl DhtV4 {
         self.server.find_node(target).await
     }
 
-    pub async fn get_peers(&self, info_hash: InfoHash) -> Vec<SocketAddrV4> {
-        match self.server.get_peers(info_hash).await {
-            Result::Ok(peers) => peers,
-            _ => vec![],
-        }
+    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<dht_handle::GetPeersResult, OurError> {
+        self.server.get_peers(info_hash).await
     }
 
     /// Keep the DHT running so you can use the clients and servers, usually you put spawn this
