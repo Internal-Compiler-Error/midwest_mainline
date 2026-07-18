@@ -1,6 +1,5 @@
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
-use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::r2d2::PooledConnection;
@@ -423,6 +422,7 @@ mod tests {
     use super::*;
     use crate::dht::SensibleOptions;
     use crate::dht::txn_id_generator::TxnIdGenerator;
+    use std::sync::Arc;
     use tokio::net::UdpSocket;
 
     /// A RoutingTable over a single-connection in-memory sqlite pool (max_size 1 so every
