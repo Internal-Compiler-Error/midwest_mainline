@@ -84,7 +84,15 @@ impl KrpcBroker {
             let mut buf = [0u8; 1500];
 
             loop {
-                let (amount, socket_addr) = socket.recv_from(&mut buf).await.unwrap();
+                // recv_from can fail transiently (e.g. ICMP port-unreachable from an
+                // earlier send on macOS/BSD); that must not kill the broker loop
+                let (amount, socket_addr) = match socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("udp recv_from failed: {e}");
+                        continue;
+                    }
+                };
                 trace!("received packet from {socket_addr}");
                 match (&buf[..amount]).parse() {
                     Ok(msg) => {
@@ -157,7 +165,9 @@ impl KrpcBroker {
         let buf = msg.encode_with_additional(&HashMap::new());
 
         tokio::spawn(async move {
-            socket.send_to(&buf, peer).await.unwrap();
+            if let Err(e) = socket.send_to(&buf, peer).await {
+                warn!("failed to send message to {peer}: {e}");
+            }
         });
     }
 
@@ -169,7 +179,9 @@ impl KrpcBroker {
             self.send_msg_background(&message, endpoint);
             rx
         };
-        let (response, _addr) = rx.await.unwrap();
+        let (response, _addr) = rx
+            .await
+            .map_err(|_| naur!("pending request superseded or dropped before a response arrived"))?;
 
         // no node_id means the reponse is a krpc error message, only error message omit the node
         // id

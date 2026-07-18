@@ -125,7 +125,7 @@ impl DhtHandle {
         let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
 
         // if we have an exact match, it will be the first element in the vector
-        return if closest_eight[0].id() == query.target_id() {
+        return if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
             let res = ResBuilder::new(self.our_id).with_node(closest_eight[0].clone()).build();
             KrpcBody::FindNodeGetPeersResponse(res)
         } else {

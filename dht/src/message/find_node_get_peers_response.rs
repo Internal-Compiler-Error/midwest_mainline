@@ -131,7 +131,10 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
                 });
             }
 
-            if !self.nodes.is_empty() {
+            // a get_peers answer with values needs no nodes; anything else (find_node
+            // answer, get_peers fallback, empty table) must still carry the key, even
+            // as an empty string
+            if !self.nodes.is_empty() || self.values.is_empty() {
                 // nodes is a giant binary string, its length is some product of 26, each
                 // 26 byte is compromised of 20 bytes of node id, 4 bytes of ip address and
                 // 2 bytes of port number
@@ -217,6 +220,21 @@ mod tests {
 
         let expected =
             "d1:rd2:id20:abcdefghij01234567895:nodes26:lmnopqrstuvxyz098765axje.u5:token8:aoeusnthe1:t2:aa1:y1:re";
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn empty_response_still_carries_the_nodes_key() {
+        use std::str;
+
+        let txn_id = TransactionId::from_bytes(*&b"aa");
+        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789")).build();
+
+        let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
+        let encoded = str::from_utf8(&*encoded).unwrap();
+
+        let expected = "d1:rd2:id20:abcdefghij01234567895:nodes0:e1:t2:aa1:y1:re";
 
         assert_eq!(encoded, expected);
     }

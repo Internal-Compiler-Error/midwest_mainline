@@ -69,7 +69,7 @@ fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<No
         return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
     };
 
-    Ok(NodeId::from_bytes(querier))
+    NodeId::try_from_bytes(querier).ok_or(OurError::DecodeError(eyre!("'id' key is not 20 bytes")))
 }
 
 fn report_unused_keys<V>(dict: &BTreeMap<&[u8], V>, err_template: &'static str) {
@@ -101,7 +101,8 @@ fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
         return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
     };
 
-    let find_node_request = FindNodeQuery::new(querier, NodeId::from_bytes(target));
+    let target = NodeId::try_from_bytes(target).ok_or(OurError::DecodeError(eyre!("'target' key is not 20 bytes")))?;
+    let find_node_request = FindNodeQuery::new(querier, target);
 
     report_unused_keys(&arguments, "Find_node query body has unused keys");
     Ok(find_node_request)
@@ -118,7 +119,9 @@ fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
         return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
     };
 
-    let get_peers = GetPeersQuery::new(querier, InfoHash::from_bytes(info_hash));
+    let info_hash =
+        InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
+    let get_peers = GetPeersQuery::new(querier, info_hash);
 
     report_unused_keys(&arguments, "Get_peers query body has unused keys");
     Ok(get_peers)
@@ -154,13 +157,9 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
         return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
     };
 
-    let announce_peer = AnnouncePeerQuery::new(
-        querier,
-        implied_port,
-        port as u16,
-        InfoHash::from_bytes(info_hash),
-        token,
-    );
+    let info_hash =
+        InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
+    let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port as u16, info_hash, token);
 
     report_unused_keys(&arguments, "Announce_peer query body has unused keys");
     Ok(announce_peer)
@@ -223,6 +222,7 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
         .filter_map(|sock_addr| {
             if sock_addr.len() != 6 {
                 info!("Encoutered one string in `values` list that isn't 6 bytes long");
+                return None;
             }
 
             let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
@@ -268,7 +268,9 @@ impl ParseKrpc for &[u8] {
 
         let (unused, mut parsed) =
             parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained: {e}")))?;
-        assert!(unused.len() == 0);
+        if !unused.is_empty() {
+            return Err(OurError::DecodeError(eyre!("trailing bytes after the bencode dict")));
+        }
 
         let message_type_indicator = parsed
             .remove(b"y".as_slice())
@@ -342,7 +344,8 @@ impl ParseKrpc for &[u8] {
             let BencodeItemView::ByteString(target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
-            let target_id = NodeId::from_bytes(target_id);
+            let target_id = NodeId::try_from_bytes(target_id)
+                .ok_or(OurError::DecodeError(eyre!("response 'id' key is not 20 bytes")))?;
 
             // if the message contains a "nodes", then try to parse it out
             let nodes = extract_nodes(&mut response)?;
@@ -762,7 +765,8 @@ mod test {
         // compact format is 26 bytes per node (id + contact), so the fixture here uses
         // that: node id "mnopqrstuvwxyz123456" at 1.2.3.4:6881
         let message =
-            b"d1:rd2:id20:0123456789abcdefghij5:nodes26:mnopqrstuvwxyz123456\x01\x02\x03\x04\x1a\xe1e1:t2:aa1:y1:re" as &[u8];
+            b"d1:rd2:id20:0123456789abcdefghij5:nodes26:mnopqrstuvwxyz123456\x01\x02\x03\x04\x1a\xe1e1:t2:aa1:y1:re"
+                as &[u8];
         let decoded = message.parse().unwrap();
 
         use find_node_get_peers_response::Builder;
@@ -794,6 +798,40 @@ mod test {
 
         let expected = Krpc::new_standard_generic_error_response(TransactionId::from_bytes(*&b"aa"));
         assert_eq!(expected, decoded);
+    }
+
+    #[test]
+    fn malformed_wire_lengths_are_decode_errors_not_panics() {
+        // ping query with a 19-byte id
+        let msg = b"d1:ad2:id19:0123456789abcdefghijeq1:q4:ping1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+
+        // find_node query with a 3-byte target
+        let msg = b"d1:ad2:id20:0123456789abcdefghij6:target3:fooeq1:q9:find_node1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+
+        // get_peers query with a 3-byte info_hash
+        let msg = b"d1:ad2:id20:0123456789abcdefghij9:info_hash3:fooeq1:q9:get_peers1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+
+        // trailing bytes after an otherwise valid message
+        let msg = b"d1:ad2:id20:0123456789abcdefghijeq1:q4:ping1:t2:aa1:y1:qeJUNK" as &[u8];
+        assert!(msg.parse().is_err());
+    }
+
+    #[test]
+    fn short_values_entries_are_skipped() {
+        // a get_peers response whose values list has a 3-byte entry among valid ones
+        let msg = b"d1:rd2:id20:0123456789abcdefghij5:token2:aa6:valuesl3:abc6:\x01\x02\x03\x04\x05\x06ee1:t2:aa1:y1:re"
+            as &[u8];
+        let parsed = msg.parse().unwrap();
+        let KrpcBody::FindNodeGetPeersResponse(resp) = parsed.body else {
+            panic!("expected a find_node/get_peers response");
+        };
+        assert_eq!(
+            resp.values(),
+            &vec![SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506)]
+        );
     }
 
     // #[test]

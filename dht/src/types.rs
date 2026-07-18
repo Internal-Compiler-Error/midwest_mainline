@@ -27,15 +27,16 @@ impl Debug for NodeId {
 }
 
 impl NodeId {
+    /// Returns `None` if the length is not exactly NODE_ID_LEN (e.g. malformed network input).
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        let arr: &[u8; NODE_ID_LEN] = bytes.try_into().ok()?;
+        Some(NodeId(*arr))
+    }
+
     /// Panics if the length is not exactly NODE_ID_LEN
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() != NODE_ID_LEN {
-            panic!("Node id must be exactly {NODE_ID_LEN} bytes got {} bytes", bytes.len());
-        }
-
-        let mut arr = [0u8; NODE_ID_LEN];
-        arr.copy_from_slice(bytes);
-        NodeId(arr)
+        Self::try_from_bytes(bytes)
+            .unwrap_or_else(|| panic!("Node id must be exactly {NODE_ID_LEN} bytes got {} bytes", bytes.len()))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -91,13 +92,20 @@ impl ToBencode for NodeId {
 pub struct InfoHash(pub [u8; NODE_ID_LEN]);
 
 impl InfoHash {
+    /// Returns `None` if the length is not exactly NODE_ID_LEN (e.g. malformed network input).
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        let arr: &[u8; NODE_ID_LEN] = bytes.try_into().ok()?;
+        Some(InfoHash(*arr))
+    }
+
     /// Panics if `bytes` is not 20 bytes in length
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        assert!(bytes.len() == NODE_ID_LEN);
-
-        let mut arr = [0u8; NODE_ID_LEN];
-        arr.copy_from_slice(bytes);
-        InfoHash(arr)
+        Self::try_from_bytes(bytes).unwrap_or_else(|| {
+            panic!(
+                "Info hash must be exactly {NODE_ID_LEN} bytes got {} bytes",
+                bytes.len()
+            )
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
