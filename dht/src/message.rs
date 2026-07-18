@@ -726,11 +726,29 @@ mod test {
         let res_token = Token::from_bytes(&res_token);
 
         use find_node_get_peers_response::Builder;
+
+        // the fixture also carries 8 nodes (208-byte compact string); the expected response
+        // must include them
+        let expected_nodes: Vec<NodeInfo> = hex::decode("233b7b388eaded578cb8b62a1ddfef3277bf01945c202537c8d5233a010302bab6e6726e991228571f8807a9f77eb2aae6fd12a42339069106980533f8df5b5b9a17d6b704740b7bde6241279f032338bd5ff8d5779c7170d17343b8b3fe405fe71eb96b5f496d86233f9938fa19e256821896495e11e0f63ff032706ad22134e1ed233e6bd6ae529049f1f1bbe9ebb3a6db3c870ce15a9a5df9bbc8233dafab3b38a789a3e53433380dd825c45b3f57b9a76343c8d5233cddccbe1f9e5041e3b3d4d124f9c252697ef0755dab53c8d5")
+            .unwrap()
+            .chunks(26)
+            .map(|c| {
+                NodeInfo::new(
+                    NodeId::from_bytes(&c[..20]),
+                    SocketAddrV4::new(
+                        Ipv4Addr::new(c[20], c[21], c[22], c[23]),
+                        u16::from_be_bytes([c[24], c[25]]),
+                    ),
+                )
+            })
+            .collect();
+
         let body = Builder::new(responding)
             .with_token(res_token)
             .with_value(SocketAddrV4::new(Ipv4Addr::new(178, 143, 32, 252), 24385))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(176, 37, 231, 137), 36878))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(91, 214, 242, 127), 1070))
+            .with_nodes(&expected_nodes)
             .build();
         let body = KrpcBody::FindNodeGetPeersResponse(body);
         let expected = Krpc::new_with_body(txn_id, body);
@@ -740,7 +758,11 @@ mod test {
 
     #[test]
     fn can_parse_example_find_node_response() {
-        let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re" as &[u8];
+        // the BEP 5 document's own example uses a legacy 20-byte `nodes` string; the
+        // compact format is 26 bytes per node (id + contact), so the fixture here uses
+        // that: node id "mnopqrstuvwxyz123456" at 1.2.3.4:6881
+        let message =
+            b"d1:rd2:id20:0123456789abcdefghij5:nodes26:mnopqrstuvwxyz123456\x01\x02\x03\x04\x1a\xe1e1:t2:aa1:y1:re" as &[u8];
         let decoded = message.parse().unwrap();
 
         use find_node_get_peers_response::Builder;
@@ -748,7 +770,7 @@ mod test {
         let expected = Builder::new(NodeId::from_bytes(*&b"0123456789abcdefghij"))
             .with_node(NodeInfo::new(
                 NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
-                SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0),
+                SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 6881),
             ))
             .build();
         let body = KrpcBody::FindNodeGetPeersResponse(expected);

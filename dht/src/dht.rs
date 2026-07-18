@@ -328,6 +328,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "integration test: needs network access, a public IP, DATABASE_URL, and live DHT bootstrap nodes"]
     async fn bootstrap() -> color_eyre::Result<()> {
         TEST_INIT.call_once(set_up_tracing);
 
