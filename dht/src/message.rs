@@ -132,7 +132,8 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
 
     let implied_port = arguments.remove(&b"implied_port".as_slice());
     let implied_port = match implied_port {
-        Some(BencodeItemView::Integer(i)) if i == 1 => true,
+        // BEP 5: any non-zero value means use the packet's origin port
+        Some(BencodeItemView::Integer(i)) => i != 0,
         _ => false,
     };
 
@@ -140,6 +141,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
     let Some(BencodeItemView::Integer(port)) = port else {
         return Err(OurError::DecodeError(eyre!("'port' key is not a number")));
     };
+    let port = u16::try_from(port).map_err(|_| OurError::DecodeError(eyre!("'port' out of range: {port}")))?;
 
     let token = arguments
         .remove(&b"token".as_slice())
@@ -159,7 +161,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
 
     let info_hash =
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
-    let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port as u16, info_hash, token);
+    let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port, info_hash, token);
 
     report_unused_keys(&arguments, "Announce_peer query body has unused keys");
     Ok(announce_peer)
@@ -327,7 +329,8 @@ impl ParseKrpc for &[u8] {
                 KrpcBody::AnnouncePeerQuery(extract_announce_peer(&mut arguments)?)
             } else {
                 let query_type = String::from_utf8_lossy(&*query_type);
-                return Err(OurError::DecodeError(eyre!("Unsupported query type: {query_type}")));
+                info!("Unsupported query type: {query_type}");
+                return Err(OurError::UnsupportedQuery(txn_id));
             }
         } else if message_type == b"r" {
             // responses
@@ -832,6 +835,23 @@ mod test {
             resp.values(),
             &vec![SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506)]
         );
+    }
+
+    #[test]
+    fn implied_port_is_any_nonzero_value() {
+        // BEP 5: implied_port counts when non-zero, not only when it is exactly 1
+        let msg = b"d1:ad2:id20:abcdefghij012345678912:implied_porti2e9:info_hash20:mnopqrstuvwxyz1234564:porti6881e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe" as &[u8];
+        let parsed = msg.parse().unwrap();
+        let KrpcBody::AnnouncePeerQuery(query) = parsed.body else {
+            panic!("expected an announce_peer query");
+        };
+        assert!(query.implied_port());
+    }
+
+    #[test]
+    fn out_of_range_announce_port_is_a_decode_error() {
+        let msg = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti70000e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
     }
 
     // #[test]

@@ -127,9 +127,29 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
             // IP changed, generate new ID
             let id = random_idv4(&public_ip, rand::rng().random::<u8>());
             db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
+            // every stored bucket was computed against the previous id; recompute
+            recompute_buckets(&id, conn)?;
             Ok(id)
         }
     })
+}
+
+/// Recompute every node's bucket against a new identity (bucket assignments are derived
+/// from xor distance to our own id, so they go stale when the id changes).
+fn recompute_buckets(our_id: &NodeId, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    use crate::schema::node::dsl::*;
+
+    let rows: Vec<Vec<u8>> = node.select(id).load(conn)?;
+    for raw in rows {
+        let Some(node_id) = NodeId::try_from_bytes(&raw) else {
+            continue;
+        };
+        let b = router::bucket_index(our_id, &node_id);
+        diesel::update(node.filter(id.eq(&raw)))
+            .set(bucket.eq(b))
+            .execute(conn)?;
+    }
+    Ok(())
 }
 
 fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<NodeId, diesel::result::Error> {
@@ -369,5 +389,74 @@ mod tests {
 
         drop(dht_eventloop);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recompute_tests {
+    use super::{SensibleOptions, resume_identity};
+    use crate::dht::router::bucket_index;
+    use crate::schema::node::dsl as node_dsl;
+    use crate::types::NodeId;
+    use crate::utils::{base64_enc, db_put};
+    use diesel::connection::SimpleConnection;
+    use diesel::r2d2::{ConnectionManager, Pool};
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn identity_change_recomputes_buckets() {
+        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(SensibleOptions))
+            .build(manager)
+            .unwrap();
+        let mut conn = pool.get().unwrap();
+        conn.batch_execute(
+            "CREATE TABLE misc (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE node (
+                id BLOB PRIMARY KEY,
+                bucket INTEGER NOT NULL,
+                last_contacted BIGINT NOT NULL,
+                ip_addr TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                failed_requests INTEGER NOT NULL,
+                removed BOOLEAN NOT NULL,
+                last_sent BIGINT,
+                added BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+
+        // pretend we were 1.2.3.4 with the all-zero id last session
+        db_put("public_ip".to_string(), "1.2.3.4".to_string(), &mut *conn).unwrap();
+        db_put("id".to_string(), base64_enc(&[0u8; 20]), &mut *conn).unwrap();
+
+        // a node whose bucket was computed against that old identity
+        let peer_node = NodeId([0xF0; 20]);
+        diesel::insert_into(node_dsl::node)
+            .values(crate::models::Node {
+                id: peer_node.0.to_vec(),
+                bucket: bucket_index(&NodeId([0; 20]), &peer_node),
+                last_contacted: 0,
+                ip_addr: "10.0.0.1".to_string(),
+                port: 6881,
+                failed_requests: 0,
+                removed: false,
+            })
+            .execute(&mut *conn)
+            .unwrap();
+
+        // our IP changed: a new identity must be adopted and buckets recomputed against it
+        let new_id = resume_identity(&mut *conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
+        assert_ne!(new_id, NodeId([0; 20]), "a new identity must be adopted");
+
+        let stored: i32 = node_dsl::node
+            .filter(node_dsl::id.eq(peer_node.0.to_vec()))
+            .select(node_dsl::bucket)
+            .first(&mut *conn)
+            .unwrap();
+        assert_eq!(stored, bucket_index(&new_id, &peer_node));
     }
 }

@@ -27,12 +27,31 @@ use crate::{
 use super::dht_handle::REQ_TIMEOUT;
 use super::krpc_broker::KrpcBroker;
 
+/// Which of the 160 buckets `target` falls into, relative to `our_id`.
+pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
+    let dist = our_id.dist(target);
+    if dist == types::ZERO_DIST {
+        // all zero means we're finding ourself, then we go look for in the last bucket
+        return 159;
+    }
+
+    let first_nonzero_byte = dist.into_iter().position(|radix| radix != 0).unwrap();
+    let byte = dist[first_nonzero_byte];
+
+    let bucket_idx = 159 - (first_nonzero_byte * 8 + byte.leading_zeros() as usize);
+    bucket_idx.try_into().unwrap()
+}
+
 #[derive(Debug, Clone)]
 /// A Router will tell you who are the closest nodes that we know
 pub struct Router {
     id: NodeId,
     table: Pool<ConnectionManager<SqliteConnection>>,
     message_broker: KrpcBroker,
+    /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
+    /// We keep 160 flat buckets of 1024 and let `find_closest` gather across buckets;
+    /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
+    /// table fresh. Revisit if the table ever outgrows this.
     bucket_size: usize,
     inbound_messages: Arc<Mutex<Option<mpsc::Receiver<(Krpc, SocketAddrV4)>>>>,
 }
@@ -113,17 +132,7 @@ impl Router {
 
     /// Returns the bucket index that the target node belongs in
     fn index(&self, target: &NodeId) -> i32 {
-        let dist = self.id.dist(&target);
-        if dist == types::ZERO_DIST {
-            // all zero means we're finding ourself, then we go look for in the last bucket
-            return 159;
-        }
-
-        let first_nonzero_byte = dist.into_iter().position(|radix| radix != 0).unwrap();
-        let byte = dist[first_nonzero_byte];
-
-        let bucket_idx = 159 - (first_nonzero_byte * 8 + byte.leading_zeros() as usize);
-        bucket_idx.try_into().unwrap()
+        bucket_index(&self.id, target)
     }
 
     fn closest_in_bucket(&self, target: &NodeId, i: i32, limit: i64, conn: &mut SqliteConnection) -> Vec<NodeInfo> {
@@ -329,11 +338,21 @@ impl Router {
     }
 
     pub async fn refresh_table(&self) {
-        let tasks = (0..20).map(|i| async move { self.refresh_bucket(i).await });
-        for i in 0..20 {
-            self.refresh_bucket(i).await;
+        // housekeeping: expired peers and tombstoned nodes go for good, so the store
+        // doesn't grow unboundedly
+        {
+            use crate::schema::{node, peer};
+            let cutoff = unix_timestmap_ms() - 45 * 60 * 1000;
+            let mut conn = self.conn();
+            let _ = diesel::delete(peer::table.filter(peer::last_announced.lt(cutoff)))
+                .execute(&mut conn)
+                .inspect_err(|e| error!("{e}"));
+            let _ = diesel::delete(node::table.filter(node::removed.eq(true)))
+                .execute(&mut conn)
+                .inspect_err(|e| error!("{e}"));
         }
-        join_all(tasks).await;
+
+        join_all((0..160).map(|i| async move { self.refresh_bucket(i).await })).await;
     }
 
     pub async fn refresh_table_loop(&self) {

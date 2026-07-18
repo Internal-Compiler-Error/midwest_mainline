@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use diesel::prelude::*;
 use diesel::SqliteConnection;
+use diesel::prelude::*;
 use std::{future::Future, time::SystemTime};
 use tokio::task::{JoinError, JoinSet};
 
@@ -72,7 +72,13 @@ macro_rules! bail_on_none {
 pub fn db_put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
     use crate::schema::misc::dsl::*;
     diesel::insert_into(misc)
-        .values(Misc { key: keyy, value: vall })
+        .values(Misc {
+            key: keyy,
+            value: vall.clone(),
+        })
+        .on_conflict(key)
+        .do_update()
+        .set(value.eq(vall))
         .execute(conn)
         .inspect_err(|e| tracing::error!("{e}"))?;
     Ok(())

@@ -1,9 +1,15 @@
 use std::io;
 use thiserror::Error;
 
+use crate::types::TransactionId;
+
 #[derive(Debug, Error)]
 /// An old joke on soviet union
 pub enum OurError {
+    /// A query with a method we don't implement; BEP 5 wants a 204 Method Unknown reply
+    /// carrying the same transaction id
+    #[error("unsupported query method")]
+    UnsupportedQuery(TransactionId),
     // #[error("Issue with parsing bencode")]
     // #[error(transparent)]
     // DecodeError {

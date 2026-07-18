@@ -141,11 +141,11 @@ impl DhtHandle {
     }
 
     fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<SocketAddrV4> {
-        // determines when does a peer is considered expired, default is 30 mins
-        // TODO: should be configurable in the future.
+        // peers are considered expired 45 minutes after their announce (BEP 5's suggested
+        // lifetime); the cap keeps get_peers responses comfortably inside a datagram
         fn cutoff() -> i64 {
-            let thirty_minutes_ms = 30 * 60 * 1000;
-            unix_timestmap_ms() - thirty_minutes_ms
+            let forty_five_minutes_ms = 45 * 60 * 1000;
+            unix_timestmap_ms() - forty_five_minutes_ms
         }
 
         let mut conn = self.conn.get().expect("failed to get one connection from pool");
@@ -155,6 +155,7 @@ impl DhtHandle {
             .filter(swarm::info_hash.eq(&info_hash.0))
             .filter(peer::last_announced.ge(cutoff()))
             .select((peer::ip_addr, peer::port))
+            .limit(50)
             .load::<(String, i32)>(&mut conn)
             .unwrap();
         let peers: Vec<SocketAddrV4> = peers

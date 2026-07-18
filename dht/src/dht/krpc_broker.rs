@@ -80,6 +80,7 @@ impl KrpcBroker {
         let socket = self.socket.clone();
         let pending_responses = self.pending_responses.clone();
         let inbound_subscribers = self.inbound_subscribers.clone();
+        let this = self.clone();
 
         let event_loop = async move {
             let mut buf = [0u8; 1500];
@@ -121,10 +122,12 @@ impl KrpcBroker {
                             subcribers.retain(|s| !s.is_closed());
 
                             for sub in &*subcribers {
-                                // TODO: It should really be a ring buffer instead of a regular
-                                // channel. Not using send here because `subcribers` mutex guard
-                                // is not Send and it lives across await points
-                                let _ = sub.try_send((msg.clone(), socket_addr));
+                                // Not using send here because `subcribers` mutex guard
+                                // is not Send and it lives across await points; a lagging
+                                // subscriber loses messages but must not stall the broker
+                                if sub.try_send((msg.clone(), socket_addr)).is_err() {
+                                    warn!("inbound subscriber lagging, dropping a message for it");
+                                }
                             }
                         }
 
@@ -145,6 +148,13 @@ impl KrpcBroker {
                                     pending_responses.lock().unwrap().insert(id.clone(), (expected, sender));
                                 }
                             }
+                        }
+                    }
+                    Err(OurError::UnsupportedQuery(txn)) => {
+                        // BEP 5: unknown query methods get a 204 Method Unknown error reply
+                        if let SocketAddr::V4(addr) = socket_addr {
+                            let response = Krpc::new_unsupported_error(txn);
+                            this.send_msg_background(&response, addr);
                         }
                     }
                     Err(e) => {
@@ -176,8 +186,19 @@ impl KrpcBroker {
     /// Send a message, fires up a new stask in background
     fn send_msg_background(&self, msg: &Krpc, peer: SocketAddrV4) {
         let socket = self.socket.clone();
-        // TODO: send the "ip" field with the requester's ip
-        let buf = msg.encode_with_additional(&HashMap::new());
+
+        let mut additional = HashMap::new();
+        // BEP 5: every message should carry our client version
+        additional.insert(&b"v"[..], value::Value::Bytes(Cow::Borrowed(&b"MW01"[..])));
+        // BEP 42: in responses, tell the requester the external address we see for it
+        if !msg.body.is_query() {
+            let mut ip = [0u8; 6];
+            ip[..4].copy_from_slice(&peer.ip().octets());
+            ip[4..].copy_from_slice(&peer.port().to_be_bytes());
+            additional.insert(&b"ip"[..], value::Value::Bytes(Cow::Owned(ip.to_vec())));
+        }
+
+        let buf = msg.encode_with_additional(&additional);
 
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&buf, peer).await {
@@ -296,6 +317,40 @@ mod tests {
             broker.pending_responses.lock().unwrap().is_empty(),
             "a timed-out query must not leak its pending_requests entry"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_query_method_gets_a_204_with_version_and_ip() {
+        let broker = test_broker().await;
+        broker.run().await.unwrap();
+        let broker_addr = broker.socket.local_addr().unwrap();
+
+        let us = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        // a query with a made-up method name
+        us.send_to(
+            b"d1:ad2:id20:0123456789abcdefghije1:q9:scrape_it1:t2:aa1:y1:qe",
+            broker_addr,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0u8; 1500];
+        let (n, _) = timeout(Duration::from_secs(2), us.recv_from(&mut buf))
+            .await
+            .expect("no error reply received")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            text.contains("i204e"),
+            "expected a 204 Method Unknown error, got: {text}"
+        );
+        assert!(
+            text.contains("1:v4:MW01"),
+            "expected the client version key, got: {text}"
+        );
+        assert!(text.contains("2:ip6:"), "expected the BEP 42 ip key, got: {text}");
     }
 
     #[tokio::test]
