@@ -1,7 +1,7 @@
 use crate::defs::Identity;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle};
+use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
 use anyhow::bail;
 use futures::future::{join_all, select_all};
 use midwest_mainline::types::InfoHash;
@@ -11,6 +11,7 @@ use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub struct BtClient {
@@ -18,6 +19,7 @@ pub struct BtClient {
     swarms: HashMap<InfoHash, TorrentSwarm>,
     handles: HashMap<InfoHash, TorrentSwarmHandle>,
     peer_factories: HashMap<InfoHash, PeerFactory>,
+    stats: HashMap<InfoHash, watch::Receiver<TorrentSwarmStats>>,
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
     shutdown: CancellationToken,
@@ -30,6 +32,7 @@ impl BtClient {
             swarms: HashMap::new(),
             handles: HashMap::new(),
             peer_factories: HashMap::new(),
+            stats: HashMap::new(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -37,6 +40,14 @@ impl BtClient {
     /// A handle the caller can cancel (e.g. on Ctrl+C) to trigger a graceful shutdown.
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+
+    /// A live view of `torrent`'s aggregate progress, if it's been added via `add_torrent`.
+    /// Keeps updating for as long as the torrent's swarm task is running, including after
+    /// `work()` has taken ownership of this `BtClient` -- the receiver only depends on the
+    /// underlying channel, not on anything reachable through `self`.
+    pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
+        self.stats.get(&torrent.info_hash).cloned()
     }
 
     pub fn add_torrent(&mut self, mut torrent: Torrent) -> anyhow::Result<()> {
@@ -65,16 +76,18 @@ impl BtClient {
 
         self.handles.insert(torrent.info_hash, task.make_handle());
         self.peer_factories.insert(torrent.info_hash, task.peer_factory());
+        self.stats.insert(torrent.info_hash, task.subscribe_stats());
         self.swarms.insert(torrent.info_hash, task);
         Ok(())
     }
 
-    pub(crate) async fn work(self) -> anyhow::Result<()> {
+    pub async fn work(self) -> anyhow::Result<()> {
         let BtClient {
             id,
             mut swarms,
             handles,
             peer_factories,
+            stats: _,
             shutdown,
         } = self;
 

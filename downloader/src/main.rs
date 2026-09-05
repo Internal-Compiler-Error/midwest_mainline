@@ -1,21 +1,9 @@
-mod bt_client;
-mod defs;
-pub mod download;
-mod peer;
-mod settings;
-mod storage;
-mod torrent;
-pub mod torrent_swarm;
-mod wire;
-
-use crate::bt_client::BtClient;
-use defs::Identity;
+use downloader::{BtClient, Identity, parse_torrent};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::str::FromStr;
-use torrent::parse_torrent;
 use tracing::level_filters::LevelFilter;
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {

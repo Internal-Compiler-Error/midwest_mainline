@@ -697,11 +697,15 @@ pub struct TorrentSwarmStats {
 }
 
 impl TorrentSwarmStats {
-    fn verified_cnt(&self) -> usize {
+    pub fn verified_cnt(&self) -> usize {
         self.verified.count_ones()
     }
 
-    fn all_verified(&self) -> bool {
+    pub fn total_pieces(&self) -> usize {
+        self.verified.len()
+    }
+
+    pub fn all_verified(&self) -> bool {
         self.verified.iter().all(|v| *v)
     }
 }
@@ -820,15 +824,12 @@ pub struct TorrentSwarm {
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
-    /// Not read anywhere yet -- `HttpAnnouncer`/`UdpAnnouncer` each hold their own clone (taken
-    /// from `stat_rx` at construction, see `TorrentSwarm::new`) for deciding when to send
-    /// `event=completed`, so this one on `TorrentSwarm` itself has no consumer today. Kept
-    /// (rather than deleted) as the natural seed for a future stats subscription -- e.g. for a
-    /// UI -- once something exists to hand a clone of it out through (this field alone can't be:
-    /// `work_loop(self)` consumes the `TorrentSwarm` by value, so nothing outside this file can
-    /// reach it after the swarm starts running).
-    #[allow(dead_code)]
+    /// Cloned out via `subscribe_stats` before `work_loop(self)` takes ownership of the swarm
+    /// -- the clone stays valid (and keeps updating) after that, since it's independent of
+    /// `TorrentSwarm` itself, just backed by the same channel `stat_snapshot_tx` publishes to.
     stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
+
+    shutdown: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -918,6 +919,7 @@ impl TorrentSwarm {
             stat_snapshot_rx: stat_rx,
             inbound_msgs: command_rx,
             outbound_msgs: command_tx,
+            shutdown,
         }
     }
 
@@ -995,6 +997,10 @@ impl TorrentSwarm {
                     self.run_pex_round().await;
                 }
                 Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
+                // without this, this loop (and so the `JoinHandle` `BtClient::work` awaits for
+                // this torrent) never ends on its own -- `accept_incoming` and the announcer
+                // loops already check `shutdown.cancelled()`, this one just never did
+                _ = self.shutdown.cancelled() => break,
             }
         }
     }
@@ -1277,6 +1283,15 @@ impl TorrentSwarm {
         }
 
         Ok(())
+    }
+
+    /// A live view of this torrent's aggregate progress (uploaded/downloaded/left/written/
+    /// verified/completed). Must be called before `work_loop(self)` takes ownership of the
+    /// swarm (e.g. right after `TorrentSwarm::new`, which is what `BtClient::add_torrent` does)
+    /// -- the returned receiver keeps working after that, since it only depends on the
+    /// underlying channel, not on `TorrentSwarm` itself still being reachable.
+    pub(crate) fn subscribe_stats(&self) -> watch::Receiver<TorrentSwarmStats> {
+        self.stat_snapshot_rx.clone()
     }
 
     pub fn verified_cnt(&self) -> usize {
