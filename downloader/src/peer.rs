@@ -408,7 +408,7 @@ fn build_pex_message(added: &[SocketAddr]) -> Vec<u8> {
 /// BEP 9 ut_metadata "data" message: a bencoded prefix (`msg_type`, `piece`, `total_size`)
 /// immediately followed by the raw metadata bytes for that piece -- there's no length-prefixed
 /// framing between the two, the dict's own encoding is how a parser knows where it ends.
-fn build_ut_metadata_data_message(piece: u32, total_size: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn build_ut_metadata_data_message(piece: u32, total_size: u32, data: &[u8]) -> Vec<u8> {
     let mut payload = format!("d8:msg_typei1e5:piecei{piece}e10:total_sizei{total_size}ee").into_bytes();
     payload.extend_from_slice(data);
     payload

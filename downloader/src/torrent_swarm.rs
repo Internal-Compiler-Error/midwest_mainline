@@ -7,6 +7,7 @@ use crate::settings::{
 };
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
+use midwest_mainline::types::InfoHash;
 use crate::wire::{BitField, Piece, shake_hands};
 use anyhow::{self, Context, bail};
 use bitvec::boxed::BitBox;
@@ -34,10 +35,14 @@ use futures::future::join_all;
 use derive_more::{Eq, PartialEq};
 
 /// Handles announcements to a single tracker server
+///
+/// Keyed on a bare `InfoHash` rather than a whole `Torrent`: announcing only ever needs the
+/// hash, and a magnet link's pre-metadata phase (see `metadata::fetch`) has nothing else to
+/// give -- that's the whole reason it can reuse these announcers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpAnnouncer {
     tracker: Url,
-    torrent: Arc<Torrent>,
+    info_hash: InfoHash,
 
     #[eq(skip)]
     identity: Arc<Identity>,
@@ -57,6 +62,35 @@ struct HttpAnnouncer {
 
 pub enum AnnouncerEvent {
     DiscoveredPeers(Vec<SocketAddr>),
+}
+
+/// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
+/// `events`. Split out so a magnet link's pre-metadata phase can announce with nothing but an
+/// info hash (see `metadata::fetch`) -- at that point there is no `Torrent` and no
+/// `TorrentSwarm` to hang the announcers off.
+pub(crate) fn spawn_announcers(
+    trackers: &[String],
+    info_hash: InfoHash,
+    identity: Arc<Identity>,
+    stat_rx: watch::Receiver<TorrentSwarmStats>,
+    events: mpsc::Sender<TorrentSwarmCommand>,
+    shutdown: CancellationToken,
+) {
+    for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
+        match url.scheme() {
+            "http" | "https" => {
+                let announcer =
+                    HttpAnnouncer::new(url, info_hash, identity.clone(), stat_rx.clone(), events.clone(), shutdown.clone());
+                tokio::spawn(announcer.ev_loop());
+            }
+            "udp" => {
+                let announcer =
+                    UdpAnnouncer::new(url, info_hash, identity.clone(), stat_rx.clone(), events.clone(), shutdown.clone());
+                tokio::spawn(announcer.ev_loop());
+            }
+            scheme => warn!("ignoring tracker with unsupported scheme {scheme:?}"),
+        }
+    }
 }
 
 /// The tracker `event` parameter (BEP 3 for HTTP, BEP 15 for UDP). The first announce to a
@@ -96,7 +130,7 @@ impl AnnounceEvent {
 impl HttpAnnouncer {
     fn new(
         tracker: Url,
-        torrent: Arc<Torrent>,
+        info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         events: mpsc::Sender<TorrentSwarmCommand>,
@@ -106,7 +140,7 @@ impl HttpAnnouncer {
 
         HttpAnnouncer {
             tracker,
-            torrent,
+            info_hash,
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
@@ -126,7 +160,7 @@ impl HttpAnnouncer {
     #[tracing::instrument(skip(self))]
     async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddr>> {
         // percent encode info_hash and peer_id
-        let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.torrent.info_hash.0).collect();
+        let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.info_hash.0).collect();
         let peer_id_encoded: String = form_urlencoded::byte_serialize(&self.identity.peer_id).collect();
 
         let swarm_stat = self.swarm_stat.borrow().clone();
@@ -265,7 +299,7 @@ impl HttpAnnouncer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UdpAnnouncer {
     tracker: Url,
-    torrent: Arc<Torrent>,
+    info_hash: InfoHash,
 
     #[eq(skip)]
     identity: Arc<Identity>,
@@ -308,7 +342,7 @@ enum Event {
 impl UdpAnnouncer {
     fn new(
         tracker_url: Url,
-        torrent: Arc<Torrent>,
+        info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         event: mpsc::Sender<TorrentSwarmCommand>,
@@ -317,7 +351,7 @@ impl UdpAnnouncer {
         debug_assert!(tracker_url.scheme() == "udp");
         UdpAnnouncer {
             tracker: tracker_url,
-            torrent,
+            info_hash,
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
@@ -471,7 +505,7 @@ impl UdpAnnouncer {
             connection_id: self.connection_id.into(),
             action: (Action::Announce as i32).into(),
             transaction_id: transaction_id.into(),
-            info_hash: self.torrent.info_hash.0,
+            info_hash: self.info_hash.0,
             peer_id: self.identity.peer_id,
             downloaded: downloaded.into(),
             left: left.into(),
@@ -884,7 +918,7 @@ impl TorrentSwarm {
             .map(|t| {
                 HttpAnnouncer::new(
                     t,
-                    torrent.clone(),
+                    torrent.info_hash,
                     id.clone(),
                     stat_rx.clone(),
                     command_tx.clone(),
@@ -897,7 +931,7 @@ impl TorrentSwarm {
             .map(|t| {
                 UdpAnnouncer::new(
                     t,
-                    torrent.clone(),
+                    torrent.info_hash,
                     id.clone(),
                     stat_rx.clone(),
                     command_tx.clone(),

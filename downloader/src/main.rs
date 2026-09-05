@@ -1,10 +1,11 @@
-use downloader::{BtClient, Identity, parse_torrent};
+use downloader::{BtClient, Identity, load_source};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
-use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::level_filters::LevelFilter;
+use tokio_util::sync::CancellationToken;
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     let mut rng = rand::rng();
@@ -40,17 +41,35 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = env::args().collect::<Vec<_>>();
-
-    let meta_file = PathBuf::from(&args[1]);
-    let meta_bytes = std::fs::read(&meta_file).unwrap();
-    let torrent = parse_torrent(&meta_bytes).unwrap();
-
-    let public_ip = Ipv4Addr::from_str("99.226.33.190")?;
-    let mut client = BtClient::new(Identity {
-        peer_id: random_idv4(&public_ip, 3),
-        serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
+    let source = args.get(1).cloned().unwrap_or_else(|| {
+        eprintln!("usage: downloader <path-to-.torrent | magnet-uri>");
+        std::process::exit(2);
     });
 
+    let public_ip = Ipv4Addr::from_str("99.226.33.190")?;
+    let identity = Identity {
+        peer_id: random_idv4(&public_ip, 3),
+        serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
+    };
+
+    // A magnet has to fetch its metadata off the network before there's anything to download,
+    // so this can run for a while (or fail) where a .torrent returns immediately -- long enough
+    // that Ctrl+C has to work during it, not just once the download proper has started.
+    if downloader::is_magnet_uri(&source) {
+        tracing::info!("resolving magnet link, fetching metadata from peers...");
+    }
+    let resolving = CancellationToken::new();
+    let torrent = tokio::select! {
+        resolved = load_source(&source, Arc::new(identity), resolving.clone()) => resolved?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("interrupted while resolving, stopping tracker announces...");
+            resolving.cancel();
+            return Ok(());
+        }
+    };
+    tracing::info!("got metadata for {} files, starting download", torrent.files.len());
+
+    let mut client = BtClient::new(identity);
     client.add_torrent(torrent).unwrap();
 
     let shutdown = client.shutdown_token();

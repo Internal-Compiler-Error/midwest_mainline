@@ -33,20 +33,42 @@ choking-algorithm commits). Reasons:
 If this gets revisited, the write-atomicity issue is the one that actually has to be solved
 first -- everything else is secondary.
 
-# magnet links / DHT: out of scope by explicit user decision
-The workspace already has a working `dht` crate (`midwest_mainline`, sibling of this crate --
-see `../dht`, 33 tests passing) with `DhtSession::bootstrap`/`get_peers`/`announce_peers`, so
-DHT-based peer discovery for a magnet link is not a research problem here, it's plumbing. It was
-still ruled out of scope for "fully spec compliant" (asked explicitly, 2026-09-05), because it
-isn't just plumbing on top of what exists here: `BtClient::add_torrent`, `TorrentStorage::new`,
-and `PeerFactory` all currently require a fully-parsed `Torrent` (piece count, piece length, file
-list) up front. A magnet link starts with only an info hash -- every one of those needs a
-pre-metadata phase (discover peers with no metadata yet -> BEP 10 extended handshake -> BEP 9
-*consume* ut_metadata, the side that was deliberately not built when ut_metadata was added
-serve-side-only -> verify reassembled bytes against the info hash -> only then construct a
-`Torrent` and proceed as today). That's a restructure of the client's entry path, not a feature
-addition, so it was called out and deferred rather than built silently. The `.torrent`-file entry
-point is the accepted scope.
+# magnet links: supported (tracker-only). DHT: still out of scope
+Magnet links work as of 2026-09-05 -- `magnet:?xt=urn:btih:...&tr=...`, hex or base32 info
+hash. **Peer discovery is tracker-only**: the `&tr=` params are the sole peer source, because
+DHT remains deliberately unimplemented (that was the explicit instruction when this was added).
+A magnet with no `tr=` params is therefore rejected at parse time rather than accepted and left
+spinning at 0% -- without DHT there is genuinely nowhere for it to find a peer.
+
+How it hangs together (`magnet.rs` + `metadata.rs`):
+1. `parse_magnet` pulls the info hash, display name, and tracker list out of the URI.
+2. `metadata::fetch` announces to those trackers with nothing but the info hash, which is why
+   `HttpAnnouncer`/`UdpAnnouncer` were changed to key on a bare `InfoHash` rather than an
+   `Arc<Torrent>` -- pre-metadata there is no `Torrent` to give them.
+3. For each peer the trackers return, it does the BEP 9 *consuming* side (the half that was
+   deliberately skipped when ut_metadata was first added serve-side-only): BEP 10 extended
+   handshake, then request the info dict in 16KiB pieces, honouring the ut_metadata id the
+   peer negotiated rather than assuming one.
+4. The reassembled bytes are SHA-1'd and checked against the info hash from the URI. That check
+   is the only reason it's safe to accept metadata from an untrusted peer, and it's tested
+   directly (`rejects_metadata_that_doesnt_match_the_info_hash`).
+5. The verified info dict is wrapped back into a synthetic `.torrent` (info dict embedded
+   byte-for-byte, so the recomputed hash necessarily matches) and handed to the existing
+   `parse_torrent`, after which the normal download path runs completely unchanged.
+
+The entry-point restructure this was once deferred over turned out to be avoidable: rather than
+teaching `BtClient`/`TorrentStorage`/`PeerFactory` to tolerate a metadata-less `Torrent`, the
+metadata phase happens entirely *before* any of them exist, and they still only ever see a fully
+parsed `Torrent`. `load_source` is the single entry point that takes either a path or a magnet.
+That dodge isn't free, though, and the earlier analysis wasn't simply wrong: because metadata is
+fetched to completion up front, there's no partial-metadata resume and nothing to show during
+the fetch beyond a spinner. Teaching the download path to start with an incomplete `Torrent`
+is still what you'd need for either of those.
+
+The `dht` crate in this workspace (`../dht`, `DhtSession::bootstrap`/`get_peers`) is still
+unused by the downloader. Wiring it in is the remaining piece if trackerless magnets are ever
+wanted; nothing in the current design blocks it -- `metadata::fetch` would just need a second
+peer source alongside `spawn_announcers`.
 
 # "fully spec compliant" scope: closed, 2026-09-05
 `/goal`'s Stop hook holds the session open until the downloader is "fully spec compliant" --
@@ -56,11 +78,12 @@ connection encryption). Asked the user directly where "done" should mean done. A
 future agent (or Stop hook) re-litigating this: **current scope is the accepted stopping point.**
 
 Implemented: BEP 3 (core wire protocol), BEP 6 (Fast Extension), BEP 7 (IPv6 peers/trackers),
-BEP 9 (`ut_metadata`, serve-side only), BEP 10 (Extension Protocol), BEP 11 (PEX), BEP 27
-(private-torrent flag disables PEX -- see below), all on the `.torrent`-file entry point.
+BEP 9 (`ut_metadata`, **both** serve and fetch sides), BEP 10 (Extension Protocol), BEP 11
+(PEX), BEP 27 (private-torrent flag disables PEX -- see below), plus magnet-link entry
+(tracker-only, see the section above).
 
-Out of scope, explicit decision (see the magnet-links/DHT section above): BEP 5 (DHT) and
-magnet-link support (needs BEP 9's *consuming* side, not just serving).
+Out of scope, explicit decision: BEP 5 (DHT). Magnet links were later added *without* it, on
+trackers alone -- see the magnet section above.
 
 Not pursued, and not equivalent to the above -- these were never asked about, just not picked
 up, because the project's actual point is UCB peer selection, not exhaustive BEP coverage:
