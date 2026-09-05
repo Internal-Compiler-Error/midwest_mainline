@@ -12,7 +12,7 @@ use juicy_bencode::BencodeItemView;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
@@ -72,7 +72,7 @@ pub struct PeerHandle {
     // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
     pub remote_peer_id: [u8; 20],
 
-    pub remote_addr: SocketAddrV4,
+    pub remote_addr: SocketAddr,
 
     #[eq(skip)]
     pub(crate) peer_tx: mpsc::Sender<PeerCommands>,
@@ -109,10 +109,15 @@ impl PeerHandle {
         torrent: &Torrent,
         remote_supports_extensions: bool,
     ) -> Self {
+        // `to_canonical()` collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a
+        // v4 peer looks like when accepted on a dual-stack `[::]` listener) down to plain
+        // `a.b.c.d`. Without this, the same peer gets a different `remote_addr` depending on
+        // whether we dialed it (plain v4) or it dialed us (v4-mapped-in-v6) -- and `active_peers`
+        // is a sorted vec keyed on `remote_addr`, so that peer could occupy two entries, dedup
+        // against a tracker-discovered address could fail, and `Disconnected` could remove the
+        // wrong one (or none).
         let remote_addr = tcp_stream.peer_addr().unwrap();
-        let SocketAddr::V4(remote_addr) = remote_addr else {
-            panic!("we only support ipv4");
-        };
+        let remote_addr = SocketAddr::new(remote_addr.ip().to_canonical(), remote_addr.port());
         let (reader, writer) = tcp_stream.into_split();
         let (commands_tx, commands_rx) = mpsc::channel(1024);
 
@@ -276,7 +281,7 @@ struct PeerConnection {
     /// their extended handshake; `None` until then (or if they don't support it)
     their_ut_metadata_id: Option<u8>,
 
-    remote_addr: SocketAddrV4,
+    remote_addr: SocketAddr,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
     writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
 

@@ -13,7 +13,7 @@ use rand::Rng;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
 use std::mem;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
@@ -53,7 +53,7 @@ struct HttpAnnouncer {
 }
 
 pub enum AnnouncerEvent {
-    DiscoveredPeers(Vec<SocketAddrV4>),
+    DiscoveredPeers(Vec<SocketAddr>),
 }
 
 /// The tracker `event` parameter (BEP 3 for HTTP, BEP 15 for UDP). The first announce to a
@@ -121,7 +121,7 @@ impl HttpAnnouncer {
 
     /// Perform a single announce and return the interval and discovered peers
     #[tracing::instrument(skip(self))]
-    async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddrV4>> {
+    async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddr>> {
         // percent encode info_hash and peer_id
         let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.torrent.info_hash.0).collect();
         let peer_id_encoded: String = form_urlencoded::byte_serialize(&self.identity.peer_id).collect();
@@ -211,7 +211,21 @@ impl HttpAnnouncer {
 
                 let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                peers.push(SocketAddrV4::new(ip, port));
+                peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+            }
+        }
+
+        // BEP 7: IPv6 peers come back separately under "peers6", same compact encoding but
+        // 18 bytes each (16 bytes IP, 2 bytes port).
+        if let Some(BencodeItemView::ByteString(peer_bytes)) = dict.remove(b"peers6".as_slice()) {
+            for chunk in peer_bytes.chunks(18) {
+                if chunk.len() != 18 {
+                    break;
+                }
+
+                let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
+                let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+                peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
             }
         }
 
@@ -341,27 +355,22 @@ impl UdpAnnouncer {
         sleep_until(self.next_ready)
     }
 
+    /// Resolves the tracker's host to any address family; which one we get back determines
+    /// which family we bind/connect our own UDP socket as (see `ev_loop`) and how we parse the
+    /// peer list in the announce response (see `announce`).
     #[tracing::instrument(skip(self))]
-    async fn resolve_v4(&self) -> anyhow::Result<Option<SocketAddr>> {
+    async fn resolve(&self) -> anyhow::Result<Option<SocketAddr>> {
         let host_name = self.tracker.host_str().unwrap();
         let host_port = self.tracker.port().unwrap();
         let query = format!("{}:{}", host_name, host_port);
         info!("Resolving {}", query);
-        let addresses: Vec<_> = lookup_host(&query)
+        let mut addresses: Vec<_> = lookup_host(&query)
             .await
             .inspect_err(|e| info!("{:?}", e))
             .with_context(|| format!("Failed to resolve {}", &query))?
             .collect();
 
         info!("Looking up {} came back with {:?}", query, &addresses);
-
-        let mut addresses: Vec<_> = addresses
-            .into_iter()
-            .filter_map(|a| match a {
-                SocketAddr::V4(_) => Some(a),
-                SocketAddr::V6(_) => None,
-            })
-            .collect();
 
         Ok(addresses.pop())
     }
@@ -439,7 +448,7 @@ impl UdpAnnouncer {
 
     /// Perform a single announce and return the interval and discovered peers
     #[tracing::instrument(skip(self))]
-    async fn announce(&mut self, socket: &mut UdpSocket, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddrV4>> {
+    async fn announce(&mut self, socket: &mut UdpSocket, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddr>> {
         macro_rules! udp_log {
             ($level:ident, $fmt:literal $(, $args:expr)* $(,)?) => {
                 $level!(
@@ -530,13 +539,38 @@ impl UdpAnnouncer {
             port: U16,
         }
 
-        impl From<Peer> for SocketAddrV4 {
-            fn from(value: Peer) -> SocketAddrV4 {
+        impl From<Peer> for SocketAddr {
+            fn from(value: Peer) -> SocketAddr {
                 let ip = Ipv4Addr::from_octets(value.ip.as_bytes().try_into().unwrap());
                 let port = u16::from_be_bytes(value.port.as_bytes().try_into().unwrap());
-                SocketAddrV4::new(ip, port)
+                SocketAddr::V4(SocketAddrV4::new(ip, port))
             }
         }
+
+        // The classic BEP 15 wire format only ever defined a 4-byte-IP peer entry; there's no
+        // separate field distinguishing v4 from v6 the way BEP 7's "peers"/"peers6" split does
+        // for HTTP trackers. Common tracker software instead just returns 18-byte (16 IP + 2
+        // port) entries when the announce itself arrived over an IPv6 socket -- so which layout
+        // to expect is determined by which family we connected to the tracker as, not by
+        // anything in the response itself.
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned,
+        )]
+        #[repr(C)]
+        struct Peer6 {
+            ip: [u8; 16],
+            port: U16,
+        }
+
+        impl From<Peer6> for SocketAddr {
+            fn from(value: Peer6) -> SocketAddr {
+                let ip = Ipv6Addr::from(value.ip);
+                let port = u16::from_be_bytes(value.port.as_bytes().try_into().unwrap());
+                SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0))
+            }
+        }
+
+        let is_v6 = matches!(socket.peer_addr(), Ok(SocketAddr::V6(_)));
 
         let mut buf = [0u8; 1500];
         let read_size = socket.recv(&mut buf).await.with_context(|| {
@@ -550,15 +584,28 @@ impl UdpAnnouncer {
 
         // construct the response from raw bytes
         let header_size = size_of::<AnnounceResponseHeader>();
+        if buf.len() < header_size {
+            bail!("announce response from tracker [{}] is shorter than a header", self.tracker);
+        }
         let header =
             AnnounceResponseHeader::ref_from_bytes(&buf[..header_size]).expect("header alignment should be good");
+        let peer_bytes = &buf[header_size..];
 
-        let peer_size = size_of::<Peer>();
-        let peer_bytes = buf.len() - header_size;
-        if peer_bytes % peer_size != 0 {
-            bail!("trailing content is a multiple of peer size");
-        }
-        let peers = <[Peer]>::ref_from_bytes(&buf[header_size..]).expect("shit should work");
+        let peers: Vec<SocketAddr> = if is_v6 {
+            let peer_size = size_of::<Peer6>();
+            if peer_bytes.len() % peer_size != 0 {
+                bail!("trailing content is not a multiple of peer size");
+            }
+            let peers = <[Peer6]>::ref_from_bytes(peer_bytes).expect("shit should work");
+            peers.iter().copied().map(SocketAddr::from).collect()
+        } else {
+            let peer_size = size_of::<Peer>();
+            if peer_bytes.len() % peer_size != 0 {
+                bail!("trailing content is not a multiple of peer size");
+            }
+            let peers = <[Peer]>::ref_from_bytes(peer_bytes).expect("shit should work");
+            peers.iter().copied().map(SocketAddr::from).collect()
+        };
 
         // verify the response is valid
         let action: i32 = header.action.into();
@@ -578,26 +625,29 @@ impl UdpAnnouncer {
 
         // why the type casting insanity? because the protocol in their infinite wisdom decided using signed for interval was a good idea
         self.next_ready = Instant::now() + Duration::from_secs(i32::from(header.interval).try_into().unwrap());
-        let peers: Vec<SocketAddrV4> = peers.iter().copied().map(SocketAddrV4::from).collect();
         udp_log!(info, "Announce success, got {:?}", &peers);
         Ok(peers)
     }
 
     #[tracing::instrument(skip(self))]
     async fn ev_loop(mut self) -> anyhow::Result<()> {
-        let tracker_addr = self.resolve_v4().await.inspect_err(|e| warn!("{:?}", e))?;
+        let tracker_addr = self.resolve().await.inspect_err(|e| warn!("{:?}", e))?;
 
         let Some(tracker_addr) = tracker_addr else {
-            bail!("Tracker [{}] has no ipv4", self.tracker);
+            bail!("Tracker [{}] did not resolve to any address", self.tracker);
         };
 
         info!("Tracker [{}] resolved as {}", self.tracker, tracker_addr);
 
-        let our_socket = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
+        // bind our own socket in the same family as the tracker resolved to
+        let our_socket: SocketAddr = match tracker_addr {
+            SocketAddr::V4(_) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into(),
+        };
         info!("Binding to socket");
         let mut socket = UdpSocket::bind(our_socket)
             .await
-            .with_context(|| format!("Failed bind to 0.0.0.0 as an udp socket"))
+            .with_context(|| format!("Failed to bind a udp socket on {our_socket}"))
             .inspect_err(|e| warn!("{:?}", e))?;
 
         info!("\"Connecting\" to {}", tracker_addr);
@@ -728,7 +778,7 @@ impl TorrentSwarmHandle {
             .await;
     }
 
-    pub async fn handle_discovered_peers(&self, peers: Vec<SocketAddrV4>) {
+    pub async fn handle_discovered_peers(&self, peers: Vec<SocketAddr>) {
         let _ = self
             .tx
             .send(TorrentSwarmCommand::SelfCommand(
@@ -739,7 +789,7 @@ impl TorrentSwarmHandle {
 }
 
 pub(crate) enum TorrentSwarmCommand {
-    ProcessPeerEvent { from: SocketAddrV4, event: PeerEvent },
+    ProcessPeerEvent { from: SocketAddr, event: PeerEvent },
     ProcessDownloadEvent(DownloadEvent),
     ProcessAnnounceEvent(AnnouncerEvent),
     SelfCommand(TorrentSwarmSelfCommand),
@@ -747,7 +797,7 @@ pub(crate) enum TorrentSwarmCommand {
 
 pub(crate) enum TorrentSwarmSelfCommand {
     HandleNewPeerConnection(PeerHandle),
-    HandleNewDiscoveredPeers(Vec<SocketAddrV4>),
+    HandleNewDiscoveredPeers(Vec<SocketAddr>),
     /// `Download` runs as its own task and has no direct (aliasing-unsafe) access to
     /// `TorrentSwarm`'s peer list, so it asks for a pick over the command channel instead.
     ChooseBestPeer {
@@ -789,7 +839,7 @@ pub struct TorrentSwarm {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingPeer {
-    pub socket_addr: SocketAddrV4,
+    pub socket_addr: SocketAddr,
     /// It's possible that we would have completed a piece *after* we've started to connect and sent a bitfield but *before* the connection is established
     /// they need to be informed
     pub pending_messages: Vec<u32>,
@@ -1044,7 +1094,7 @@ impl TorrentSwarm {
         }
     }
 
-    async fn process_peer_event(&mut self, from: SocketAddrV4, event: PeerEvent) {
+    async fn process_peer_event(&mut self, from: SocketAddr, event: PeerEvent) {
         match event {
             PeerEvent::Requested(request) => {
                 // never serve a piece we haven't hash-verified, and never serve more than
@@ -1276,7 +1326,7 @@ impl TorrentSwarm {
         &self.storage
     }
 
-    pub fn connect_peer(&self, remote_addr: SocketAddrV4) -> impl Future<Output = anyhow::Result<PeerHandle>> + use<> {
+    pub fn connect_peer(&self, remote_addr: SocketAddr) -> impl Future<Output = anyhow::Result<PeerHandle>> + use<> {
         let torrent = self.torrent.clone();
         let our_id = self.id.clone();
         let event_tx = self.outbound_msgs.clone();
@@ -1328,7 +1378,7 @@ impl TorrentSwarm {
             .collect();
         interested.sort_by(|a, b| b.stats().mean_rx.total_cmp(&a.stats().mean_rx));
 
-        let mut to_unchoke: Vec<SocketAddrV4> =
+        let mut to_unchoke: Vec<SocketAddr> =
             interested.iter().take(MAX_UNCHOKED_PEERS).map(|p| p.remote_addr).collect();
 
         if round % OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS == 0 {

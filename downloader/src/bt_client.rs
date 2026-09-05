@@ -3,11 +3,12 @@ use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle};
 use anyhow::bail;
-use futures::future::join_all;
+use futures::future::{join_all, select_all};
 use midwest_mainline::types::InfoHash;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -94,18 +95,39 @@ impl BtClient {
         peer_factories: Arc<HashMap<InfoHash, PeerFactory>>,
         shutdown: CancellationToken,
     ) {
-        let listener = match TcpListener::bind(id.serving).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                tracing::error!("failed to bind inbound listen address {}: {e:?}", id.serving);
-                return;
+        // Listen on both families independently rather than relying on a single dual-stack
+        // socket (whether an unspecified IPv6 bind also accepts v4-mapped connections is a
+        // platform/sysctl-dependent default, not something we can portably assume). Bind IPv6
+        // first: if the platform's default *does* make it dual-stack, the IPv4 bind below then
+        // fails with AddrInUse, which we treat as "already covered", not an error.
+        let port = id.serving.port();
+        let mut listeners = Vec::new();
+
+        match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)).await {
+            Ok(listener) => {
+                tracing::info!("listening for inbound peer connections on {}", listener.local_addr().unwrap());
+                listeners.push(listener);
             }
-        };
-        tracing::info!("listening for inbound peer connections on {}", id.serving);
+            Err(e) => tracing::warn!("no ipv6 inbound listener on port {port} ({e}); ipv6 peers can't dial us"),
+        }
+        match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).await {
+            Ok(listener) => {
+                tracing::info!("listening for inbound peer connections on {}", listener.local_addr().unwrap());
+                listeners.push(listener);
+            }
+            Err(e) => tracing::warn!(
+                "no ipv4 inbound listener on port {port} ({e}); relying on the ipv6 listener above if it's dual-stack"
+            ),
+        }
+
+        if listeners.is_empty() {
+            tracing::error!("failed to bind any inbound listener on port {port}; not accepting inbound connections");
+            return;
+        }
 
         loop {
             let (mut tcp, remote_addr) = tokio::select! {
-                accepted = listener.accept() => match accepted {
+                (accepted, _idx, _rest) = select_all(listeners.iter().map(|l| Box::pin(l.accept()))) => match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         tracing::warn!("failed to accept an inbound connection: {e:?}");

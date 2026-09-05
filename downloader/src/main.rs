@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let public_ip = Ipv4Addr::from_str("99.226.33.190")?;
     let mut client = BtClient::new(Identity {
         peer_id: random_idv4(&public_ip, 3),
-        serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881),
+        serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
     });
 
     client.add_torrent(torrent).unwrap();
