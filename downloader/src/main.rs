@@ -4,7 +4,6 @@ pub mod download;
 mod peer;
 mod settings;
 mod storage;
-mod sys_tcp;
 mod torrent;
 pub mod torrent_swarm;
 mod wire;

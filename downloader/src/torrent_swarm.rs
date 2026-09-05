@@ -1,28 +1,23 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
-use crate::peer::{PeerCommands, PeerEvent, PeerHandle, PeerStatistics};
+use crate::peer::{PeerCommands, PeerEvent, PeerHandle};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::wire::{BitField, BtMessage, Piece, shake_hands};
+use crate::wire::{BitField, Piece, shake_hands};
 use anyhow::{self, Context, bail};
 use bitvec::boxed::BitBox;
-use futures::StreamExt;
-use futures::stream::FuturesOrdered;
+use bitvec::order::Msb0;
 use juicy_bencode::BencodeItemView;
 use rand::Rng;
 use reqwest::Client;
-use std::any::Any;
-use std::fmt::format;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
-use std::slice::from_raw_parts;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{Instant, Sleep, interval, sleep, sleep_until};
+use tokio::time::{Instant, Sleep, interval, sleep_until};
 use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
@@ -564,7 +559,10 @@ pub struct TorrentSwarmStats {
     pub written: usize,
     /// indexed by piece number, indicates which pieces have been verified, note it also implies we
     /// have a piece if it's verified
-    pub verified: BitBox<u8>,
+    ///
+    /// stored MSB-first (`Msb0`) so `as_raw_slice()` matches BEP 3's bitfield byte layout
+    /// directly: piece 0 is the high bit of byte 0.
+    pub verified: BitBox<u8, Msb0>,
 
     pub completed: bool,
 }
@@ -660,7 +658,7 @@ impl Ord for PendingPeer {
 impl TorrentSwarm {
     pub fn new(torrent: Arc<Torrent>, storage: Arc<TorrentStorage>, id: Arc<Identity>) -> TorrentSwarm {
         let verified = vec![false; torrent.pieces.len()];
-        let verified = BitBox::from_iter(verified.iter());
+        let verified: BitBox<u8, Msb0> = BitBox::from_iter(verified.iter());
         // TODO: this only works for fresh downloads
         // TODO: verified is not updated
         let stat = TorrentSwarmStats {
@@ -741,10 +739,10 @@ impl TorrentSwarm {
         let mut download_done = false;
 
         // TODO: probably store the join handles so they can be aborted when necessary
-        // let http_announcers = mem::take(&mut self.http_announcers);
-        // for http_announcer in http_announcers {
-        //     tokio::spawn(http_announcer.ev_loop());
-        // }
+        let http_announcers = mem::take(&mut self.http_announcers);
+        for http_announcer in http_announcers {
+            tokio::spawn(http_announcer.ev_loop());
+        }
 
         let udp_announcers = mem::take(&mut self.udp_announcers);
         for udp_announcer in udp_announcers {
@@ -845,20 +843,28 @@ impl TorrentSwarm {
     async fn process_peer_event(&mut self, from: SocketAddrV4, event: PeerEvent) {
         match event {
             PeerEvent::Requested(request) => {
-                let data = self.storage.read_piece(request.index);
-                if data.is_err() {
+                // never serve a piece we haven't hash-verified, and never serve more than
+                // the peer actually asked for
+                let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
+                if !verified {
                     return;
                 }
 
-                let data = data.unwrap();
-                let (_head, tail) = data.split_at(request.begin as usize);
-                let tail: Box<[u8]> = tail.into();
+                let Ok(data) = self.storage.read_piece(request.index) else {
+                    return;
+                };
+
+                let begin = request.begin as usize;
+                let end = begin.saturating_add(request.length as usize).min(data.len());
+                if begin >= end {
+                    return;
+                }
 
                 let resp = Piece {
                     index: request.index,
                     begin: request.begin,
-                    length: (data.len() - request.begin as usize) as u32,
-                    data: tail,
+                    length: (end - begin) as u32,
+                    data: Box::from(&data[begin..end]),
                 };
                 let peer_idx = self
                     .active_peers

@@ -157,7 +157,12 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     let pieces = pieces.chunks(20).map(|e| e.try_into().unwrap()).collect();
     let total_size = files.iter().map(|(len, _f)| *len as u64).sum();
     let piece_len: u64 = piece_len.try_into()?;
-    let last_piece_len = total_size % piece_len;
+    // an evenly-divisible torrent has a "remainder" of 0, but the last piece is still
+    // full-sized in that case
+    let last_piece_len = match total_size % piece_len {
+        0 => piece_len,
+        remainder => remainder,
+    };
 
     Ok(Torrent {
         announce_tiers,
@@ -194,14 +199,73 @@ fn compute_info_hash(input: &[u8]) -> InfoHash {
 
 #[cfg(test)]
 mod test {
-    use std::fs;
-
     use super::*;
 
+    fn bencode_string(bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!("{}:", bytes.len()).into_bytes();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// Hand-builds the bencode for a minimal single-file torrent, so parsing tests don't
+    /// depend on an external `.torrent` fixture.
+    fn single_file_torrent(total_size: u64, piece_length: u32) -> Vec<u8> {
+        let num_pieces = total_size.div_ceil(piece_length as u64) as usize;
+        let pieces: Vec<u8> = (0..num_pieces)
+            .flat_map(|i| {
+                let mut hash = [0u8; 20];
+                hash[0] = i as u8;
+                hash
+            })
+            .collect();
+
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d");
+        info.extend_from_slice(&bencode_string(b"length"));
+        info.extend_from_slice(format!("i{total_size}e").as_bytes());
+        info.extend_from_slice(&bencode_string(b"name"));
+        info.extend_from_slice(&bencode_string(b"test.txt"));
+        info.extend_from_slice(&bencode_string(b"piece length"));
+        info.extend_from_slice(format!("i{piece_length}e").as_bytes());
+        info.extend_from_slice(&bencode_string(b"pieces"));
+        info.extend_from_slice(&bencode_string(&pieces));
+        info.extend_from_slice(b"e");
+
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d");
+        torrent.extend_from_slice(&bencode_string(b"announce"));
+        torrent.extend_from_slice(&bencode_string(b"http://tracker.test/announce"));
+        torrent.extend_from_slice(&bencode_string(b"info"));
+        torrent.extend_from_slice(&info);
+        torrent.extend_from_slice(b"e");
+        torrent
+    }
+
     #[test]
-    fn it_works() {
-        let file = fs::read("./test.torrent").unwrap();
-        let torrent = parse_torrent(&file).unwrap();
-        println!("{:#?}", torrent);
+    fn parses_evenly_divisible_torrent() {
+        let bytes = single_file_torrent(15, 5);
+        let torrent = parse_torrent(&bytes).unwrap();
+
+        assert_eq!(torrent.total_size, 15);
+        assert_eq!(torrent.piece_size, 5);
+        assert_eq!(torrent.pieces.len(), 3);
+        // an evenly-divisible torrent's last piece is still full-sized, not zero
+        assert_eq!(torrent.last_piece_size, 5);
+        assert_eq!(torrent.nth_piece_size(2u32), Some(5));
+        assert_eq!(torrent.files.len(), 1);
+        assert_eq!(torrent.files[0].0, 15);
+        assert_eq!(torrent.primary_tracker(), Some("http://tracker.test/announce"));
+    }
+
+    #[test]
+    fn parses_torrent_with_a_short_last_piece() {
+        let bytes = single_file_torrent(17, 5);
+        let torrent = parse_torrent(&bytes).unwrap();
+
+        assert_eq!(torrent.pieces.len(), 4);
+        assert_eq!(torrent.last_piece_size, 2);
+        assert_eq!(torrent.nth_piece_size(0u32), Some(5));
+        assert_eq!(torrent.nth_piece_size(3u32), Some(2));
+        assert_eq!(torrent.nth_piece_size(4u32), None);
     }
 }

@@ -5,12 +5,10 @@ use std::io::ErrorKind;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_util::io::read_buf;
 use tokio_util::{
     bytes::Buf,
     codec::{Decoder, Encoder},
 };
-use tracing::debug;
 use tracing::info;
 use tracing::warn;
 use zerocopy::FromBytes;
@@ -143,9 +141,12 @@ impl Encode for Piece {
     fn encode(&self, buf: &mut [u8]) {
         let (length, header) = buf.split_at_mut(4);
         let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&((1 + 12 + self.data.len()) as u32).to_be_bytes());
+        length.copy_from_slice(&((1 + 8 + self.data.len()) as u32).to_be_bytes());
         header.copy_from_slice(&[7u8]);
-        body.copy_from_slice(&self.data);
+        let (index_begin, data) = body.split_at_mut(8);
+        index_begin[0..4].copy_from_slice(&self.index.to_be_bytes());
+        index_begin[4..8].copy_from_slice(&self.begin.to_be_bytes());
+        data.copy_from_slice(&self.data);
     }
 }
 
@@ -200,7 +201,25 @@ impl Encoder<BtMessage> for BtEncoder {
     type Error = io::Error;
 
     fn encode(&mut self, item: BtMessage, dst: &mut tokio_util::bytes::BytesMut) -> Result<(), Self::Error> {
-        let buf: &mut [u8] = &mut *dst;
+        // Total on-wire size, including the 4-byte length prefix itself.
+        let total_len = match &item {
+            BtMessage::KeepAlive(_) => 4,
+            BtMessage::Choke(_) => 5,
+            BtMessage::Unchoke(_) => 5,
+            BtMessage::Interested(_) => 5,
+            BtMessage::NotInterested(_) => 5,
+            BtMessage::Have(_) => 9,
+            BtMessage::BitField(bit_field) => 5 + bit_field.has.len(),
+            BtMessage::Request(_) => 17,
+            BtMessage::Piece(piece) => 13 + piece.data.len(),
+            BtMessage::Cancel(_) => 17,
+            BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
+        };
+
+        let start = dst.len();
+        dst.resize(start + total_len, 0);
+        let buf = &mut dst[start..];
+
         match item {
             BtMessage::KeepAlive(keep_alive) => keep_alive.encode(buf),
             BtMessage::Choke(choke) => choke.encode(buf),
@@ -233,9 +252,9 @@ impl Decoder for BtDecoder {
 
         let mut length_bytes = [0u8; 4];
         length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_le_bytes(length_bytes) as usize;
+        let length = u32::from_be_bytes(length_bytes) as usize;
 
-        if 4 + length < src.len() {
+        if src.len() < 4 + length {
             return Ok(None);
         }
 
@@ -244,47 +263,52 @@ impl Decoder for BtDecoder {
             let keep_alive = BtMessage::KeepAlive(KeepAlive);
             return Ok(Some(keep_alive));
         }
-        src.advance(4 + length);
 
-        let msg_type = src[4..5][0];
-        let buf = &src[5..5 + length];
-
-        let msg = match msg_type {
-            0 => BtMessage::Choke(Choke),
-            1 => BtMessage::Unchoke(Unchoke),
-            2 => BtMessage::Interested(Interested),
-            3 => BtMessage::NotInterested(NotInterested),
-            4 => BtMessage::Have(Have {
-                checked: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-            }),
-            5 => BtMessage::BitField(BitField { has: Box::from(buf) }),
-            6 => {
-                let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                BtMessage::Request(Request { index, begin, length })
+        let msg_type = src[4];
+        let msg = {
+            // the byte range [5, 4 + length) is the payload following the 1-byte message id;
+            // `length` counts the id byte itself, so the payload is `length - 1` bytes
+            let buf = &src[5..4 + length];
+            match msg_type {
+                0 => BtMessage::Choke(Choke),
+                1 => BtMessage::Unchoke(Unchoke),
+                2 => BtMessage::Interested(Interested),
+                3 => BtMessage::NotInterested(NotInterested),
+                4 => BtMessage::Have(Have {
+                    checked: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                }),
+                5 => BtMessage::BitField(BitField { has: Box::from(buf) }),
+                6 => {
+                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                    BtMessage::Request(Request { index, begin, length })
+                }
+                7 => {
+                    // on the wire a piece message is just <index><begin><block>, with no
+                    // separate length field -- the block extends to the end of the message
+                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                    let data: Box<[u8]> = Box::from(&buf[8..]);
+                    let length = data.len() as u32;
+                    BtMessage::Piece(Piece {
+                        index,
+                        begin,
+                        length,
+                        data,
+                    })
+                }
+                8 => {
+                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                    BtMessage::Cancel(Cancel { index, begin, length })
+                }
+                t => BtMessage::Unknown(t, Box::from(buf)),
             }
-            7 => {
-                let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                let data = Box::from(&buf[12..]);
-                BtMessage::Piece(Piece {
-                    index,
-                    begin,
-                    length,
-                    data,
-                })
-            }
-            8 => {
-                let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                BtMessage::Cancel(Cancel { index, begin, length })
-            }
-            t => BtMessage::Unknown(t, Box::from(buf)),
         };
 
+        src.advance(4 + length);
         Ok(Some(msg))
     }
 }
@@ -356,4 +380,153 @@ pub(crate) async fn shake_hands(
     }
 
     Ok(handshake.clone())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tokio_util::bytes::BytesMut;
+
+    fn round_trip(msg: BtMessage) -> BtMessage {
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(msg, &mut buf).unwrap();
+        let decoded = BtDecoder.decode(&mut buf).unwrap().expect("a full message");
+        assert!(buf.is_empty(), "decoder should consume the whole frame");
+        decoded
+    }
+
+    #[test]
+    fn keep_alive_round_trips() {
+        assert_eq!(round_trip(BtMessage::KeepAlive(KeepAlive)), BtMessage::KeepAlive(KeepAlive));
+    }
+
+    #[test]
+    fn choke_round_trips() {
+        assert_eq!(round_trip(BtMessage::Choke(Choke)), BtMessage::Choke(Choke));
+    }
+
+    #[test]
+    fn unchoke_round_trips() {
+        assert_eq!(round_trip(BtMessage::Unchoke(Unchoke)), BtMessage::Unchoke(Unchoke));
+    }
+
+    #[test]
+    fn interested_round_trips() {
+        assert_eq!(round_trip(BtMessage::Interested(Interested)), BtMessage::Interested(Interested));
+    }
+
+    #[test]
+    fn not_interested_round_trips() {
+        assert_eq!(
+            round_trip(BtMessage::NotInterested(NotInterested)),
+            BtMessage::NotInterested(NotInterested)
+        );
+    }
+
+    #[test]
+    fn have_round_trips() {
+        let have = Have { checked: 0x1234abcd };
+        assert_eq!(round_trip(BtMessage::Have(have)), BtMessage::Have(have));
+    }
+
+    #[test]
+    fn bitfield_round_trips() {
+        let bit_field = BitField {
+            has: Box::from([0xffu8, 0x00, 0xa5]),
+        };
+        assert_eq!(round_trip(BtMessage::BitField(bit_field.clone())), BtMessage::BitField(bit_field));
+    }
+
+    #[test]
+    fn request_round_trips() {
+        let request = Request {
+            index: 1,
+            begin: 2,
+            length: 3,
+        };
+        assert_eq!(round_trip(BtMessage::Request(request)), BtMessage::Request(request));
+    }
+
+    #[test]
+    fn cancel_round_trips() {
+        let cancel = Cancel {
+            index: 1,
+            begin: 2,
+            length: 3,
+        };
+        assert_eq!(round_trip(BtMessage::Cancel(cancel)), BtMessage::Cancel(cancel));
+    }
+
+    #[test]
+    fn piece_round_trips() {
+        let piece = Piece {
+            index: 7,
+            begin: 16384,
+            length: 4,
+            data: Box::from([1u8, 2, 3, 4]),
+        };
+        assert_eq!(round_trip(BtMessage::Piece(piece.clone())), BtMessage::Piece(piece));
+    }
+
+    /// The two frames back to back exercise that the decoder only consumes exactly one
+    /// frame's worth of bytes and leaves the rest for the next call, per BEP 3 framing.
+    #[test]
+    fn decoder_only_consumes_one_frame_at_a_time() {
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
+        BtEncoder.encode(BtMessage::Interested(Interested), &mut buf).unwrap();
+
+        assert_eq!(buf.len(), 10);
+        let first = BtDecoder.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(first, BtMessage::Unchoke(Unchoke));
+        assert_eq!(buf.len(), 5);
+        let second = BtDecoder.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(second, BtMessage::Interested(Interested));
+        assert!(buf.is_empty());
+    }
+
+    /// Decoder must wait (return `Ok(None)`) instead of erroring or panicking when a frame
+    /// has been announced by its length prefix but hasn't fully arrived yet.
+    #[test]
+    fn decoder_waits_for_a_full_frame() {
+        let mut full = BytesMut::new();
+        BtEncoder.encode(BtMessage::Have(Have { checked: 5 }), &mut full).unwrap();
+
+        let mut partial = BytesMut::from(&full[..full.len() - 1]);
+        assert_eq!(BtDecoder.decode(&mut partial).unwrap(), None);
+        assert_eq!(partial.len(), full.len() - 1, "decoder must not consume a partial frame");
+    }
+
+    /// BEP 3 requires the length prefix to be big-endian (network byte order), and the piece
+    /// message to carry only `<index><begin><block>` with no embedded length field.
+    #[test]
+    fn wire_bytes_match_bep3_exactly() {
+        // unchoke: <len=0001><id=1>
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 1, 1]);
+
+        // have: <len=0005><id=4><piece index>
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(BtMessage::Have(Have { checked: 1 }), &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 5, 4, 0, 0, 0, 1]);
+
+        // piece: <len=0009+X><id=7><index><begin><block>, no separate length field
+        let mut buf = BytesMut::new();
+        BtEncoder
+            .encode(
+                BtMessage::Piece(Piece {
+                    index: 1,
+                    begin: 2,
+                    length: 3,
+                    data: Box::from([9u8, 8, 7]),
+                }),
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(
+            &buf[..],
+            &[0, 0, 0, 12, 7, 0, 0, 0, 1, 0, 0, 0, 2, 9, 8, 7]
+        );
+    }
 }

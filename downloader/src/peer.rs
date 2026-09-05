@@ -370,7 +370,8 @@ impl PeerConnection {
                 let index = have.checked / 8;
                 let offset = have.checked % 8;
 
-                let flag = 1u8 << offset;
+                // BEP 3 bitfields are MSB-first: piece 0 is the high bit of byte 0
+                let flag = 0x80u8 >> offset;
                 self.state.they_have[index as usize] |= flag;
             }
             BtMessage::BitField(bit_field) => {
@@ -455,7 +456,8 @@ impl PeerState {
         let index = piece / 8;
         let offset = piece % 8;
 
-        let flag = 1u8 << offset;
+        // BEP 3 bitfields are MSB-first: piece 0 is the high bit of byte 0
+        let flag = 0x80u8 >> offset;
         (self.they_have[index as usize] & flag) != 0
     }
 

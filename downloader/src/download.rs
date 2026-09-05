@@ -101,7 +101,8 @@ impl Download<'_> {
     }
 
     async fn download_piece(&self, piece: u32, peer: PeerHandle) -> anyhow::Result<()> {
-        let mut buf = vec![0u8; self.torrent.piece_size as usize];
+        let piece_size = self.torrent.nth_piece_size(piece).expect("piece index in range");
+        let mut buf = vec![0u8; piece_size];
         let disjoint_sections = buf.chunks_mut(BLOCK_SIZE).enumerate();
 
         let mut download_blocks = vec![];
@@ -111,8 +112,8 @@ impl Download<'_> {
             download_blocks.push(async move {
                 self.download_block(
                     Request {
-                        index: idx,
-                        begin: idx * self.torrent.piece_size,
+                        index: piece,
+                        begin: idx * BLOCK_SIZE as u32,
                         length: section.len() as u32,
                     },
                     peer,

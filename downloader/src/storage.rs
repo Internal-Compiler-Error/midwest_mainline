@@ -1,10 +1,9 @@
 use crate::torrent::Torrent;
 use anyhow::anyhow;
-use bitvec::prelude::*;
 use std::fs::File;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 ///// Storage statistics shared via watch channel
 // #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -75,11 +74,9 @@ impl TorrentStorage {
     // }
 
     fn files_responsible(&self, piece: u32) -> Range<usize> {
-        // TODO: last piece has a different size
-        assert_ne!(piece as usize, self.torrent.pieces.len() - 1);
-
-        let piece_start = (piece * self.torrent.piece_size) as usize;
-        let piece_end = piece_start + self.torrent.piece_size as usize;
+        let piece_start = (piece as usize) * (self.torrent.piece_size as usize);
+        let piece_size = self.torrent.nth_piece_size(piece).expect("piece index in range");
+        let piece_end = piece_start + piece_size;
 
         let first = self
             .offsets
@@ -95,7 +92,7 @@ impl TorrentStorage {
         let mut written = 0;
         for (file, range) in segments {
             let size = range.end - range.start;
-            file.write_all_at(&complete_piece[written..size], range.start.try_into().unwrap())?;
+            file.write_all_at(&complete_piece[written..written + size], range.start.try_into().unwrap())?;
             written += size;
         }
         // if !self.verify_hash(piece) {
@@ -116,7 +113,8 @@ impl TorrentStorage {
         // let stat = self.stat.read().expect("lock poisoning is stupid");
         // let has_block = stat.verified.get(piece as usize);
 
-        let mut buf = vec![0u8; self.torrent.piece_size as usize];
+        let piece_size = self.torrent.nth_piece_size(piece).ok_or_else(|| anyhow!("piece index out of range"))?;
+        let mut buf = vec![0u8; piece_size];
         let mut read = 0;
         for (file, interval) in self.file_segments(piece) {
             let len = interval.len();
