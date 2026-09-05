@@ -121,7 +121,9 @@ impl Download {
                     // there's now room for one more in-flight piece
                     unblocked.notify_one();
                 }
-                // TODO: suprious wakeups?
+                // `Notify::notified()` can return without a matching `notify_one()` (a stored
+                // permit, coalesced notifications); re-checking real state below rather than
+                // trusting the wakeup is what makes that safe, not anything about this select arm
                 _ = unblocked.notified() => {
                     if in_flight.len() >= self.max_inflight {
                         continue;

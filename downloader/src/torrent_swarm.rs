@@ -144,24 +144,6 @@ impl HttpAnnouncer {
             event = event.http_str().map(|e| format!("&event={e}")).unwrap_or_default(),
         );
 
-        // fn percent_encode(bytes: &[u8]) -> String {
-        //     bytes.iter().map(|b| format!("%{:02X}", b)).collect()
-        // }
-
-        // debug_assert!(percent_encode(&self.torrent.info_hash.0).len() == 60);
-
-        // let mut url = self.tracker.clone();
-        // url.query_pairs_mut()
-        //     .encoding_override(None)
-        //     .append_pair("info_hash", &percent_encode(&self.torrent.info_hash.0))
-        //     // .append_pair("info_hash", &info_hash_encoded)
-        //     // .append_pair("peer_id", &peer_id_encoded)
-        //     .append_pair("peer_id", &percent_encode(&self.identity.peer_id))
-        //     .append_pair("port", &self.identity.serving.port().to_string())
-        //     .append_pair("uploaded", &swarm_stat.uploaded.to_string())
-        //     .append_pair("downloaded", &swarm_stat.downloaded.to_string())
-        //     .append_pair("left", &swarm_stat.left.to_string())
-        //     .append_pair("compact", &1.to_string());
         let url = Url::parse(&url).unwrap();
 
         info!("Annoucing to {url}");
@@ -281,7 +263,6 @@ impl HttpAnnouncer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 struct UdpAnnouncer {
     tracker: Url,
     torrent: Arc<Torrent>,
@@ -319,15 +300,11 @@ enum Action {
 #[repr(i32)]
 enum Event {
     None = 0,
-    #[allow(dead_code)]
     Completed = 1,
-    #[allow(dead_code)]
     Started = 2,
-    #[allow(dead_code)]
     Stopped = 3,
 }
 
-#[allow(dead_code)]
 impl UdpAnnouncer {
     fn new(
         tracker_url: Url,
@@ -526,13 +503,6 @@ impl UdpAnnouncer {
             seeders: I32,
         }
 
-        #[derive(PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-        #[repr(C)]
-        struct AnnounceResponse {
-            header: AnnounceResponseHeader,
-            peers: [Peer],
-        }
-
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned,
         )]
@@ -674,7 +644,6 @@ impl UdpAnnouncer {
                         .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
                     self.sent_started = true;
 
-                    // TODO: should we send events directly or use the handle
                     let _ = self
                         .event
                         .send(TorrentSwarmCommand::ProcessAnnounceEvent(
@@ -743,14 +712,13 @@ pub struct TorrentSwarmHandle {
 }
 
 /// Builds `PeerHandle`s for a specific torrent's swarm without holding a reference into
-/// `TorrentSwarm` itself -- everything it needs (an `Arc<Torrent>`, a command-channel sender,
-/// a stats watch) is cheap to clone and hands off safely across tasks. Used by the inbound
-/// connection listener, which accepts a socket before it knows which swarm it belongs to.
+/// `TorrentSwarm` itself -- everything it needs (an `Arc<Torrent>`, a command-channel sender)
+/// is cheap to clone and hands off safely across tasks. Used by the inbound connection
+/// listener, which accepts a socket before it knows which swarm it belongs to.
 #[derive(Clone)]
 pub(crate) struct PeerFactory {
     torrent: Arc<Torrent>,
     event_tx: mpsc::Sender<TorrentSwarmCommand>,
-    stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 }
 
 impl PeerFactory {
@@ -765,7 +733,6 @@ impl PeerFactory {
             tcp_stream,
             remote_peer_id,
             self.event_tx.clone(),
-            self.stat_snapshot_rx.clone(),
             &self.torrent,
             remote_supports_extensions,
             remote_supports_fast,
@@ -853,6 +820,14 @@ pub struct TorrentSwarm {
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
+    /// Not read anywhere yet -- `HttpAnnouncer`/`UdpAnnouncer` each hold their own clone (taken
+    /// from `stat_rx` at construction, see `TorrentSwarm::new`) for deciding when to send
+    /// `event=completed`, so this one on `TorrentSwarm` itself has no consumer today. Kept
+    /// (rather than deleted) as the natural seed for a future stats subscription -- e.g. for a
+    /// UI -- once something exists to hand a clone of it out through (this field alone can't be:
+    /// `work_loop(self)` consumes the `TorrentSwarm` by value, so nothing outside this file can
+    /// reach it after the swarm starts running).
+    #[allow(dead_code)]
     stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 }
 
@@ -978,7 +953,6 @@ impl TorrentSwarm {
         PeerFactory {
             torrent: self.torrent.clone(),
             event_tx: self.outbound_msgs.clone(),
-            stat_snapshot_rx: self.stat_snapshot_rx.clone(),
         }
     }
 
@@ -1335,7 +1309,6 @@ impl TorrentSwarm {
         let torrent = self.torrent.clone();
         let our_id = self.id.clone();
         let event_tx = self.outbound_msgs.clone();
-        let stat_snapshot_rx = self.stat_snapshot_rx.clone();
 
         async move {
             let mut tcp = TcpStream::connect(remote_addr)
@@ -1350,7 +1323,6 @@ impl TorrentSwarm {
                 tcp,
                 handshake.peer_id,
                 event_tx,
-                stat_snapshot_rx,
                 &torrent,
                 crate::wire::supports_extensions(&handshake.extensions),
                 crate::wire::supports_fast_extension(&handshake.extensions),

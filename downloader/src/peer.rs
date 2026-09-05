@@ -1,6 +1,6 @@
 use crate::settings::{KEEPALIVE_INTERVAL, PEER_TIMEOUT};
 use crate::torrent::Torrent;
-use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
+use crate::torrent_swarm::TorrentSwarmCommand;
 use crate::wire::{
     BitField, BtDecoder, BtEncoder, BtMessage, Choke, Extended, Have, Interested, KeepAlive, NotInterested, Piece,
     Request, Unchoke,
@@ -125,7 +125,6 @@ impl PeerHandle {
         tcp_stream: TcpStream,
         remote_peer_id: [u8; 20],
         event_tx: mpsc::Sender<TorrentSwarmCommand>,
-        torrent_status: watch::Receiver<TorrentSwarmStats>,
         torrent: &Torrent,
         remote_supports_extensions: bool,
         remote_supports_fast: bool,
@@ -181,8 +180,6 @@ impl PeerHandle {
 
             stats: Default::default(),
             stats_tx,
-
-            torrent_stat: torrent_status,
         };
 
         tokio::spawn(peer_ev_loop(peer, remote_supports_extensions));
@@ -351,8 +348,6 @@ struct PeerConnection {
     /// bumped on every inbound message (including keep-alives); a peer that sends nothing for
     /// PEER_TIMEOUT is considered dead
     last_received: Instant,
-
-    torrent_stat: watch::Receiver<TorrentSwarmStats>,
 
     stats: PeerStatistics,
     stats_tx: watch::Sender<PeerStatistics>,

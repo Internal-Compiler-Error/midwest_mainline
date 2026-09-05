@@ -45,9 +45,16 @@ impl BtClient {
         }
 
         let mut files = vec![];
-        for (_size, file) in torrent.files.iter_mut() {
+        for (size, file) in torrent.files.iter_mut() {
             fs::create_dir_all(file.parent().unwrap()).unwrap();
-            files.push(File::create(&file)?);
+            let f = File::create(&file)?;
+            // `TorrentStorage::new` reads each file's on-disk length back out (via
+            // `file.metadata()`) to compute per-file offsets into the torrent's conceptual
+            // single address space -- a freshly `File::create`d file is 0 bytes, so without
+            // this every file's offset would come out as 0, corrupting storage for anything
+            // but a single-file torrent.
+            f.set_len(*size as u64)?;
+            files.push(f);
         }
 
         let torrent = Arc::new(torrent);

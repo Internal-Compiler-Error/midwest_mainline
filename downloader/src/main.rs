@@ -45,14 +45,11 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // init_tracing();
     tracing_subscriber::fmt()
         .with_max_level(LevelFilter::INFO)
         .without_time()
         .pretty()
         .init();
-
-    // tracing_subscriber::fmt().event_format(format).init();
 
     let args = env::args().collect::<Vec<_>>();
 

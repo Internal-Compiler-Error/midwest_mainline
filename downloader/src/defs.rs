@@ -1,9 +1,4 @@
-#![allow(dead_code)]
-
 use std::net::SocketAddr;
-
-pub type AMutex<T> = tokio::sync::Mutex<T>;
-pub type ARwLock<T> = tokio::sync::RwLock<T>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord, Copy)]
 pub struct Identity {
