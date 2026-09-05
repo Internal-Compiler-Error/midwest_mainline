@@ -28,7 +28,6 @@ use derive_more::{Display, Error};
 #[derive(Debug)]
 pub(crate) enum PeerCommands {
     UnchokePeer,
-    #[allow(dead_code)]
     ChokePeer,
     FancyPeer,
     RequestDataFromPeer {
@@ -205,6 +204,11 @@ impl PeerHandle {
 
     pub fn try_unchoke_peer(&self) -> Result<(), PeerDied> {
         self.peer_tx.try_send(PeerCommands::UnchokePeer).map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    pub async fn choke_peer(&self) -> Result<(), PeerDied> {
+        self.peer_tx.send(PeerCommands::ChokePeer).await.map_err(|_| PeerDied)?;
         Ok(())
     }
 

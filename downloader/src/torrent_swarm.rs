@@ -1,6 +1,7 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
 use crate::peer::{PeerCommands, PeerEvent, PeerHandle};
+use crate::settings::{CHOKING_ROUND_INTERVAL, MAX_UNCHOKED_PEERS, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::wire::{BitField, Piece, shake_hands};
@@ -9,6 +10,7 @@ use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
 use juicy_bencode::BencodeItemView;
 use rand::Rng;
+use rand::seq::IndexedRandom;
 use reqwest::Client;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -899,6 +901,8 @@ impl TorrentSwarm {
 
     pub(crate) async fn work_loop(mut self) {
         let mut aggregate_ticker = interval(Duration::from_mins(1));
+        let mut choking_ticker = interval(CHOKING_ROUND_INTERVAL);
+        let mut choking_round: u64 = 0;
 
         // `Download` only holds owned/shared (Arc, Sender) state -- it talks to the swarm
         // over the command channel rather than borrowing it, so it can run as its own task
@@ -924,6 +928,10 @@ impl TorrentSwarm {
             tokio::select! {
                 _ = aggregate_ticker.tick() => {
                     self.aggregate_peer_stats();
+                }
+                _ = choking_ticker.tick() => {
+                    choking_round += 1;
+                    self.run_choking_algorithm(choking_round).await;
                 }
                 Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
             }
@@ -1244,9 +1252,48 @@ impl TorrentSwarm {
         let has = Box::from(self.stat.verified.clone().as_raw_slice());
 
         peer.try_bitfield(BitField { has })?;
-        peer.try_unchoke_peer()?;
         peer.try_fancy_peer()?;
+        // BEP 3: connections start choked; whether to unchoke is the choking algorithm's
+        // call (run periodically in work_loop), not an automatic grant on connect
 
         Ok(())
+    }
+
+    /// Tit-for-tat unchoking, run periodically. Ranks interested peers (those who want to
+    /// download from us) by the download rate they've been giving us -- reciprocation is the
+    /// point -- and unchokes the top MAX_UNCHOKED_PEERS. Every OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS
+    /// rounds, one additional peer is unchoked at random so a new or under-rated peer gets a
+    /// chance to prove itself instead of the same top N being unchoked forever.
+    async fn run_choking_algorithm(&mut self, round: u64) {
+        let mut interested: Vec<PeerHandle> = self
+            .active_peers
+            .iter()
+            .filter(|p| p.state().interested_us)
+            .cloned()
+            .collect();
+        interested.sort_by(|a, b| b.stats().mean_rx.total_cmp(&a.stats().mean_rx));
+
+        let mut to_unchoke: Vec<SocketAddrV4> =
+            interested.iter().take(MAX_UNCHOKED_PEERS).map(|p| p.remote_addr).collect();
+
+        if round % OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS == 0 {
+            let candidates: Vec<_> = interested
+                .iter()
+                .filter(|p| !to_unchoke.contains(&p.remote_addr))
+                .collect();
+            if let Some(pick) = candidates.choose(&mut rand::rng()) {
+                to_unchoke.push(pick.remote_addr);
+            }
+        }
+
+        for peer in &self.active_peers {
+            let should_unchoke = to_unchoke.contains(&peer.remote_addr);
+            let currently_choked = peer.state().choked_them;
+            if should_unchoke && currently_choked {
+                let _ = peer.unchoke_peer().await;
+            } else if !should_unchoke && !currently_choked {
+                let _ = peer.choke_peer().await;
+            }
+        }
     }
 }
