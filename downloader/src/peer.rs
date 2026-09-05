@@ -1,7 +1,9 @@
+use crate::settings::{KEEPALIVE_INTERVAL, PEER_TIMEOUT};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
 use crate::wire::{
-    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, NotInterested, Piece, Request, Unchoke,
+    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, KeepAlive, NotInterested, Piece, Request,
+    Unchoke,
 };
 use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
@@ -16,6 +18,7 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::interval;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::info;
 
@@ -39,6 +42,10 @@ pub(crate) enum PeerCommands {
 
 pub enum PeerEvent {
     Requested(Request),
+    /// The connection closed, either because the peer went silent past PEER_TIMEOUT or
+    /// because the socket/command channel closed outright. Lets the swarm drop this peer
+    /// from `active_peers` instead of holding a dead handle forever.
+    Disconnected,
 }
 
 // TODO: Should refactor the design so that a peer connection and handle can be constructed even
@@ -121,6 +128,7 @@ impl PeerHandle {
             reader: FramedRead::new(reader, BtDecoder),
             writer: FramedWrite::new(writer, BtEncoder),
             requested: Default::default(),
+            last_received: Instant::now(),
 
             stats: Default::default(),
             stats_tx,
@@ -238,6 +246,9 @@ struct PeerConnection {
     writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
 
     requested: BTreeMap<Request, (oneshot::Sender<Box<[u8]>>, Instant)>,
+    /// bumped on every inbound message (including keep-alives); a peer that sends nothing for
+    /// PEER_TIMEOUT is considered dead
+    last_received: Instant,
 
     torrent_stat: watch::Receiver<TorrentSwarmStats>,
 
@@ -248,6 +259,9 @@ struct PeerConnection {
 }
 
 async fn peer_ev_loop(mut peer: PeerConnection) {
+    let mut keepalive_ticker = interval(KEEPALIVE_INTERVAL);
+    keepalive_ticker.tick().await; // the first tick fires immediately; skip it
+
     loop {
         tokio::select! {
             // Handle commands from the peer handle
@@ -256,21 +270,37 @@ async fn peer_ev_loop(mut peer: PeerConnection) {
             // Process incoming BitTorrent protocol messages
             Some(Ok(msg)) = peer.reader.next() => { peer.process_message(msg).await }
 
+            // BEP 3: send a keep-alive periodically, and consider the peer dead if it hasn't
+            // sent us anything (not even its own keep-alives) in a while
+            _ = keepalive_ticker.tick() => {
+                if peer.last_received.elapsed() > PEER_TIMEOUT {
+                    info!("{} timed out (no messages for {:?}), disconnecting", peer.remote_addr, peer.last_received.elapsed());
+                    break;
+                }
+                if peer.writer.send(BtMessage::KeepAlive(KeepAlive)).await.is_err() {
+                    break;
+                }
+            }
+
             // Exit loop if all channels are closed
             else => break,
         }
     }
+
+    peer.emit_event(PeerEvent::Disconnected).await;
 }
 
 impl PeerConnection {
     async fn emit_event(&mut self, event: PeerEvent) {
-        self.events
+        // the swarm task may already be gone (e.g. mid-shutdown); that's not this
+        // connection's problem to panic over
+        let _ = self
+            .events
             .send(TorrentSwarmCommand::ProcessPeerEvent {
                 from: self.remote_addr,
-                event: event,
+                event,
             })
-            .await
-            .unwrap();
+            .await;
     }
 
     pub async fn request_data_from_peer(
@@ -363,6 +393,7 @@ impl PeerConnection {
     #[tracing::instrument(skip(self))]
     pub async fn process_message(&mut self, msg: BtMessage) {
         info!("Handling one {:?} BitTorrent message", msg);
+        self.last_received = Instant::now();
         match msg {
             BtMessage::KeepAlive(_) => return,
             BtMessage::Choke(_) => self.state.choked_us = true,

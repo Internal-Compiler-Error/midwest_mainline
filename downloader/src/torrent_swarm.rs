@@ -911,6 +911,12 @@ impl TorrentSwarm {
                 };
                 let _ = self.active_peers[peer_idx].send_data(resp).await;
             }
+            PeerEvent::Disconnected => {
+                if let Ok(idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) {
+                    self.active_peers.remove(idx);
+                    info!("{} disconnected, removed from active peers", from);
+                }
+            }
         }
     }
 
