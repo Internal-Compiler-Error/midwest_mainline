@@ -9,7 +9,7 @@
 
 use downloader::{Progress, ResumeSummary, Session, SessionState, human_bytes, is_magnet_uri, list_resume_files};
 use eframe::egui;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Resume files go next to the downloads, and are shared with the CLI.
@@ -18,8 +18,9 @@ const RESUME_DIR: &str = "resume";
 fn main() -> eframe::Result {
     let mut session = Session::new(random_peer_id(), 6881).expect("failed to start a session");
     session.set_resume_dir(RESUME_DIR);
+    let download_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(source) = std::env::args().nth(1) {
-        session.start(source);
+        session.start(source, download_dir.clone());
     }
 
     let options = eframe::NativeOptions {
@@ -37,6 +38,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(App {
                 session,
                 input: String::new(),
+                download_dir,
                 resumable: list_resume_files(Path::new(RESUME_DIR)),
             }))
         }),
@@ -53,8 +55,24 @@ fn random_peer_id() -> [u8; 20] {
 struct App {
     session: Session,
     input: String,
+    /// where the next torrent goes; the folder picker starts here and updates it
+    download_dir: PathBuf,
     /// what's in `RESUME_DIR`; refreshed on demand, not every frame
     resumable: Vec<ResumeSummary>,
+}
+
+impl App {
+    /// Asks where this torrent should go, then starts it. Cancelling the picker cancels the add.
+    fn start(&mut self, source: String) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Download into…")
+            .set_directory(&self.download_dir)
+            .pick_folder();
+        if let Some(dir) = picked {
+            self.download_dir = dir.clone();
+            self.session.start(source, dir);
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -67,7 +85,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if ui.button("Open .torrent…").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("torrent", &["torrent"]).pick_file() {
-                        self.session.start(path.display().to_string());
+                        self.start(path.display().to_string());
                     }
                 }
                 ui.separator();
@@ -80,7 +98,8 @@ impl eframe::App for App {
                 );
                 let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ready && (entered || ui.add_enabled(ready, egui::Button::new("Add")).clicked()) {
-                    self.session.start(std::mem::take(&mut self.input));
+                    let magnet = std::mem::take(&mut self.input);
+                    self.start(magnet);
                 }
             });
             ui.add_space(4.0);
@@ -131,7 +150,7 @@ fn draw_resumable(ui: &mut egui::Ui, resumable: &mut Vec<ResumeSummary>) -> Opti
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 for entry in resumable.iter() {
-                    ui.label(&entry.name);
+                    ui.label(&entry.name).on_hover_text(entry.root.display().to_string());
                     ui.add(
                         egui::ProgressBar::new(entry.fraction())
                             .show_percentage()
@@ -195,6 +214,7 @@ fn draw_progress(ui: &mut egui::Ui, p: &Progress) {
         .spacing([16.0, 6.0])
         .show(ui, |ui| {
             for (label, value) in [
+                ("Location", p.root.clone()),
                 (
                     "Downloaded",
                     format!(

@@ -45,7 +45,8 @@ pub struct Torrent {
     /// Hash of each piece
     pub pieces: Vec<[u8; 20]>,
 
-    /// Files in the torrent: (size in bytes, file path)
+    /// Files in the torrent: (size in bytes, path relative to the download root), always
+    /// starting with `name` -- the single file's name, or the directory holding them all
     pub files: Vec<(u32, PathBuf)>,
 
     /// Total size of all files combined in bytes
@@ -162,10 +163,9 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         bail!("name needs to be a string");
     };
     let name = str::from_utf8(name)?.to_string();
-    let mut root = PathBuf::new();
-    // TODO: make this configurable
-    root.push("./");
-    root.push(safe_path_component(&name)?);
+    // paths are relative to a download root the caller chooses per torrent (see
+    // `BtClient::add_torrent`); this only decides the layout under it
+    let root = safe_path_component(&name)?;
 
     let BencodeItemView::Integer(piece_len) = info.remove(b"piece length".as_slice()).unwrap() else {
         bail!("piece length needs to be an integer");

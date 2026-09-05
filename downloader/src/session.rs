@@ -41,6 +41,8 @@ pub enum SessionState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
     pub name: String,
+    /// the directory the files are under
+    pub root: String,
     pub files: Vec<String>,
     pub total_size: u64,
     pub downloaded: u64,
@@ -74,6 +76,7 @@ enum Phase {
     },
     Downloading {
         torrent: Arc<Torrent>,
+        root: PathBuf,
         stats: watch::Receiver<TorrentSwarmStats>,
     },
     Failed {
@@ -123,35 +126,36 @@ impl Session {
         self.resume_dir = Some(dir.into());
     }
 
-    /// Starts downloading `source`, which may be a path to a `.torrent` or a magnet URI.
-    /// Replaces whatever was running before. Returns immediately; watch [`Session::state`] for
-    /// what happens next.
-    pub fn start(&mut self, source: impl Into<String>) {
+    /// Starts downloading `source`, which may be a path to a `.torrent` or a magnet URI, into
+    /// `root` (see `BtClient::add_torrent` for the layout under it). Replaces whatever was
+    /// running before. Returns immediately; watch [`Session::state`] for what happens next.
+    pub fn start(&mut self, source: impl Into<String>, root: impl Into<PathBuf>) {
         let source = source.into();
+        let root = root.into();
         let identity = self.identity.clone();
         self.launch(source.clone(), |cancel| async move {
             let torrent = load_source(&source, identity, cancel).await?;
             let nothing = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-            Ok((torrent, nothing, false))
+            Ok((torrent, root, nothing, false))
         });
     }
 
-    /// Picks a download back up from a resume file (see `ResumeData`). Replaces whatever was
-    /// running before, like [`Session::start`].
+    /// Picks a download back up from a resume file (see `ResumeData`), in the root it was
+    /// started in. Replaces whatever was running before, like [`Session::start`].
     pub fn resume(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
         self.launch(path.display().to_string(), |_cancel| async move {
             let data = ResumeData::read(&path)?;
-            Ok((data.to_torrent()?, data.verified, true))
+            Ok((data.to_torrent()?, data.root, data.verified, true))
         });
     }
 
-    /// Shared tail of `start`/`resume`: `resolve` produces the torrent plus which pieces are
-    /// already had, and whether the target files are expected to exist already.
+    /// Shared tail of `start`/`resume`: `resolve` produces the torrent, where its files go,
+    /// which pieces are already had, and whether the target files are expected to exist.
     fn launch<F, Fut>(&mut self, source: String, resolve: F)
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<(Torrent, BitBox<u8, Msb0>, bool)>> + Send,
+        Fut: Future<Output = anyhow::Result<(Torrent, PathBuf, BitBox<u8, Msb0>, bool)>> + Send,
     {
         self.stop();
         self.rates = Rates::new();
@@ -172,7 +176,7 @@ impl Session {
                     error: format!("{e:#}"),
                 });
             };
-            let (torrent, verified, resumed) = match resolve(cancel.clone()).await {
+            let (torrent, root, verified, resumed) = match resolve(cancel.clone()).await {
                 Ok(resolved) => resolved,
                 Err(e) => return fail(e),
             };
@@ -180,9 +184,9 @@ impl Session {
             // share the session's token so `Session::stop` shuts the client down too
             let mut client = BtClient::new_with_shutdown(*identity, cancel.clone());
             let added = if resumed {
-                client.add_torrent_resumed(torrent.clone(), verified)
+                client.add_torrent_resumed(torrent.clone(), &root, verified)
             } else {
-                client.add_torrent(torrent.clone())
+                client.add_torrent(torrent.clone(), &root)
             };
             if let Err(e) = added {
                 return fail(e);
@@ -193,9 +197,15 @@ impl Session {
 
             let torrent = Arc::new(torrent);
             if let Some(dir) = resume_dir {
-                tokio::spawn(keep_saving(torrent.clone(), stats.clone(), dir, cancel.clone()));
+                tokio::spawn(keep_saving(
+                    torrent.clone(),
+                    root.clone(),
+                    stats.clone(),
+                    dir,
+                    cancel.clone(),
+                ));
             }
-            let _ = phase_tx.send(Phase::Downloading { torrent, stats });
+            let _ = phase_tx.send(Phase::Downloading { torrent, root, stats });
             let _ = client.work().await;
         });
     }
@@ -218,11 +228,12 @@ impl Session {
                 source,
                 elapsed: started.elapsed(),
             },
-            Phase::Downloading { torrent, stats } => {
+            Phase::Downloading { torrent, root, stats } => {
                 let stats = stats.borrow().clone();
                 self.rates.update(&stats);
                 SessionState::Downloading(Progress {
                     name: torrent.name.clone(),
+                    root: root.display().to_string(),
                     files: torrent.files.iter().map(|(_, p)| p.display().to_string()).collect(),
                     total_size: torrent.total_size,
                     downloaded: stats.downloaded,
@@ -322,6 +333,7 @@ mod test {
     fn fraction_is_clamped_and_total() {
         let mut p = Progress {
             name: String::new(),
+            root: String::new(),
             files: vec![],
             total_size: 0,
             downloaded: 0,

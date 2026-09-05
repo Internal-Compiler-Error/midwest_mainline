@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -56,17 +57,24 @@ impl BtClient {
         self.stats.get(&torrent.info_hash).cloned()
     }
 
-    /// Starts `torrent` from scratch: target files are created (or truncated) and sized.
-    pub fn add_torrent(&mut self, torrent: Torrent) -> anyhow::Result<()> {
+    /// Starts `torrent` from scratch under `root`: target files are created (or truncated)
+    /// and sized. A single-file torrent becomes `root/<name>`, a multi-file one
+    /// `root/<name>/...`, the way every mainstream client lays a download out.
+    pub fn add_torrent(&mut self, torrent: Torrent, root: &Path) -> anyhow::Result<()> {
         let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-        self.add_torrent_with(torrent, verified, true)
+        self.add_torrent_with(torrent, root, verified, true)
     }
 
     /// Picks `torrent` back up where a previous run left it: pieces set in `verified` are
     /// taken to be on disk and correct, so they're neither downloaded nor re-hashed. Target
     /// files are opened in place and must already be their full size -- a missing or
     /// wrong-sized file is an error, since the bitfield can't be trusted against it.
-    pub fn add_torrent_resumed(&mut self, torrent: Torrent, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
+    pub fn add_torrent_resumed(
+        &mut self,
+        torrent: Torrent,
+        root: &Path,
+        verified: BitBox<u8, Msb0>,
+    ) -> anyhow::Result<()> {
         if verified.len() != torrent.pieces.len() {
             bail!(
                 "resume bitfield covers {} pieces but the torrent has {}",
@@ -74,23 +82,30 @@ impl BtClient {
                 torrent.pieces.len()
             );
         }
-        self.add_torrent_with(torrent, verified, false)
+        self.add_torrent_with(torrent, root, verified, false)
     }
 
-    fn add_torrent_with(&mut self, torrent: Torrent, verified: BitBox<u8, Msb0>, fresh: bool) -> anyhow::Result<()> {
+    fn add_torrent_with(
+        &mut self,
+        torrent: Torrent,
+        root: &Path,
+        verified: BitBox<u8, Msb0>,
+        fresh: bool,
+    ) -> anyhow::Result<()> {
         if self.swarms.contains_key(&torrent.info_hash) {
             bail!("task with this info hash already exists");
         }
 
         let mut files = vec![];
-        for (size, file) in torrent.files.iter() {
+        for (size, relative) in torrent.files.iter() {
+            let file = root.join(relative);
             fs::create_dir_all(file.parent().unwrap())?;
             let f = File::options()
                 .read(true)
                 .write(true)
                 .create(fresh)
                 .truncate(fresh)
-                .open(file)
+                .open(&file)
                 .with_context(|| format!("opening {}", file.display()))?;
             if fresh {
                 // `TorrentStorage::new` derives per-file offsets from on-disk lengths

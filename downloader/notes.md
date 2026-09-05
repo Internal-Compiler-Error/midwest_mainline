@@ -101,7 +101,8 @@ finds them again, and hands one to `Session::resume` / `BtClient::add_torrent_re
 front ends use `./resume/` so the CLI and the GUI can resume each other's downloads.
 
 Format: one bencoded file per torrent, `<info hash hex>.resume`, keys `info` (the raw info
-dict, verbatim), `trackers`, `verified` (BEP 3 bitfield layout), `version`. Storing the info
+dict, verbatim), `root` (the download directory, see below), `trackers`, `verified` (BEP 3
+bitfield layout), `version` (2). Storing the info
 dict is what lets a *magnet*-sourced download resume without going back to the network for
 metadata; it's also why the file is written immediately, before any piece is verified.
 
@@ -140,3 +141,11 @@ until it drains or dies. If a swarm-wide pause ever shows up, look here first.
 
 UCB numbers were kept exactly: `picked_count` counts block requests (not pieces), `mean_rx`
 is updated per block, `t` is pieces completed this session.
+
+# Download root is per torrent, 2026-09-05
+`Torrent` no longer bakes a location into its file paths: they're relative (`<name>` for a
+single file, `<name>/<path...>` otherwise) and the root is an argument to
+`BtClient::add_torrent`, `Session::start`, and the CLI (`downloader <source> [dir]`, default
+cwd), the way every mainstream client asks per torrent. The GUI asks with a folder picker on
+every add, starting from the last answer. The resume file records the root so resuming never
+asks again -- `Session::resume` takes only the resume file.

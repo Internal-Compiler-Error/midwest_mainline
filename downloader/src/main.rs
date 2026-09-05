@@ -46,7 +46,9 @@ async fn main() -> anyhow::Result<()> {
 
     let args = env::args().collect::<Vec<_>>();
     let source = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: downloader <path-to-.torrent | magnet-uri | path-to-.resume>");
+        eprintln!(
+            "usage: downloader <path-to-.torrent | magnet-uri> [download-dir]\n       downloader <path-to-.resume>"
+        );
         std::process::exit(2);
     });
 
@@ -57,21 +59,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut client = BtClient::new(identity);
-    let torrent = if Path::new(&source)
+    let (torrent, root) = if Path::new(&source)
         .extension()
         .is_some_and(|ext| ext == downloader::resume::EXTENSION)
     {
         let data = ResumeData::read(Path::new(&source))?;
         let torrent = data.to_torrent()?;
         tracing::info!(
-            "resuming {} with {}/{} pieces already verified",
+            "resuming {} in {} with {}/{} pieces already verified",
             torrent.name,
+            data.root.display(),
             data.verified.count_ones(),
             data.verified.len()
         );
-        client.add_torrent_resumed(torrent.clone(), data.verified)?;
-        torrent
+        client.add_torrent_resumed(torrent.clone(), &data.root, data.verified)?;
+        (torrent, data.root)
     } else {
+        let root = PathBuf::from(args.get(2).map(String::as_str).unwrap_or("."));
         // A magnet has to fetch its metadata off the network before there's anything to
         // download, so this can run for a while (or fail) where a .torrent returns
         // immediately -- long enough that Ctrl+C has to work during it, not just once the
@@ -88,9 +92,13 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         };
-        tracing::info!("got metadata for {} files, starting download", torrent.files.len());
-        client.add_torrent(torrent.clone())?;
-        torrent
+        tracing::info!(
+            "got metadata for {} files, downloading into {}",
+            torrent.files.len(),
+            root.display()
+        );
+        client.add_torrent(torrent.clone(), &root)?;
+        (torrent, root)
     };
 
     let resume_dir = PathBuf::from(RESUME_DIR);
@@ -101,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
     let stats = client.stats(&torrent).expect("torrent was just added");
     tokio::spawn(keep_saving(
         Arc::new(torrent),
+        root,
         stats,
         resume_dir,
         client.shutdown_token(),

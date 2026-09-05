@@ -1,7 +1,7 @@
 //! Resume files: enough to pick a download back up after the process exits.
 //!
 //! One file per torrent, `<info hash, hex>.resume`, holding the raw info dict, the tracker
-//! list, and the verified-piece bitfield. The info dict is stored verbatim so a torrent that
+//! list, the download root, and the verified-piece bitfield. The info dict is stored verbatim so a torrent that
 //! came from a magnet link resumes without going back to the network for metadata.
 //!
 //! The library owns the format and does the reading and writing; where the files live, and
@@ -26,22 +26,27 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 pub const EXTENSION: &str = "resume";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeData {
     pub raw_info: Vec<u8>,
     pub trackers: Vec<String>,
+    /// the directory the torrent's files live under, as given to `BtClient::add_torrent`
+    pub root: PathBuf,
     /// same layout as `TorrentSwarmStats::verified` (piece 0 is the high bit of byte 0)
     pub verified: BitBox<u8, Msb0>,
 }
 
 impl ResumeData {
-    pub fn from_torrent(torrent: &Torrent, verified: &BitSlice<u8, Msb0>) -> Self {
+    pub fn from_torrent(torrent: &Torrent, root: &Path, verified: &BitSlice<u8, Msb0>) -> Self {
         Self {
             raw_info: torrent.raw_info.clone(),
             trackers: torrent.all_trackers(),
+            // stored absolute: a resume file is read back from whatever directory the process
+            // happens to start in later, not necessarily where it was written
+            root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
             verified: verified.to_bitvec().into_boxed_bitslice(),
         }
     }
@@ -71,6 +76,8 @@ impl ResumeData {
         let mut out = vec![b'd'];
         out.extend_from_slice(&bstr(b"info"));
         out.extend_from_slice(&self.raw_info);
+        out.extend_from_slice(&bstr(b"root"));
+        out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
         out.extend_from_slice(&bstr(b"trackers"));
         out.push(b'l');
         for t in &self.trackers {
@@ -107,6 +114,10 @@ impl ResumeData {
         let Some(BencodeItemView::ByteString(verified)) = dict.remove(b"verified".as_slice()) else {
             bail!("missing 'verified' bitfield");
         };
+        let Some(BencodeItemView::ByteString(root)) = dict.remove(b"root".as_slice()) else {
+            bail!("missing 'root' path");
+        };
+        let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
 
         let raw_info = raw_info_bytes(bytes)?;
 
@@ -129,6 +140,7 @@ impl ResumeData {
         Ok(Self {
             raw_info,
             trackers,
+            root,
             verified: verified.into_boxed_bitslice(),
         })
     }
@@ -157,6 +169,7 @@ impl ResumeData {
 /// one per `MIN_INTERVAL`, since `stats` changes on every verified piece.
 pub async fn keep_saving(
     torrent: Arc<Torrent>,
+    root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
     dir: PathBuf,
     shutdown: CancellationToken,
@@ -165,7 +178,7 @@ pub async fn keep_saving(
 
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
     let save = |stats: &watch::Receiver<TorrentSwarmStats>| {
-        let data = ResumeData::from_torrent(&torrent, &stats.borrow().verified);
+        let data = ResumeData::from_torrent(&torrent, &root, &stats.borrow().verified);
         let written = std::fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| data.write(&path));
@@ -201,6 +214,7 @@ pub async fn keep_saving(
 pub struct ResumeSummary {
     pub path: PathBuf,
     pub name: String,
+    pub root: PathBuf,
     pub info_hash: InfoHash,
     pub verified_pieces: usize,
     pub total_pieces: usize,
@@ -214,6 +228,7 @@ impl ResumeSummary {
         Ok(Self {
             path: path.to_path_buf(),
             name: torrent.name.clone(),
+            root: data.root,
             info_hash: torrent.info_hash,
             verified_pieces: data.verified.count_ones(),
             total_pieces: data.verified.len(),
@@ -335,12 +350,16 @@ mod test {
         verified.set(0, true);
         verified.set(4, true);
 
-        let data = ResumeData::from_torrent(&torrent, &verified);
+        let data = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &verified);
         let decoded = ResumeData::decode(&data.encode()).unwrap();
 
         assert_eq!(decoded, data);
         assert_eq!(decoded.info_hash(), torrent.info_hash);
         assert_eq!(decoded.trackers, torrent.all_trackers());
+        assert_eq!(decoded.root, Path::new("/downloads"));
+        let relative = ResumeData::from_torrent(&torrent, Path::new("music/here"), &verified);
+        assert!(relative.root.is_absolute(), "a relative root is stored resolved: {:?}", relative.root);
+        assert!(relative.root.ends_with("music/here"));
         assert_eq!(decoded.verified.len(), 5);
         assert_eq!(decoded.verified.count_ones(), 2);
         assert_eq!(decoded.to_torrent().unwrap(), torrent);
@@ -349,7 +368,7 @@ mod test {
     #[test]
     fn rejects_a_bitfield_of_the_wrong_length() {
         let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
-        let mut data = ResumeData::from_torrent(&torrent, &bitvec![u8, Msb0; 0; 7]);
+        let mut data = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &bitvec![u8, Msb0; 0; 7]);
         // 7 pieces fit in one byte; hand it two
         data.verified = bitvec![u8, Msb0; 0; 16].into_boxed_bitslice();
         let err = ResumeData::decode(&data.encode()).unwrap_err();
@@ -361,7 +380,7 @@ mod test {
         let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
         let mut padded = bitvec![u8, Msb0; 0; 8];
         padded.set(7, true); // 7 pieces, so bit 7 is padding
-        let mut data = ResumeData::from_torrent(&torrent, &bitvec![u8, Msb0; 0; 7]);
+        let mut data = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &bitvec![u8, Msb0; 0; 7]);
         data.verified = padded.into_boxed_bitslice();
         assert!(ResumeData::decode(&data.encode()).is_err());
     }
@@ -369,7 +388,7 @@ mod test {
     #[test]
     fn rejects_a_truncated_file() {
         let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
-        let bytes = ResumeData::from_torrent(&torrent, &bitvec![u8, Msb0; 1; 7]).encode();
+        let bytes = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &bitvec![u8, Msb0; 1; 7]).encode();
         for cut in [1, bytes.len() / 2, bytes.len() - 1] {
             assert!(
                 ResumeData::decode(&bytes[..cut]).is_err(),
@@ -384,7 +403,7 @@ mod test {
         let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
         let mut verified = bitvec![u8, Msb0; 0; 7];
         verified.set(3, true);
-        let data = ResumeData::from_torrent(&torrent, &verified);
+        let data = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &verified);
         let path = dir.join(ResumeData::file_name(&torrent.info_hash));
         data.write(&path).unwrap();
         assert!(path.file_name().unwrap().to_str().unwrap().ends_with(".resume"));
@@ -401,6 +420,7 @@ mod test {
         let summary = &listed[0];
         assert_eq!(summary.path, path);
         assert_eq!(summary.name, "resume-test.bin");
+        assert_eq!(summary.root, Path::new("/downloads"));
         assert_eq!(summary.info_hash, torrent.info_hash);
         assert_eq!((summary.verified_pieces, summary.total_pieces), (1, 7));
         assert_eq!(summary.total_size, 100);
@@ -415,11 +435,15 @@ mod test {
     async fn resumed_client_keeps_the_bytes_and_counts_them() {
         let dir = scratch_dir("client");
         let bytes = content(4 * 16 + 5);
-        let mut torrent = test_torrent(&bytes, 16, &["udp://a.test:1"]);
-        torrent.files[0].1 = dir.join("resume-test.bin");
+        let torrent = test_torrent(&bytes, 16, &["udp://a.test:1"]);
+        assert_eq!(
+            torrent.files[0].1,
+            Path::new("resume-test.bin"),
+            "paths are relative to the root"
+        );
 
         let mut fresh = BtClient::new(identity());
-        fresh.add_torrent(torrent.clone()).unwrap();
+        fresh.add_torrent(torrent.clone(), &dir).unwrap();
         assert_eq!(fresh.stats(&torrent).unwrap().borrow().left, bytes.len());
         drop(fresh);
 
@@ -433,13 +457,17 @@ mod test {
         verified.set(4, true);
 
         let path = dir.join(ResumeData::file_name(&torrent.info_hash));
-        ResumeData::from_torrent(&torrent, &verified).write(&path).unwrap();
+        ResumeData::from_torrent(&torrent, &dir, &verified)
+            .write(&path)
+            .unwrap();
 
         let data = ResumeData::read(&path).unwrap();
-        let mut rebuilt = data.to_torrent().unwrap();
-        rebuilt.files[0].1 = dir.join("resume-test.bin");
+        let rebuilt = data.to_torrent().unwrap();
+        assert_eq!(data.root, dir);
         let mut resumed = BtClient::new(identity());
-        resumed.add_torrent_resumed(rebuilt.clone(), data.verified).unwrap();
+        resumed
+            .add_torrent_resumed(rebuilt.clone(), &data.root, data.verified)
+            .unwrap();
 
         let stats = resumed.stats(&rebuilt).unwrap().borrow().clone();
         assert_eq!(stats.written, 16 + 5);
@@ -454,7 +482,7 @@ mod test {
 
         // fully verified resumes as complete, and stays that way
         let mut done = BtClient::new(identity());
-        done.add_torrent_resumed(rebuilt.clone(), bitvec![u8, Msb0; 1; 5].into_boxed_bitslice())
+        done.add_torrent_resumed(rebuilt.clone(), &dir, bitvec![u8, Msb0; 1; 5].into_boxed_bitslice())
             .unwrap();
         let stats = done.stats(&rebuilt).unwrap().borrow().clone();
         assert!(stats.completed);
@@ -466,24 +494,27 @@ mod test {
     #[tokio::test]
     async fn resume_refuses_missing_or_wrong_sized_files() {
         let dir = scratch_dir("refuse");
-        let mut torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
-        torrent.files[0].1 = dir.join("resume-test.bin");
+        let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
         let some = bitvec![u8, Msb0; 0; 7].into_boxed_bitslice();
 
         let mut client = BtClient::new(identity());
-        let err = client.add_torrent_resumed(torrent.clone(), some.clone()).unwrap_err();
+        let err = client
+            .add_torrent_resumed(torrent.clone(), &dir, some.clone())
+            .unwrap_err();
         assert!(err.to_string().contains("opening"), "{err:#}");
         assert!(!dir.join("resume-test.bin").exists(), "resume must not create the file");
 
         std::fs::write(dir.join("resume-test.bin"), b"short").unwrap();
         let mut client = BtClient::new(identity());
-        let err = client.add_torrent_resumed(torrent.clone(), some.clone()).unwrap_err();
+        let err = client
+            .add_torrent_resumed(torrent.clone(), &dir, some.clone())
+            .unwrap_err();
         assert!(err.to_string().contains("5 bytes on disk"), "{err:#}");
         assert_eq!(std::fs::read(dir.join("resume-test.bin")).unwrap(), b"short");
 
         let mut client = BtClient::new(identity());
         let err = client
-            .add_torrent_resumed(torrent, bitvec![u8, Msb0; 0; 8].into_boxed_bitslice())
+            .add_torrent_resumed(torrent, &dir, bitvec![u8, Msb0; 0; 8].into_boxed_bitslice())
             .unwrap_err();
         assert!(err.to_string().contains("covers 8 pieces"), "{err:#}");
 
@@ -504,7 +535,13 @@ mod test {
         };
         let (tx, rx) = watch::channel(stats.clone());
         let shutdown = CancellationToken::new();
-        let saver = tokio::spawn(keep_saving(torrent.clone(), rx, dir.join("nested"), shutdown.clone()));
+        let saver = tokio::spawn(keep_saving(
+            torrent.clone(),
+            dir.clone(),
+            rx,
+            dir.join("nested"),
+            shutdown.clone(),
+        ));
 
         let path = dir.join("nested").join(ResumeData::file_name(&torrent.info_hash));
         tokio::time::timeout(Duration::from_secs(2), async {
