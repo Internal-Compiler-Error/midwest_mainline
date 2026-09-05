@@ -344,6 +344,28 @@ impl Encoder<BtMessage> for BtEncoder {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BtDecoder;
 
+/// Both halves in one type, for a `Framed<TcpStream, _>` that reads and writes through the
+/// same object (`FramedRead`/`FramedWrite` over split halves want the two separate types).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BtCodec;
+
+impl Encoder<BtMessage> for BtCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: BtMessage, dst: &mut tokio_util::bytes::BytesMut) -> Result<(), Self::Error> {
+        BtEncoder.encode(item, dst)
+    }
+}
+
+impl Decoder for BtCodec {
+    type Item = BtMessage;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut tokio_util::bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        BtDecoder.decode(src)
+    }
+}
+
 impl Decoder for BtDecoder {
     type Item = BtMessage;
     type Error = io::Error;
@@ -566,7 +588,10 @@ mod test {
 
     #[test]
     fn keep_alive_round_trips() {
-        assert_eq!(round_trip(BtMessage::KeepAlive(KeepAlive)), BtMessage::KeepAlive(KeepAlive));
+        assert_eq!(
+            round_trip(BtMessage::KeepAlive(KeepAlive)),
+            BtMessage::KeepAlive(KeepAlive)
+        );
     }
 
     #[test]
@@ -581,7 +606,10 @@ mod test {
 
     #[test]
     fn interested_round_trips() {
-        assert_eq!(round_trip(BtMessage::Interested(Interested)), BtMessage::Interested(Interested));
+        assert_eq!(
+            round_trip(BtMessage::Interested(Interested)),
+            BtMessage::Interested(Interested)
+        );
     }
 
     #[test]
@@ -603,7 +631,10 @@ mod test {
         let bit_field = BitField {
             has: Box::from([0xffu8, 0x00, 0xa5]),
         };
-        assert_eq!(round_trip(BtMessage::BitField(bit_field.clone())), BtMessage::BitField(bit_field));
+        assert_eq!(
+            round_trip(BtMessage::BitField(bit_field.clone())),
+            BtMessage::BitField(bit_field)
+        );
     }
 
     #[test]
@@ -674,7 +705,10 @@ mod test {
     #[test]
     fn suggest_piece_round_trips() {
         let suggest = SuggestPiece { piece: 42 };
-        assert_eq!(round_trip(BtMessage::SuggestPiece(suggest)), BtMessage::SuggestPiece(suggest));
+        assert_eq!(
+            round_trip(BtMessage::SuggestPiece(suggest)),
+            BtMessage::SuggestPiece(suggest)
+        );
     }
 
     #[test]
@@ -694,13 +728,19 @@ mod test {
             begin: 2,
             length: 3,
         };
-        assert_eq!(round_trip(BtMessage::RejectRequest(reject)), BtMessage::RejectRequest(reject));
+        assert_eq!(
+            round_trip(BtMessage::RejectRequest(reject)),
+            BtMessage::RejectRequest(reject)
+        );
     }
 
     #[test]
     fn allowed_fast_round_trips() {
         let allowed = AllowedFast { piece: 9 };
-        assert_eq!(round_trip(BtMessage::AllowedFast(allowed)), BtMessage::AllowedFast(allowed));
+        assert_eq!(
+            round_trip(BtMessage::AllowedFast(allowed)),
+            BtMessage::AllowedFast(allowed)
+        );
     }
 
     /// The two frames back to back exercise that the decoder only consumes exactly one
@@ -725,11 +765,17 @@ mod test {
     #[test]
     fn decoder_waits_for_a_full_frame() {
         let mut full = BytesMut::new();
-        BtEncoder.encode(BtMessage::Have(Have { checked: 5 }), &mut full).unwrap();
+        BtEncoder
+            .encode(BtMessage::Have(Have { checked: 5 }), &mut full)
+            .unwrap();
 
         let mut partial = BytesMut::from(&full[..full.len() - 1]);
         assert_eq!(BtDecoder.decode(&mut partial).unwrap(), None);
-        assert_eq!(partial.len(), full.len() - 1, "decoder must not consume a partial frame");
+        assert_eq!(
+            partial.len(),
+            full.len() - 1,
+            "decoder must not consume a partial frame"
+        );
     }
 
     /// BEP 3 requires the length prefix to be big-endian (network byte order), and the piece
@@ -743,7 +789,9 @@ mod test {
 
         // have: <len=0005><id=4><piece index>
         let mut buf = BytesMut::new();
-        BtEncoder.encode(BtMessage::Have(Have { checked: 1 }), &mut buf).unwrap();
+        BtEncoder
+            .encode(BtMessage::Have(Have { checked: 1 }), &mut buf)
+            .unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 5, 4, 0, 0, 0, 1]);
 
         // piece: <len=0009+X><id=7><index><begin><block>, no separate length field
@@ -759,10 +807,7 @@ mod test {
                 &mut buf,
             )
             .unwrap();
-        assert_eq!(
-            &buf[..],
-            &[0, 0, 0, 12, 7, 0, 0, 0, 1, 0, 0, 0, 2, 9, 8, 7]
-        );
+        assert_eq!(&buf[..], &[0, 0, 0, 12, 7, 0, 0, 0, 1, 0, 0, 0, 2, 9, 8, 7]);
 
         // extended: <len=0002+X><id=20><ext_id><payload>, per BEP 10
         let mut buf = BytesMut::new();

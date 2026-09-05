@@ -1,362 +1,291 @@
-use crate::settings::{KEEPALIVE_INTERVAL, PEER_TIMEOUT};
-use crate::torrent::Torrent;
-use crate::torrent_swarm::TorrentSwarmCommand;
 use crate::wire::{
-    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Extended, Have, Interested, KeepAlive, NotInterested, Piece,
-    Request, Unchoke,
+    BitField, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
+    RejectRequest, Request, Unchoke,
 };
-use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
-use futures::StreamExt;
 use juicy_bencode::BencodeItemView;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::interval;
-use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::info;
-
-use derive_more::{Display, Error};
+use tokio_util::codec::Framed;
 
 /// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
 /// since it's entirely our own choice -- only the id the *remote* wants is negotiated.
-const UT_METADATA_ID: u8 = 1;
+pub(crate) const UT_METADATA_ID: u8 = 1;
 /// BEP 10: same idea as `UT_METADATA_ID`, but for BEP 11 (PEX) messages.
-const UT_PEX_ID: u8 = 2;
+pub(crate) const UT_PEX_ID: u8 = 2;
 
-/// It's not great that this is pub(crate) instead of fully private
-#[derive(Debug)]
-pub(crate) enum PeerCommands {
-    UnchokePeer,
-    ChokePeer,
-    FancyPeer,
-    RequestDataFromPeer {
-        req: Request,
-        syn: oneshot::Sender<Box<[u8]>>,
-    },
-    SendWeHave(u32),
-    BitField(BitField),
-    /// BEP 6: sent in place of `BitField` when we have every piece.
-    SendHaveAll,
-    /// BEP 6: sent in place of `BitField` when we have no pieces at all.
-    SendHaveNone,
-    SendData(Piece),
-    /// BEP 6: we're declining a `Request`; tells the requester to stop waiting on it now
-    /// instead of idling out its own timeout. A no-op if the remote never advertised Fast
-    /// Extension support (there's no obligation, and nothing on the classic wire protocol to
-    /// send instead -- a plain drop is what a non-fast peer already expects).
-    RejectRequest(Request),
-    /// BEP 9: reply to a ut_metadata request with one piece (up to 16KiB) of the raw info dict.
-    SendMetadataPiece {
-        piece: u32,
-        total_size: u32,
-        data: Box<[u8]>,
-    },
-    /// BEP 11 (PEX): tell this peer about other peers we know of.
-    SendPex { added: Vec<SocketAddr> },
-}
-
-pub enum PeerEvent {
-    Requested(Request),
-    /// The connection closed, either because the peer went silent past PEER_TIMEOUT or
-    /// because the socket/command channel closed outright. Lets the swarm drop this peer
-    /// from `active_peers` instead of holding a dead handle forever.
-    Disconnected,
-    /// BEP 9: the peer asked (via ut_metadata) for one piece of our info dict. TorrentSwarm
-    /// has the actual bytes (`Arc<Torrent>::raw_info`); this connection only knows how to
-    /// frame the reply once it's given the data.
-    MetadataRequested { piece: u32 },
-    /// BEP 11 (PEX): the peer sent us its view of other peers in the swarm.
-    PexReceived(Vec<SocketAddr>),
-}
-
-// TODO: Should refactor the design so that a peer connection and handle can be constructed even
-// when the TCP stream is not yet established, so we can queue up messages before the connection is
-// establlished. This is needed as we can have piece completion messages can need to be sent but
-// the connection isn't established yet.
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PeerHandle {
-    // TODO: i guess it's possible for multiple connections per peer, but within one download this shouldn't be true
-    pub remote_peer_id: [u8; 20],
-
+/// One connected peer. Owned outright by its `TorrentSwarm`, which is the only thing that ever
+/// reads from or writes to the socket, so everything here is a plain field: no channels, no
+/// snapshots, no task of its own. The swarm's event loop polls every peer's socket and calls
+/// the `&mut self` methods below in between.
+///
+/// What lives here is per-connection state and the wire-level sends. Anything that needs the
+/// rest of the swarm (serving a `Request`, assembling a piece, dialing PEX peers) is in
+/// `TorrentSwarm`.
+pub(crate) struct Peer {
     pub remote_addr: SocketAddr,
-
     /// BEP 6: whether the remote advertised Fast Extension support in its handshake. A fixed
-    /// fact about the connection (unlike ut_metadata/ut_pex ids, not renegotiated later), so
-    /// it's exposed here the same way `remote_addr`/`remote_peer_id` are.
+    /// fact about the connection, unlike the ids below which are negotiated later.
     pub remote_supports_fast: bool,
+    /// the message id the remote wants us to use for ut_metadata messages, learned from
+    /// their extended handshake; `None` until then (or if they don't support it)
+    pub their_ut_metadata_id: Option<u8>,
+    /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
+    pub their_ut_pex_id: Option<u8>,
 
-    #[eq(skip)]
-    pub(crate) peer_tx: mpsc::Sender<PeerCommands>,
+    pub socket: Framed<TcpStream, BtCodec>,
 
-    #[eq(skip)]
-    state: watch::Receiver<PeerState>,
+    /// BEP 3 bitfield layout: `ceil(num_pieces / 8)` bytes, piece 0 is the high bit of byte 0
+    they_have: Box<[u8]>,
+    num_pieces: usize,
 
-    #[eq(skip)]
-    pub(crate) stats: watch::Receiver<PeerStatistics>,
+    /// We choked the peer, i.e. we won't send data until we unchoke them
+    pub choked_them: bool,
+    /// The peer choked us, i.e. they won't send data until they unchoke us
+    pub choked_us: bool,
+    /// We are interested in them, i.e. they have something we want
+    pub interested_them: bool,
+    /// They are interested in us, i.e. they want something from us
+    pub interested_us: bool,
+
+    /// blocks we've asked this peer for and haven't received yet, with when we asked
+    pub requested: BTreeMap<Request, Instant>,
+    /// bumped on every inbound message (including keep-alives); a peer that sends nothing for
+    /// PEER_TIMEOUT is considered dead
+    pub last_received: Instant,
+
+    pub stats: PeerStatistics,
 }
 
-#[derive(Debug, Clone, Copy, Display, Error)]
-pub struct PeerDied;
+/// The remote broke the protocol (an out-of-range `Have`, a wrong-sized bitfield); the swarm
+/// drops the connection rather than risk an out-of-bounds index later.
+#[derive(Debug)]
+pub(crate) struct ProtocolViolation(pub String);
 
-impl PartialOrd for PeerHandle {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for PeerHandle {
-    // every lookup into `TorrentSwarm::active_peers` searches by `remote_addr` (there's only
-    // ever one connection per address), so the sort key here must match, not `remote_peer_id`
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.remote_addr.cmp(&other.remote_addr)
-    }
-}
-
-impl PeerHandle {
-    /// `remote_addr` is passed in rather than read back off the socket: `peer_addr()` fails
-    /// with EINVAL once the peer has gone away, and a peer that hangs up between connecting and
-    /// arriving here is completely routine -- it used to panic this task. Both callers already
-    /// know the address anyway (one dialled it, the other got it from `accept`).
-    pub(crate) fn new(
-        tcp_stream: TcpStream,
-        remote_addr: SocketAddr,
-        remote_peer_id: [u8; 20],
-        event_tx: mpsc::Sender<TorrentSwarmCommand>,
-        torrent: &Torrent,
-        remote_supports_extensions: bool,
-        remote_supports_fast: bool,
-    ) -> Self {
-        // `to_canonical()` collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a
-        // v4 peer looks like when accepted on a dual-stack `[::]` listener) down to plain
-        // `a.b.c.d`. Without this, the same peer gets a different `remote_addr` depending on
-        // whether we dialed it (plain v4) or it dialed us (v4-mapped-in-v6) -- and `active_peers`
-        // is a sorted vec keyed on `remote_addr`, so that peer could occupy two entries, dedup
-        // against a tracker-discovered address could fail, and `Disconnected` could remove the
-        // wrong one (or none).
-        let remote_addr = SocketAddr::new(remote_addr.ip().to_canonical(), remote_addr.port());
-        let (reader, writer) = tcp_stream.into_split();
-        let (commands_tx, commands_rx) = mpsc::channel(1024);
-
-        // Create watch channel for this peer's statistics
-        let initial_stats = PeerStatistics::default();
-        let (stats_tx, stats_rx) = watch::channel(initial_stats);
-
-        let num_pieces = torrent.pieces.len();
-        let state = PeerState {
-            // BEP 3 bitfields are `ceil(num_pieces / 8)` bytes, not one byte per piece
-            they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
-            // BEP 3: "At the start of the connection, both sides ... are choked." Starting
-            // these `false` meant we'd request from a peer before it ever unchoked us, and
-            // serve any peer's requests before the choking algorithm's first round ran.
-            choked_us: true,
-            choked_them: true,
-            interested_them: false,
-            interested_us: false,
-        };
-        let (state_tx, state_rx) = watch::channel(state.clone());
-
-        let peer = PeerConnection {
-            commands: commands_rx,
-            events: event_tx,
-
-            state: state.clone(),
-            state_tx,
-            num_pieces,
-            metadata_size: torrent.metadata_size(),
-            private: torrent.private,
+impl Peer {
+    pub fn new(tcp: TcpStream, remote_addr: SocketAddr, num_pieces: usize, remote_supports_fast: bool) -> Self {
+        Self {
+            remote_addr,
+            remote_supports_fast,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
-            remote_supports_fast,
-
-            remote_addr,
-            reader: FramedRead::new(reader, BtDecoder),
-            writer: FramedWrite::new(writer, BtEncoder),
-            requested: Default::default(),
+            socket: Framed::new(tcp, BtCodec),
+            they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
+            num_pieces,
+            // BEP 3: "At the start of the connection, both sides ... are choked."
+            choked_them: true,
+            choked_us: true,
+            interested_them: false,
+            interested_us: false,
+            requested: BTreeMap::new(),
             last_received: Instant::now(),
-
-            stats: Default::default(),
-            stats_tx,
-        };
-
-        tokio::spawn(peer_ev_loop(peer, remote_supports_extensions));
-
-        Self {
-            remote_peer_id,
-            peer_tx: commands_tx,
-            stats: stats_rx,
-            state: state_rx.clone(),
-            remote_addr,
-            remote_supports_fast,
+            stats: PeerStatistics::default(),
         }
     }
 
-    // TODO: this one probably has a more complicated error scenario
-    pub async fn request_data_from_peer(&self, req: Request) -> anyhow::Result<Box<[u8]>> {
-        let (syn, ack) = oneshot::channel();
-
-        self.peer_tx
-            .send(PeerCommands::RequestDataFromPeer { req, syn })
-            .await?;
-        let data = ack.await?;
-        Ok(data)
+    pub fn they_have(&self, piece: u32) -> bool {
+        let index = piece / 8;
+        let offset = piece % 8;
+        let flag = 0x80u8 >> offset;
+        (self.they_have[index as usize] & flag) != 0
     }
 
-    pub async fn fancy_peer(&self) -> Result<(), PeerDied> {
-        self.peer_tx.send(PeerCommands::FancyPeer).await.map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub fn try_fancy_peer(&self) -> Result<(), PeerDied> {
-        self.peer_tx.try_send(PeerCommands::FancyPeer).map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// Tell the peer that we now have a particular piece, note as with all functions on the
-    /// handle, this only sends a message to the message channel linking the peer, the completion
-    /// of this funciton doesn't mean the message has been copied to kernel network buffer
-    pub async fn send_we_have(&self, piece: u32) -> Result<(), PeerDied> {
-        self.peer_tx
-            .send(PeerCommands::SendWeHave(piece))
-            .await
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub async fn bit_field(&self, bit_field: BitField) -> Result<(), PeerDied> {
-        self.peer_tx
-            .send(PeerCommands::BitField(bit_field))
-            .await
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// Try to send the bitfield message without blocking/awaiting
-    pub fn try_bitfield(&self, bit_field: BitField) -> Result<(), PeerDied> {
-        self.peer_tx
-            .try_send(PeerCommands::BitField(bit_field))
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// BEP 6: like `try_bitfield`, but for the "we have everything" shorthand.
-    pub fn try_have_all(&self) -> Result<(), PeerDied> {
-        self.peer_tx.try_send(PeerCommands::SendHaveAll).map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// BEP 6: like `try_bitfield`, but for the "we have nothing" shorthand.
-    pub fn try_have_none(&self) -> Result<(), PeerDied> {
-        self.peer_tx.try_send(PeerCommands::SendHaveNone).map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// BEP 6: decline a `Request` this peer made. A no-op (from the wire's perspective) unless
-    /// the peer advertised Fast Extension support -- see `PeerConnection::send_reject`.
-    pub async fn send_reject(&self, req: Request) -> Result<(), PeerDied> {
-        self.peer_tx.send(PeerCommands::RejectRequest(req)).await.map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub async fn unchoke_peer(&self) -> Result<(), PeerDied> {
-        self.peer_tx
-            .send(PeerCommands::UnchokePeer)
-            .await
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub fn try_unchoke_peer(&self) -> Result<(), PeerDied> {
-        self.peer_tx.try_send(PeerCommands::UnchokePeer).map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub async fn choke_peer(&self) -> Result<(), PeerDied> {
-        self.peer_tx.send(PeerCommands::ChokePeer).await.map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub async fn send_data(&self, piece: Piece) -> Result<(), PeerDied> {
-        self.peer_tx
-            .send(PeerCommands::SendData(piece))
-            .await
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub async fn send_metadata_piece(&self, piece: u32, total_size: u32, data: Box<[u8]>) -> Result<(), PeerDied> {
-        self.peer_tx
-            .send(PeerCommands::SendMetadataPiece { piece, total_size, data })
-            .await
-            .map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    /// BEP 11 (PEX): tell this peer about other peers we know of.
-    pub async fn send_pex(&self, added: Vec<SocketAddr>) -> Result<(), PeerDied> {
-        self.peer_tx.send(PeerCommands::SendPex { added }).await.map_err(|_| PeerDied)?;
-        Ok(())
-    }
-
-    pub fn state(&self) -> PeerState {
-        self.state.borrow().clone()
-    }
-
-    pub fn stats(&self) -> PeerStatistics {
-        self.stats.borrow().clone()
-    }
-
+    /// Is the peer ready for more requests?
     pub fn ready(&self) -> bool {
-        self.state().ready()
+        !self.choked_us
     }
-}
 
-/// Represents an active connection to a peer in the BitTorrent network
-#[derive(Debug)]
-struct PeerConnection {
-    commands: Receiver<PeerCommands>,
-    // we never ask for anything from the torrent swarm, only posting events, they handle want to do with
-    // us using the channel above
-    events: mpsc::Sender<TorrentSwarmCommand>,
+    /// Applies a message that only touches this connection's own state. Anything else (data
+    /// requests, blocks, extension payloads) is the swarm's business and is returned as
+    /// `Ok(Some(msg))` for it to handle.
+    pub fn apply(&mut self, msg: BtMessage) -> Result<Option<BtMessage>, ProtocolViolation> {
+        self.last_received = Instant::now();
+        match msg {
+            BtMessage::KeepAlive(_) | BtMessage::Cancel(_) => {}
+            BtMessage::Choke(_) => self.choked_us = true,
+            BtMessage::Unchoke(_) => self.choked_us = false,
+            // whether to unchoke in return is the choking algorithm's call, not an
+            // automatic grant for declaring interest
+            BtMessage::Interested(_) => self.interested_us = true,
+            BtMessage::NotInterested(_) => self.interested_us = false,
+            BtMessage::Have(have) => {
+                if have.checked as usize >= self.num_pieces {
+                    return Err(ProtocolViolation(format!(
+                        "Have for out-of-range piece {}",
+                        have.checked
+                    )));
+                }
+                self.they_have[(have.checked / 8) as usize] |= 0x80u8 >> (have.checked % 8);
+            }
+            BtMessage::BitField(bit_field) => {
+                if bit_field.has.len() != self.num_pieces.div_ceil(8) {
+                    return Err(ProtocolViolation(format!(
+                        "bitfield of length {} for {} pieces",
+                        bit_field.has.len(),
+                        self.num_pieces
+                    )));
+                }
+                self.they_have = bit_field.has;
+            }
+            BtMessage::HaveAll(_) => self.they_have = vec![0xFFu8; self.num_pieces.div_ceil(8)].into(),
+            BtMessage::HaveNone(_) => self.they_have = vec![0u8; self.num_pieces.div_ceil(8)].into(),
+            // BEP 6: both are advisory-only, and we don't implement request-while-choked
+            BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {}
+            BtMessage::Extended(ext) if ext.ext_id == 0 => self.handle_extended_handshake(&ext.payload),
+            BtMessage::Unknown(msg_type, _) => {
+                tracing::warn!("{} sent unsupported message type {msg_type}", self.remote_addr)
+            }
+            other => return Ok(Some(other)),
+        }
+        Ok(None)
+    }
 
-    state: PeerState,
-    state_tx: watch::Sender<PeerState>,
-    num_pieces: usize,
-    /// total size of the bencoded info dict, advertised in our BEP 10 extended handshake
-    metadata_size: u32,
-    /// BEP 27: if set, we don't advertise ut_pex in our extended handshake, don't run PEX
-    /// rounds, and don't act on any PEX we somehow still receive.
-    private: bool,
-    /// the message id the remote wants us to use for ut_metadata messages, learned from
-    /// their extended handshake; `None` until then (or if they don't support it)
-    their_ut_metadata_id: Option<u8>,
-    /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
-    their_ut_pex_id: Option<u8>,
-    /// BEP 6: whether the remote advertised Fast Extension support in its handshake. Unlike
-    /// `their_ut_metadata_id`/`their_ut_pex_id`, this is known at construction time (it's a
-    /// handshake reserved-bit, not something negotiated via a later extended handshake).
-    remote_supports_fast: bool,
+    /// BEP 10: the extended handshake dict looks like `{"m": {"ut_metadata": <their id>, ...},
+    /// "metadata_size": <n>, ...}`. A malformed or unsupported payload is just ignored, not a
+    /// protocol violation worth disconnecting over (this is optional and best-effort).
+    fn handle_extended_handshake(&mut self, payload: &[u8]) {
+        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
+            return;
+        };
+        let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) else {
+            return;
+        };
+        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) {
+            self.their_ut_metadata_id = Some(*id as u8);
+        }
+        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_pex".as_slice()) {
+            self.their_ut_pex_id = Some(*id as u8);
+        }
+    }
 
-    remote_addr: SocketAddr,
-    reader: FramedRead<OwnedReadHalf, BtDecoder>,
-    writer: FramedWrite<OwnedWriteHalf, BtEncoder>,
+    /// Records a block that answers one of our requests. `None` if we never asked for it (or
+    /// gave up waiting), in which case the caller should ignore the data.
+    pub fn block_received(&mut self, piece: &Piece) -> Option<()> {
+        let requested_at = self.requested.remove(&Request {
+            index: piece.index,
+            begin: piece.begin,
+            length: piece.length,
+        })?;
+        self.stats.received += piece.length as usize;
+        let speed = piece.length as f64 / requested_at.elapsed().as_secs_f64();
+        // online average update formula
+        self.stats.mean_rx_cnt += 1;
+        self.stats.mean_rx += (speed - self.stats.mean_rx) / self.stats.mean_rx_cnt as f64;
+        Some(())
+    }
 
-    requested: BTreeMap<Request, (oneshot::Sender<Box<[u8]>>, Instant)>,
-    /// bumped on every inbound message (including keep-alives); a peer that sends nothing for
-    /// PEER_TIMEOUT is considered dead
-    last_received: Instant,
+    pub async fn send_extended_handshake(&mut self, metadata_size: u32, private: bool) -> io::Result<()> {
+        let payload = build_extended_handshake(metadata_size, private);
+        self.socket
+            .send(BtMessage::Extended(Extended {
+                ext_id: 0,
+                payload: payload.into_boxed_slice(),
+            }))
+            .await
+    }
 
-    stats: PeerStatistics,
-    stats_tx: watch::Sender<PeerStatistics>,
-    ///// if the connection is closed, then the peer should be disposed off when able
-    // connection_closed: bool,
+    pub async fn send_keepalive(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::KeepAlive(KeepAlive)).await
+    }
+
+    pub async fn request_block(&mut self, req: Request) -> io::Result<()> {
+        // UCB's "times this arm was played" counts block requests, not pieces
+        self.stats.picked_count += 1;
+        self.requested.insert(req, Instant::now());
+        self.socket.send(BtMessage::Request(req)).await
+    }
+
+    pub async fn unchoke(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::Unchoke(Unchoke)).await?;
+        self.choked_them = false;
+        Ok(())
+    }
+
+    pub async fn choke(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::Choke(Choke)).await?;
+        self.choked_them = true;
+        Ok(())
+    }
+
+    pub async fn show_interest(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::Interested(Interested)).await?;
+        self.interested_them = true;
+        Ok(())
+    }
+
+    pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
+        self.socket.send(BtMessage::BitField(bit_field)).await
+    }
+
+    /// BEP 6: sent in place of `BitField` when we have every piece.
+    pub async fn send_have_all(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::HaveAll(HaveAll)).await
+    }
+
+    /// BEP 6: sent in place of `BitField` when we have no pieces at all.
+    pub async fn send_have_none(&mut self) -> io::Result<()> {
+        self.socket.send(BtMessage::HaveNone(HaveNone)).await
+    }
+
+    /// BEP 3: `Have` isn't the piece's data and isn't subject to choking, so it goes out
+    /// regardless of choke/interest state.
+    pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
+        self.socket.send(BtMessage::Have(Have { checked: index })).await
+    }
+
+    /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
+    /// support -- the classic protocol has no "I'm declining this" message, and a plain drop
+    /// is exactly what such a peer already expects.
+    pub async fn send_reject(&mut self, req: Request) -> io::Result<()> {
+        if !self.remote_supports_fast {
+            return Ok(());
+        }
+        self.socket
+            .send(BtMessage::RejectRequest(RejectRequest {
+                index: req.index,
+                begin: req.begin,
+                length: req.length,
+            }))
+            .await
+    }
+
+    pub async fn send_block(&mut self, piece: Piece) -> io::Result<()> {
+        let length = piece.length as usize;
+        self.socket.send(BtMessage::Piece(piece)).await?;
+        self.stats.sent += length;
+        Ok(())
+    }
+
+    /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict. A silent
+    /// no-op if the peer never declared ut_metadata support -- there's no sane id to send on.
+    pub async fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: &[u8]) -> io::Result<()> {
+        let Some(their_id) = self.their_ut_metadata_id else {
+            return Ok(());
+        };
+        self.socket
+            .send(BtMessage::Extended(Extended {
+                ext_id: their_id,
+                payload: build_ut_metadata_data_message(piece, total_size, data).into_boxed_slice(),
+            }))
+            .await
+    }
+
+    /// BEP 11 (PEX): silent no-op if the peer never declared ut_pex support, same reasoning as
+    /// `send_metadata_piece`.
+    pub async fn send_pex(&mut self, added: &[SocketAddr]) -> io::Result<()> {
+        let Some(their_id) = self.their_ut_pex_id else {
+            return Ok(());
+        };
+        self.socket
+            .send(BtMessage::Extended(Extended {
+                ext_id: their_id,
+                payload: build_pex_message(added).into_boxed_slice(),
+            }))
+            .await
+    }
 }
 
 /// BEP 10 extended handshake payload: declares the message ids we want the remote to use for
@@ -409,6 +338,45 @@ fn build_pex_message(added: &[SocketAddr]) -> Vec<u8> {
     out
 }
 
+/// BEP 11 (PEX): the "added"/"added6" compact peer lists of an incoming message.
+/// "added.f"/"dropped"/"dropped6" are ignored -- PEX is treated purely as a discovery hint.
+pub(crate) fn parse_pex_message(payload: &[u8]) -> Vec<SocketAddr> {
+    let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
+        return vec![];
+    };
+
+    let mut peers = Vec::new();
+    if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added".as_slice()) {
+        for chunk in bytes.chunks_exact(6) {
+            let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            peers.push(SocketAddr::from((ip, port)));
+        }
+    }
+    if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added6".as_slice()) {
+        for chunk in bytes.chunks_exact(18) {
+            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            peers.push(SocketAddr::from((ip, port)));
+        }
+    }
+    peers
+}
+
+/// BEP 9: the piece index of an incoming ut_metadata *request* (msg_type 0); `None` for
+/// anything else. We always have the full metadata, so requests are the only message worth
+/// handling.
+pub(crate) fn parse_ut_metadata_request(payload: &[u8]) -> Option<u32> {
+    let (_, dict) = juicy_bencode::parse_bencode_dict(payload).ok()?;
+    let BencodeItemView::Integer(0) = dict.get(b"msg_type".as_slice())? else {
+        return None;
+    };
+    let BencodeItemView::Integer(piece) = dict.get(b"piece".as_slice())? else {
+        return None;
+    };
+    Some(*piece as u32)
+}
+
 /// BEP 9 ut_metadata "data" message: a bencoded prefix (`msg_type`, `piece`, `total_size`)
 /// immediately followed by the raw metadata bytes for that piece -- there's no length-prefixed
 /// framing between the two, the dict's own encoding is how a parser knows where it ends.
@@ -416,489 +384,6 @@ pub(crate) fn build_ut_metadata_data_message(piece: u32, total_size: u32, data: 
     let mut payload = format!("d8:msg_typei1e5:piecei{piece}e10:total_sizei{total_size}ee").into_bytes();
     payload.extend_from_slice(data);
     payload
-}
-
-async fn peer_ev_loop(mut peer: PeerConnection, remote_supports_extensions: bool) {
-    if remote_supports_extensions {
-        // BEP 10: send our extended handshake first, declaring the ut_metadata message id
-        // we want the remote to use when sending *us* ut_metadata messages
-        let payload = build_extended_handshake(peer.metadata_size, peer.private);
-        let _ = peer
-            .writer
-            .send(BtMessage::Extended(Extended {
-                ext_id: 0,
-                payload: payload.into_boxed_slice(),
-            }))
-            .await;
-    }
-
-    let mut keepalive_ticker = interval(KEEPALIVE_INTERVAL);
-    keepalive_ticker.tick().await; // the first tick fires immediately; skip it
-
-    loop {
-        tokio::select! {
-            // Handle commands from the peer handle
-            Some(command) = peer.commands.recv() => {
-                if let Err(e) = peer.process_command(command).await {
-                    info!("{} write failed ({e}), disconnecting", peer.remote_addr);
-                    break;
-                }
-            }
-
-            // Process incoming BitTorrent protocol messages
-            Some(Ok(msg)) = peer.reader.next() => { peer.process_message(msg).await }
-
-            // BEP 3: send a keep-alive periodically, and consider the peer dead if it hasn't
-            // sent us anything (not even its own keep-alives) in a while
-            _ = keepalive_ticker.tick() => {
-                if peer.last_received.elapsed() > PEER_TIMEOUT {
-                    info!("{} timed out (no messages for {:?}), disconnecting", peer.remote_addr, peer.last_received.elapsed());
-                    break;
-                }
-                if peer.writer.send(BtMessage::KeepAlive(KeepAlive)).await.is_err() {
-                    break;
-                }
-            }
-
-            // Exit loop if all channels are closed
-            else => break,
-        }
-    }
-
-    peer.emit_event(PeerEvent::Disconnected).await;
-}
-
-impl PeerConnection {
-    async fn emit_event(&mut self, event: PeerEvent) {
-        // the swarm task may already be gone (e.g. mid-shutdown); that's not this
-        // connection's problem to panic over
-        let _ = self
-            .events
-            .send(TorrentSwarmCommand::ProcessPeerEvent {
-                from: self.remote_addr,
-                event,
-            })
-            .await;
-    }
-
-    /// BEP 10: the extended handshake dict looks like `{"m": {"ut_metadata": <their id>, ...},
-    /// "metadata_size": <n>, ...}`. We only care about the id they want for ut_metadata; a
-    /// malformed or unsupported payload is just ignored, not a protocol violation worth
-    /// disconnecting over (unlike Have/BitField, this is optional and best-effort).
-    fn handle_extended_handshake(&mut self, payload: &[u8]) {
-        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
-            return;
-        };
-        let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) else {
-            return;
-        };
-        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) {
-            self.their_ut_metadata_id = Some(*id as u8);
-        }
-        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_pex".as_slice()) {
-            self.their_ut_pex_id = Some(*id as u8);
-        }
-    }
-
-    /// BEP 11 (PEX): decode "added"/"added6" compact peer lists and hand the addresses to the
-    /// swarm, which dials any we're not already connected to. "added.f"/"dropped"/"dropped6"
-    /// are ignored -- PEX is treated purely as a discovery hint here.
-    async fn handle_pex_message(&mut self, payload: &[u8]) {
-        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
-            return;
-        };
-
-        let mut peers = Vec::new();
-        if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added".as_slice()) {
-            for chunk in bytes.chunks(6) {
-                if chunk.len() != 6 {
-                    break;
-                }
-                let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                peers.push(SocketAddr::from((ip, port)));
-            }
-        }
-        if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added6".as_slice()) {
-            for chunk in bytes.chunks(18) {
-                if chunk.len() != 18 {
-                    break;
-                }
-                let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
-                let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-                peers.push(SocketAddr::from((ip, port)));
-            }
-        }
-
-        if !peers.is_empty() {
-            self.emit_event(PeerEvent::PexReceived(peers)).await;
-        }
-    }
-
-    /// BEP 9: we only ever have the full metadata (we start from a .torrent file, not a magnet
-    /// link), so the only incoming message worth handling is a request (msg_type 0) for one
-    /// piece; the swarm has the actual bytes and builds the reply.
-    async fn handle_ut_metadata_message(&mut self, payload: &[u8]) {
-        // We reply using `their_ut_metadata_id`, negotiated via the extended handshake. Without
-        // it, any reply we build is unaddressable and silently dropped by `send_metadata_piece`
-        // -- so skip the parse/emit/swarm round-trip entirely rather than doing it for nothing
-        // (a peer that never sent a handshake could otherwise trigger this in a loop for free).
-        if self.their_ut_metadata_id.is_none() {
-            return;
-        }
-        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
-            return;
-        };
-        let Some(BencodeItemView::Integer(msg_type)) = dict.get(b"msg_type".as_slice()) else {
-            return;
-        };
-        let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
-            return;
-        };
-
-        if *msg_type == 0 {
-            self.emit_event(PeerEvent::MetadataRequested { piece: *piece as u32 }).await;
-        }
-    }
-
-    pub async fn request_data_from_peer(
-        &mut self,
-        req: Request,
-        syn: oneshot::Sender<Box<[u8]>>,
-    ) -> anyhow::Result<()> {
-        self.stats.picked_count += 1;
-        self.publish_stat();
-
-        self.requested.insert(req, (syn, Instant::now()));
-        self.writer.send(BtMessage::Request(req)).await?;
-
-        Ok(())
-    }
-
-    pub async fn unchoke_peer(&mut self) -> io::Result<()> {
-        let unchoke = Unchoke;
-        self.writer.send(BtMessage::Unchoke(unchoke)).await?;
-        self.state.choked_them = false;
-
-        Ok(())
-    }
-
-    pub async fn choke_peer(&mut self) -> io::Result<()> {
-        let choke = Choke;
-        self.writer.send(BtMessage::Choke(choke)).await?;
-        self.state.choked_them = true;
-
-        Ok(())
-    }
-
-    pub async fn fancy_peer(&mut self) -> io::Result<()> {
-        let interested = Interested;
-        self.writer.send(BtMessage::Interested(interested)).await?;
-        self.state.interested_them = true;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn unfancy_peer(&mut self) -> io::Result<()> {
-        let not_interested = NotInterested;
-        self.writer.send(BtMessage::NotInterested(not_interested)).await?;
-        self.state.interested_them = false;
-
-        Ok(())
-    }
-
-    pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
-        self.writer.send(BtMessage::BitField(bit_field)).await?;
-        Ok(())
-    }
-
-    /// BEP 6: sent in place of `BitField` when we have every piece.
-    async fn send_have_all(&mut self) -> io::Result<()> {
-        self.writer.send(BtMessage::HaveAll(crate::wire::HaveAll)).await
-    }
-
-    /// BEP 6: sent in place of `BitField` when we have no pieces at all.
-    async fn send_have_none(&mut self) -> io::Result<()> {
-        self.writer.send(BtMessage::HaveNone(crate::wire::HaveNone)).await
-    }
-
-    /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
-    /// support -- the classic protocol has no "I'm declining this" message, a plain drop (what
-    /// happens if this is a no-op) is exactly what such a peer already expects.
-    async fn send_reject(&mut self, req: Request) -> anyhow::Result<()> {
-        if !self.remote_supports_fast {
-            return Ok(());
-        }
-        self.writer
-            .send(BtMessage::RejectRequest(crate::wire::RejectRequest {
-                index: req.index,
-                begin: req.begin,
-                length: req.length,
-            }))
-            .await?;
-        Ok(())
-    }
-
-    /// BEP 3: `Have` announces possession of a piece; it isn't the piece's data and isn't
-    /// subject to choking, so it must go out regardless of choke/interest state. This used to
-    /// be gated on `!interested_us || choked_them`, which was masked back when every peer was
-    /// unchoked unconditionally -- once the choking algorithm (see run_choking_algorithm) started
-    /// actually choking most peers, that gate silently dropped piece announcements to almost
-    /// everyone, starving their rarest-first availability data (and any future PEX/BEP 11 use)
-    /// for no spec reason at all.
-    pub async fn send_we_have(&mut self, index: u32) -> io::Result<()> {
-        let have = Have { checked: index };
-        self.writer.send(BtMessage::Have(have)).await?;
-
-        Ok(())
-    }
-
-    pub async fn send_data(&mut self, piece: Piece) -> anyhow::Result<()> {
-        let length = piece.length.clone();
-        self.writer.send(BtMessage::Piece(piece)).await?;
-        self.stats.sent += length as usize;
-        self.publish_stat();
-
-        Ok(())
-    }
-
-    /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict. A silent
-    /// no-op if the peer never declared ut_metadata support -- there's no sane id to send on.
-    async fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: Box<[u8]>) -> anyhow::Result<()> {
-        let Some(their_id) = self.their_ut_metadata_id else {
-            return Ok(());
-        };
-
-        let payload = build_ut_metadata_data_message(piece, total_size, &data);
-
-        self.writer
-            .send(BtMessage::Extended(Extended {
-                ext_id: their_id,
-                payload: payload.into_boxed_slice(),
-            }))
-            .await?;
-        Ok(())
-    }
-
-    /// BEP 11 (PEX): silent no-op if the peer never declared ut_pex support, same reasoning as
-    /// `send_metadata_piece` -- there's no id to address a reply to.
-    async fn send_pex(&mut self, added: &[SocketAddr]) -> anyhow::Result<()> {
-        let Some(their_id) = self.their_ut_pex_id else {
-            return Ok(());
-        };
-
-        let payload = build_pex_message(added);
-
-        self.writer
-            .send(BtMessage::Extended(Extended {
-                ext_id: their_id,
-                payload: payload.into_boxed_slice(),
-            }))
-            .await?;
-        Ok(())
-    }
-
-    /// Returns `Err` if writing to the peer failed, which means the connection is gone and the
-    /// event loop should wind this peer down. A peer hanging up mid-write (`BrokenPipe`) is
-    /// entirely routine -- these used to be `.unwrap()`s, which turned every such disconnect
-    /// into a panicked task.
-    #[tracing::instrument(skip(self))]
-    async fn process_command(&mut self, command: PeerCommands) -> anyhow::Result<()> {
-        info!("Handling one {:?} command", command);
-        match command {
-            PeerCommands::UnchokePeer => self.unchoke_peer().await?,
-            PeerCommands::ChokePeer => self.choke_peer().await?,
-            PeerCommands::RequestDataFromPeer { req, syn } => self.request_data_from_peer(req, syn).await?,
-            PeerCommands::FancyPeer => self.fancy_peer().await?,
-            PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await?,
-            PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await?,
-            PeerCommands::SendHaveAll => self.send_have_all().await?,
-            PeerCommands::SendHaveNone => self.send_have_none().await?,
-            PeerCommands::RejectRequest(req) => self.send_reject(req).await?,
-            PeerCommands::SendData(piece) => self.send_data(piece).await?,
-            PeerCommands::SendMetadataPiece { piece, total_size, data } => {
-                self.send_metadata_piece(piece, total_size, data).await?
-            }
-            PeerCommands::SendPex { added } => self.send_pex(&added).await?,
-        }
-        // unlike process_message, nothing else publishes state after a command runs --
-        // without this, choke/unchoke/interested changes made here are invisible to
-        // PeerHandle::state() (and so to the choking algorithm) forever
-        let _ = self.state_tx.send(self.state.clone());
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn process_message(&mut self, msg: BtMessage) {
-        info!("Handling one {:?} BitTorrent message", msg);
-        self.last_received = Instant::now();
-        match msg {
-            BtMessage::KeepAlive(_) => return,
-            BtMessage::Choke(_) => self.state.choked_us = true,
-            BtMessage::Unchoke(_) => self.state.choked_us = false,
-            BtMessage::Interested(_) => {
-                // whether to unchoke is the choking algorithm's call (run periodically by
-                // TorrentSwarm), not an automatic grant for declaring interest -- doing it
-                // here would bypass tit-for-tat ranking entirely
-                self.state.interested_us = true;
-            }
-            BtMessage::NotInterested(_) => self.state.interested_us = false,
-            BtMessage::Have(have) => {
-                if have.checked as usize >= self.num_pieces {
-                    tracing::warn!("{} sent Have for out-of-range piece {}", self.remote_addr, have.checked);
-                    let _ = self.writer.close().await;
-                    return;
-                }
-
-                let index = have.checked / 8;
-                let offset = have.checked % 8;
-
-                // BEP 3 bitfields are MSB-first: piece 0 is the high bit of byte 0
-                let flag = 0x80u8 >> offset;
-                self.state.they_have[index as usize] |= flag;
-            }
-            BtMessage::BitField(bit_field) => {
-                // BEP 3: a bitfield of the wrong length is a protocol violation; drop the
-                // connection rather than risk an out-of-bounds index later
-                if bit_field.has.len() != self.num_pieces.div_ceil(8) {
-                    tracing::warn!(
-                        "{} sent a bitfield of length {} for {} pieces",
-                        self.remote_addr,
-                        bit_field.has.len(),
-                        self.num_pieces
-                    );
-                    let _ = self.writer.close().await;
-                    return;
-                }
-                self.state.they_have = bit_field.has;
-            }
-            BtMessage::HaveAll(_) => {
-                self.state.they_have = vec![0xFFu8; self.num_pieces.div_ceil(8)].into();
-            }
-            BtMessage::HaveNone(_) => {
-                self.state.they_have = vec![0u8; self.num_pieces.div_ceil(8)].into();
-            }
-            BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {
-                // BEP 6: both are advisory-only; acting on either is optional for the receiver
-                // and we don't implement request-while-choked, so there's nothing to do here
-                // beyond having parsed them instead of treating them as Unknown.
-            }
-            BtMessage::RejectRequest(reject) => {
-                // BEP 6: cancels a request we made, the same way a `Piece` fulfills one --
-                // dropping the oneshot sender fails the waiting `.await` immediately instead of
-                // leaving it to idle out BLOCK_REQUEST_TIMEOUT. A reject for a request we have
-                // no record of (already fulfilled, or the peer never had this data) is just
-                // ignored, not a protocol violation worth disconnecting over.
-                self.requested.remove(&Request {
-                    index: reject.index,
-                    begin: reject.begin,
-                    length: reject.length,
-                });
-            }
-            BtMessage::Request(request) => {
-                // BEP 3: a choked peer isn't entitled to any data, full stop -- serving them
-                // anyway (which is what happened here before) bypasses the choking algorithm
-                // entirely. BEP 6 turns "ignore it" into "must say so": once Fast Extension is
-                // negotiated, a declined request needs an explicit RejectRequest rather than a
-                // silent drop, which `send_reject` already no-ops on its own if it isn't.
-                if self.state.choked_them {
-                    let _ = self.send_reject(request).await;
-                    return;
-                }
-                // best-effort: during shutdown the swarm can go away before its peers do,
-                // and that race must not panic this task
-                self.emit_event(PeerEvent::Requested(request)).await;
-            }
-            BtMessage::Piece(piece) => {
-                if !self.requested.contains_key(&Request {
-                    index: piece.index,
-                    begin: piece.begin,
-                    length: piece.length,
-                }) {
-                    let _ = self.writer.close().await;
-                    // TODO: let the handle know in someway
-                    return;
-                }
-
-                let (syn, requested_time) = self
-                    .requested
-                    .remove(&Request {
-                        index: piece.index,
-                        begin: piece.begin,
-                        length: piece.length,
-                    })
-                    .unwrap();
-
-                self.stats.received += piece.length as usize;
-
-                let speed = (piece.length as f64) / (Instant::now() - requested_time).as_secs_f64();
-                self.update_speed_estimation(speed);
-                self.publish_stat();
-                let _ = syn.send(piece.data);
-            }
-            BtMessage::Cancel(_cancel) => return,
-            BtMessage::Extended(ext) => {
-                if ext.ext_id == 0 {
-                    self.handle_extended_handshake(&ext.payload);
-                } else if ext.ext_id == UT_METADATA_ID {
-                    self.handle_ut_metadata_message(&ext.payload).await;
-                } else if ext.ext_id == UT_PEX_ID {
-                    self.handle_pex_message(&ext.payload).await;
-                } else {
-                    tracing::debug!("{} sent an unsupported extended message id {}", self.remote_addr, ext.ext_id);
-                }
-            }
-            BtMessage::Unknown(msg_type, _) => {
-                tracing::warn!("Unsupported message type {msg_type}");
-            }
-        }
-        let _ = self.state_tx.send(self.state.clone());
-    }
-
-    fn publish_stat(&self) {
-        // TODO: don't only publish every .5 second or something
-        let _ = self.stats_tx.send(self.stats);
-    }
-
-    fn update_speed_estimation(&mut self, sampled_speed: f64) {
-        // online average update formula
-        self.stats.mean_rx_cnt += 1;
-        self.stats.mean_rx = self.stats.mean_rx + (sampled_speed - self.stats.mean_rx) / self.stats.mean_rx_cnt as f64;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PeerState {
-    they_have: Box<[u8]>,
-
-    /// We choked the peer, i.e. we won't send data until we unchoke them
-    pub choked_them: bool,
-
-    /// The peer choked us, i.e. they won't send data until they unchoke us
-    pub choked_us: bool,
-
-    /// We are interested in them, i.e. they have something we want
-    pub interested_them: bool,
-
-    /// They are interested in us, i.e. they want something from us
-    pub interested_us: bool,
-}
-
-impl PeerState {
-    pub fn they_have(&self, piece: u32) -> bool {
-        let index = piece / 8;
-        let offset = piece % 8;
-
-        // BEP 3 bitfields are MSB-first: piece 0 is the high bit of byte 0
-        let flag = 0x80u8 >> offset;
-        (self.they_have[index as usize] & flag) != 0
-    }
-
-    /// Is the peer ready for more requests?
-    pub fn ready(&self) -> bool {
-        !self.choked_us
-    }
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Default)]
@@ -951,7 +436,10 @@ mod test {
     fn extended_handshake_is_valid_bencode_with_expected_fields() {
         let payload = build_extended_handshake(12345, false);
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
-        assert!(remaining.is_empty(), "handshake payload must be exactly one bencoded dict");
+        assert!(
+            remaining.is_empty(),
+            "handshake payload must be exactly one bencoded dict"
+        );
 
         let BencodeItemView::Dictionary(m) = dict.get(b"m".as_slice()).unwrap() else {
             panic!("\"m\" must be a dict");
@@ -981,7 +469,10 @@ mod test {
         let BencodeItemView::Dictionary(m) = dict.get(b"m".as_slice()).unwrap() else {
             panic!("\"m\" must be a dict");
         };
-        assert!(m.contains_key(b"ut_metadata".as_slice()), "ut_metadata is unaffected by \"private\"");
+        assert!(
+            m.contains_key(b"ut_metadata".as_slice()),
+            "ut_metadata is unaffected by \"private\""
+        );
         assert!(
             !m.contains_key(b"ut_pex".as_slice()),
             "BEP 27: a private torrent must not offer PEX to its peers"
@@ -1014,7 +505,17 @@ mod test {
     }
 
     #[test]
-    fn pex_message_is_valid_bencode_with_compact_v4_and_v6_peers() {
+    fn ut_metadata_request_is_recognised_and_data_is_not() {
+        assert_eq!(parse_ut_metadata_request(b"d8:msg_typei0e5:piecei4ee"), Some(4));
+        assert_eq!(
+            parse_ut_metadata_request(b"d8:msg_typei1e5:piecei4e10:total_sizei9ee"),
+            None
+        );
+        assert_eq!(parse_ut_metadata_request(b"garbage"), None);
+    }
+
+    #[test]
+    fn pex_message_round_trips_compact_v4_and_v6_peers() {
         let v4: SocketAddr = "1.2.3.4:6881".parse().unwrap();
         let v6: SocketAddr = "[fe80::1]:6882".parse().unwrap();
         let message = build_pex_message(&[v4, v6]);
@@ -1034,6 +535,8 @@ mod test {
         };
         assert_eq!(added6.len(), 18, "one compact ipv6 peer entry is 18 bytes");
         assert_eq!(u16::from_be_bytes([added6[16], added6[17]]), 6882);
+
+        assert_eq!(parse_pex_message(&message), vec![v4, v6]);
     }
 
     #[test]

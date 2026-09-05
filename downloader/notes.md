@@ -117,3 +117,26 @@ truncated file outright anyway.
 Spec wrinkle worth knowing: a torrent that was already complete when resumed starts the
 announcers with `sent_completed = true`, because BEP 3 says `event=completed` must not be
 sent for a download that was complete when the client started.
+
+# Peers are owned, not messaged, 2026-09-05
+`PeerHandle`/`PeerCommands` (a task per peer connection, driven over an mpsc channel, with
+`watch` snapshots of its state) and the separate `Download` task are gone. The user's read was
+that the command channel existed only to sidestep `&mut self` on a peer, and that a peer
+should have exactly one owner. It does now: `TorrentSwarm::peers` is a `Vec<Peer>`, and the
+swarm's single `work_loop` polls every peer's socket (`select_all` over the `Framed`s, rotated
+so no peer is always first), the command channel, and the timers. Everything that used to be
+a request/response pair over channels -- pick a peer, pick a piece, is it all verified,
+hash this piece -- is a plain method call on `&mut self`. Piece assembly is swarm state
+(`missing`, `in_flight`, per-peer `requested`).
+
+What the channel is still used for is ownership transfer and results from spawned work: a
+handshaken socket from the inbound listener or a dial task (`PeerConnected`), a failed dial,
+tracker results. That's not the same thing as commanding a peer.
+
+The deliberate trade, chosen by the user over a per-peer writer task: writes are direct
+awaits on the loop, so a peer whose kernel send buffer is full (a downloader we're uploading
+to that stopped reading) stalls the *whole* swarm -- reads from every other peer included --
+until it drains or dies. If a swarm-wide pause ever shows up, look here first.
+
+UCB numbers were kept exactly: `picked_count` counts block requests (not pieces), `mean_rx`
+is updated per block, `t` is pieces completed this session.

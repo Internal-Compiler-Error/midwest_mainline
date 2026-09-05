@@ -1,7 +1,7 @@
 use crate::defs::Identity;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
+use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
 use anyhow::{Context, bail};
 use bitvec::prelude::*;
 use futures::future::{join_all, select_all};
@@ -19,7 +19,6 @@ pub struct BtClient {
     id: Arc<Identity>,
     swarms: HashMap<InfoHash, TorrentSwarm>,
     handles: HashMap<InfoHash, TorrentSwarmHandle>,
-    peer_factories: HashMap<InfoHash, PeerFactory>,
     stats: HashMap<InfoHash, watch::Receiver<TorrentSwarmStats>>,
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
@@ -39,7 +38,6 @@ impl BtClient {
             id: Arc::new(id),
             swarms: HashMap::new(),
             handles: HashMap::new(),
-            peer_factories: HashMap::new(),
             stats: HashMap::new(),
             shutdown,
         }
@@ -122,7 +120,6 @@ impl BtClient {
         );
 
         self.handles.insert(torrent.info_hash, task.make_handle());
-        self.peer_factories.insert(torrent.info_hash, task.peer_factory());
         self.stats.insert(torrent.info_hash, task.subscribe_stats());
         self.swarms.insert(torrent.info_hash, task);
         Ok(())
@@ -133,17 +130,11 @@ impl BtClient {
             id,
             mut swarms,
             handles,
-            peer_factories,
             stats: _,
             shutdown,
         } = self;
 
-        let mut tasks = vec![tokio::spawn(Self::accept_incoming(
-            id,
-            Arc::new(handles),
-            Arc::new(peer_factories),
-            shutdown,
-        ))];
+        let mut tasks = vec![tokio::spawn(Self::accept_incoming(id, Arc::new(handles), shutdown))];
         for (_info_hash, swarm) in swarms.drain() {
             tasks.push(tokio::spawn(swarm.work_loop()));
         }
@@ -159,7 +150,6 @@ impl BtClient {
     async fn accept_incoming(
         id: Arc<Identity>,
         handles: Arc<HashMap<InfoHash, TorrentSwarmHandle>>,
-        peer_factories: Arc<HashMap<InfoHash, PeerFactory>>,
         shutdown: CancellationToken,
     ) {
         // Listen on both families independently rather than relying on a single dual-stack
@@ -212,7 +202,6 @@ impl BtClient {
 
             let id = id.clone();
             let handles = handles.clone();
-            let peer_factories = peer_factories.clone();
             tokio::spawn(async move {
                 let handshake = match crate::wire::read_handshake(&mut tcp).await {
                     Ok(handshake) => handshake,
@@ -222,7 +211,7 @@ impl BtClient {
                     }
                 };
 
-                let Some(factory) = peer_factories.get(&handshake.info_hash) else {
+                let Some(handle) = handles.get(&handshake.info_hash) else {
                     tracing::debug!("inbound connection from {remote_addr} named a torrent we're not serving");
                     return;
                 };
@@ -232,16 +221,14 @@ impl BtClient {
                     return;
                 }
 
-                let peer = factory.accept(
-                    tcp,
-                    remote_addr,
-                    handshake.peer_id,
-                    crate::wire::supports_extensions(&handshake.extensions),
-                    crate::wire::supports_fast_extension(&handshake.extensions),
-                );
-                if let Some(handle) = handles.get(&handshake.info_hash) {
-                    handle.add_initialized_peer(peer).await;
-                }
+                handle
+                    .peer_connected(ConnectedPeer {
+                        tcp,
+                        remote_addr,
+                        remote_supports_extensions: crate::wire::supports_extensions(&handshake.extensions),
+                        remote_supports_fast: crate::wire::supports_fast_extension(&handshake.extensions),
+                    })
+                    .await;
             });
         }
     }

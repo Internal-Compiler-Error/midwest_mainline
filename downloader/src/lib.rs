@@ -1,6 +1,5 @@
 mod bt_client;
 mod defs;
-pub mod download;
 pub mod magnet;
 pub mod metadata;
 mod peer;
