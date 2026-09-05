@@ -460,12 +460,14 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// BEP 3: `Have` announces possession of a piece; it isn't the piece's data and isn't
+    /// subject to choking, so it must go out regardless of choke/interest state. This used to
+    /// be gated on `!interested_us || choked_them`, which was masked back when every peer was
+    /// unchoked unconditionally -- once the choking algorithm (see run_choking_algorithm) started
+    /// actually choking most peers, that gate silently dropped piece announcements to almost
+    /// everyone, starving their rarest-first availability data (and any future PEX/BEP 11 use)
+    /// for no spec reason at all.
     pub async fn send_we_have(&mut self, index: u32) -> io::Result<()> {
-        let connection_state = { self.state.clone() };
-        if !connection_state.interested_us || connection_state.choked_them {
-            return Ok(());
-        }
-
         let have = Have { checked: index };
         self.writer.send(BtMessage::Have(have)).await?;
 
