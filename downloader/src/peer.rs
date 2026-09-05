@@ -463,21 +463,24 @@ impl PeerStatistics {
 
     /// UCB1: the peer's download throughput plus an exploration bonus that shrinks the more
     /// often it's been picked, relative to how often *anyone* has been picked (`total_picks`,
-    /// block requests to every peer so far).
-    pub fn rx_speed_ucb(&self, total_picks: usize) -> f64 {
+    /// block requests to every peer so far). UCB1's bonus is sized for rewards in `0..=1`,
+    /// so the rate is divided by `rate_scale`, the fastest rate seen in the swarm; added to
+    /// raw bytes per second the bonus would be invisible and exploration would end with each
+    /// peer's first pick.
+    pub fn rx_speed_ucb(&self, total_picks: usize, rate_scale: f64) -> f64 {
         let c = 1f64;
         let t = total_picks as f64;
         let n_t = self.picked_count as f64;
-        self.rx_rate + c * (t.ln() / n_t).sqrt()
+        self.rx_rate / rate_scale + c * (t.ln() / n_t).sqrt()
     }
 
-    pub fn score(&self, total_picks: usize) -> f64 {
+    pub fn score(&self, total_picks: usize, rate_scale: f64) -> f64 {
         // In UCB, when an arm hasn't been played yet, it should be picked first, we just assign an
         // infinite score to peers who haven't been requested yet
         if total_picks == 0 || self.picked_count == 0 {
             f64::INFINITY
         } else {
-            self.rx_speed_ucb(total_picks)
+            self.rx_speed_ucb(total_picks, rate_scale)
         }
     }
 }
@@ -611,18 +614,48 @@ mod test {
     #[test]
     fn ucb_score_is_never_nan() {
         let mut stats = PeerStatistics::default();
-        assert_eq!(stats.score(0), f64::INFINITY, "an unpicked peer is picked first");
+        assert_eq!(stats.score(0, 1.0), f64::INFINITY, "an unpicked peer is picked first");
         stats.block_requested();
         // one pick, nothing delivered yet: used to be NaN, which sorted above infinity
-        assert!(!stats.score(1).is_nan());
+        assert!(!stats.score(1, 1.0).is_nan());
         assert!(
-            stats.score(1) < f64::INFINITY,
+            stats.score(1, 1.0) < f64::INFINITY,
             "a picked peer must lose to an unpicked one"
         );
         let now = Instant::now();
         stats.requests_started(now);
         stats.block_received(16_384, now + Duration::from_millis(100));
-        assert!(stats.score(10) > stats.rx_rate, "the exploration bonus is positive");
+        assert!(
+            stats.score(10, stats.rx_rate) > 1.0,
+            "the exploration bonus is positive"
+        );
+    }
+
+    #[test]
+    fn a_rarely_picked_peer_can_outscore_the_fastest_one() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        let mut fast = PeerStatistics::default();
+        fast.requests_started(t0);
+        fast.block_received(1_000_000, later);
+        let mut slow = PeerStatistics::default();
+        slow.requests_started(t0);
+        slow.block_received(500_000, later);
+
+        for _ in 0..5000 {
+            fast.block_requested();
+        }
+        slow.block_requested();
+        let total = 5001;
+
+        assert!(
+            slow.score(total, fast.rx_rate) > fast.score(total, fast.rx_rate),
+            "half the speed but 5000 fewer picks deserves another look"
+        );
+        assert!(
+            slow.score(total, 1.0) < fast.score(total, 1.0),
+            "in raw bytes per second the bonus would never make up the difference"
+        );
     }
 
     #[test]

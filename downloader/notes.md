@@ -196,5 +196,9 @@ instead of decaying to zero and never being picked again. The choking algorithm 
 same number. Tests: `throughput_ignores_queue_depth_and_idle_time`,
 `throughput_forgets_deliveries_older_than_the_window`.
 
-Still open on the estimator: the exploration bonus is a bare `sqrt(ln t / n)`, unitless and
-around 1, added to a rate in bytes per second, so it's effectively zero after the first pick.
+# UCB's rate is normalised before the bonus is added, 2026-09-05
+UCB1's bonus `sqrt(ln t / n)` is sized for rewards in 0..=1. Added to a rate in bytes per
+second (millions) it was invisible, so exploration ended with each peer's first pick and the
+one peer that happened to measure fastest took every request it had room for. `best_peer`
+now divides each rate by the fastest rate in the swarm, so a peer at 80% of the best speed
+with far fewer picks still wins some. Test: `a_rarely_picked_peer_can_outscore_the_fastest_one`.

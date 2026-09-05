@@ -653,11 +653,12 @@ impl TorrentSwarm {
     /// already loaded up to `MAX_OUTSTANDING_BLOCKS_PER_PEER`, the one with the highest upper
     /// confidence bound on its download speed.
     fn best_peer(&self, piece: u32) -> Option<usize> {
+        let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
         self.peers
             .iter()
             .enumerate()
             .filter(|(_, p)| p.ready() && p.they_have(piece) && p.requested.len() < MAX_OUTSTANDING_BLOCKS_PER_PEER)
-            .map(|(idx, p)| (idx, p.stats.score(self.total_picks)))
+            .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
     }
