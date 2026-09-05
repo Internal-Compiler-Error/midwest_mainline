@@ -392,6 +392,10 @@ impl PeerConnection {
             PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
             PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
         }
+        // unlike process_message, nothing else publishes state after a command runs --
+        // without this, choke/unchoke/interested changes made here are invisible to
+        // PeerHandle::state() (and so to the choking algorithm) forever
+        let _ = self.state_tx.send(self.state.clone());
     }
 
     #[tracing::instrument(skip(self))]
@@ -403,8 +407,10 @@ impl PeerConnection {
             BtMessage::Choke(_) => self.state.choked_us = true,
             BtMessage::Unchoke(_) => self.state.choked_us = false,
             BtMessage::Interested(_) => {
+                // whether to unchoke is the choking algorithm's call (run periodically by
+                // TorrentSwarm), not an automatic grant for declaring interest -- doing it
+                // here would bypass tit-for-tat ranking entirely
                 self.state.interested_us = true;
-                let _ = self.unchoke_peer().await;
             }
             BtMessage::NotInterested(_) => self.state.interested_us = false,
             BtMessage::Have(have) => {
