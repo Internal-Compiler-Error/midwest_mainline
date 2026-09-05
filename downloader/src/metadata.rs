@@ -92,7 +92,9 @@ pub async fn fetch(
         magnet.info_hash,
         identity.clone(),
         stat_rx,
-        event_tx,
+        // announcers hold weak senders (see `TorrentSwarmHandle`); `event_tx` itself lives in
+        // this frame, so the channel stays open exactly as long as this fetch does
+        event_tx.downgrade(),
         announcer_shutdown.0.clone(),
     );
 

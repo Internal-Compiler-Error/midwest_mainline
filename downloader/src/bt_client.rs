@@ -126,15 +126,9 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let task = TorrentSwarm::new_with_verified(
-            torrent.clone(),
-            storage,
-            self.id.clone(),
-            self.shutdown.clone(),
-            verified,
-        );
+        let (task, handle) = TorrentSwarm::new_with_verified(torrent.clone(), storage, self.id.clone(), verified);
 
-        self.handles.insert(torrent.info_hash, task.make_handle());
+        self.handles.insert(torrent.info_hash, handle);
         self.stats.insert(torrent.info_hash, task.subscribe_stats());
         self.swarms.insert(torrent.info_hash, task);
         Ok(())
@@ -149,12 +143,20 @@ impl BtClient {
             shutdown,
         } = self;
 
-        let mut tasks = vec![tokio::spawn(Self::accept_incoming(id, Arc::new(handles), shutdown))];
-        for (_info_hash, swarm) in swarms.drain() {
-            tasks.push(tokio::spawn(swarm.work_loop()));
-        }
+        let handles = Arc::new(handles);
+        let listener = tokio::spawn(Self::accept_incoming(id, handles.clone(), shutdown.clone()));
+        let swarms: Vec<_> = swarms
+            .drain()
+            .map(|(_, swarm)| tokio::spawn(swarm.work_loop()))
+            .collect();
 
-        join_all(tasks).await;
+        // a swarm runs for as long as a handle to it exists (see `TorrentSwarmHandle`); this
+        // frame holds them until shutdown, so a listener that fails early doesn't take the
+        // swarms down with it
+        shutdown.cancelled().await;
+        drop(handles);
+        let _ = listener.await;
+        join_all(swarms).await;
         Ok(())
     }
 

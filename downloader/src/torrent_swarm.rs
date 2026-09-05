@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, Sleep, interval, sleep_until};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
@@ -52,7 +52,7 @@ struct HttpAnnouncer {
     #[eq(skip)]
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
     #[eq(skip)]
-    events: mpsc::Sender<SwarmEvent>,
+    events: mpsc::WeakSender<SwarmEvent>,
     #[eq(skip)]
     sent_started: bool,
     #[eq(skip)]
@@ -70,7 +70,7 @@ pub(crate) fn spawn_announcers(
     info_hash: InfoHash,
     identity: Arc<Identity>,
     stat_rx: watch::Receiver<TorrentSwarmStats>,
-    events: mpsc::Sender<SwarmEvent>,
+    events: mpsc::WeakSender<SwarmEvent>,
     shutdown: CancellationToken,
 ) {
     for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
@@ -142,7 +142,7 @@ impl HttpAnnouncer {
         info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        events: mpsc::Sender<SwarmEvent>,
+        events: mpsc::WeakSender<SwarmEvent>,
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
@@ -270,10 +270,9 @@ impl HttpAnnouncer {
                     match self.announce(event).await {
                         Ok(result) => {
                             self.sent_started = true;
-                            let _ = self
-                                .events
-                                .send(SwarmEvent::PeersDiscovered(result))
-                                .await;
+                            if let Some(events) = self.events.upgrade() {
+                                let _ = events.send(SwarmEvent::PeersDiscovered(result)).await;
+                            }
                         }
                         Err(e) => {
                             tracing::error!("{:?}", e);
@@ -317,9 +316,8 @@ struct UdpAnnouncer {
 
     connection_id: i64,
 
-    // TODO: Maybe this should be a weak sender?
     #[eq(skip)]
-    event: mpsc::Sender<SwarmEvent>,
+    event: mpsc::WeakSender<SwarmEvent>,
 
     #[eq(skip)]
     sent_started: bool,
@@ -352,7 +350,7 @@ impl UdpAnnouncer {
         info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        event: mpsc::Sender<SwarmEvent>,
+        event: mpsc::WeakSender<SwarmEvent>,
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
@@ -691,10 +689,9 @@ impl UdpAnnouncer {
                         .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
                     self.sent_started = true;
 
-                    let _ = self
-                        .event
-                        .send(SwarmEvent::PeersDiscovered(peers))
-                        .await;
+                    if let Some(events) = self.event.upgrade() {
+                        let _ = events.send(SwarmEvent::PeersDiscovered(peers)).await;
+                    }
                 }
                 // BEP 15: a single announce reporting event=completed should follow the
                 // download finishing, rather than waiting for the next periodic announce
@@ -755,6 +752,10 @@ impl TorrentSwarmStats {
     }
 }
 
+/// Keeps its `TorrentSwarm` running: the swarm's event loop ends when the last handle is
+/// dropped, closing every peer connection and (via its own token) stopping its announcers with
+/// a farewell announce. Everything the swarm spawns for itself holds only a weak sender, so
+/// nothing but a handle can keep it alive.
 #[derive(Debug, Clone)]
 pub struct TorrentSwarmHandle {
     tx: mpsc::Sender<SwarmEvent>,
@@ -765,10 +766,6 @@ impl TorrentSwarmHandle {
     /// the inbound listener (`BtClient::accept_incoming`) and the swarm's own dial tasks.
     pub(crate) async fn peer_connected(&self, connected: ConnectedPeer) {
         let _ = self.tx.send(SwarmEvent::PeerConnected(connected)).await;
-    }
-
-    async fn dial_failed(&self, addr: SocketAddr) {
-        let _ = self.tx.send(SwarmEvent::DialFailed(addr)).await;
     }
 }
 
@@ -829,8 +826,9 @@ pub struct TorrentSwarm {
     udp_announcers: Vec<UdpAnnouncer>,
 
     events_rx: mpsc::Receiver<SwarmEvent>,
-    /// cloned into every task that reports back to the swarm (announcers, dials, the listener)
-    events_tx: mpsc::Sender<SwarmEvent>,
+    /// for the tasks the swarm spawns for itself (announcers, dials, block reads) to report
+    /// back on; weak so they can't keep the swarm alive, only a `TorrentSwarmHandle` can
+    events_tx: mpsc::WeakSender<SwarmEvent>,
 
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
@@ -845,18 +843,19 @@ pub struct TorrentSwarm {
     /// `TorrentSwarm` itself, just backed by the same channel `stat_snapshot_tx` publishes to.
     stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 
-    shutdown: CancellationToken,
+    /// cancels the announcers' token when the swarm goes away, so they get to say goodbye
+    _stop_announcers: DropGuard,
 }
 
 impl TorrentSwarm {
+    /// Also returns the handle that keeps the swarm alive; see `TorrentSwarmHandle`.
     pub fn new(
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
-        shutdown: CancellationToken,
-    ) -> TorrentSwarm {
+    ) -> (TorrentSwarm, TorrentSwarmHandle) {
         let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-        Self::new_with_verified(torrent, storage, id, shutdown, verified)
+        Self::new_with_verified(torrent, storage, id, verified)
     }
 
     /// Like `new`, but starting from pieces that are already on disk and hash-verified (a
@@ -865,9 +864,8 @@ impl TorrentSwarm {
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
-        shutdown: CancellationToken,
         verified: BitBox<u8, Msb0>,
-    ) -> TorrentSwarm {
+    ) -> (TorrentSwarm, TorrentSwarmHandle) {
         assert_eq!(
             verified.len(),
             torrent.pieces.len(),
@@ -892,6 +890,9 @@ impl TorrentSwarm {
         let trackers = trackers.into_iter().map(|s| Url::parse(&s)).filter_map(Result::ok);
 
         let (events_tx, events_rx) = mpsc::channel(512);
+        let handle = TorrentSwarmHandle { tx: events_tx };
+        let events_tx = handle.tx.downgrade();
+        let children = CancellationToken::new();
 
         let http_announcers: Vec<_> = trackers
             .clone()
@@ -903,7 +904,7 @@ impl TorrentSwarm {
                     id.clone(),
                     stat_rx.clone(),
                     events_tx.clone(),
-                    shutdown.clone(),
+                    children.clone(),
                 )
             })
             .collect();
@@ -916,12 +917,12 @@ impl TorrentSwarm {
                     id.clone(),
                     stat_rx.clone(),
                     events_tx.clone(),
-                    shutdown.clone(),
+                    children.clone(),
                 )
             })
             .collect();
 
-        TorrentSwarm {
+        let swarm = TorrentSwarm {
             peers: vec![],
             dialing: BTreeSet::new(),
             poll_offset: 0,
@@ -938,14 +939,9 @@ impl TorrentSwarm {
             stat,
             stat_snapshot_tx: stat_tx,
             stat_snapshot_rx: stat_rx,
-            shutdown,
-        }
-    }
-
-    pub fn make_handle(&self) -> TorrentSwarmHandle {
-        TorrentSwarmHandle {
-            tx: self.events_tx.clone(),
-        }
+            _stop_announcers: children.drop_guard(),
+        };
+        (swarm, handle)
     }
 
     /// A live view of this torrent's aggregate progress (uploaded/downloaded/left/written/
@@ -1006,7 +1002,11 @@ impl TorrentSwarm {
                         }
                     }
                 }
-                Some(event) = self.events_rx.recv() => self.process_event(event).await,
+                event = self.events_rx.recv() => match event {
+                    Some(event) => self.process_event(event).await,
+                    // the last TorrentSwarmHandle is gone: this torrent is being dropped
+                    None => break,
+                },
                 _ = housekeeping_ticker.tick() => self.housekeeping().await,
                 _ = keepalive_ticker.tick() => {
                     self.broadcast(|peer| Box::pin(peer.send_keepalive())).await;
@@ -1016,9 +1016,13 @@ impl TorrentSwarm {
                     self.run_choking_algorithm(choking_round).await;
                 }
                 _ = pex_ticker.tick() => self.run_pex_round().await,
-                _ = self.shutdown.cancelled() => break,
             }
         }
+        info!(
+            "{} swarm stopped, {} peers dropped",
+            self.torrent.name,
+            self.peers.len()
+        );
     }
 
     async fn process_event(&mut self, event: SwarmEvent) {
@@ -1228,7 +1232,9 @@ impl TorrentSwarm {
                     warn!("couldn't read {request:?} for {to}: {e:#}");
                     request
                 });
-            let _ = events.blocking_send(SwarmEvent::BlockRead { to, block });
+            if let Some(events) = events.upgrade() {
+                let _ = events.blocking_send(SwarmEvent::BlockRead { to, block });
+            }
         });
     }
 
@@ -1455,16 +1461,20 @@ impl TorrentSwarm {
             if self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
                 continue;
             }
-            let handle = self.make_handle();
+            let events = self.events_tx.clone();
             let torrent = self.torrent.clone();
             let our_id = self.id.clone();
             tokio::spawn(async move {
-                match dial(addr, &torrent, &our_id).await {
-                    Ok(connected) => handle.peer_connected(connected).await,
+                let result = match dial(addr, &torrent, &our_id).await {
+                    Ok(connected) => SwarmEvent::PeerConnected(connected),
                     Err(e) => {
                         info!("Failed to connect to {addr}: {e:?}");
-                        handle.dial_failed(addr).await;
+                        SwarmEvent::DialFailed(addr)
                     }
+                };
+                // if the swarm is gone meanwhile, the socket just drops here
+                if let Some(events) = events.upgrade() {
+                    let _ = events.send(result).await;
                 }
             });
         }
@@ -1592,12 +1602,12 @@ mod test {
 
     /// A swarm for a single-file torrent of `content()`, its target file in a scratch dir, and
     /// no announcers (the only tracker URL has a scheme no announcer handles).
-    fn swarm(name: &str) -> (TorrentSwarm, PathBuf) {
+    fn swarm(name: &str) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
         swarm_with(name, false)
     }
 
     /// `seeding`: the file already holds `content()` and every piece counts as verified.
-    fn swarm_with(name: &str, seeding: bool) -> (TorrentSwarm, PathBuf) {
+    fn swarm_with(name: &str, seeding: bool) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
         let bytes = content();
         let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
         let mut info = format!(
@@ -1634,10 +1644,8 @@ mod test {
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
-        (
-            TorrentSwarm::new_with_verified(torrent, storage, id, CancellationToken::new(), verified),
-            path,
-        )
+        let (swarm, handle) = TorrentSwarm::new_with_verified(torrent, storage, id, verified);
+        (swarm, handle, path)
     }
 
     /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
@@ -1700,8 +1708,7 @@ mod test {
 
     #[tokio::test]
     async fn downloads_pieces_from_a_peer_and_announces_them() {
-        let (swarm, path) = swarm("happy");
-        let handle = swarm.make_handle();
+        let (swarm, handle, path) = swarm("happy");
         let mut stats = swarm.subscribe_stats();
         tokio::spawn(swarm.work_loop());
 
@@ -1742,8 +1749,7 @@ mod test {
     /// with the first peer when it hangs up.
     #[tokio::test]
     async fn pieces_abandoned_by_a_dead_peer_are_requested_from_another() {
-        let (swarm, path) = swarm("dead");
-        let handle = swarm.make_handle();
+        let (swarm, handle, path) = swarm("dead");
         let mut stats = swarm.subscribe_stats();
         tokio::spawn(swarm.work_loop());
 
@@ -1789,8 +1795,7 @@ mod test {
     /// either -- the request is simply dropped.
     #[tokio::test]
     async fn requests_from_a_choked_peer_are_not_served() {
-        let (swarm, path) = swarm("choked");
-        let handle = swarm.make_handle();
+        let (swarm, handle, path) = swarm("choked");
         tokio::spawn(swarm.work_loop());
 
         let mut leech = fake_peer(&handle, "10.0.0.3:6881").await;
@@ -1818,8 +1823,7 @@ mod test {
     /// piece is rejected rather than served or dropped.
     #[tokio::test]
     async fn serves_blocks_to_an_unchoked_peer() {
-        let (swarm, path) = swarm_with("seed", true);
-        let handle = swarm.make_handle();
+        let (swarm, handle, path) = swarm_with("seed", true);
         let mut stats = swarm.subscribe_stats();
         tokio::spawn(swarm.work_loop());
 
@@ -1887,6 +1891,31 @@ mod test {
         })
         .await
         .expect("uploaded bytes never reached the stats");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The handle is what keeps a swarm alive: once the last one is gone the loop ends and
+    /// every peer's socket closes with it.
+    #[tokio::test]
+    async fn dropping_the_last_handle_stops_the_swarm_and_its_peers() {
+        let (swarm, handle, path) = swarm("lifetime");
+        let running = tokio::spawn(swarm.work_loop());
+
+        let mut peer = fake_peer(&handle, "10.0.0.5:6881").await;
+        let Some(Ok(BtMessage::BitField(_))) = peer.next().await else {
+            panic!("expected our bitfield");
+        };
+
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the swarm loop kept running without a handle")
+            .unwrap();
+        // whatever's buffered (Interested) drains, then the socket is closed
+        let closed = async { while let Some(Ok(_)) = peer.next().await {} };
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("peer socket stayed open after the swarm stopped");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
