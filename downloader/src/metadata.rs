@@ -11,11 +11,12 @@
 //!
 //! There is deliberately no DHT here; trackers are the only peer source.
 
+use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::torrent::{Torrent, parse_torrent};
-use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats, spawn_announcers};
+use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use crate::wire::{BtDecoder, BtEncoder, BtMessage, Extended, shake_hands, supports_extensions};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;

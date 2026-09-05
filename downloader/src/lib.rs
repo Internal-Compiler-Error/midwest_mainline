@@ -1,3 +1,4 @@
+mod announcer;
 mod bt_client;
 mod defs;
 pub mod magnet;
