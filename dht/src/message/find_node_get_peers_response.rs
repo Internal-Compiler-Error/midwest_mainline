@@ -1,5 +1,3 @@
-#![allow(unused_variables, dead_code)]
-
 use std::net::SocketAddrV4;
 
 use bendy::encoding::SingleItemEncoder;
@@ -8,10 +6,9 @@ use crate::types::{NodeId, NodeInfo, Token};
 
 use super::ToKrpcBody;
 
-/// TODO:
-///
-/// TLDR is that responses are not tagged to indicate what kind of message they are so it's much
-/// easier to just keep all of them in one place
+/// KRPC responses are not tagged with the query they answer, so find_node and get_peers
+/// responses share one struct: `nodes` covers find_node (and the get_peers fallback),
+/// `values` + `token` cover get_peers.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     queried: NodeId,

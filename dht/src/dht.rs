@@ -1,3 +1,16 @@
+//! The wired-up DHT node: [`DhtSession`] owns the four moving parts and runs them.
+//!
+//! - [`RpcManager`] is the message broker: the only owner of the UDP socket. Outbound
+//!   queries register their transaction id and await the response on a oneshot; inbound
+//!   packets are fanned out to every subscriber (routing table, server) and matched to
+//!   pending queries.
+//! - [`RoutingTable`] is the k-bucket store, persisted in SQLite so contacts survive
+//!   restarts. It also learns passively from every inbound packet.
+//! - [`DhtClient`] (handle via [`DhtSession::handle`]) runs iterative lookups.
+//! - `DhtServer` answers inbound queries.
+//!
+//! Both halves share one `SharedState`; nothing is owned twice.
+
 pub mod client;
 pub mod routing_table;
 pub mod rpc_manager;
@@ -9,7 +22,7 @@ use crate::{
     dht::client::DhtClient,
     dht::server::DhtServer,
     dht::state::SharedState,
-    our_error::OurError,
+    our_error::{OurError, naur},
     types::{InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
     utils::{base64_dec, base64_enc, db_get, db_put},
 };
@@ -34,7 +47,6 @@ use txn_id_generator::TxnIdGenerator;
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DhtSession {
     client: DhtClient,
     server: DhtServer,
@@ -86,6 +98,9 @@ define_sql_function! {
     fn xor(x: sql_types::Binary, y: sql_types::Binary) -> sql_types::Binary;
 }
 
+/// A BEP 42 node id for our external IP: the top 21 bits are the CRC32C of the masked IP
+/// (so the id is verifiably tied to the IP and hard to choose freely), the rest is random
+/// except the last byte, which repeats the random `rand` mixed into the CRC input.
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     let mut rng = rand::rng();
     let r = rand & 0x07;
@@ -111,6 +126,10 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     NodeId(id)
 }
 
+/// Reuse last session's identity if our public IP is unchanged; otherwise mint a new
+/// one. BEP 42 binds the id to the IP, so keeping the old id across an IP change would
+/// make us present an id other nodes consider invalid — and every stored bucket index
+/// was computed against the old id anyway.
 fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<NodeId, diesel::result::Error> {
     conn.transaction(|conn| {
         let prev_ip = db_get("public_ip", conn)?;
@@ -190,14 +209,10 @@ impl DhtSession {
             .build(manager)
             .expect("Could not build DB connection pool");
 
-        let our_id = resume_identity(&mut db.get().unwrap(), external_addr)?;
+        let mut conn = db.get().map_err(|e| naur!("could not check out a db connection: {e}"))?;
+        let our_id = resume_identity(&mut conn, external_addr)?;
 
-        let rpc_manager = RpcManager::new(
-            listen_socket,
-            db.clone(),
-            Arc::new(TxnIdGenerator::new()).clone(),
-            external_addr,
-        );
+        let rpc_manager = RpcManager::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()));
 
         let routing_table = RoutingTable::new(our_id, rpc_manager.clone(), db.clone());
 
@@ -396,40 +411,19 @@ mod tests {
 
 #[cfg(test)]
 mod recompute_tests {
-    use super::{SensibleOptions, resume_identity};
+    use super::resume_identity;
     use crate::dht::routing_table::bucket_index;
     use crate::schema::node::dsl as node_dsl;
+    use crate::test_support::memory_pool;
     use crate::types::NodeId;
     use crate::utils::{base64_enc, db_put};
-    use diesel::connection::SimpleConnection;
-    use diesel::r2d2::{ConnectionManager, Pool};
-    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
     use std::net::Ipv4Addr;
 
     #[test]
     fn identity_change_recomputes_buckets() {
-        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
-        let pool = Pool::builder()
-            .max_size(1)
-            .connection_customizer(Box::new(SensibleOptions))
-            .build(manager)
-            .unwrap();
+        let pool = memory_pool();
         let mut conn = pool.get().unwrap();
-        conn.batch_execute(
-            "CREATE TABLE misc (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE node (
-                id BLOB PRIMARY KEY,
-                bucket INTEGER NOT NULL,
-                last_contacted BIGINT NOT NULL,
-                ip_addr TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                failed_requests INTEGER NOT NULL,
-                removed BOOLEAN NOT NULL,
-                last_sent BIGINT,
-                added BIGINT NOT NULL DEFAULT 0
-            )",
-        )
-        .unwrap();
 
         // pretend we were 1.2.3.4 with the all-zero id last session
         db_put("public_ip".to_string(), "1.2.3.4".to_string(), &mut *conn).unwrap();

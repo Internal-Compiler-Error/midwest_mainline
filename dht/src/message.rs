@@ -1,3 +1,8 @@
+//! The KRPC wire protocol (BEP 5): bencoded dicts with a transaction id (`t`), a message
+//! type (`y` = q/r/e), and a body. Parsing is two-pass: bendy validates the bencode,
+//! juicy_bencode borrows the fields. KRPC responses are not self-describing, so both
+//! find_node and get_peers responses map to one [`FindNodeGetPeersResponse`] struct.
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -53,7 +58,7 @@ fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurEr
         return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
     };
     let message = str::from_utf8(message)
-        .map_err(|_e| OurError::DecodeError(eyre!("Fuck, utf8 bet is wrong")))?
+        .map_err(|_e| OurError::DecodeError(eyre!("error description is not valid utf8")))?
         .to_string();
 
     let code: u32 = *code as u32;
@@ -509,9 +514,9 @@ impl Krpc {
         self.txn_id = txn_id;
     }
 
-    // IS this function a good idea?
+    /// The id of the node on the other end of this message: the requestor for queries,
+    /// the responder for responses. Error messages carry no id, hence the `Option`.
     pub fn node_id(&self) -> Option<NodeId> {
-        // TODO: we really need to agree on whether to copy or share with node_id by default
         match &self.body {
             KrpcBody::AnnouncePeerQuery(announce_peer_query) => Some(*announce_peer_query.requestor()),
             KrpcBody::FindNodeQuery(find_node_query) => Some(find_node_query.requestor()),
@@ -846,51 +851,4 @@ mod test {
         let msg = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:porti70000e5:token8:aoeusnthe1:q13:announce_peer1:t2:aa1:y1:qe" as &[u8];
         assert!(msg.parse().is_err());
     }
-
-    // #[test]
-    // fn deserialize_con_compliant_get_peers() {
-    //     // if all this following is painful to read, trust me, it was painful to write
-    //     // and even more painful to realize this has to be supported
-    //     let bencoded = hex::decode(
-    //         "64323a6970363ab8972559c8d6313a7264323a696432303\
-    //         a32f54e697351ff4aec29cdbaabf2fbe3467cc267353a6e6f6465733431363aa5490d805d411f43c4cd594d9\
-    //         d4818c4cc675e256317945fc491513c322f8cbab9f21cb9b9c12336923f016634d8c35829b00605ab2ec7148\
-    //         90ba9e6348c1409c291096bb95988d35e658c5bc15ce06915d1eefec905aa7224c1c9dbd0c4a1f990596db1f\
-    //         5581ae1b13de8394dbb53bf3d886142880584f3bf1f6edbbcfeb16f5d4d07e637b49d82b743e9e2a4c47889f\
-    //         f37cd2604bfd808b5d1282b6bf699d52b44c0e5275b41fc933e4acfeb49499dc6391bf2eba979b76b5a58a4d\
-    //         59fecffb360095658264c7a1ec9aa9692727a8a139c04a5ba0a9d60d1e27c5cda0823f39e76275fc95001c9a\
-    //         48974d45ab9647301de8a187ea8e9976ba28abc63dd68b295b6c491d6fc73087d29a2d45aebefd2155f7753e\
-    //         4ddc89fb1dff65f315c327e3131966d1b4edf83f572322a6a4d9f00e525b46b5c3c98b31506518750a5c57bc\
-    //         b76d11fc800ecde98a20da371fdc158350eed510bb4c7f04904ea794ef82cac713edd9f1db75403918979a7\
-    //         8abacbf3267657c26e095e73f75abf9398e0f6e6bd9a26b5bda700000000000000000000000000000000000\
-    //         000005778ea621cb665313a74323a025f313a79313a7265",
-    //     )
-    //     .unwrap();
-    //
-    //     let expected = Krpc::new_get_peers_deferred_response_con_compliant(
-    //         hex::decode("025f")?.as_slice().try_into().unwrap(),
-    //         hex::decode("32f54e697351ff4aec29cdbaabf2fbe3467cc267")?
-    //             .try_into()
-    //             .unwrap(),
-    //         Box::from(
-    //             hex::decode(
-    //                 "a5490d805d411f43c4cd594d9d4818c4cc675e25631\
-    //             7945fc491513c322f8cbab9f21cb9b9c12336923f016634d8c35829b00605ab2ec714890ba9e6348c140\
-    //             9c291096bb95988d35e658c5bc15ce06915d1eefec905aa7224c1c9dbd0c4a1f990596db1f5581ae1b13\
-    //             de8394dbb53bf3d886142880584f3bf1f6edbbcfeb16f5d4d07e637b49d82b743e9e2a4c47889ff37cd26\
-    //             04bfd808b5d1282b6bf699d52b44c0e5275b41fc933e4acfeb49499dc6391bf2eba979b76b5a58a4d59f\
-    //             ecffb360095658264c7a1ec9aa9692727a8a139c04a5ba0a9d60d1e27c5cda0823f39e76275fc95001c9\
-    //             a48974d45ab9647301de8a187ea8e9976ba28abc63dd68b295b6c491d6fc73087d29a2d45aebefd2155f\
-    //             7753e4ddc89fb1dff65f315c327e3131966d1b4edf83f572322a6a4d9f00e525b46b5c3c98b315065187\
-    //             50a5c57bcb76d11fc800ecde98a20da371fdc158350eed510bb4c7f04904ea794ef82cac713edd9f1db75\
-    //             403918979a78abacbf3267657c26e095e73f75abf9398e0f6e6bd9a26b5bda70000000000000000000000\
-    //             0000000000000000005778ea621cb6",
-    //             )?
-    //             .as_slice(),
-    //         ),
-    //         // Box::from(hex::decode("b8972559c8d6")?.as_slice()),
-    //     );
-    //
-    //     assert_eq!(expected, from_bytes::<Krpc>(&bencoded).unwrap());
-    // }
 }

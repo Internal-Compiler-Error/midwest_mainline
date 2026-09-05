@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -44,8 +44,6 @@ pub struct RpcManager {
     /// a SPMC-esque queue, each readers can progress indepednelty
     inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<(Krpc, SocketAddrV4)>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
-
-    public_ip: Ipv4Addr,
 }
 
 pub trait Routable {
@@ -63,7 +61,6 @@ impl RpcManager {
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
-        public_ip: Ipv4Addr,
     ) -> RpcManager {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
@@ -71,7 +68,6 @@ impl RpcManager {
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
             txn_id_generator,
-            public_ip,
         }
     }
 
@@ -167,7 +163,6 @@ impl RpcManager {
         Builder::new().name("Message broker").spawn(event_loop)
     }
 
-    /// Subscribe to the reply with the provided transaction_id
     /// Subscribe to the reply with the provided transaction_id, expected from `endpoint`
     pub fn subscribe_one(
         &self,
@@ -222,7 +217,7 @@ impl RpcManager {
         // no node_id means the reponse is a krpc error message, only error message omit the node
         // id
         let response_node_id = response.node_id().ok_or(naur!("node responded with error"))?;
-        let mut conn = self.db.get().unwrap();
+        let mut conn = self.db.get().map_err(|e| naur!("could not check out a db connection: {e}"))?;
         // it's a double update but that's issue for another day
         update_last_sent(&response_node_id, sent_time, &mut conn);
         Ok(response)
@@ -271,23 +266,18 @@ impl RpcManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::SensibleOptions;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::message::ping_announce_peer_response::PingAnnouncePeerResponse;
     use crate::message::ping_query::PingQuery;
+    use crate::test_support::memory_pool;
     use crate::types::NodeId;
+    use std::net::Ipv4Addr;
 
     async fn test_broker() -> RpcManager {
-        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
-        let pool = Pool::builder()
-            .max_size(1)
-            .connection_customizer(Box::new(SensibleOptions))
-            .build(manager)
-            .unwrap();
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        RpcManager::new(socket, pool, Arc::new(TxnIdGenerator::new()), Ipv4Addr::LOCALHOST)
+        RpcManager::new(socket, memory_pool(), Arc::new(TxnIdGenerator::new()))
     }
 
     #[tokio::test]

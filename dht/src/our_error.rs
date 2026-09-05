@@ -10,14 +10,6 @@ pub enum OurError {
     /// carrying the same transaction id
     #[error("unsupported query method")]
     UnsupportedQuery(TransactionId),
-    // #[error("Issue with parsing bencode")]
-    // #[error(transparent)]
-    // DecodeError {
-    //     #[from]
-    //     report: color_eyre::Report,
-    //
-    //     backtrace: Backtrace,
-    // },
     #[error(transparent)]
     DecodeError(eyre::Error),
     // stupid ass bendy library's error type only implements Debug + Display and not actually Error
@@ -33,11 +25,9 @@ pub enum OurError {
     #[error(transparent)]
     Generic(#[from] eyre::Error),
 
-    // wtf
     #[error("Join Error")]
     JoinError(#[from] tokio::task::JoinError),
 
-    // wtf
     #[error("Timed out")]
     Timeout(#[from] tokio::time::error::Elapsed),
 
@@ -48,8 +38,7 @@ pub enum OurError {
 /// When Australians say no
 macro_rules! naur {
     ($msg:literal $(,)?) => { OurError::Generic(eyre::eyre!($msg)) };
-    ($err:expr $(,)?) => { OurError::Generic(eyre::eyre!($expr)) };
-    ($fmt:expr, $($arg:tt)*) => { OurError::Generic(eyre::eyre!($fmt $($arg)*)) };
+    ($fmt:literal, $($arg:tt)*) => { OurError::Generic(eyre::eyre!($fmt, $($arg)*)) };
 }
 
 // https://stackoverflow.com/questions/26731243/how-do-i-use-a-macro-across-module-files

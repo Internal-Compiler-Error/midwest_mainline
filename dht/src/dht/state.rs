@@ -66,10 +66,9 @@ impl SharedState {
             .map(|(ip, port)| {
                 assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
 
-                let ip: Ipv4Addr = ip.parse().expect(&format!(
-                    "invalid ip string representation got into the database: {}",
-                    ip
-                ));
+                let ip: Ipv4Addr = ip
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid ip string representation got into the database: {}", ip));
                 SocketAddrV4::new(ip, port as u16)
             })
             .collect();

@@ -1,3 +1,9 @@
+//! The shared vocabulary: node ids, info hashes, tokens, transaction ids.
+//!
+//! [`NodeId`] and [`InfoHash`] are both 160-bit values in the same key space — that is
+//! what makes Kademlia work: "peers for this info hash" are stored at the nodes whose
+//! ids are closest to the hash, by xor distance ([`NodeId::dist`], [`cmp_resp`]).
+
 use bendy::encoding::ToBencode;
 use num::traits::ops::bytes;
 use smallvec::SmallVec;
@@ -67,25 +73,6 @@ impl ToBencode for NodeId {
         encoder.emit_bytes(&self.0)
     }
 }
-
-// impl PartialOrd for NodeId {
-//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-//         for (lhs, rhs) in self.0.iter().zip(other.0.iter()) {
-//             match lhs.cmp(rhs) {
-//                 Ordering::Equal => continue,
-//                 Ordering::Less => return Some(Ordering::Less),
-//                 Ordering::Greater => return Some(Ordering::Greater),
-//             }
-//         }
-//         Some(Ordering::Equal)
-//     }
-// }
-//
-// impl Ord for NodeId {
-//     fn cmp(&self, other: &Self) -> Ordering {
-//         self.partial_cmp(other).unwrap()
-//     }
-// }
 
 #[derive(Hash, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout)]
 #[repr(C, packed)]

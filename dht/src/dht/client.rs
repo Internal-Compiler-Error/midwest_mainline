@@ -308,28 +308,14 @@ impl DhtClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::SensibleOptions;
     use crate::dht::routing_table::RoutingTable;
     use crate::dht::rpc_manager::RpcManager;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::message::find_node_get_peers_response::Builder as ResBuilder;
     use crate::message::{Krpc, ParseKrpc};
-    use diesel::SqliteConnection;
-    use diesel::connection::SimpleConnection;
-    use diesel::r2d2::{ConnectionManager, Pool};
+    use crate::test_support::memory_pool;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
-
-    fn test_pool(ddl: &str) -> Pool<ConnectionManager<SqliteConnection>> {
-        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
-        let pool = Pool::builder()
-            .max_size(1)
-            .connection_customizer(Box::new(SensibleOptions))
-            .build(manager)
-            .unwrap();
-        pool.get().unwrap().batch_execute(ddl).unwrap();
-        pool
-    }
 
     /// A fake DHT node that answers every get_peers query with the given response body
     async fn fake_dht_node(socket: UdpSocket, body: KrpcBody) {
@@ -382,40 +368,14 @@ mod tests {
         tokio::spawn(fake_dht_node(socket_a, body_a));
 
         // our client, with node A as the entire routing table
-        let router_pool = test_pool(
-            "CREATE TABLE node (
-                id BLOB PRIMARY KEY,
-                bucket INTEGER NOT NULL,
-                last_contacted BIGINT NOT NULL,
-                ip_addr TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                failed_requests INTEGER NOT NULL,
-                removed BOOLEAN NOT NULL,
-                last_sent BIGINT,
-                added BIGINT NOT NULL DEFAULT 0
-            )",
-        );
-        let swarm_pool = test_pool(
-            "CREATE TABLE swarm (info_hash BLOB PRIMARY KEY);
-             CREATE TABLE peer (
-                ip_addr TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                last_announced BIGINT NOT NULL,
-                swarm BLOB NOT NULL,
-                PRIMARY KEY (ip_addr, port, swarm)
-            )",
-        );
+        let router_pool = memory_pool();
+        let swarm_pool = memory_pool();
 
         let our_id = NodeId([0x01; 20]);
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = RpcManager::new(
-            socket,
-            router_pool.clone(),
-            Arc::new(TxnIdGenerator::new()),
-            Ipv4Addr::LOCALHOST,
-        );
+        let broker = RpcManager::new(socket, router_pool.clone(), Arc::new(TxnIdGenerator::new()));
         broker.run().await.unwrap();
         let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool);
         routing_table.add(NodeId([0xAA; 20]), addr_a);

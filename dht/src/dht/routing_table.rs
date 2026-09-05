@@ -1,3 +1,11 @@
+//! The k-bucket contact store, persisted in SQLite so contacts survive restarts.
+//!
+//! The table learns passively: `run` consumes the broker's inbound message fan-out and
+//! records every sender we hear from. Liveness is tracked with a `failed_requests`
+//! counter — 3+ failures and a stale `last_sent` lands a node on the replacement queue,
+//! and a failed refresh ping tombstones it (`removed`). Tombstones and expired peers
+//! are purged on the periodic `refresh_table` tick.
+
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::time::Duration;
@@ -51,7 +59,7 @@ pub struct RoutingTable {
     /// We keep 160 flat buckets of 1024 and let `find_closest` gather across buckets;
     /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
     /// table fresh. Revisit if the table ever outgrows this.
-    bucket_size: usize,
+    bucket_capacity: usize,
 }
 
 impl RoutingTable {
@@ -60,7 +68,7 @@ impl RoutingTable {
             id,
             table,
             rpc_manager,
-            bucket_size: 1024, // TODO: make this configurable in the future
+            bucket_capacity: 1024, // TODO: make this configurable in the future
         }
     }
 
@@ -198,11 +206,8 @@ impl RoutingTable {
 
     pub fn full_bucket(&self, i: i32) -> bool {
         let size = self.bucket_size(i);
-        assert!(
-            !(size > self.bucket_size),
-            "bucket managed to grow beyond the size limit"
-        );
-        self.bucket_size(i) == self.bucket_size
+        assert!(size <= self.bucket_capacity, "bucket managed to grow beyond the size limit");
+        size == self.bucket_capacity
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
@@ -340,15 +345,6 @@ impl RoutingTable {
         join_all((0..160).map(|i| async move { self.refresh_bucket(i).await })).await;
     }
 
-    pub async fn refresh_table_loop(&self) {
-        // TODO: make this configurable
-        let refresh_duration = Duration::from_secs(3 * 60);
-        loop {
-            self.refresh_table().await;
-            sleep(refresh_duration).await;
-        }
-    }
-
     // TODO: use AsRef or Into to make it take in anything that can turn into an ID
     fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
@@ -420,48 +416,18 @@ pub fn update_last_sent(nodee: &NodeId, sent_timestamp: i64, conn: &mut SqliteCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht::SensibleOptions;
     use crate::dht::txn_id_generator::TxnIdGenerator;
+    use crate::test_support::memory_pool;
     use std::sync::Arc;
     use tokio::net::UdpSocket;
 
-    /// A RoutingTable over a single-connection in-memory sqlite pool (max_size 1 so every
-    /// checkout shares the same in-memory database), with the same connection
-    /// customizer as production (the custom `xor()` SQL function lives there).
     async fn test_routing_table(our_id: NodeId) -> RoutingTable {
-        let manager = ConnectionManager::<SqliteConnection>::new(":memory:");
-        let pool = Pool::builder()
-            .max_size(1)
-            .connection_customizer(Box::new(SensibleOptions))
-            .build(manager)
-            .unwrap();
-
-        let mut conn = pool.get().unwrap();
-        diesel::sql_query(
-            "CREATE TABLE node (
-                id BLOB PRIMARY KEY,
-                bucket INTEGER NOT NULL,
-                last_contacted BIGINT NOT NULL,
-                ip_addr TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                failed_requests INTEGER NOT NULL,
-                removed BOOLEAN NOT NULL,
-                last_sent BIGINT,
-                added BIGINT NOT NULL DEFAULT 0
-            )",
-        )
-        .execute(&mut *conn)
-        .unwrap();
+        let pool = memory_pool();
 
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = RpcManager::new(
-            socket,
-            pool.clone(),
-            Arc::new(TxnIdGenerator::new()),
-            Ipv4Addr::LOCALHOST,
-        );
+        let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()));
         RoutingTable::new(our_id, broker, pool)
     }
 

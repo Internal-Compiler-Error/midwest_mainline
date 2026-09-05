@@ -1,32 +1,6 @@
-use async_trait::async_trait;
 use diesel::SqliteConnection;
 use diesel::prelude::*;
-use std::{future::Future, time::SystemTime};
-use tokio::task::{JoinError, JoinSet};
-
-#[async_trait]
-pub trait ParSpawnAndAwait {
-    type Awaited;
-
-    async fn par_spawn_and_await(self) -> Result<Self::Awaited, JoinError>;
-}
-
-#[async_trait]
-impl<F, R> ParSpawnAndAwait for Vec<F>
-where
-    R: Send + 'static,
-    F: Future<Output = R> + Send + 'static,
-{
-    type Awaited = Vec<R>;
-
-    async fn par_spawn_and_await(self) -> Result<Self::Awaited, JoinError> {
-        let mut set = JoinSet::new();
-        for task in self {
-            set.spawn(task);
-        }
-        Ok(set.join_all().await)
-    }
-}
+use std::time::SystemTime;
 
 pub fn unix_timestmap_ms() -> i64 {
     let timestamp_ms = SystemTime::now()
@@ -47,26 +21,6 @@ pub fn base64_dec<T: AsRef<[u8]>>(data: T) -> Vec<u8> {
     use base64::prelude::*;
 
     BASE64_STANDARD.decode(data).unwrap()
-}
-
-#[allow(unused)]
-macro_rules! bail_on_err {
-    ($result:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(_e) => return,
-        }
-    };
-}
-
-#[allow(unused)]
-macro_rules! bail_on_none {
-    ($result:expr) => {
-        match $result {
-            Some(val) => val,
-            None => return,
-        }
-    };
 }
 
 pub fn db_put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
@@ -99,6 +53,3 @@ pub fn db_get(keyy: &str, conn: &mut SqliteConnection) -> Result<Option<String>,
         .optional()
 }
 use crate::models::{Misc, MiscVal};
-
-#[allow(unused)]
-pub(crate) use {bail_on_err, bail_on_none};

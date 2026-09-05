@@ -82,17 +82,15 @@ impl DhtServer {
     #[tracing::instrument(skip(self))]
     fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> KrpcBody {
         let table = &self.state.routing_table;
-        let closest_eight: Vec<_> = table.find_closest(query.target_id()).into_iter().collect();
+        let closest_eight = table.find_closest(query.target_id());
 
         // if we have an exact match, it will be the first element in the vector
-        if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
-            let res = ResBuilder::new(self.state.our_id).with_node(closest_eight[0]).build();
-            KrpcBody::FindNodeGetPeersResponse(res)
+        let res = if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
+            ResBuilder::new(self.state.our_id).with_node(closest_eight[0]).build()
         } else {
-            let stupid: Vec<_> = closest_eight.into_iter().collect();
-            let res = ResBuilder::new(self.state.our_id).with_nodes(&stupid).build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        }
+            ResBuilder::new(self.state.our_id).with_nodes(&closest_eight).build()
+        };
+        KrpcBody::FindNodeGetPeersResponse(res)
     }
 
     #[tracing::instrument(skip(self))]
@@ -149,8 +147,8 @@ impl DhtServer {
         peer_contact: SocketAddrV4,
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
     ) -> Result<usize, diesel::result::Error> {
-        // the ensure that the swarm bit should probably be a separate function
         conn.transaction(|conn| {
+            // the peer table references the swarm, so make sure it exists first
             let info_hash = info_hash.as_bytes().to_vec();
             let _ = insert_into(swarm::table)
                 .values(swarm::info_hash.eq(&info_hash))

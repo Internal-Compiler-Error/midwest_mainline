@@ -19,6 +19,33 @@
 //! - For an excellent video explaining it, [see](https://youtu.be/NxhZ_c8YX8E)
 //! - For the BitTorrent specification, [see](https://www.bittorrent.org/beps/bep_0005.html)
 //!
+//! ## high level design
+//! The crate is layered bottom-up:
+//!
+//! - [`message`] — the KRPC wire protocol (BEP 5): bencode parsing and encoding for the
+//!   four queries (ping, find_node, get_peers, announce_peer), their responses, and
+//!   errors. Pure data, no I/O.
+//! - [`dht::rpc_manager`] — the message broker and sole owner of the UDP socket. An
+//!   outbound query gets a fresh transaction id and a oneshot waiting for its response
+//!   (matched on both transaction id *and* sender address); every inbound packet is also
+//!   fanned out to all subscribers. Send work is spawned so a slow write never stalls
+//!   the receive loop.
+//! - [`dht::routing_table`] — the k-bucket contact store, persisted in SQLite so contacts
+//!   and our node id survive restarts. It subscribes to the broker's inbound fan-out and
+//!   learns from everything we hear; dead nodes are evicted by a failure counter plus
+//!   periodic refresh pings.
+//! - [`dht::client`] / `dht::server` — the two halves of the node, sharing one
+//!   `SharedState`. The client runs iterative lookups (closest-known nodes, `CONCURRENT_REQS`
+//!   at a time, following referrals); the server answers inbound queries and stores
+//!   announced peers (token-validated per BEP 5, tokens from `token_generator`).
+//! - [`dht::DhtSession`] wires it all together: resumes or mints a BEP 42 node id from
+//!   the database, then `run()` drives the broker, the routing table, and the server.
+//!
+//! Two deliberate deviations from BEP 5: the routing table is 160 flat buckets of 1024
+//! nodes instead of k = 8 with bucket splitting (eviction keeps it fresh; see the note on
+//! [`dht::routing_table::RoutingTable`]), and all diesel calls are synchronous — fine for
+//! local SQLite, but don't hold them across network awaits.
+//!
 //! ## roadmap
 //! - [x] routing
 //! - [x] bootstrapping
@@ -36,7 +63,8 @@
 //! - [x] upload to crate.io
 //!
 //! ## state of the development
-//! As of right now, the code base is still experience large changes daily and very little comments are added.
+//! The core BEP 5 feature set is complete (see the roadmap above); the public interfaces
+//! are still subject to change.
 //!
 //! ## warning
 //! I do not have any formal training in security, anything that listens for incoming traffic should be considered as
@@ -91,6 +119,8 @@ pub mod message;
 pub(crate) mod models;
 pub mod our_error;
 pub(crate) mod schema;
+#[cfg(test)]
+mod test_support;
 pub(crate) mod token_generator;
 pub mod types;
 pub mod utils;
