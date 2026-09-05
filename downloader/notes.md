@@ -139,7 +139,7 @@ awaits on the loop, so a peer whose kernel send buffer is full (a downloader we'
 to that stopped reading) stalls the *whole* swarm -- reads from every other peer included --
 until it drains or dies. If a swarm-wide pause ever shows up, look here first.
 
-UCB numbers were kept exactly: `picked_count` counts block requests (not pieces), `mean_rx`
+UCB numbers were kept exactly: `picked_count` counts block requests (not pieces), the rate
 is updated per block, `t` is pieces completed this session.
 
 # Download root is per torrent, 2026-09-05
@@ -183,3 +183,18 @@ Result on the same torrent: metadata in seconds (128 dead addresses written off)
 spread across ~200 peers. Note for the earlier "UCB works" impression: before the NaN fix,
 every download was single-peer until its first piece completed, so any speed seen then came
 from one peer's pipelining, not from selection.
+
+# UCB reward is windowed throughput, not per-block speed, 2026-09-05
+The reward used to be a lifetime mean of `block length / time since that block was
+requested`. With up to 256 blocks queued at a peer, that wait is almost all queueing behind
+the other blocks, so a fast peer with a full queue scored like a slow one, and the number
+never changed once the queue depth settled. `PeerStatistics::rx_rate` is now bytes delivered
+in the last `RATE_WINDOW` divided by the time the peer has been busy within that window
+(`requests_started` marks when its queue went from empty to non-empty). It's computed at
+each delivery and held while the peer is idle, so an idle peer keeps its last measured rate
+instead of decaying to zero and never being picked again. The choking algorithm ranks by the
+same number. Tests: `throughput_ignores_queue_depth_and_idle_time`,
+`throughput_forgets_deliveries_older_than_the_window`.
+
+Still open on the estimator: the exploration bonus is a bare `sqrt(ln t / n)`, unitless and
+around 1, added to a rate in bytes per second, so it's effectively zero after the first pick.

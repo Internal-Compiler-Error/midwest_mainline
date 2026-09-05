@@ -762,7 +762,7 @@ impl TorrentSwarm {
             .peers
             .iter()
             .filter(|p| p.interested_us)
-            .map(|p| (p.remote_addr, p.stats.mean_rx))
+            .map(|p| (p.remote_addr, p.stats.rx_rate))
             .collect();
         interested.sort_by(|a, b| b.1.total_cmp(&a.1));
 

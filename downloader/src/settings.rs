@@ -27,6 +27,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// opposed to disconnecting outright, is the failure mode this guards against.
 pub const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How far back a peer's download throughput is measured over. Shorter reacts faster to a
+/// peer's upload slots changing hands, longer smooths out TCP burstiness.
+pub const RATE_WINDOW: Duration = Duration::from_secs(10);
+
 /// BEP 3: "it is common to send a message every two minutes to keep the connection alive".
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(100);
 

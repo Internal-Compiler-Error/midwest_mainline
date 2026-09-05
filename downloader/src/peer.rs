@@ -1,10 +1,11 @@
+use crate::settings::RATE_WINDOW;
 use crate::wire::{
     BitField, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
     RejectRequest, Request, Unchoke,
 };
 use futures::SinkExt;
 use juicy_bencode::BencodeItemView;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -168,12 +169,12 @@ impl Peer {
     /// Records a block that answers one of our requests. `None` if we never asked for it (or
     /// gave up waiting), in which case the caller should ignore the data.
     pub fn block_received(&mut self, piece: &Piece) -> Option<()> {
-        let requested_at = self.requested.remove(&Request {
+        self.requested.remove(&Request {
             index: piece.index,
             begin: piece.begin,
             length: piece.length,
         })?;
-        self.stats.block_received(piece.length as usize, requested_at.elapsed());
+        self.stats.block_received(piece.length as usize, Instant::now());
         self.last_progress = Instant::now();
         Some(())
     }
@@ -204,6 +205,7 @@ impl Peer {
         self.stats.block_requested();
         if self.requested.is_empty() {
             self.last_progress = Instant::now();
+            self.stats.requests_started(self.last_progress);
         }
         self.requested.insert(req, Instant::now());
         self.socket.send(BtMessage::Request(req)).await
@@ -397,7 +399,7 @@ pub(crate) fn build_ut_metadata_data_message(piece: u32, total_size: u32, data: 
     payload
 }
 
-#[derive(Clone, Debug, Copy, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct PeerStatistics {
     /// Number of bytes we've sent to the peer
     pub sent: usize,
@@ -405,12 +407,16 @@ pub struct PeerStatistics {
     /// Number of bytes we've received from the peer
     pub received: usize,
 
-    /// Mean download speed from this peer
-    pub mean_rx: f64,
+    /// Download throughput from this peer, bytes per second, measured over the last
+    /// RATE_WINDOW of deliveries. Only updated while the peer owes us blocks, so it holds the
+    /// last measured value while the peer sits idle rather than decaying to zero.
+    pub rx_rate: f64,
 
-    /// how many times have the download speed been sampled, mostly used in online averaging
-    /// calculation
-    pub mean_rx_cnt: usize,
+    /// Deliveries within the last RATE_WINDOW, oldest first
+    arrivals: VecDeque<(Instant, usize)>,
+
+    /// When the current run of outstanding requests began
+    busy_since: Option<Instant>,
 
     /// how many times this peer has been chosen to request a piece
     pub picked_count: usize,
@@ -422,27 +428,47 @@ impl PeerStatistics {
         self.picked_count += 1;
     }
 
-    /// A requested block arrived `waited` after we asked for it.
-    pub fn block_received(&mut self, length: usize, waited: Duration) {
+    /// The peer went from owing us nothing to owing us blocks. Throughput is measured from
+    /// here, so time spent idle doesn't count against the peer.
+    pub fn requests_started(&mut self, now: Instant) {
+        self.busy_since = Some(now);
+        self.arrivals.clear();
+    }
+
+    /// A requested block arrived. The throughput sample is bytes delivered over the window
+    /// divided by the time the peer has been busy within it, not the wait for this block: with
+    /// hundreds of blocks queued at a peer, each block's wait is mostly queueing behind the
+    /// others and says nothing about how fast the peer sends.
+    pub fn block_received(&mut self, length: usize, now: Instant) {
         self.received += length;
-        let speed = length as f64 / waited.as_secs_f64();
-        // online average update formula
-        self.mean_rx_cnt += 1;
-        self.mean_rx += (speed - self.mean_rx) / self.mean_rx_cnt as f64;
+        self.arrivals.push_back((now, length));
+        while self
+            .arrivals
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > RATE_WINDOW)
+        {
+            self.arrivals.pop_front();
+        }
+        let window_start = self.busy_since.map_or(now, |since| since.max(now - RATE_WINDOW));
+        let span = now.duration_since(window_start).as_secs_f64();
+        if span > 0.0 {
+            let bytes: usize = self.arrivals.iter().map(|(_, len)| len).sum();
+            self.rx_rate = bytes as f64 / span;
+        }
     }
 
     pub fn block_sent(&mut self, length: usize) {
         self.sent += length;
     }
 
-    /// UCB1: the peer's mean download speed plus an exploration bonus that shrinks the more
+    /// UCB1: the peer's download throughput plus an exploration bonus that shrinks the more
     /// often it's been picked, relative to how often *anyone* has been picked (`total_picks`,
     /// block requests to every peer so far).
     pub fn rx_speed_ucb(&self, total_picks: usize) -> f64 {
         let c = 1f64;
         let t = total_picks as f64;
         let n_t = self.picked_count as f64;
-        self.mean_rx + c * (t.ln() / n_t).sqrt()
+        self.rx_rate + c * (t.ln() / n_t).sqrt()
     }
 
     pub fn score(&self, total_picks: usize) -> f64 {
@@ -587,15 +613,55 @@ mod test {
         let mut stats = PeerStatistics::default();
         assert_eq!(stats.score(0), f64::INFINITY, "an unpicked peer is picked first");
         stats.block_requested();
-        // one pick, nothing completed yet: used to be NaN, which sorted above infinity
-        assert!(!stats.score(0).is_nan());
+        // one pick, nothing delivered yet: used to be NaN, which sorted above infinity
+        assert!(!stats.score(1).is_nan());
         assert!(
-            stats.score(0) < f64::INFINITY,
+            stats.score(1) < f64::INFINITY,
             "a picked peer must lose to an unpicked one"
         );
-        assert!(!stats.score(1).is_nan());
-        stats.block_received(16_384, Duration::from_millis(100));
-        assert!(stats.score(10) > stats.mean_rx, "the exploration bonus is positive");
+        let now = Instant::now();
+        stats.requests_started(now);
+        stats.block_received(16_384, now + Duration::from_millis(100));
+        assert!(stats.score(10) > stats.rx_rate, "the exploration bonus is positive");
+    }
+
+    #[test]
+    fn throughput_ignores_queue_depth_and_idle_time() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+
+        // eight blocks asked for at once, delivered one per second: 16 KiB/s, however long
+        // each individual block waited in the queue
+        let mut deep = PeerStatistics::default();
+        deep.requests_started(t0);
+        for i in 1..=8 {
+            deep.block_received(16_384, t0 + s(i));
+        }
+        assert_eq!(deep.rx_rate, 16_384.0);
+
+        // the same deliveries after a long idle stretch measure the same, and the last
+        // measurement survives going idle again
+        let mut idle = PeerStatistics::default();
+        idle.requests_started(t0 + s(600));
+        for i in 1..=8 {
+            idle.block_received(16_384, t0 + s(600 + i));
+        }
+        assert_eq!(idle.rx_rate, 16_384.0);
+        assert_eq!(idle.rx_rate, deep.rx_rate);
+    }
+
+    #[test]
+    fn throughput_forgets_deliveries_older_than_the_window() {
+        let t0 = Instant::now();
+        let mut stats = PeerStatistics::default();
+        stats.requests_started(t0);
+        stats.block_received(1_000_000, t0 + Duration::from_secs(1));
+        assert_eq!(stats.rx_rate, 1_000_000.0);
+
+        // a trickle after the burst has aged out of the window shows the current rate only
+        let later = t0 + RATE_WINDOW + Duration::from_secs(10);
+        stats.block_received(1_000, later);
+        assert_eq!(stats.rx_rate, 1_000.0 / RATE_WINDOW.as_secs_f64());
     }
 
     #[tokio::test]
