@@ -53,6 +53,9 @@ pub(crate) struct Peer {
 
     /// blocks we've asked this peer for and haven't received yet, with when we asked
     pub requested: BTreeMap<Request, Instant>,
+    /// the last time this peer delivered a block, or was first asked for one after being idle;
+    /// what "stalled" is measured from (see `stalled`)
+    last_progress: Instant,
     /// bumped on every inbound message (including keep-alives); a peer that sends nothing for
     /// PEER_TIMEOUT is considered dead
     pub last_received: Instant,
@@ -81,6 +84,7 @@ impl Peer {
             interested_them: false,
             interested_us: false,
             requested: BTreeMap::new(),
+            last_progress: Instant::now(),
             last_received: Instant::now(),
             stats: PeerStatistics::default(),
         }
@@ -170,7 +174,16 @@ impl Peer {
             length: piece.length,
         })?;
         self.stats.block_received(piece.length as usize, requested_at.elapsed());
+        self.last_progress = Instant::now();
         Some(())
+    }
+
+    /// Whether this peer owes us blocks and hasn't delivered any for `limit`. Measured from
+    /// its last delivery rather than from each request: a whole piece is requested at once,
+    /// so "block older than the limit" would condemn any peer slower than piece size over
+    /// limit, however steadily it's sending.
+    pub fn stalled(&self, limit: Duration) -> bool {
+        !self.requested.is_empty() && self.last_progress.elapsed() > limit
     }
 
     pub async fn send_extended_handshake(&mut self, metadata_size: u32, private: bool) -> io::Result<()> {
@@ -189,6 +202,9 @@ impl Peer {
 
     pub async fn request_block(&mut self, req: Request) -> io::Result<()> {
         self.stats.block_requested();
+        if self.requested.is_empty() {
+            self.last_progress = Instant::now();
+        }
         self.requested.insert(req, Instant::now());
         self.socket.send(BtMessage::Request(req)).await
     }
@@ -583,5 +599,44 @@ mod test {
         assert!(!stats.score(1).is_nan());
         stats.block_received(16_384, Duration::from_millis(100));
         assert!(stats.score(10) > stats.mean_rx, "the exploration bonus is positive");
+    }
+
+    #[tokio::test]
+    async fn stalled_means_no_delivery_not_old_requests() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let _other_end = listener.accept().await.unwrap();
+        let mut peer = Peer::new(tcp, "10.0.0.1:1".parse().unwrap(), 4, false);
+        let limit = Duration::from_millis(50);
+
+        assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");
+        let first = Request {
+            index: 0,
+            begin: 0,
+            length: 4,
+        };
+        let second = Request {
+            index: 0,
+            begin: 4,
+            length: 4,
+        };
+        peer.request_block(first).await.unwrap();
+        peer.request_block(second).await.unwrap();
+        tokio::time::sleep(limit * 2).await;
+        assert!(peer.stalled(limit), "two requests, no delivery");
+
+        // one block arrives: the other request is just as old, but the peer is delivering
+        peer.block_received(&Piece {
+            index: 0,
+            begin: 0,
+            length: 4,
+            data: Box::new([0; 4]),
+        })
+        .unwrap();
+        assert!(!peer.stalled(limit));
+        tokio::time::sleep(limit * 2).await;
+        assert!(peer.stalled(limit), "and then it stops again");
     }
 }

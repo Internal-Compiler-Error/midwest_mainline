@@ -162,3 +162,24 @@ resolves, adds, runs the resume saver, then waits for either session shutdown (f
 resume data kept) or removal. Removal, per the user's decision, deletes both the resume file
 and the data (`root/<top level>`), after the saver has finished so the two can't race. The
 entry leaves `torrents()` immediately; deletion finishes in the background.
+
+# What the console found on a 2.9 GB, 4 MiB-piece torrent, 2026-09-05
+Three bugs that a 217 MB / 256 KiB-piece torrent never surfaced:
+
+- **UCB scored NaN until the first piece completed.** `t` was pieces done this session, so
+  `sqrt(ln 0 / n)` = NaN, and `f64::total_cmp` sorts NaN *above* +inf: the first peer picked
+  beat every fresh peer (score +inf) on every pick. `t` is now total block requests to anyone,
+  floored at 1. Test: `peer::test::ucb_score_is_never_nan`.
+- **No per-peer request cap.** One peer was handed 100 pieces = 25,600 outstanding blocks;
+  clients cap their request queue (250-500) and reject the rest. `MAX_OUTSTANDING_BLOCKS_PER_PEER`
+  = 256 now skips a loaded peer. Related: the in-flight limit was 100 *pieces*, which for 4 MiB
+  pieces was 400 MB of buffers; it's `MAX_INFLIGHT_BYTES` = 64 MiB.
+- **TCP connects had no timeout.** Most tracker addresses are unreachable and the OS takes
+  ~75s to say so; with 8 metadata fetches at a time a magnet tried 16 peers in its 120s
+  budget and failed. `wire::connect` bounds every dial at `CONNECT_TIMEOUT` (5s) and the
+  fetcher runs 32 at once.
+
+Result on the same torrent: metadata in seconds (128 dead addresses written off), ~4-5 MB/s
+spread across ~200 peers. Note for the earlier "UCB works" impression: before the NaN fix,
+every download was single-peer until its first piece completed, so any speed seen then came
+from one peer's pipelining, not from selection.

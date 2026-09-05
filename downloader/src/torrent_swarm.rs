@@ -311,14 +311,11 @@ impl TorrentSwarm {
                 silent.push(idx);
                 continue;
             }
-            // a peer that accepted a request and then just goes quiet (as opposed to
-            // disconnecting outright) would otherwise hold its piece's slot forever
-            stalled.extend(
-                peer.requested
-                    .iter()
-                    .filter(|(_, at)| at.elapsed() > BLOCK_REQUEST_TIMEOUT)
-                    .map(|(req, _)| req.index),
-            );
+            // a peer that accepted requests and then went quiet (as opposed to disconnecting
+            // outright) would otherwise hold its pieces' slots forever
+            if peer.stalled(BLOCK_REQUEST_TIMEOUT) {
+                stalled.extend(peer.requested.keys().map(|req| req.index));
+            }
         }
         for idx in silent.into_iter().rev() {
             info!(
@@ -330,7 +327,7 @@ impl TorrentSwarm {
         stalled.sort_unstable();
         stalled.dedup();
         for piece in stalled {
-            info!("piece {piece} timed out, will retry");
+            info!("piece {piece} stalled, will retry");
             self.fail_piece(piece);
         }
 
