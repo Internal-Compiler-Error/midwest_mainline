@@ -1171,6 +1171,11 @@ impl TorrentSwarm {
                 let _ = self.active_peers[peer_idx].send_metadata_piece(piece, total_size, data).await;
             }
             PeerEvent::PexReceived(peers) => {
+                // BEP 27: don't act on PEX for a private torrent even if some peer sends it
+                // anyway (we don't advertise ut_pex when private, so a compliant peer won't).
+                if self.torrent.private {
+                    return;
+                }
                 self.connect_to_discovered_peers(peers).await;
             }
         }
@@ -1457,6 +1462,11 @@ impl TorrentSwarm {
     /// we just resend the current full membership every round, which is redundant but simple
     /// and spec-legal (PEX is a discovery hint, not an authoritative membership feed).
     async fn run_pex_round(&mut self) {
+        // BEP 27: a private torrent's peers must come only from its trackers.
+        if self.torrent.private {
+            return;
+        }
+
         let all_addrs: Vec<SocketAddr> = self.active_peers.iter().map(|p| p.remote_addr).collect();
 
         for peer in &self.active_peers {

@@ -168,6 +168,7 @@ impl PeerHandle {
             state_tx,
             num_pieces,
             metadata_size: torrent.metadata_size(),
+            private: torrent.private,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
             remote_supports_fast,
@@ -329,6 +330,9 @@ struct PeerConnection {
     num_pieces: usize,
     /// total size of the bencoded info dict, advertised in our BEP 10 extended handshake
     metadata_size: u32,
+    /// BEP 27: if set, we don't advertise ut_pex in our extended handshake, don't run PEX
+    /// rounds, and don't act on any PEX we somehow still receive.
+    private: bool,
     /// the message id the remote wants us to use for ut_metadata messages, learned from
     /// their extended handshake; `None` until then (or if they don't support it)
     their_ut_metadata_id: Option<u8>,
@@ -357,12 +361,17 @@ struct PeerConnection {
 }
 
 /// BEP 10 extended handshake payload: declares the message ids we want the remote to use for
-/// ut_metadata and ut_pex, plus the total metadata size.
-fn build_extended_handshake(metadata_size: u32) -> Vec<u8> {
-    format!(
-        "d1:md11:ut_metadatai{UT_METADATA_ID}e6:ut_pexi{UT_PEX_ID}ee13:metadata_sizei{metadata_size}ee"
-    )
-    .into_bytes()
+/// ut_metadata and (unless this is a BEP 27 private torrent) ut_pex, plus the total metadata
+/// size. BEP 27: a private torrent's peers must come only from its trackers -- not omitting
+/// "ut_pex" here would invite a compliant peer to use PEX with us, defeating the point of the
+/// flag even if we ourselves never act on what we'd receive.
+fn build_extended_handshake(metadata_size: u32, private: bool) -> Vec<u8> {
+    let m = if private {
+        format!("d11:ut_metadatai{UT_METADATA_ID}ee")
+    } else {
+        format!("d11:ut_metadatai{UT_METADATA_ID}e6:ut_pexi{UT_PEX_ID}ee")
+    };
+    format!("d1:m{m}13:metadata_sizei{metadata_size}ee").into_bytes()
 }
 
 /// BEP 11 (PEX) message: compact peer lists, split by address family the same way BEP 7 splits
@@ -414,7 +423,7 @@ async fn peer_ev_loop(mut peer: PeerConnection, remote_supports_extensions: bool
     if remote_supports_extensions {
         // BEP 10: send our extended handshake first, declaring the ut_metadata message id
         // we want the remote to use when sending *us* ut_metadata messages
-        let payload = build_extended_handshake(peer.metadata_size);
+        let payload = build_extended_handshake(peer.metadata_size, peer.private);
         let _ = peer
             .writer
             .send(BtMessage::Extended(Extended {
@@ -936,7 +945,7 @@ mod test {
 
     #[test]
     fn extended_handshake_is_valid_bencode_with_expected_fields() {
-        let payload = build_extended_handshake(12345);
+        let payload = build_extended_handshake(12345, false);
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
         assert!(remaining.is_empty(), "handshake payload must be exactly one bencoded dict");
 
@@ -957,6 +966,22 @@ mod test {
             panic!("\"metadata_size\" must be an integer");
         };
         assert_eq!(*metadata_size, 12345);
+    }
+
+    #[test]
+    fn private_torrent_extended_handshake_omits_ut_pex() {
+        let payload = build_extended_handshake(12345, true);
+        let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
+        assert!(remaining.is_empty());
+
+        let BencodeItemView::Dictionary(m) = dict.get(b"m".as_slice()).unwrap() else {
+            panic!("\"m\" must be a dict");
+        };
+        assert!(m.contains_key(b"ut_metadata".as_slice()), "ut_metadata is unaffected by \"private\"");
+        assert!(
+            !m.contains_key(b"ut_pex".as_slice()),
+            "BEP 27: a private torrent must not offer PEX to its peers"
+        );
     }
 
     #[test]

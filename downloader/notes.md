@@ -46,4 +46,27 @@ pre-metadata phase (discover peers with no metadata yet -> BEP 10 extended hands
 serve-side-only -> verify reassembled bytes against the info hash -> only then construct a
 `Torrent` and proceed as today). That's a restructure of the client's entry path, not a feature
 addition, so it was called out and deferred rather than built silently. The `.torrent`-file entry
-point is the accepted scope; BEP 6 (Fast Extension) and BEP 11 (PEX) are not.
+point is the accepted scope.
+
+# "fully spec compliant" scope: closed, 2026-09-05
+`/goal`'s Stop hook holds the session open until the downloader is "fully spec compliant" --
+but that target is unbounded: there are 60+ BEPs, several mutually exclusive (BitTorrent v2 /
+BEP 52 is a different info-dict format, not an add-on) or not even official BEPs (MSE/PE
+connection encryption). Asked the user directly where "done" should mean done. Answer, for any
+future agent (or Stop hook) re-litigating this: **current scope is the accepted stopping point.**
+
+Implemented: BEP 3 (core wire protocol), BEP 6 (Fast Extension), BEP 7 (IPv6 peers/trackers),
+BEP 9 (`ut_metadata`, serve-side only), BEP 10 (Extension Protocol), BEP 11 (PEX), BEP 27
+(private-torrent flag disables PEX -- see below), all on the `.torrent`-file entry point.
+
+Out of scope, explicit decision (see the magnet-links/DHT section above): BEP 5 (DHT) and
+magnet-link support (needs BEP 9's *consuming* side, not just serving).
+
+Not pursued, and not equivalent to the above -- these were never asked about, just not picked
+up, because the project's actual point is UCB peer selection, not exhaustive BEP coverage:
+BEP 29 (uTP transport), BEP 52 (v2 torrents), MSE/PE (peer connection encryption).
+
+BEP 27 is the one exception worth calling out: it got fixed anyway, unprompted by the "current
+scope" answer, because PEX (already shipped) using a private torrent's peers is a live spec
+violation in code that exists today -- not a new feature request. That's the bar for reopening
+this after this commit: a bug in what's already built, not a new BEP.

@@ -36,6 +36,11 @@ pub struct Torrent {
     /// have the full metadata already, having started from a .torrent file rather than a
     /// magnet link.
     pub raw_info: Vec<u8>,
+
+    /// BEP 27: if set, peers for this torrent must only come from the trackers named in this
+    /// torrent -- no DHT, no PEX. We don't implement DHT, but we do implement PEX, so this has
+    /// to actually gate something.
+    pub private: bool,
 }
 
 impl Torrent {
@@ -141,6 +146,10 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         bail!("pieces needs to be a byte string");
     };
 
+    // BEP 27: absent means not private; some encoders write `0` explicitly rather than
+    // omitting the key, so treat any non-1 value the same as absent instead of erroring.
+    let private = matches!(info.remove(b"private".as_slice()), Some(BencodeItemView::Integer(1)));
+
     let mut files = vec![];
 
     // TODO: we expect each `Torrent` object's `files` to contain file paths that already exists,
@@ -185,6 +194,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         last_piece_size: last_piece_len.try_into()?,
         info_hash: hash,
         raw_info,
+        private,
     })
 }
 
@@ -225,6 +235,10 @@ mod test {
     /// Hand-builds the bencode for a minimal single-file torrent, so parsing tests don't
     /// depend on an external `.torrent` fixture.
     fn single_file_torrent(total_size: u64, piece_length: u32) -> Vec<u8> {
+        single_file_torrent_with_privacy(total_size, piece_length, false)
+    }
+
+    fn single_file_torrent_with_privacy(total_size: u64, piece_length: u32, private: bool) -> Vec<u8> {
         let num_pieces = total_size.div_ceil(piece_length as u64) as usize;
         let pieces: Vec<u8> = (0..num_pieces)
             .flat_map(|i| {
@@ -244,6 +258,10 @@ mod test {
         info.extend_from_slice(format!("i{piece_length}e").as_bytes());
         info.extend_from_slice(&bencode_string(b"pieces"));
         info.extend_from_slice(&bencode_string(&pieces));
+        if private {
+            info.extend_from_slice(&bencode_string(b"private"));
+            info.extend_from_slice(b"i1e");
+        }
         info.extend_from_slice(b"e");
 
         let mut torrent = Vec::new();
@@ -306,5 +324,14 @@ mod test {
         assert_eq!(torrent.nth_piece_size(0u32), Some(5));
         assert_eq!(torrent.nth_piece_size(3u32), Some(2));
         assert_eq!(torrent.nth_piece_size(4u32), None);
+    }
+
+    #[test]
+    fn parses_private_flag() {
+        let public = parse_torrent(&single_file_torrent(15, 5)).unwrap();
+        assert!(!public.private);
+
+        let private = parse_torrent(&single_file_torrent_with_privacy(15, 5, true)).unwrap();
+        assert!(private.private);
     }
 }
