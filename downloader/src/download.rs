@@ -2,7 +2,7 @@ use crate::peer::PeerHandle;
 use crate::settings::BLOCK_SIZE;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use crate::torrent_swarm::TorrentSwarm;
+use crate::torrent_swarm::{TorrentSwarm, TorrentSwarmCommand, TorrentSwarmSelfCommand};
 use crate::wire::Request;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -10,7 +10,7 @@ use rand::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{info, trace};
 
@@ -18,25 +18,57 @@ pub enum DownloadEvent {
     PieceCompleted(u32),
 }
 
-pub struct Download<'a> {
+/// Runs as its own task alongside `TorrentSwarm`. It only holds owned/shared state (Arcs, a
+/// command-channel sender) rather than a reference into `TorrentSwarm`, so it can't alias with
+/// the `&mut self` methods the swarm's own event loop uses concurrently.
+pub struct Download {
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
     max_inflight: usize,
-    torrent_swarm: &'a TorrentSwarm,
+    command_tx: mpsc::Sender<TorrentSwarmCommand>,
 }
 
-impl<'a> Download<'a> {
-    pub fn new(torrent_swarm: &'a TorrentSwarm) -> Download<'a> {
+impl Download {
+    pub fn new(torrent_swarm: &TorrentSwarm) -> Download {
         Self {
             torrent: torrent_swarm.torrent().clone(),
             storage: torrent_swarm.storage().clone(),
             max_inflight: 100, // TODO: should be configurable
-            torrent_swarm,
+            command_tx: torrent_swarm.command_sender(),
         }
+    }
+
+    /// Asks the swarm to pick the best peer to request `piece` from.
+    async fn best_peer(&self, piece: u32, total_piece_requested: usize) -> Option<PeerHandle> {
+        let (resp, rx) = oneshot::channel();
+        self.command_tx
+            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::ChooseBestPeer {
+                piece,
+                total_piece_requested,
+                resp,
+            }))
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// Asks the swarm whether every piece has been hash-verified. If the swarm is gone,
+    /// treat that as "done" so this task doesn't spin forever.
+    async fn all_verified(&self) -> bool {
+        let (resp, rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::QueryAllVerified { resp }))
+            .await
+            .is_err()
+        {
+            return true;
+        }
+        rx.await.unwrap_or(true)
     }
 }
 
-impl Download<'_> {
+impl Download {
     #[tracing::instrument(skip(self))]
     pub async fn download_loop(&self) {
         // the number of pieces downloaded *in* this session, already download pieces don't count
@@ -53,14 +85,14 @@ impl Download<'_> {
                 break;
             }
 
-            if self.torrent_swarm.all_verified() {
+            if self.all_verified().await {
                 break;
             }
 
             tokio::select! {
-                Some((peer, piece)) = piece_completed.next() => {
+                Some(piece) = piece_completed.next() => {
                     info!("piece {} is completed", piece);
-                    let peer: PeerHandle = peer;
+                    downloaded += 1;
 
                     in_flight.remove(&piece);
                     missing_pieces.retain(|missing| *missing != piece);
@@ -68,7 +100,6 @@ impl Download<'_> {
                     if in_flight.len() <= self.max_inflight {
                         unblocked.notify_one();
                     }
-                    let _ = peer.send_we_have(piece).await;
                 }
                 // TODO: suprious wakeups?
                 _ = unblocked.notified() => {
@@ -77,16 +108,14 @@ impl Download<'_> {
                         continue;
                     };
 
-                    if let Some(peer) = self.torrent_swarm.best_peer(piece, downloaded) {
+                    if let Some(peer) = self.best_peer(piece, downloaded).await {
                         in_flight.insert(piece);
 
                         piece_completed.push(async move {
-                            let piece = piece;
                             info!("Started downloading piece {}", piece);
                             self.download_piece(piece, peer.clone()).await.expect("Oh this is wrong for sure, download can absolutely fail");
-                            downloaded += 1;
 
-                            (peer, piece)
+                            piece
                         });
 
                     } else {
@@ -127,6 +156,13 @@ impl Download<'_> {
         // TODO: need to ensure they all succeeded
         let _: () = join_all(download_blocks).await.into_iter().collect();
         self.storage.write_piece(piece, buf.into_boxed_slice())?;
+
+        // hand off to the swarm: it hash-verifies, updates the verified bitset, and
+        // broadcasts Have to every active peer
+        let _ = self
+            .command_tx
+            .send(TorrentSwarmCommand::ProcessDownloadEvent(DownloadEvent::PieceCompleted(piece)))
+            .await;
 
         Ok(())
     }

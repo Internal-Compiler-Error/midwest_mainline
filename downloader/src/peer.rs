@@ -78,7 +78,7 @@ impl Ord for PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn new(
+    pub(crate) fn new(
         tcp_stream: TcpStream,
         remote_peer_id: [u8; 20],
         event_tx: mpsc::Sender<TorrentSwarmCommand>,

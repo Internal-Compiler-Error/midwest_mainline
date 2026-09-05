@@ -12,11 +12,10 @@ use rand::Rng;
 use reqwest::Client;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Sleep, interval, sleep_until};
 use tracing::{info, warn};
 use url::{Url, form_urlencoded};
@@ -602,16 +601,24 @@ impl TorrentSwarmHandle {
     }
 }
 
-pub enum TorrentSwarmCommand {
+pub(crate) enum TorrentSwarmCommand {
     ProcessPeerEvent { from: SocketAddrV4, event: PeerEvent },
     ProcessDownloadEvent(DownloadEvent),
     ProcessAnnounceEvent(AnnouncerEvent),
     SelfCommand(TorrentSwarmSelfCommand),
 }
 
-enum TorrentSwarmSelfCommand {
+pub(crate) enum TorrentSwarmSelfCommand {
     HandleNewPeerConnection(PeerHandle),
     HandleNewDiscoveredPeers(Vec<SocketAddrV4>),
+    /// `Download` runs as its own task and has no direct (aliasing-unsafe) access to
+    /// `TorrentSwarm`'s peer list, so it asks for a pick over the command channel instead.
+    ChooseBestPeer {
+        piece: u32,
+        total_piece_requested: usize,
+        resp: oneshot::Sender<Option<PeerHandle>>,
+    },
+    QueryAllVerified { resp: oneshot::Sender<bool> },
 }
 
 pub struct TorrentSwarm {
@@ -722,21 +729,23 @@ impl TorrentSwarm {
         }
     }
 
+    /// A cloneable sender onto this swarm's command queue, for tasks (like `Download`) that
+    /// need to talk to the swarm without holding a reference into it.
+    pub(crate) fn command_sender(&self) -> mpsc::Sender<TorrentSwarmCommand> {
+        self.outbound_msgs.clone()
+    }
+
     pub(crate) async fn work_loop(mut self) {
         let mut aggregate_ticker = interval(Duration::from_mins(1));
 
-        // Get a raw pointer to self to bypass borrow checker
-        let self_ptr: *const TorrentSwarm = &self;
-
-        // SAFETY: This is safe because:
-        // 1. Download::choose() only reads peer_handles and doesn't hold references across await points
-        // 2. tokio::select! branches are mutually exclusive - only one executes at a time
-        // 3. When download is polled (branch 3), it doesn't hold any references while other branches execute
-        // 4. Mutable accesses to announcers and peer_handles in branches 1 and 2 don't overlap with
-        //    download's immutable access to peer_handles in branch 3
-        let download = unsafe { Download::new(&*self_ptr) };
-        let mut download = pin!(download.download_loop());
-        let mut download_done = false;
+        // `Download` only holds owned/shared (Arc, Sender) state -- it talks to the swarm
+        // over the command channel rather than borrowing it, so it can run as its own task
+        // instead of needing to be polled alongside `&mut self` here.
+        let download = Download::new(&self);
+        tokio::spawn(async move {
+            download.download_loop().await;
+            info!("download ended");
+        });
 
         // TODO: probably store the join handles so they can be aborted when necessary
         let http_announcers = mem::take(&mut self.http_announcers);
@@ -754,10 +763,6 @@ impl TorrentSwarm {
                 _ = aggregate_ticker.tick() => {
                     self.aggregate_peer_stats();
                 }
-                _ = &mut download, if !download_done => {
-                    info!("download ended with");
-                    download_done = true;
-                },
                 Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
             }
         }
@@ -991,6 +996,16 @@ impl TorrentSwarm {
 
                 self.pending_peers.append(&mut pending_peers);
                 self.pending_peers.sort_unstable();
+            }
+            TorrentSwarmSelfCommand::ChooseBestPeer {
+                piece,
+                total_piece_requested,
+                resp,
+            } => {
+                let _ = resp.send(self.best_peer(piece, total_piece_requested));
+            }
+            TorrentSwarmSelfCommand::QueryAllVerified { resp } => {
+                let _ = resp.send(self.all_verified());
             }
         }
 
