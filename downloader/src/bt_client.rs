@@ -2,7 +2,8 @@ use crate::defs::Identity;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
-use anyhow::bail;
+use anyhow::{Context, bail};
+use bitvec::prelude::*;
 use futures::future::{join_all, select_all};
 use midwest_mainline::types::InfoHash;
 use std::collections::HashMap;
@@ -57,24 +58,54 @@ impl BtClient {
         self.stats.get(&torrent.info_hash).cloned()
     }
 
-    pub fn add_torrent(&mut self, mut torrent: Torrent) -> anyhow::Result<()> {
+    /// Starts `torrent` from scratch: target files are created (or truncated) and sized.
+    pub fn add_torrent(&mut self, torrent: Torrent) -> anyhow::Result<()> {
+        let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
+        self.add_torrent_with(torrent, verified, true)
+    }
+
+    /// Picks `torrent` back up where a previous run left it: pieces set in `verified` are
+    /// taken to be on disk and correct, so they're neither downloaded nor re-hashed. Target
+    /// files are opened in place and must already be their full size -- a missing or
+    /// wrong-sized file is an error, since the bitfield can't be trusted against it.
+    pub fn add_torrent_resumed(&mut self, torrent: Torrent, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
+        if verified.len() != torrent.pieces.len() {
+            bail!(
+                "resume bitfield covers {} pieces but the torrent has {}",
+                verified.len(),
+                torrent.pieces.len()
+            );
+        }
+        self.add_torrent_with(torrent, verified, false)
+    }
+
+    fn add_torrent_with(&mut self, torrent: Torrent, verified: BitBox<u8, Msb0>, fresh: bool) -> anyhow::Result<()> {
         if self.swarms.contains_key(&torrent.info_hash) {
             bail!("task with this info hash already exists");
         }
 
         let mut files = vec![];
-        for (size, file) in torrent.files.iter_mut() {
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            // read+write, not `File::create`: that opens write-only, and every completed piece
-            // is read back off disk to hash-verify it (`TorrentStorage::read_piece`), which
-            // then fails with EBADF. That surfaced as the swarm task panicking mid-download.
-            let f = File::options().read(true).write(true).create(true).truncate(true).open(&file)?;
-            // `TorrentStorage::new` reads each file's on-disk length back out (via
-            // `file.metadata()`) to compute per-file offsets into the torrent's conceptual
-            // single address space -- a freshly `File::create`d file is 0 bytes, so without
-            // this every file's offset would come out as 0, corrupting storage for anything
-            // but a single-file torrent.
-            f.set_len(*size as u64)?;
+        for (size, file) in torrent.files.iter() {
+            fs::create_dir_all(file.parent().unwrap())?;
+            let f = File::options()
+                .read(true)
+                .write(true)
+                .create(fresh)
+                .truncate(fresh)
+                .open(file)
+                .with_context(|| format!("opening {}", file.display()))?;
+            if fresh {
+                // `TorrentStorage::new` derives per-file offsets from on-disk lengths
+                f.set_len(*size as u64)?;
+            } else {
+                let on_disk = f.metadata()?.len();
+                if on_disk != *size as u64 {
+                    bail!(
+                        "{} is {on_disk} bytes on disk but the torrent says {size}; can't resume",
+                        file.display()
+                    );
+                }
+            }
             files.push(f);
         }
 
@@ -82,7 +113,13 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let task = TorrentSwarm::new(torrent.clone(), storage, self.id.clone(), self.shutdown.clone());
+        let task = TorrentSwarm::new_with_verified(
+            torrent.clone(),
+            storage,
+            self.id.clone(),
+            self.shutdown.clone(),
+            verified,
+        );
 
         self.handles.insert(torrent.info_hash, task.make_handle());
         self.peer_factories.insert(torrent.info_hash, task.peer_factory());
@@ -135,14 +172,20 @@ impl BtClient {
 
         match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)).await {
             Ok(listener) => {
-                tracing::info!("listening for inbound peer connections on {}", listener.local_addr().unwrap());
+                tracing::info!(
+                    "listening for inbound peer connections on {}",
+                    listener.local_addr().unwrap()
+                );
                 listeners.push(listener);
             }
             Err(e) => tracing::warn!("no ipv6 inbound listener on port {port} ({e}); ipv6 peers can't dial us"),
         }
         match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).await {
             Ok(listener) => {
-                tracing::info!("listening for inbound peer connections on {}", listener.local_addr().unwrap());
+                tracing::info!(
+                    "listening for inbound peer connections on {}",
+                    listener.local_addr().unwrap()
+                );
                 listeners.push(listener);
             }
             Err(e) => tracing::warn!(

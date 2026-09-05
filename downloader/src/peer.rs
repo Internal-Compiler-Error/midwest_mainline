@@ -870,7 +870,6 @@ impl PeerConnection {
 
 #[derive(Clone, Debug)]
 pub struct PeerState {
-    // TODO: it's only used when selecting peers, probably shouldn't be here
     they_have: Box<[u8]>,
 
     /// We choked the peer, i.e. we won't send data until we unchoke them

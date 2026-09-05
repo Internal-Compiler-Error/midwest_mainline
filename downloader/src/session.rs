@@ -7,9 +7,13 @@
 //! [`Session::state`] whenever it wants to draw, and renders the [`SessionState`] it gets back.
 
 use crate::defs::Identity;
+use crate::resume::{ResumeData, keep_saving};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
+use bitvec::prelude::*;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
@@ -23,9 +27,14 @@ pub enum SessionState {
     /// Resolving a source into a torrent. For a magnet this means announcing to its trackers
     /// and fetching metadata from a peer, which can take a while; `elapsed` is for showing
     /// that something is still happening.
-    Resolving { source: String, elapsed: Duration },
+    Resolving {
+        source: String,
+        elapsed: Duration,
+    },
     Downloading(Progress),
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 /// A flat snapshot of download progress, in the units a UI wants to display.
@@ -59,9 +68,17 @@ impl Progress {
 #[derive(Clone)]
 enum Phase {
     Idle,
-    Resolving { source: String, started: Instant },
-    Downloading { torrent: Arc<Torrent>, stats: watch::Receiver<TorrentSwarmStats> },
-    Failed { error: String },
+    Resolving {
+        source: String,
+        started: Instant,
+    },
+    Downloading {
+        torrent: Arc<Torrent>,
+        stats: watch::Receiver<TorrentSwarmStats>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 pub struct Session {
@@ -75,6 +92,8 @@ pub struct Session {
     /// cancels whatever is currently running (a resolve, a download, or both)
     current: Option<CancellationToken>,
     rates: Rates,
+    /// where resume files are written; none means progress isn't persisted
+    resume_dir: Option<PathBuf>,
 }
 
 impl Session {
@@ -93,7 +112,15 @@ impl Session {
             phase_rx,
             current: None,
             rates: Rates::new(),
+            resume_dir: None,
         })
+    }
+
+    /// Persist progress to `dir/<info hash>.resume` for every download from now on. Finding
+    /// those files again and handing them to [`Session::resume`] is the caller's job; see
+    /// `list_resume_files`.
+    pub fn set_resume_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.resume_dir = Some(dir.into());
     }
 
     /// Starts downloading `source`, which may be a path to a `.torrent` or a magnet URI.
@@ -101,44 +128,74 @@ impl Session {
     /// what happens next.
     pub fn start(&mut self, source: impl Into<String>) {
         let source = source.into();
+        let identity = self.identity.clone();
+        self.launch(source.clone(), |cancel| async move {
+            let torrent = load_source(&source, identity, cancel).await?;
+            let nothing = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
+            Ok((torrent, nothing, false))
+        });
+    }
+
+    /// Picks a download back up from a resume file (see `ResumeData`). Replaces whatever was
+    /// running before, like [`Session::start`].
+    pub fn resume(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref().to_path_buf();
+        self.launch(path.display().to_string(), |_cancel| async move {
+            let data = ResumeData::read(&path)?;
+            Ok((data.to_torrent()?, data.verified, true))
+        });
+    }
+
+    /// Shared tail of `start`/`resume`: `resolve` produces the torrent plus which pieces are
+    /// already had, and whether the target files are expected to exist already.
+    fn launch<F, Fut>(&mut self, source: String, resolve: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<(Torrent, BitBox<u8, Msb0>, bool)>> + Send,
+    {
         self.stop();
         self.rates = Rates::new();
 
         let cancel = CancellationToken::new();
         self.current = Some(cancel.clone());
         let _ = self.phase_tx.send(Phase::Resolving {
-            source: source.clone(),
+            source,
             started: Instant::now(),
         });
 
         let identity = self.identity.clone();
         let phase_tx = self.phase_tx.clone();
+        let resume_dir = self.resume_dir.clone();
         self.handle.spawn(async move {
-            let torrent = match load_source(&source, identity.clone(), cancel.clone()).await {
-                Ok(torrent) => torrent,
-                Err(e) => {
-                    let _ = phase_tx.send(Phase::Failed { error: format!("{e:#}") });
-                    return;
-                }
+            let fail = |e: anyhow::Error| {
+                let _ = phase_tx.send(Phase::Failed {
+                    error: format!("{e:#}"),
+                });
+            };
+            let (torrent, verified, resumed) = match resolve(cancel.clone()).await {
+                Ok(resolved) => resolved,
+                Err(e) => return fail(e),
             };
 
             // share the session's token so `Session::stop` shuts the client down too
             let mut client = BtClient::new_with_shutdown(*identity, cancel.clone());
-            if let Err(e) = client.add_torrent(torrent.clone()) {
-                let _ = phase_tx.send(Phase::Failed { error: format!("{e:#}") });
-                return;
+            let added = if resumed {
+                client.add_torrent_resumed(torrent.clone(), verified)
+            } else {
+                client.add_torrent(torrent.clone())
+            };
+            if let Err(e) = added {
+                return fail(e);
             }
             let Some(stats) = client.stats(&torrent) else {
-                let _ = phase_tx.send(Phase::Failed {
-                    error: "torrent was added but reported no stats".to_string(),
-                });
-                return;
+                return fail(anyhow::anyhow!("torrent was added but reported no stats"));
             };
 
-            let _ = phase_tx.send(Phase::Downloading {
-                torrent: Arc::new(torrent),
-                stats,
-            });
+            let torrent = Arc::new(torrent);
+            if let Some(dir) = resume_dir {
+                tokio::spawn(keep_saving(torrent.clone(), stats.clone(), dir, cancel.clone()));
+            }
+            let _ = phase_tx.send(Phase::Downloading { torrent, stats });
             let _ = client.work().await;
         });
     }
@@ -165,11 +222,7 @@ impl Session {
                 let stats = stats.borrow().clone();
                 self.rates.update(&stats);
                 SessionState::Downloading(Progress {
-                    name: torrent
-                        .files
-                        .first()
-                        .map(|(_, p)| p.display().to_string())
-                        .unwrap_or_default(),
+                    name: torrent.name.clone(),
                     files: torrent.files.iter().map(|(_, p)| p.display().to_string()).collect(),
                     total_size: torrent.total_size,
                     downloaded: stats.downloaded,

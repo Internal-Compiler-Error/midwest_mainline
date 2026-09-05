@@ -7,12 +7,11 @@ use crate::settings::{
 };
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
-use midwest_mainline::types::InfoHash;
 use crate::wire::{BitField, Piece, shake_hands};
 use anyhow::{self, Context, bail};
-use bitvec::boxed::BitBox;
-use bitvec::order::Msb0;
+use bitvec::prelude::*;
 use juicy_bencode::BencodeItemView;
+use midwest_mainline::types::InfoHash;
 use rand::Rng;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
@@ -79,13 +78,25 @@ pub(crate) fn spawn_announcers(
     for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
         match url.scheme() {
             "http" | "https" => {
-                let announcer =
-                    HttpAnnouncer::new(url, info_hash, identity.clone(), stat_rx.clone(), events.clone(), shutdown.clone());
+                let announcer = HttpAnnouncer::new(
+                    url,
+                    info_hash,
+                    identity.clone(),
+                    stat_rx.clone(),
+                    events.clone(),
+                    shutdown.clone(),
+                );
                 tokio::spawn(announcer.ev_loop());
             }
             "udp" => {
-                let announcer =
-                    UdpAnnouncer::new(url, info_hash, identity.clone(), stat_rx.clone(), events.clone(), shutdown.clone());
+                let announcer = UdpAnnouncer::new(
+                    url,
+                    info_hash,
+                    identity.clone(),
+                    stat_rx.clone(),
+                    events.clone(),
+                    shutdown.clone(),
+                );
                 tokio::spawn(announcer.ev_loop());
             }
             scheme => warn!("ignoring tracker with unsupported scheme {scheme:?}"),
@@ -137,16 +148,19 @@ impl HttpAnnouncer {
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
+        let already_complete = swarm_stat.borrow().completed;
 
         HttpAnnouncer {
             tracker,
             info_hash,
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
-            swarm_stat,
             events,
             sent_started: false,
-            sent_completed: false,
+            // a torrent that was already complete when resumed must not announce
+            // event=completed again (BEP 3)
+            sent_completed: already_complete,
+            swarm_stat,
             shutdown,
         }
     }
@@ -208,10 +222,7 @@ impl HttpAnnouncer {
         let Ok((_remaining, mut dict)) = parsed else {
             bail!("Tracker [{}] responded with invalid bencoded content", self.tracker);
         };
-        info!(
-            "Parsed bencode from tracker [{}] as {:?}",
-            self.tracker, &dict
-        );
+        info!("Parsed bencode from tracker [{}] as {:?}", self.tracker, &dict);
 
         let mut peers = vec![];
         let Some(BencodeItemView::Integer(interval)) = dict.remove(b"interval".as_slice()) else {
@@ -349,17 +360,20 @@ impl UdpAnnouncer {
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
+        let already_complete = swarm_stat.borrow().completed;
         UdpAnnouncer {
             tracker: tracker_url,
             info_hash,
             identity,
             next_ready: Instant::now() + Duration::from_millis(10),
-            swarm_stat,
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
             // haven't done anything
             event,
             sent_started: false,
-            sent_completed: false,
+            // a torrent that was already complete when resumed must not announce
+            // event=completed again (BEP 3)
+            sent_completed: already_complete,
+            swarm_stat,
             shutdown,
         }
     }
@@ -592,7 +606,10 @@ impl UdpAnnouncer {
         // construct the response from raw bytes
         let header_size = size_of::<AnnounceResponseHeader>();
         if buf.len() < header_size {
-            bail!("announce response from tracker [{}] is shorter than a header", self.tracker);
+            bail!(
+                "announce response from tracker [{}] is shorter than a header",
+                self.tracker
+            );
         }
         let header =
             AnnounceResponseHeader::ref_from_bytes(&buf[..header_size]).expect("header alignment should be good");
@@ -802,7 +819,9 @@ impl TorrentSwarmHandle {
     async fn dial_failed(&self, addr: SocketAddr) {
         let _ = self
             .tx
-            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::DialFailed(addr)))
+            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::DialFailed(
+                addr,
+            )))
             .await;
     }
 }
@@ -824,7 +843,9 @@ pub(crate) enum TorrentSwarmSelfCommand {
         total_piece_requested: usize,
         resp: oneshot::Sender<Option<PeerHandle>>,
     },
-    QueryAllVerified { resp: oneshot::Sender<bool> },
+    QueryAllVerified {
+        resp: oneshot::Sender<bool>,
+    },
     /// Rarest-first piece selection: pick whichever of `candidates` the fewest active peers
     /// have (ties broken randomly), so swarm-wide availability stays balanced. This decides
     /// *which piece* to request next; `ChooseBestPeer`'s UCB scoring separately decides *which
@@ -895,17 +916,35 @@ impl TorrentSwarm {
         id: Arc<Identity>,
         shutdown: CancellationToken,
     ) -> TorrentSwarm {
-        let verified = vec![false; torrent.pieces.len()];
-        let verified: BitBox<u8, Msb0> = BitBox::from_iter(verified.iter());
-        // TODO: this only works for fresh downloads
-        // TODO: verified is not updated
+        let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
+        Self::new_with_verified(torrent, storage, id, shutdown, verified)
+    }
+
+    /// Like `new`, but starting from pieces that are already on disk and hash-verified (a
+    /// resumed download). Those pieces won't be requested again and count as had for `left`.
+    pub fn new_with_verified(
+        torrent: Arc<Torrent>,
+        storage: Arc<TorrentStorage>,
+        id: Arc<Identity>,
+        shutdown: CancellationToken,
+        verified: BitBox<u8, Msb0>,
+    ) -> TorrentSwarm {
+        assert_eq!(
+            verified.len(),
+            torrent.pieces.len(),
+            "verified bitfield must have one bit per piece"
+        );
+        let written: usize = verified
+            .iter_ones()
+            .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
+            .sum();
         let stat = TorrentSwarmStats {
             uploaded: 0,
             downloaded: 0,
-            left: torrent.total_size as usize,
-            written: 0,
+            left: torrent.total_size as usize - written,
+            written,
+            completed: verified.all(),
             verified,
-            completed: false,
         };
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
@@ -1075,8 +1114,11 @@ impl TorrentSwarm {
     fn rarest_piece(&self, candidates: &[u32]) -> Option<u32> {
         let availability = |piece: u32| self.active_peers.iter().filter(|p| p.state().they_have(piece)).count();
 
-        let mut by_availability: Vec<(u32, usize)> =
-            candidates.iter().map(|&p| (p, availability(p))).filter(|&(_, count)| count > 0).collect();
+        let mut by_availability: Vec<(u32, usize)> = candidates
+            .iter()
+            .map(|&p| (p, availability(p)))
+            .filter(|&(_, count)| count > 0)
+            .collect();
         let rarest_count = by_availability.iter().map(|&(_, count)| count).min()?;
         by_availability.retain(|&(_, count)| count == rarest_count);
 
@@ -1147,9 +1189,15 @@ impl TorrentSwarm {
                 // never serve a piece we haven't hash-verified, and never serve more than
                 // the peer actually asked for
                 let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
-                let data = if verified { self.storage.read_piece(request.index).ok() } else { None };
+                let data = if verified {
+                    self.storage.read_piece(request.index).ok()
+                } else {
+                    None
+                };
                 let begin = request.begin as usize;
-                let end = data.as_ref().map(|d| begin.saturating_add(request.length as usize).min(d.len()));
+                let end = data
+                    .as_ref()
+                    .map(|d| begin.saturating_add(request.length as usize).min(d.len()));
 
                 let Some((data, end)) = data.zip(end).filter(|&(_, end)| begin < end) else {
                     let _ = self.active_peers[peer_idx].send_reject(request).await;
@@ -1184,7 +1232,9 @@ impl TorrentSwarm {
                 let Ok(peer_idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) else {
                     return;
                 };
-                let _ = self.active_peers[peer_idx].send_metadata_piece(piece, total_size, data).await;
+                let _ = self.active_peers[peer_idx]
+                    .send_metadata_piece(piece, total_size, data)
+                    .await;
             }
             PeerEvent::PexReceived(peers) => {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
@@ -1338,6 +1388,10 @@ impl TorrentSwarm {
         self.stat.all_verified()
     }
 
+    pub fn verified(&self) -> &BitBox<u8, Msb0> {
+        &self.stat.verified
+    }
+
     fn verify_hash(&mut self, piece: u32) -> bool {
         // a read failure means we can't confirm the piece, so treat it as unverified and let
         // it be retried -- never panic, this runs on the swarm's own event loop
@@ -1393,7 +1447,9 @@ impl TorrentSwarm {
     /// Shared by tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
     async fn connect_to_discovered_peers(&mut self, mut peers: Vec<SocketAddr>) {
         peers.retain(|s| {
-            self.active_peers.binary_search_by_key(s, |handle| handle.remote_addr).is_err()
+            self.active_peers
+                .binary_search_by_key(s, |handle| handle.remote_addr)
+                .is_err()
                 && self.pending_peers.binary_search_by_key(s, |p| p.socket_addr).is_err()
         });
 
@@ -1411,7 +1467,9 @@ impl TorrentSwarm {
 
             let connect = self.connect_peer(peer_addr);
             tokio::spawn(async move {
-                let Ok(connection) = connect.await.inspect_err(|e| info!("Failed to connect to {peer_addr}: {e:?}"))
+                let Ok(connection) = connect
+                    .await
+                    .inspect_err(|e| info!("Failed to connect to {peer_addr}: {e:?}"))
                 else {
                     // without this, an address that never connects sits in `pending_peers`
                     // forever -- it's only ever removed on success -- and the dedup above
@@ -1462,8 +1520,11 @@ impl TorrentSwarm {
             .collect();
         interested.sort_by(|a, b| b.stats().mean_rx.total_cmp(&a.stats().mean_rx));
 
-        let mut to_unchoke: Vec<SocketAddr> =
-            interested.iter().take(MAX_UNCHOKED_PEERS).map(|p| p.remote_addr).collect();
+        let mut to_unchoke: Vec<SocketAddr> = interested
+            .iter()
+            .take(MAX_UNCHOKED_PEERS)
+            .map(|p| p.remote_addr)
+            .collect();
 
         if round % OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS == 0 {
             let candidates: Vec<_> = interested

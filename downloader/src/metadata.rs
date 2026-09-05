@@ -310,7 +310,7 @@ fn parse_data_message(payload: &[u8]) -> anyhow::Result<Option<(usize, &[u8])>> 
 /// The info dict is embedded byte-for-byte, so the info hash `parse_torrent` recomputes over it
 /// is necessarily the same one we just verified against. Keys are emitted in ascending order
 /// ("announce" < "announce-list" < "info") as bencode requires.
-fn build_torrent_file(raw_info: &[u8], trackers: &[String]) -> Vec<u8> {
+pub(crate) fn build_torrent_file(raw_info: &[u8], trackers: &[String]) -> Vec<u8> {
     fn bencode_str(bytes: &[u8]) -> Vec<u8> {
         let mut out = format!("{}:", bytes.len()).into_bytes();
         out.extend_from_slice(bytes);

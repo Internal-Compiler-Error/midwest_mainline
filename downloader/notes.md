@@ -93,3 +93,27 @@ BEP 27 is the one exception worth calling out: it got fixed anyway, unprompted b
 scope" answer, because PEX (already shipped) using a private torrent's peers is a live spec
 violation in code that exists today -- not a new feature request. That's the bar for reopening
 this after this commit: a bug in what's already built, not a new BEP.
+
+# Resumption, 2026-09-05
+Split of responsibility, per the user's framing: the **library** owns the resume-file format
+and all reading/writing of it (`resume.rs`); a **UI** only decides where those files live,
+finds them again, and hands one to `Session::resume` / `BtClient::add_torrent_resumed`. Both
+front ends use `./resume/` so the CLI and the GUI can resume each other's downloads.
+
+Format: one bencoded file per torrent, `<info hash hex>.resume`, keys `info` (the raw info
+dict, verbatim), `trackers`, `verified` (BEP 3 bitfield layout), `version`. Storing the info
+dict is what lets a *magnet*-sourced download resume without going back to the network for
+metadata; it's also why the file is written immediately, before any piece is verified.
+
+What's trusted: only the bitfield, and only because a bit is set strictly after a piece was
+written *and* hash-verified, so the file is always a subset of what's on disk. That invariant
+holds only if the target files are still their full size, so a resume refuses (rather than
+silently `set_len`s) any missing or wrong-sized file. Nothing is re-hashed on resume: a full
+rehash of a large torrent would make resuming slower than starting over, and the invariant
+above is what every other client relies on too. Writes are tmp+rename so a crash mid-write
+can't leave a truncated file that parses as "nothing verified" -- a decoder rejects a
+truncated file outright anyway.
+
+Spec wrinkle worth knowing: a torrent that was already complete when resumed starts the
+announcers with `sent_completed = true`, because BEP 3 says `event=completed` must not be
+sent for a download that was complete when the client started.

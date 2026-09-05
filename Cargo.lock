@@ -1481,7 +1481,6 @@ dependencies = [
  "eframe",
  "futures",
  "juicy_bencode 0.2.0",
- "libc",
  "midwest_mainline",
  "rand 0.9.4",
  "reqwest",

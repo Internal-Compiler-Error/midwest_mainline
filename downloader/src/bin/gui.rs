@@ -1,15 +1,23 @@
-//! Desktop front end for the `downloader` library. Takes a `.torrent` file or a magnet link.
+//! Desktop front end for the `downloader` library. Takes a `.torrent` file, a magnet link, or
+//! a resume file from an earlier run.
 //!
 //! This file deliberately contains no download logic: it forwards user input to
-//! `Session::start`/`stop`, and renders whatever `Session::state()` reports. Everything else --
-//! the runtime, resolving magnets, driving the client, transfer rates -- lives in the library.
+//! `Session::start`/`resume`/`stop`, and renders whatever `Session::state()` reports.
+//! Everything else -- the runtime, resolving magnets, driving the client, transfer rates,
+//! writing resume files -- lives in the library. The one thing the library leaves to the UI is
+//! *finding* resume files: this one keeps them in `RESUME_DIR` and lists whatever is there.
 
-use downloader::{Progress, Session, SessionState, human_bytes, is_magnet_uri};
+use downloader::{Progress, ResumeSummary, Session, SessionState, human_bytes, is_magnet_uri, list_resume_files};
 use eframe::egui;
+use std::path::Path;
 use std::time::Duration;
+
+/// Resume files go next to the downloads, and are shared with the CLI.
+const RESUME_DIR: &str = "resume";
 
 fn main() -> eframe::Result {
     let mut session = Session::new(random_peer_id(), 6881).expect("failed to start a session");
+    session.set_resume_dir(RESUME_DIR);
     if let Some(source) = std::env::args().nth(1) {
         session.start(source);
     }
@@ -25,7 +33,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "downloader",
         options,
-        Box::new(move |_cc| Ok(Box::new(App { session, input: String::new() }))),
+        Box::new(move |_cc| {
+            Ok(Box::new(App {
+                session,
+                input: String::new(),
+                resumable: list_resume_files(Path::new(RESUME_DIR)),
+            }))
+        }),
     )
 }
 
@@ -39,6 +53,8 @@ fn random_peer_id() -> [u8; 20] {
 struct App {
     session: Session,
     input: String,
+    /// what's in `RESUME_DIR`; refreshed on demand, not every frame
+    resumable: Vec<ResumeSummary>,
 }
 
 impl eframe::App for App {
@@ -72,7 +88,11 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.session.state() {
             SessionState::Idle => {
-                ui.centered_and_justified(|ui| ui.label("Open a .torrent file, or paste a magnet link above."));
+                ui.label("Open a .torrent file, or paste a magnet link above.");
+                ui.add_space(12.0);
+                if let Some(path) = draw_resumable(ui, &mut self.resumable) {
+                    self.session.resume(path);
+                }
             }
             SessionState::Failed { error } => {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("⚠ {error}"));
@@ -87,6 +107,46 @@ impl eframe::App for App {
     }
 }
 
+/// Lists earlier downloads that can be picked back up; returns the one the user chose.
+fn draw_resumable(ui: &mut egui::Ui, resumable: &mut Vec<ResumeSummary>) -> Option<std::path::PathBuf> {
+    ui.horizontal(|ui| {
+        ui.strong("Resume an earlier download");
+        if ui
+            .small_button("⟳")
+            .on_hover_text(format!("rescan ./{RESUME_DIR}"))
+            .clicked()
+        {
+            *resumable = list_resume_files(Path::new(RESUME_DIR));
+        }
+    });
+    if resumable.is_empty() {
+        ui.weak(format!("(nothing in ./{RESUME_DIR})"));
+        return None;
+    }
+
+    let mut chosen = None;
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("resumable")
+            .num_columns(3)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for entry in resumable.iter() {
+                    ui.label(&entry.name);
+                    ui.add(
+                        egui::ProgressBar::new(entry.fraction())
+                            .show_percentage()
+                            .desired_width(120.0),
+                    );
+                    if ui.button("Resume").clicked() {
+                        chosen = Some(entry.path.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+    chosen
+}
+
 fn draw_resolving(ui: &mut egui::Ui, source: &str, elapsed: Duration) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -96,7 +156,7 @@ fn draw_resolving(ui: &mut egui::Ui, source: &str, elapsed: Duration) {
             ui.label(if is_magnet_uri(source) {
                 "Fetching metadata from peers…"
             } else {
-                "Loading torrent…"
+                "Loading…"
             });
             ui.weak(format!("{:.0}s", elapsed.as_secs_f32()));
             // with no DHT, a magnet whose trackers are all dead has no fallback
@@ -130,18 +190,31 @@ fn draw_progress(ui: &mut egui::Ui, p: &Progress) {
     ui.label(format!("{} / {} pieces verified", p.verified_pieces, p.total_pieces));
 
     ui.add_space(10.0);
-    egui::Grid::new("transfer").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-        for (label, value) in [
-            ("Downloaded", format!("{}  ({}/s)", human_bytes(p.downloaded), human_bytes(p.download_bps as u64))),
-            ("Uploaded", format!("{}  ({}/s)", human_bytes(p.uploaded), human_bytes(p.upload_bps as u64))),
-            ("Remaining", human_bytes(p.left)),
-            ("Total size", human_bytes(p.total_size)),
-        ] {
-            ui.strong(label);
-            ui.label(value);
-            ui.end_row();
-        }
-    });
+    egui::Grid::new("transfer")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            for (label, value) in [
+                (
+                    "Downloaded",
+                    format!(
+                        "{}  ({}/s)",
+                        human_bytes(p.downloaded),
+                        human_bytes(p.download_bps as u64)
+                    ),
+                ),
+                (
+                    "Uploaded",
+                    format!("{}  ({}/s)", human_bytes(p.uploaded), human_bytes(p.upload_bps as u64)),
+                ),
+                ("Remaining", human_bytes(p.left)),
+                ("Total size", human_bytes(p.total_size)),
+            ] {
+                ui.strong(label);
+                ui.label(value);
+                ui.end_row();
+            }
+        });
 
     ui.add_space(10.0);
     ui.strong(format!("Files ({})", p.files.len()));

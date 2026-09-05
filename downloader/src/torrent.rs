@@ -54,6 +54,9 @@ pub struct Torrent {
     /// Size of the last piece in bytes
     pub last_piece_size: u32,
 
+    /// The info dict's `name`: the single file's name, or the directory everything lives under
+    pub name: String,
+
     /// Info hash of the torrent
     pub info_hash: InfoHash,
 
@@ -158,10 +161,11 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     let BencodeItemView::ByteString(name) = info.remove(b"name".as_slice()).unwrap() else {
         bail!("name needs to be a string");
     };
+    let name = str::from_utf8(name)?.to_string();
     let mut root = PathBuf::new();
     // TODO: make this configurable
     root.push("./");
-    root.push(safe_path_component(str::from_utf8(name)?)?);
+    root.push(safe_path_component(&name)?);
 
     let BencodeItemView::Integer(piece_len) = info.remove(b"piece length".as_slice()).unwrap() else {
         bail!("piece length needs to be an integer");
@@ -216,6 +220,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         total_size,
         files,
         last_piece_size: last_piece_len.try_into()?,
+        name,
         info_hash: hash,
         raw_info,
         private,

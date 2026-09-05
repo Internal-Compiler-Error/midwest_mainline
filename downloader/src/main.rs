@@ -1,11 +1,12 @@
-use downloader::{BtClient, Identity, load_source};
+use downloader::{BtClient, Identity, ResumeData, keep_saving, load_source};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::level_filters::LevelFilter;
 use tokio_util::sync::CancellationToken;
+use tracing::level_filters::LevelFilter;
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     let mut rng = rand::rng();
@@ -32,6 +33,9 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     id
 }
 
+/// Resume files go next to the downloads, so `downloader resume/<hash>.resume` picks one up.
+const RESUME_DIR: &str = "resume";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -42,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = env::args().collect::<Vec<_>>();
     let source = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: downloader <path-to-.torrent | magnet-uri>");
+        eprintln!("usage: downloader <path-to-.torrent | magnet-uri | path-to-.resume>");
         std::process::exit(2);
     });
 
@@ -52,25 +56,55 @@ async fn main() -> anyhow::Result<()> {
         serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
     };
 
-    // A magnet has to fetch its metadata off the network before there's anything to download,
-    // so this can run for a while (or fail) where a .torrent returns immediately -- long enough
-    // that Ctrl+C has to work during it, not just once the download proper has started.
-    if downloader::is_magnet_uri(&source) {
-        tracing::info!("resolving magnet link, fetching metadata from peers...");
-    }
-    let resolving = CancellationToken::new();
-    let torrent = tokio::select! {
-        resolved = load_source(&source, Arc::new(identity), resolving.clone()) => resolved?,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("interrupted while resolving, stopping tracker announces...");
-            resolving.cancel();
-            return Ok(());
-        }
-    };
-    tracing::info!("got metadata for {} files, starting download", torrent.files.len());
-
     let mut client = BtClient::new(identity);
-    client.add_torrent(torrent).unwrap();
+    let torrent = if Path::new(&source)
+        .extension()
+        .is_some_and(|ext| ext == downloader::resume::EXTENSION)
+    {
+        let data = ResumeData::read(Path::new(&source))?;
+        let torrent = data.to_torrent()?;
+        tracing::info!(
+            "resuming {} with {}/{} pieces already verified",
+            torrent.name,
+            data.verified.count_ones(),
+            data.verified.len()
+        );
+        client.add_torrent_resumed(torrent.clone(), data.verified)?;
+        torrent
+    } else {
+        // A magnet has to fetch its metadata off the network before there's anything to
+        // download, so this can run for a while (or fail) where a .torrent returns
+        // immediately -- long enough that Ctrl+C has to work during it, not just once the
+        // download proper has started.
+        if downloader::is_magnet_uri(&source) {
+            tracing::info!("resolving magnet link, fetching metadata from peers...");
+        }
+        let resolving = CancellationToken::new();
+        let torrent = tokio::select! {
+            resolved = load_source(&source, Arc::new(identity), resolving.clone()) => resolved?,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("interrupted while resolving, stopping tracker announces...");
+                resolving.cancel();
+                return Ok(());
+            }
+        };
+        tracing::info!("got metadata for {} files, starting download", torrent.files.len());
+        client.add_torrent(torrent.clone())?;
+        torrent
+    };
+
+    let resume_dir = PathBuf::from(RESUME_DIR);
+    tracing::info!(
+        "progress is saved to {}",
+        resume_dir.join(ResumeData::file_name(&torrent.info_hash)).display()
+    );
+    let stats = client.stats(&torrent).expect("torrent was just added");
+    tokio::spawn(keep_saving(
+        Arc::new(torrent),
+        stats,
+        resume_dir,
+        client.shutdown_token(),
+    ));
 
     let shutdown = client.shutdown_token();
     tokio::select! {

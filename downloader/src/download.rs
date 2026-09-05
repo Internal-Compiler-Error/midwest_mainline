@@ -4,6 +4,7 @@ use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{TorrentSwarm, TorrentSwarmCommand, TorrentSwarmSelfCommand};
 use crate::wire::Request;
+use bitvec::prelude::*;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
@@ -27,6 +28,8 @@ pub struct Download {
     storage: Arc<TorrentStorage>,
     max_inflight: usize,
     command_tx: mpsc::Sender<TorrentSwarmCommand>,
+    /// pieces verified before this task started (a resumed download); never requested
+    already_have: BitBox<u8, Msb0>,
 }
 
 impl Download {
@@ -36,6 +39,7 @@ impl Download {
             storage: torrent_swarm.storage().clone(),
             max_inflight: 100, // TODO: should be configurable
             command_tx: torrent_swarm.command_sender(),
+            already_have: torrent_swarm.verified().clone(),
         }
     }
 
@@ -89,7 +93,7 @@ impl Download {
     pub async fn download_loop(&self) {
         // the number of pieces downloaded *in* this session, already download pieces don't count
         let mut downloaded = 0;
-        let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
+        let mut missing_pieces: Vec<u32> = self.already_have.iter_zeros().map(|p| p.try_into().unwrap()).collect();
         let mut in_flight = HashSet::new();
 
         let mut piece_completed = FuturesUnordered::new();
