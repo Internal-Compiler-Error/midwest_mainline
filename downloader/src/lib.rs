@@ -3,6 +3,7 @@ mod defs;
 pub mod download;
 pub mod magnet;
 pub mod metadata;
+pub mod session;
 mod peer;
 mod settings;
 mod storage;
@@ -14,6 +15,7 @@ pub use bt_client::BtClient;
 pub use defs::Identity;
 pub use magnet::{MagnetLink, is_magnet_uri, parse_magnet};
 pub use torrent::{Torrent, parse_torrent};
+pub use session::{Progress, Session, SessionState, human_bytes};
 pub use torrent_swarm::TorrentSwarmStats;
 
 use std::sync::Arc;

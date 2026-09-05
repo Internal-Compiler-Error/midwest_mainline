@@ -121,8 +121,13 @@ impl Ord for PeerHandle {
 }
 
 impl PeerHandle {
+    /// `remote_addr` is passed in rather than read back off the socket: `peer_addr()` fails
+    /// with EINVAL once the peer has gone away, and a peer that hangs up between connecting and
+    /// arriving here is completely routine -- it used to panic this task. Both callers already
+    /// know the address anyway (one dialled it, the other got it from `accept`).
     pub(crate) fn new(
         tcp_stream: TcpStream,
+        remote_addr: SocketAddr,
         remote_peer_id: [u8; 20],
         event_tx: mpsc::Sender<TorrentSwarmCommand>,
         torrent: &Torrent,
@@ -136,7 +141,6 @@ impl PeerHandle {
         // is a sorted vec keyed on `remote_addr`, so that peer could occupy two entries, dedup
         // against a tracker-discovered address could fail, and `Disconnected` could remove the
         // wrong one (or none).
-        let remote_addr = tcp_stream.peer_addr().unwrap();
         let remote_addr = SocketAddr::new(remote_addr.ip().to_canonical(), remote_addr.port());
         let (reader, writer) = tcp_stream.into_split();
         let (commands_tx, commands_rx) = mpsc::channel(1024);
@@ -434,7 +438,12 @@ async fn peer_ev_loop(mut peer: PeerConnection, remote_supports_extensions: bool
     loop {
         tokio::select! {
             // Handle commands from the peer handle
-            Some(command) = peer.commands.recv() => { peer.process_command(command).await; }
+            Some(command) = peer.commands.recv() => {
+                if let Err(e) = peer.process_command(command).await {
+                    info!("{} write failed ({e}), disconnecting", peer.remote_addr);
+                    break;
+                }
+            }
 
             // Process incoming BitTorrent protocol messages
             Some(Ok(msg)) = peer.reader.next() => { peer.process_message(msg).await }
@@ -690,29 +699,34 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Returns `Err` if writing to the peer failed, which means the connection is gone and the
+    /// event loop should wind this peer down. A peer hanging up mid-write (`BrokenPipe`) is
+    /// entirely routine -- these used to be `.unwrap()`s, which turned every such disconnect
+    /// into a panicked task.
     #[tracing::instrument(skip(self))]
-    async fn process_command(&mut self, command: PeerCommands) {
+    async fn process_command(&mut self, command: PeerCommands) -> anyhow::Result<()> {
         info!("Handling one {:?} command", command);
         match command {
-            PeerCommands::UnchokePeer => self.unchoke_peer().await.unwrap(),
-            PeerCommands::ChokePeer => self.choke_peer().await.unwrap(),
-            PeerCommands::RequestDataFromPeer { req, syn } => self.request_data_from_peer(req, syn).await.unwrap(),
-            PeerCommands::FancyPeer => self.fancy_peer().await.unwrap(),
-            PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await.unwrap(),
-            PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
-            PeerCommands::SendHaveAll => self.send_have_all().await.unwrap(),
-            PeerCommands::SendHaveNone => self.send_have_none().await.unwrap(),
-            PeerCommands::RejectRequest(req) => self.send_reject(req).await.unwrap(),
-            PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
+            PeerCommands::UnchokePeer => self.unchoke_peer().await?,
+            PeerCommands::ChokePeer => self.choke_peer().await?,
+            PeerCommands::RequestDataFromPeer { req, syn } => self.request_data_from_peer(req, syn).await?,
+            PeerCommands::FancyPeer => self.fancy_peer().await?,
+            PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await?,
+            PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await?,
+            PeerCommands::SendHaveAll => self.send_have_all().await?,
+            PeerCommands::SendHaveNone => self.send_have_none().await?,
+            PeerCommands::RejectRequest(req) => self.send_reject(req).await?,
+            PeerCommands::SendData(piece) => self.send_data(piece).await?,
             PeerCommands::SendMetadataPiece { piece, total_size, data } => {
-                self.send_metadata_piece(piece, total_size, data).await.unwrap()
+                self.send_metadata_piece(piece, total_size, data).await?
             }
-            PeerCommands::SendPex { added } => self.send_pex(&added).await.unwrap(),
+            PeerCommands::SendPex { added } => self.send_pex(&added).await?,
         }
         // unlike process_message, nothing else publishes state after a command runs --
         // without this, choke/unchoke/interested changes made here are invisible to
         // PeerHandle::state() (and so to the choking algorithm) forever
         let _ = self.state_tx.send(self.state.clone());
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -792,13 +806,9 @@ impl PeerConnection {
                     let _ = self.send_reject(request).await;
                     return;
                 }
-                self.events
-                    .send(TorrentSwarmCommand::ProcessPeerEvent {
-                        from: self.remote_addr,
-                        event: PeerEvent::Requested(request),
-                    })
-                    .await
-                    .expect("They kill us and not the other way around, TorrentSwarm outlives us");
+                // best-effort: during shutdown the swarm can go away before its peers do,
+                // and that race must not panic this task
+                self.emit_event(PeerEvent::Requested(request)).await;
             }
             BtMessage::Piece(piece) => {
                 if !self.requested.contains_key(&Request {

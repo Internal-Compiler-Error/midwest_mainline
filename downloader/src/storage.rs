@@ -70,7 +70,9 @@ impl TorrentStorage {
         for (file, interval) in self.file_segments(piece) {
             let len = interval.len();
             let dst = &mut buf[read..read + len];
-            file.read_exact_at(dst, interval.start as u64).unwrap();
+            // propagate rather than unwrap: this runs inside the swarm's event loop, so a
+            // panic here takes the whole torrent down with it
+            file.read_exact_at(dst, interval.start as u64)?;
 
             read += len;
         }

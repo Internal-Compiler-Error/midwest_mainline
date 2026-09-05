@@ -763,12 +763,14 @@ impl PeerFactory {
     pub(crate) fn accept(
         &self,
         tcp_stream: TcpStream,
+        remote_addr: SocketAddr,
         remote_peer_id: [u8; 20],
         remote_supports_extensions: bool,
         remote_supports_fast: bool,
     ) -> PeerHandle {
         PeerHandle::new(
             tcp_stream,
+            remote_addr,
             remote_peer_id,
             self.event_tx.clone(),
             &self.torrent,
@@ -1337,7 +1339,12 @@ impl TorrentSwarm {
     }
 
     fn verify_hash(&mut self, piece: u32) -> bool {
-        let written_data = self.storage.read_piece(piece).unwrap();
+        // a read failure means we can't confirm the piece, so treat it as unverified and let
+        // it be retried -- never panic, this runs on the swarm's own event loop
+        let Ok(written_data) = self.storage.read_piece(piece) else {
+            warn!("couldn't read piece {piece} back off disk to verify it");
+            return false;
+        };
 
         let valid_piece = self.torrent.valid_piece(piece, &written_data);
         if valid_piece {
@@ -1370,6 +1377,7 @@ impl TorrentSwarm {
 
             let handle = PeerHandle::new(
                 tcp,
+                remote_addr,
                 handshake.peer_id,
                 event_tx,
                 &torrent,

@@ -27,13 +27,20 @@ pub struct BtClient {
 
 impl BtClient {
     pub fn new(id: Identity) -> Self {
+        Self::new_with_shutdown(id, CancellationToken::new())
+    }
+
+    /// Like `new`, but driven by a caller-supplied token, so an owner that already has its own
+    /// cancellation scope (see `session::Session`) can stop the client along with everything
+    /// else it started, rather than having to reach in for `shutdown_token` afterwards.
+    pub fn new_with_shutdown(id: Identity, shutdown: CancellationToken) -> Self {
         Self {
             id: Arc::new(id),
             swarms: HashMap::new(),
             handles: HashMap::new(),
             peer_factories: HashMap::new(),
             stats: HashMap::new(),
-            shutdown: CancellationToken::new(),
+            shutdown,
         }
     }
 
@@ -58,7 +65,10 @@ impl BtClient {
         let mut files = vec![];
         for (size, file) in torrent.files.iter_mut() {
             fs::create_dir_all(file.parent().unwrap()).unwrap();
-            let f = File::create(&file)?;
+            // read+write, not `File::create`: that opens write-only, and every completed piece
+            // is read back off disk to hash-verify it (`TorrentStorage::read_piece`), which
+            // then fails with EBADF. That surfaced as the swarm task panicking mid-download.
+            let f = File::options().read(true).write(true).create(true).truncate(true).open(&file)?;
             // `TorrentStorage::new` reads each file's on-disk length back out (via
             // `file.metadata()`) to compute per-file offsets into the torrent's conceptual
             // single address space -- a freshly `File::create`d file is 0 bytes, so without
@@ -181,6 +191,7 @@ impl BtClient {
 
                 let peer = factory.accept(
                     tcp,
+                    remote_addr,
                     handshake.peer_id,
                     crate::wire::supports_extensions(&handshake.extensions),
                     crate::wire::supports_fast_extension(&handshake.extensions),
