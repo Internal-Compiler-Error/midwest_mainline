@@ -16,6 +16,11 @@ pub const MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 /// so asking one fast peer for everything at once only gets requests bounced back.
 pub const MAX_OUTSTANDING_BLOCKS_PER_PEER: usize = 256;
 
+/// How long to wait for a peer's TCP connection to come up. Most addresses a tracker hands
+/// out are behind NAT or gone, and the OS default (over a minute) would hold a dial slot that
+/// long for each of them.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long to wait for a peer that accepted a block request to actually send the block.
 /// A peer that goes silent mid-request (as opposed to disconnecting outright) is the common
 /// failure mode this guards against -- without it, a single unresponsive peer hangs a piece

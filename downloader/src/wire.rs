@@ -1,6 +1,7 @@
 use midwest_mainline::types::InfoHash;
 use std::io;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -524,6 +525,14 @@ pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake
 }
 
 /// Performs the outbound side of a handshake: send ours, then read and validate theirs.
+/// `TcpStream::connect` bounded by `CONNECT_TIMEOUT`, with a timeout reported like any other
+/// connect failure.
+pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+    tokio::time::timeout(crate::settings::CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .unwrap_or_else(|_| Err(io::Error::new(ErrorKind::TimedOut, "connect timed out")))
+}
+
 #[tracing::instrument(skip(peer))]
 pub(crate) async fn shake_hands(
     peer: &mut TcpStream,

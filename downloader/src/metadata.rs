@@ -29,7 +29,6 @@ use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -39,17 +38,18 @@ use tracing::{debug, info};
 /// Our own choice, same as `peer::UT_METADATA_ID`; only the remote's id is negotiated.
 const UT_METADATA_ID: u8 = 1;
 
-/// How long a single peer gets to complete the whole exchange (connect, handshake, and hand
-/// over every metadata piece) before we give up on it and let another peer try.
+/// How long a single peer gets to complete the whole exchange (handshake and every metadata
+/// piece) once connected, before we give up on it and let another peer try. Connecting itself
+/// is bounded separately by `CONNECT_TIMEOUT`.
 const PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to keep trying peers overall before giving up on the magnet entirely.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How many peers to have metadata fetches in flight against at once. Metadata is tiny and any
-/// one peer can serve all of it, so this only needs to be big enough to tolerate a few dead or
-/// unresponsive peers, not to saturate bandwidth.
-const MAX_CONCURRENT_FETCHES: usize = 8;
+/// one peer can serve all of it; what this has to absorb is that most tracker-supplied
+/// addresses are unreachable and each costs a `CONNECT_TIMEOUT` to find out.
+const MAX_CONCURRENT_FETCHES: usize = 32;
 
 /// BEP 3 wants the number of bytes still needed, which is unknowable before we have the
 /// metadata that would tell us. Real clients send a small placeholder here for the
@@ -163,7 +163,7 @@ pub async fn fetch(
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
 async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20]) -> anyhow::Result<Vec<u8>> {
-    let mut tcp = TcpStream::connect(addr)
+    let mut tcp = crate::wire::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
     let handshake = shake_hands(&mut tcp, &info_hash, &peer_id)

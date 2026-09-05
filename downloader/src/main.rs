@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     let mut rng = rand::rng();
@@ -38,8 +38,9 @@ const RESUME_DIR: &str = "resume";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // RUST_LOG picks the verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`
     tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::INFO)
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .without_time()
         .pretty()
         .init();

@@ -841,9 +841,9 @@ async fn next_peer_message(peers: &mut [Peer], offset: usize) -> (usize, Option<
 }
 
 async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow::Result<ConnectedPeer> {
-    let mut tcp = TcpStream::connect(addr)
+    let mut tcp = crate::wire::connect(addr)
         .await
-        .with_context(|| format!("Failed to established tcp stream with {addr}"))?;
+        .with_context(|| format!("Failed to establish tcp stream with {addr}"))?;
     let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id)
         .await
         .with_context(|| format!("Failed to complete handshake with {addr}"))?;
