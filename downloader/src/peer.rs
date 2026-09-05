@@ -7,7 +7,7 @@ use juicy_bencode::BencodeItemView;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -169,11 +169,7 @@ impl Peer {
             begin: piece.begin,
             length: piece.length,
         })?;
-        self.stats.received += piece.length as usize;
-        let speed = piece.length as f64 / requested_at.elapsed().as_secs_f64();
-        // online average update formula
-        self.stats.mean_rx_cnt += 1;
-        self.stats.mean_rx += (speed - self.stats.mean_rx) / self.stats.mean_rx_cnt as f64;
+        self.stats.block_received(piece.length as usize, requested_at.elapsed());
         Some(())
     }
 
@@ -192,8 +188,7 @@ impl Peer {
     }
 
     pub async fn request_block(&mut self, req: Request) -> io::Result<()> {
-        // UCB's "times this arm was played" counts block requests, not pieces
-        self.stats.picked_count += 1;
+        self.stats.block_requested();
         self.requested.insert(req, Instant::now());
         self.socket.send(BtMessage::Request(req)).await
     }
@@ -255,7 +250,7 @@ impl Peer {
     pub async fn send_block(&mut self, piece: Piece) -> io::Result<()> {
         let length = piece.length as usize;
         self.socket.send(BtMessage::Piece(piece)).await?;
-        self.stats.sent += length;
+        self.stats.block_sent(length);
         Ok(())
     }
 
@@ -406,6 +401,24 @@ pub struct PeerStatistics {
 }
 
 impl PeerStatistics {
+    /// UCB's "times this arm was played" counts block requests, not pieces.
+    pub fn block_requested(&mut self) {
+        self.picked_count += 1;
+    }
+
+    /// A requested block arrived `waited` after we asked for it.
+    pub fn block_received(&mut self, length: usize, waited: Duration) {
+        self.received += length;
+        let speed = length as f64 / waited.as_secs_f64();
+        // online average update formula
+        self.mean_rx_cnt += 1;
+        self.mean_rx += (speed - self.mean_rx) / self.mean_rx_cnt as f64;
+    }
+
+    pub fn block_sent(&mut self, length: usize) {
+        self.sent += length;
+    }
+
     /// Calculate the peer's download's upper confidence bound based on how many pieces have been
     /// requested
     pub fn rx_speed_ucb(&self, total_piece_requested: usize) -> f64 {
