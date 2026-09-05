@@ -7,3 +7,28 @@ An actor should probably do the following
 
 # general design
 One key mantra, *slow peers* can't block other peers from proceeding.
+
+The peer-selection algorithm is UCB (Upper Confidence Bound) over per-peer download rate --
+see `PeerStatistics::score`/`rx_speed_ucb` in peer.rs and `TorrentSwarm::best_peer`. This is
+the whole point of this project, not an implementation detail. Anything that would pollute the
+reward signal (e.g. duplicate/redundant requests feeding stats from discarded data) should be
+treated as a cost, not a free feature.
+
+# endgame mode: deliberately not implemented
+Considered and rejected (see git history around the "rarest-first piece selection" /
+choking-algorithm commits). Reasons:
+- A safe implementation needs "is this piece already verified" checked and the storage write
+  to happen atomically. The natural way to add it here splits check-from-write across an
+  await point, which is a TOCTOU: a slower duplicate fetch can finish after the check passes
+  and overwrite an already-verified-good piece with bad/different data. Closing that requires
+  moving the write behind the actor that owns `verified` (a bigger change than endgame mode
+  itself), not a quick guard.
+- Duplicate concurrent fetches of the same piece from multiple peers would feed
+  `PeerStatistics` (`picked_count`, `mean_rx`) from the losing/discarded attempts too --
+  directly polluting the UCB signal above.
+- The actual problem endgame mode exists to solve (one slow/stalled peer holding up the last
+  piece indefinitely) is already handled by `BLOCK_REQUEST_TIMEOUT` + the retry path in
+  `download.rs`: a stalled request now fails within ~30s and gets re-picked, and UCB naturally
+  deprioritizes a peer with a poor track record on retry.
+If this gets revisited, the write-atomicity issue is the one that actually has to be solved
+first -- everything else is secondary.
