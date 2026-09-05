@@ -31,3 +31,10 @@ pub const MAX_UNCHOKED_PEERS: usize = 4;
 /// its reciprocation rate, so a new or currently-worse peer gets a chance to prove itself
 /// instead of the same top N being unchoked forever.
 pub const OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS: u64 = 3;
+
+/// BEP 11 (PEX): how often to send each peer our current view of the swarm. The spec asks for
+/// "not more frequently than once per minute".
+pub const PEX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// BEP 11 (PEX): the spec recommends capping a single message at roughly 50 added peers.
+pub const PEX_MAX_ADDED_PEERS: usize = 50;

@@ -1,7 +1,10 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
 use crate::peer::{PeerCommands, PeerEvent, PeerHandle};
-use crate::settings::{CHOKING_ROUND_INTERVAL, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS};
+use crate::settings::{
+    CHOKING_ROUND_INTERVAL, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEX_INTERVAL,
+    PEX_MAX_ADDED_PEERS,
+};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::wire::{BitField, Piece, shake_hands};
@@ -786,6 +789,13 @@ impl TorrentSwarmHandle {
             ))
             .await;
     }
+
+    async fn dial_failed(&self, addr: SocketAddr) {
+        let _ = self
+            .tx
+            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::DialFailed(addr)))
+            .await;
+    }
 }
 
 pub(crate) enum TorrentSwarmCommand {
@@ -814,6 +824,13 @@ pub(crate) enum TorrentSwarmSelfCommand {
         candidates: Vec<u32>,
         resp: oneshot::Sender<Option<u32>>,
     },
+    /// A dial spawned by `connect_to_discovered_peers` failed. Without this, a `PendingPeer`
+    /// entry for an address that never connects would sit in `pending_peers` forever (it's
+    /// only ever removed on success, in `HandleNewPeerConnection`) -- and since dedup against
+    /// re-discovering the same address checks `pending_peers`, that address could never be
+    /// retried. Worse now that BEP 11 (PEX) feeds this same path every round: an address a
+    /// peer keeps re-gossiping needs to actually leave the list on failure or it never clears.
+    DialFailed(SocketAddr),
 }
 
 pub struct TorrentSwarm {
@@ -967,6 +984,7 @@ impl TorrentSwarm {
         let mut aggregate_ticker = interval(Duration::from_mins(1));
         let mut choking_ticker = interval(CHOKING_ROUND_INTERVAL);
         let mut choking_round: u64 = 0;
+        let mut pex_ticker = interval(PEX_INTERVAL);
 
         // `Download` only holds owned/shared (Arc, Sender) state -- it talks to the swarm
         // over the command channel rather than borrowing it, so it can run as its own task
@@ -996,6 +1014,9 @@ impl TorrentSwarm {
                 _ = choking_ticker.tick() => {
                     choking_round += 1;
                     self.run_choking_algorithm(choking_round).await;
+                }
+                _ = pex_ticker.tick() => {
+                    self.run_pex_round().await;
                 }
                 Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
             }
@@ -1149,6 +1170,9 @@ impl TorrentSwarm {
                 };
                 let _ = self.active_peers[peer_idx].send_metadata_piece(piece, total_size, data).await;
             }
+            PeerEvent::PexReceived(peers) => {
+                self.connect_to_discovered_peers(peers).await;
+            }
         }
     }
 
@@ -1250,37 +1274,8 @@ impl TorrentSwarm {
                     self.active_peers.insert(insertion_idx, peer);
                 }
             }
-            TorrentSwarmSelfCommand::HandleNewDiscoveredPeers(mut socket_addr_v4s) => {
-                // remove all the peers we already have
-                socket_addr_v4s.retain(|s| {
-                    self.active_peers
-                        .binary_search_by_key(s, |handle| handle.remote_addr)
-                        .is_err()
-                });
-
-                let mut pending_peers: Vec<_> = socket_addr_v4s
-                    .into_iter()
-                    .map(|p| PendingPeer {
-                        socket_addr: p,
-                        pending_messages: vec![],
-                    })
-                    .collect();
-
-                for peer in &pending_peers {
-                    let moi = self.make_handle();
-
-                    let connect = self.connect_peer(peer.socket_addr.clone());
-                    tokio::spawn(async move {
-                        let connection = connect.await?;
-                        info!("Connection to peer success");
-                        moi.add_initialized_peer(connection).await;
-
-                        anyhow::Ok(())
-                    });
-                }
-
-                self.pending_peers.append(&mut pending_peers);
-                self.pending_peers.sort_unstable();
+            TorrentSwarmSelfCommand::HandleNewDiscoveredPeers(peers) => {
+                self.connect_to_discovered_peers(peers).await;
             }
             TorrentSwarmSelfCommand::ChooseBestPeer {
                 piece,
@@ -1294,6 +1289,11 @@ impl TorrentSwarm {
             }
             TorrentSwarmSelfCommand::PickRarestPiece { candidates, resp } => {
                 let _ = resp.send(self.rarest_piece(&candidates));
+            }
+            TorrentSwarmSelfCommand::DialFailed(addr) => {
+                if let Ok(idx) = self.pending_peers.binary_search_by_key(&addr, |p| p.socket_addr) {
+                    self.pending_peers.remove(idx);
+                }
             }
         }
 
@@ -1353,6 +1353,46 @@ impl TorrentSwarm {
         }
     }
 
+    /// Dials every not-already-connected address in `peers` and queues each as a `PendingPeer`
+    /// (so any `Have`s completed while the dial is in flight get delivered once it lands).
+    /// Shared by tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
+    async fn connect_to_discovered_peers(&mut self, mut peers: Vec<SocketAddr>) {
+        peers.retain(|s| {
+            self.active_peers.binary_search_by_key(s, |handle| handle.remote_addr).is_err()
+                && self.pending_peers.binary_search_by_key(s, |p| p.socket_addr).is_err()
+        });
+
+        let mut pending_peers: Vec<_> = peers
+            .into_iter()
+            .map(|p| PendingPeer {
+                socket_addr: p,
+                pending_messages: vec![],
+            })
+            .collect();
+
+        for peer in &pending_peers {
+            let moi = self.make_handle();
+            let peer_addr = peer.socket_addr;
+
+            let connect = self.connect_peer(peer_addr);
+            tokio::spawn(async move {
+                let Ok(connection) = connect.await.inspect_err(|e| info!("Failed to connect to {peer_addr}: {e:?}"))
+                else {
+                    // without this, an address that never connects sits in `pending_peers`
+                    // forever -- it's only ever removed on success -- and the dedup above
+                    // would then refuse to ever retry it
+                    moi.dial_failed(peer_addr).await;
+                    return;
+                };
+                info!("Connection to peer success");
+                moi.add_initialized_peer(connection).await;
+            });
+        }
+
+        self.pending_peers.append(&mut pending_peers);
+        self.pending_peers.sort_unstable();
+    }
+
     fn initialize_peer(&self, peer: &PeerHandle) -> anyhow::Result<()> {
         let has = Box::from(self.stat.verified.clone().as_raw_slice());
 
@@ -1399,6 +1439,28 @@ impl TorrentSwarm {
             } else if !should_unchoke && !currently_choked {
                 let _ = peer.choke_peer().await;
             }
+        }
+    }
+
+    /// BEP 11 (PEX): tell each active peer about every *other* active peer we know of. No
+    /// per-peer diffing against what we've told them before ("added"/"dropped" bookkeeping) --
+    /// we just resend the current full membership every round, which is redundant but simple
+    /// and spec-legal (PEX is a discovery hint, not an authoritative membership feed).
+    async fn run_pex_round(&mut self) {
+        let all_addrs: Vec<SocketAddr> = self.active_peers.iter().map(|p| p.remote_addr).collect();
+
+        for peer in &self.active_peers {
+            // BEP 11 recommends capping a single PEX message at roughly 50 added peers
+            let added: Vec<SocketAddr> = all_addrs
+                .iter()
+                .copied()
+                .filter(|a| *a != peer.remote_addr)
+                .take(PEX_MAX_ADDED_PEERS)
+                .collect();
+            if added.is_empty() {
+                continue;
+            }
+            let _ = peer.send_pex(added).await;
         }
     }
 }

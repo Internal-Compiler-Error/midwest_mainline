@@ -28,6 +28,8 @@ use derive_more::{Display, Error};
 /// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
 /// since it's entirely our own choice -- only the id the *remote* wants is negotiated.
 const UT_METADATA_ID: u8 = 1;
+/// BEP 10: same idea as `UT_METADATA_ID`, but for BEP 11 (PEX) messages.
+const UT_PEX_ID: u8 = 2;
 
 /// It's not great that this is pub(crate) instead of fully private
 #[derive(Debug)]
@@ -48,6 +50,8 @@ pub(crate) enum PeerCommands {
         total_size: u32,
         data: Box<[u8]>,
     },
+    /// BEP 11 (PEX): tell this peer about other peers we know of.
+    SendPex { added: Vec<SocketAddr> },
 }
 
 pub enum PeerEvent {
@@ -60,6 +64,8 @@ pub enum PeerEvent {
     /// has the actual bytes (`Arc<Torrent>::raw_info`); this connection only knows how to
     /// frame the reply once it's given the data.
     MetadataRequested { piece: u32 },
+    /// BEP 11 (PEX): the peer sent us its view of other peers in the swarm.
+    PexReceived(Vec<SocketAddr>),
 }
 
 // TODO: Should refactor the design so that a peer connection and handle can be constructed even
@@ -145,6 +151,7 @@ impl PeerHandle {
             num_pieces,
             metadata_size: torrent.metadata_size(),
             their_ut_metadata_id: None,
+            their_ut_pex_id: None,
 
             remote_addr,
             reader: FramedRead::new(reader, BtDecoder),
@@ -251,6 +258,12 @@ impl PeerHandle {
         Ok(())
     }
 
+    /// BEP 11 (PEX): tell this peer about other peers we know of.
+    pub async fn send_pex(&self, added: Vec<SocketAddr>) -> Result<(), PeerDied> {
+        self.peer_tx.send(PeerCommands::SendPex { added }).await.map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
     pub fn state(&self) -> PeerState {
         self.state.borrow().clone()
     }
@@ -280,6 +293,8 @@ struct PeerConnection {
     /// the message id the remote wants us to use for ut_metadata messages, learned from
     /// their extended handshake; `None` until then (or if they don't support it)
     their_ut_metadata_id: Option<u8>,
+    /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
+    their_ut_pex_id: Option<u8>,
 
     remote_addr: SocketAddr,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
@@ -298,10 +313,49 @@ struct PeerConnection {
     // connection_closed: bool,
 }
 
-/// BEP 10 extended handshake payload: declares the message id we want the remote to use for
-/// ut_metadata, plus the total metadata size.
+/// BEP 10 extended handshake payload: declares the message ids we want the remote to use for
+/// ut_metadata and ut_pex, plus the total metadata size.
 fn build_extended_handshake(metadata_size: u32) -> Vec<u8> {
-    format!("d1:md11:ut_metadatai{UT_METADATA_ID}ee13:metadata_sizei{metadata_size}ee").into_bytes()
+    format!(
+        "d1:md11:ut_metadatai{UT_METADATA_ID}e6:ut_pexi{UT_PEX_ID}ee13:metadata_sizei{metadata_size}ee"
+    )
+    .into_bytes()
+}
+
+/// BEP 11 (PEX) message: compact peer lists, split by address family the same way BEP 7 splits
+/// an HTTP tracker's "peers"/"peers6". Only "added"/"added6" are sent (no "added.f" flags, no
+/// "dropped" tracking) -- PEX is a discovery hint, not authoritative membership, and a peer we
+/// no longer know about simply stops being resent next round.
+fn build_pex_message(added: &[SocketAddr]) -> Vec<u8> {
+    let mut added4 = Vec::new();
+    let mut added6 = Vec::new();
+    for addr in added {
+        match addr {
+            SocketAddr::V4(a) => {
+                added4.extend_from_slice(&a.ip().octets());
+                added4.extend_from_slice(&a.port().to_be_bytes());
+            }
+            SocketAddr::V6(a) => {
+                added6.extend_from_slice(&a.ip().octets());
+                added6.extend_from_slice(&a.port().to_be_bytes());
+            }
+        }
+    }
+
+    let mut out = b"d".to_vec();
+    // omit a family's key entirely when there's nothing to say, rather than sending an empty
+    // byte string -- keeps a v4-only or v6-only round the same shape a peer would expect from
+    // any other client, instead of a payload no one else generates
+    if !added4.is_empty() {
+        out.extend_from_slice(format!("5:added{}:", added4.len()).as_bytes());
+        out.extend_from_slice(&added4);
+    }
+    if !added6.is_empty() {
+        out.extend_from_slice(format!("6:added6{}:", added6.len()).as_bytes());
+        out.extend_from_slice(&added6);
+    }
+    out.push(b'e');
+    out
 }
 
 /// BEP 9 ut_metadata "data" message: a bencoded prefix (`msg_type`, `piece`, `total_size`)
@@ -384,6 +438,44 @@ impl PeerConnection {
         };
         if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) {
             self.their_ut_metadata_id = Some(*id as u8);
+        }
+        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_pex".as_slice()) {
+            self.their_ut_pex_id = Some(*id as u8);
+        }
+    }
+
+    /// BEP 11 (PEX): decode "added"/"added6" compact peer lists and hand the addresses to the
+    /// swarm, which dials any we're not already connected to. "added.f"/"dropped"/"dropped6"
+    /// are ignored -- PEX is treated purely as a discovery hint here.
+    async fn handle_pex_message(&mut self, payload: &[u8]) {
+        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
+            return;
+        };
+
+        let mut peers = Vec::new();
+        if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added".as_slice()) {
+            for chunk in bytes.chunks(6) {
+                if chunk.len() != 6 {
+                    break;
+                }
+                let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                peers.push(SocketAddr::from((ip, port)));
+            }
+        }
+        if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added6".as_slice()) {
+            for chunk in bytes.chunks(18) {
+                if chunk.len() != 18 {
+                    break;
+                }
+                let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
+                let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+                peers.push(SocketAddr::from((ip, port)));
+            }
+        }
+
+        if !peers.is_empty() {
+            self.emit_event(PeerEvent::PexReceived(peers)).await;
         }
     }
 
@@ -506,6 +598,24 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// BEP 11 (PEX): silent no-op if the peer never declared ut_pex support, same reasoning as
+    /// `send_metadata_piece` -- there's no id to address a reply to.
+    async fn send_pex(&mut self, added: &[SocketAddr]) -> anyhow::Result<()> {
+        let Some(their_id) = self.their_ut_pex_id else {
+            return Ok(());
+        };
+
+        let payload = build_pex_message(added);
+
+        self.writer
+            .send(BtMessage::Extended(Extended {
+                ext_id: their_id,
+                payload: payload.into_boxed_slice(),
+            }))
+            .await?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn process_command(&mut self, command: PeerCommands) {
         info!("Handling one {:?} command", command);
@@ -520,6 +630,7 @@ impl PeerConnection {
             PeerCommands::SendMetadataPiece { piece, total_size, data } => {
                 self.send_metadata_piece(piece, total_size, data).await.unwrap()
             }
+            PeerCommands::SendPex { added } => self.send_pex(&added).await.unwrap(),
         }
         // unlike process_message, nothing else publishes state after a command runs --
         // without this, choke/unchoke/interested changes made here are invisible to
@@ -613,6 +724,8 @@ impl PeerConnection {
                     self.handle_extended_handshake(&ext.payload);
                 } else if ext.ext_id == UT_METADATA_ID {
                     self.handle_ut_metadata_message(&ext.payload).await;
+                } else if ext.ext_id == UT_PEX_ID {
+                    self.handle_pex_message(&ext.payload).await;
                 } else {
                     tracing::debug!("{} sent an unsupported extended message id {}", self.remote_addr, ext.ext_id);
                 }
@@ -730,6 +843,11 @@ mod test {
         };
         assert_eq!(*ut_metadata_id, UT_METADATA_ID as i64);
 
+        let BencodeItemView::Integer(ut_pex_id) = m.get(b"ut_pex".as_slice()).unwrap() else {
+            panic!("\"m\".\"ut_pex\" must be an integer");
+        };
+        assert_eq!(*ut_pex_id, UT_PEX_ID as i64);
+
         let BencodeItemView::Integer(metadata_size) = dict.get(b"metadata_size".as_slice()).unwrap() else {
             panic!("\"metadata_size\" must be an integer");
         };
@@ -759,5 +877,43 @@ mod test {
             panic!("\"total_size\" must be an integer");
         };
         assert_eq!(*total_size, 100);
+    }
+
+    #[test]
+    fn pex_message_is_valid_bencode_with_compact_v4_and_v6_peers() {
+        let v4: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+        let v6: SocketAddr = "[fe80::1]:6882".parse().unwrap();
+        let message = build_pex_message(&[v4, v6]);
+
+        let (remaining, dict) = juicy_bencode::parse_bencode_dict(&message).unwrap();
+        assert!(remaining.is_empty());
+
+        let BencodeItemView::ByteString(added) = dict.get(b"added".as_slice()).unwrap() else {
+            panic!("\"added\" must be a byte string");
+        };
+        assert_eq!(added.len(), 6, "one compact ipv4 peer entry is 6 bytes");
+        assert_eq!(&added[..4], &[1, 2, 3, 4]);
+        assert_eq!(u16::from_be_bytes([added[4], added[5]]), 6881);
+
+        let BencodeItemView::ByteString(added6) = dict.get(b"added6".as_slice()).unwrap() else {
+            panic!("\"added6\" must be a byte string");
+        };
+        assert_eq!(added6.len(), 18, "one compact ipv6 peer entry is 18 bytes");
+        assert_eq!(u16::from_be_bytes([added6[16], added6[17]]), 6882);
+    }
+
+    #[test]
+    fn pex_message_omits_added6_when_there_are_no_v6_peers() {
+        let v4: SocketAddr = "1.2.3.4:6881".parse().unwrap();
+        let message = build_pex_message(&[v4]);
+
+        let (remaining, dict) = juicy_bencode::parse_bencode_dict(&message).unwrap();
+        assert!(remaining.is_empty());
+
+        assert!(dict.contains_key(b"added".as_slice()));
+        assert!(
+            !dict.contains_key(b"added6".as_slice()),
+            "a v4-only added list shouldn't carry an empty added6 key"
+        );
     }
 }
