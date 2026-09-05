@@ -788,6 +788,11 @@ pub(crate) enum SwarmEvent {
     PeersDiscovered(Vec<SocketAddr>),
     /// a socket finished its handshake and is ours to own
     PeerConnected(ConnectedPeer),
+    /// a block a peer asked for has been read off disk (or couldn't be), see `serve_request`
+    BlockRead {
+        to: SocketAddr,
+        block: Result<Piece, Request>,
+    },
     /// A dial spawned by `connect_to_discovered_peers` failed. Without this the address would
     /// sit in `dialing` forever, and since dedup against re-discovering the same address checks
     /// `dialing`, it could never be retried -- an address a peer keeps re-gossiping over PEX
@@ -1020,6 +1025,7 @@ impl TorrentSwarm {
         match event {
             SwarmEvent::PeersDiscovered(peers) => self.connect_to_discovered_peers(peers),
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
+            SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::DialFailed(addr) => {
                 self.dialing.remove(&addr);
             }
@@ -1194,31 +1200,59 @@ impl TorrentSwarm {
             return;
         }
 
-        // never serve a piece we haven't hash-verified, and never serve more than the peer
-        // actually asked for
+        // never serve a piece we haven't hash-verified
         let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
-        let data = if verified {
-            self.storage.read_piece(request.index).ok()
-        } else {
-            None
-        };
-        let begin = request.begin as usize;
-        let end = data
-            .as_ref()
-            .map(|d| begin.saturating_add(request.length as usize).min(d.len()));
+        if !verified {
+            if peer.send_reject(request).await.is_err() {
+                self.drop_peer(idx);
+            }
+            return;
+        }
 
-        let sent = match data.zip(end).filter(|&(_, end)| begin < end) {
-            Some((data, end)) => {
-                self.stat.uploaded += (end - begin) as u64;
-                peer.send_block(Piece {
+        // The disk read happens off this loop, so a slow disk doesn't hold up every other
+        // peer; the block comes back as an event and is written to the socket then. Only
+        // the requested bytes are read, not the whole piece.
+        let storage = self.storage.clone();
+        let events = self.events_tx.clone();
+        let to = peer.remote_addr;
+        tokio::task::spawn_blocking(move || {
+            let block = storage
+                .read_block(request.index, request.begin, request.length)
+                .map(|data| Piece {
                     index: request.index,
                     begin: request.begin,
-                    length: (end - begin) as u32,
-                    data: Box::from(&data[begin..end]),
+                    length: request.length,
+                    data,
+                })
+                .map_err(|e| {
+                    warn!("couldn't read {request:?} for {to}: {e:#}");
+                    request
+                });
+            let _ = events.blocking_send(SwarmEvent::BlockRead { to, block });
+        });
+    }
+
+    /// Second half of `serve_request`: the bytes are in hand (or the read failed, in which
+    /// case the request is declined). The peer may have been choked or dropped meanwhile.
+    async fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
+        let Some(idx) = self.peer_index(to) else {
+            return;
+        };
+        let peer = &mut self.peers[idx];
+        let sent = match block {
+            Ok(block) if !peer.choked_them => {
+                self.stat.uploaded += block.length as u64;
+                peer.send_block(block).await
+            }
+            Ok(block) => {
+                peer.send_reject(Request {
+                    index: block.index,
+                    begin: block.begin,
+                    length: block.length,
                 })
                 .await
             }
-            None => peer.send_reject(request).await,
+            Err(request) => peer.send_reject(request).await,
         };
         if sent.is_err() {
             self.drop_peer(idx);
@@ -1559,6 +1593,11 @@ mod test {
     /// A swarm for a single-file torrent of `content()`, its target file in a scratch dir, and
     /// no announcers (the only tracker URL has a scheme no announcer handles).
     fn swarm(name: &str) -> (TorrentSwarm, PathBuf) {
+        swarm_with(name, false)
+    }
+
+    /// `seeding`: the file already holds `content()` and every piece counts as verified.
+    fn swarm_with(name: &str, seeding: bool) -> (TorrentSwarm, PathBuf) {
         let bytes = content();
         let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
         let mut info = format!(
@@ -1584,6 +1623,9 @@ mod test {
             .open(&path)
             .unwrap();
         file.set_len(TOTAL as u64).unwrap();
+        if seeding {
+            std::fs::write(&path, &bytes).unwrap();
+        }
 
         let torrent = Arc::new(torrent);
         let storage = Arc::new(TorrentStorage::new(torrent.clone(), vec![file]));
@@ -1591,12 +1633,20 @@ mod test {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
-        (TorrentSwarm::new(torrent, storage, id, CancellationToken::new()), path)
+        let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
+        (
+            TorrentSwarm::new_with_verified(torrent, storage, id, CancellationToken::new(), verified),
+            path,
+        )
     }
 
     /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
     /// (as if it had just completed a handshake), the test keeps the other.
     async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -> Framed<TcpStream, BtCodec> {
+        fake_peer_with(handle, pretend_addr, false).await
+    }
+
+    async fn fake_peer_with(handle: &TorrentSwarmHandle, pretend_addr: &str, fast: bool) -> Framed<TcpStream, BtCodec> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (theirs, _) = listener.accept().await.unwrap();
@@ -1605,7 +1655,7 @@ mod test {
                 tcp: ours,
                 remote_addr: pretend_addr.parse().unwrap(),
                 remote_supports_extensions: false,
-                remote_supports_fast: false,
+                remote_supports_fast: fast,
             })
             .await;
         Framed::new(theirs, BtCodec)
@@ -1760,6 +1810,83 @@ mod test {
             .unwrap();
         let answer = tokio::time::timeout(Duration::from_millis(500), leech.next()).await;
         assert!(answer.is_err(), "a choked peer must get nothing back, got {answer:?}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The upload path: an interested peer gets unchoked by the next choking round, its block
+    /// requests are answered with the right bytes, and (BEP 6) a request past the end of a
+    /// piece is rejected rather than served or dropped.
+    #[tokio::test]
+    async fn serves_blocks_to_an_unchoked_peer() {
+        let (swarm, path) = swarm_with("seed", true);
+        let handle = swarm.make_handle();
+        let mut stats = swarm.subscribe_stats();
+        tokio::spawn(swarm.work_loop());
+
+        let mut leech = fake_peer_with(&handle, "10.0.0.4:6881", true).await;
+        let Some(Ok(BtMessage::HaveAll(_))) = leech.next().await else {
+            panic!("a seeder greets a fast peer with HaveAll");
+        };
+        let Some(Ok(BtMessage::Interested(_))) = leech.next().await else {
+            panic!("expected Interested");
+        };
+        leech
+            .send(BtMessage::Interested(crate::wire::Interested))
+            .await
+            .unwrap();
+
+        // the choking algorithm runs every CHOKING_ROUND_INTERVAL; we're the only candidate
+        let unchoked = async {
+            loop {
+                if let Some(Ok(BtMessage::Unchoke(_))) = leech.next().await {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(CHOKING_ROUND_INTERVAL + Duration::from_secs(5), unchoked)
+            .await
+            .expect("never unchoked");
+
+        let good = Request {
+            index: 2,
+            begin: 4_000,
+            length: 16_000, // the last piece is 20_000 bytes
+        };
+        let past_the_end = Request {
+            index: 2,
+            begin: 4_001,
+            length: 16_000,
+        };
+        leech.send(BtMessage::Request(good)).await.unwrap();
+        leech.send(BtMessage::Request(past_the_end)).await.unwrap();
+
+        let mut got_block = false;
+        let mut got_reject = false;
+        let answers = async {
+            while !(got_block && got_reject) {
+                match leech.next().await {
+                    Some(Ok(BtMessage::Piece(piece))) => {
+                        assert_eq!((piece.index, piece.begin, piece.length), (2, 4_000, 16_000));
+                        assert_eq!(&*piece.data, &content()[2 * PIECE + 4_000..2 * PIECE + 20_000]);
+                        got_block = true;
+                    }
+                    Some(Ok(BtMessage::RejectRequest(reject))) => {
+                        assert_eq!((reject.index, reject.begin, reject.length), (2, 4_001, 16_000));
+                        got_reject = true;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), answers).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.borrow_and_update().uploaded != 16_000 {
+                stats.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("uploaded bytes never reached the stats");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
