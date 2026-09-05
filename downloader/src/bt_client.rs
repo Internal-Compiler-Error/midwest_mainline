@@ -202,7 +202,7 @@ impl BtClient {
                 (accepted, _idx, _rest) = select_all(listeners.iter().map(|l| Box::pin(l.accept()))) => match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
-                        tracing::warn!("failed to accept an inbound connection: {e:?}");
+                        tracing::warn!("failed to accept an inbound connection: {e}");
                         continue;
                     }
                 },
@@ -215,7 +215,7 @@ impl BtClient {
                 let handshake = match crate::wire::read_handshake(&mut tcp).await {
                     Ok(handshake) => handshake,
                     Err(e) => {
-                        tracing::debug!("bad handshake from {remote_addr}: {e:?}");
+                        tracing::debug!("bad handshake from {remote_addr}: {e:#}");
                         return;
                     }
                 };
@@ -230,7 +230,7 @@ impl BtClient {
                 };
 
                 if let Err(e) = crate::wire::send_handshake(&mut tcp, &handshake.info_hash, &id.peer_id).await {
-                    tracing::debug!("failed to reply to handshake from {remote_addr}: {e:?}");
+                    tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
                     return;
                 }
 

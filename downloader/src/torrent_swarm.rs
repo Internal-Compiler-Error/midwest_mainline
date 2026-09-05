@@ -735,7 +735,7 @@ impl TorrentSwarm {
                 let result = match dial(addr, &torrent, &our_id).await {
                     Ok(connected) => SwarmEvent::PeerConnected(connected),
                     Err(e) => {
-                        info!("Failed to connect to {addr}: {e:?}");
+                        tracing::debug!("couldn't connect to {addr}: {e:#}");
                         SwarmEvent::DialFailed(addr)
                     }
                 };

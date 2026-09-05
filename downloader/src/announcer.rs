@@ -261,7 +261,7 @@ impl HttpAnnouncer {
                             }
                         }
                         Err(e) => {
-                            tracing::error!("{:?}", e);
+                            warn!("{e:#}");
                             // TODO: use exponential backoff
                             self.next_ready = Instant::now() + Duration::from_mins(1);
                         }
@@ -374,7 +374,6 @@ impl UdpAnnouncer {
         info!("Resolving {}", query);
         let mut addresses: Vec<_> = lookup_host(&query)
             .await
-            .inspect_err(|e| info!("{:?}", e))
             .with_context(|| format!("Failed to resolve {}", &query))?
             .collect();
 
@@ -635,7 +634,7 @@ impl UdpAnnouncer {
 
     #[tracing::instrument(skip(self))]
     async fn ev_loop(mut self) -> anyhow::Result<()> {
-        let tracker_addr = self.resolve().await.inspect_err(|e| warn!("{:?}", e))?;
+        let tracker_addr = self.resolve().await.inspect_err(|e| warn!("{e:#}"))?;
 
         let Some(tracker_addr) = tracker_addr else {
             bail!("Tracker [{}] did not resolve to any address", self.tracker);
@@ -652,16 +651,16 @@ impl UdpAnnouncer {
         let mut socket = UdpSocket::bind(our_socket)
             .await
             .with_context(|| format!("Failed to bind a udp socket on {our_socket}"))
-            .inspect_err(|e| warn!("{:?}", e))?;
+            .inspect_err(|e| warn!("{e:#}"))?;
 
         info!("\"Connecting\" to {}", tracker_addr);
         socket
             .connect(tracker_addr)
             .await
             .with_context(|| format!("Failed to connect to addr: {}", tracker_addr))
-            .inspect_err(|e| warn!("{:?}", e))?;
+            .inspect_err(|e| warn!("{e:#}"))?;
 
-        self.connect(&mut socket).await.inspect_err(|e| warn!("{:?}", e))?;
+        self.connect(&mut socket).await.inspect_err(|e| warn!("{e:#}"))?;
 
         loop {
             tokio::select! {
