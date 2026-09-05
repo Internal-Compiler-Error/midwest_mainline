@@ -32,3 +32,18 @@ choking-algorithm commits). Reasons:
   deprioritizes a peer with a poor track record on retry.
 If this gets revisited, the write-atomicity issue is the one that actually has to be solved
 first -- everything else is secondary.
+
+# magnet links / DHT: out of scope by explicit user decision
+The workspace already has a working `dht` crate (`midwest_mainline`, sibling of this crate --
+see `../dht`, 33 tests passing) with `DhtSession::bootstrap`/`get_peers`/`announce_peers`, so
+DHT-based peer discovery for a magnet link is not a research problem here, it's plumbing. It was
+still ruled out of scope for "fully spec compliant" (asked explicitly, 2026-09-05), because it
+isn't just plumbing on top of what exists here: `BtClient::add_torrent`, `TorrentStorage::new`,
+and `PeerFactory` all currently require a fully-parsed `Torrent` (piece count, piece length, file
+list) up front. A magnet link starts with only an info hash -- every one of those needs a
+pre-metadata phase (discover peers with no metadata yet -> BEP 10 extended handshake -> BEP 9
+*consume* ut_metadata, the side that was deliberately not built when ut_metadata was added
+serve-side-only -> verify reassembled bytes against the info hash -> only then construct a
+`Torrent` and proceed as today). That's a restructure of the client's entry path, not a feature
+addition, so it was called out and deferred rather than built silently. The `.torrent`-file entry
+point is the accepted scope; BEP 6 (Fast Extension) and BEP 11 (PEX) are not.
