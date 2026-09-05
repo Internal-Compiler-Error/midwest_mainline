@@ -30,6 +30,12 @@ pub struct Torrent {
 
     /// Info hash of the torrent
     pub info_hash: InfoHash,
+
+    /// The raw bencoded bytes of the "info" dict, exactly as they appeared in the .torrent
+    /// file. Kept around so we can serve it to peers over BEP 9 (ut_metadata) -- we always
+    /// have the full metadata already, having started from a .torrent file rather than a
+    /// magnet link.
+    pub raw_info: Vec<u8>,
 }
 
 impl Torrent {
@@ -67,11 +73,17 @@ impl Torrent {
             .and_then(|tier| tier.first())
             .map(|s| s.as_str())
     }
+
+    /// Total size of the bencoded "info" dict, i.e. the total metadata size BEP 9 peers need
+    /// to know to request all of it.
+    pub fn metadata_size(&self) -> u32 {
+        self.raw_info.len() as u32
+    }
 }
 
 /// Parses a torrent metadata file and returns a Torrent struct
 pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
-    let hash = compute_info_hash(metadata_file);
+    let (hash, raw_info) = compute_info_hash(metadata_file);
 
     let (_, mut torrent) = juicy_bencode::parse_bencode_dict(metadata_file).map_err(|_| {
         // the error type has a reference on the input, we don't want that
@@ -172,11 +184,13 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         files,
         last_piece_size: last_piece_len.try_into()?,
         info_hash: hash,
+        raw_info,
     })
 }
 
-/// Computes the info hash of a torrent metadata file
-fn compute_info_hash(input: &[u8]) -> InfoHash {
+/// Computes the info hash of a torrent metadata file, and also returns the raw bencoded bytes
+/// of the "info" dict (needed to serve BEP 9 ut_metadata requests).
+fn compute_info_hash(input: &[u8]) -> (InfoHash, Vec<u8>) {
     let mut decoder = bendy::decoding::Decoder::new(input);
     let Some(Object::Dict(mut dict)) = decoder.next_object().unwrap() else {
         panic!("torrent metadata must be a dictionary")
@@ -190,7 +204,8 @@ fn compute_info_hash(input: &[u8]) -> InfoHash {
                 Object::Integer(i) => i.as_bytes(),
                 Object::Bytes(items) => items,
             };
-            return InfoHash::from_bytes(Sha1::digest(buf).as_slice());
+            let hash = InfoHash::from_bytes(Sha1::digest(buf).as_slice());
+            return (hash, buf.to_vec());
         }
     }
 
@@ -255,6 +270,30 @@ mod test {
         assert_eq!(torrent.files.len(), 1);
         assert_eq!(torrent.files[0].0, 15);
         assert_eq!(torrent.primary_tracker(), Some("http://tracker.test/announce"));
+
+        // raw_info must be exactly the bencoded "info" dict, byte for byte, since a peer
+        // fetching it over BEP 9 needs to reconstruct the exact bytes info_hash was taken over
+        let pieces: Vec<u8> = (0..3u8)
+            .flat_map(|i| {
+                let mut hash = [0u8; 20];
+                hash[0] = i;
+                hash
+            })
+            .collect();
+        let mut expected_info = Vec::new();
+        expected_info.extend_from_slice(b"d");
+        expected_info.extend_from_slice(&bencode_string(b"length"));
+        expected_info.extend_from_slice(b"i15e");
+        expected_info.extend_from_slice(&bencode_string(b"name"));
+        expected_info.extend_from_slice(&bencode_string(b"test.txt"));
+        expected_info.extend_from_slice(&bencode_string(b"piece length"));
+        expected_info.extend_from_slice(b"i5e");
+        expected_info.extend_from_slice(&bencode_string(b"pieces"));
+        expected_info.extend_from_slice(&bencode_string(&pieces));
+        expected_info.extend_from_slice(b"e");
+
+        assert_eq!(torrent.raw_info, expected_info);
+        assert_eq!(torrent.metadata_size() as usize, torrent.raw_info.len());
     }
 
     #[test]

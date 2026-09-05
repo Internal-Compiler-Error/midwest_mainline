@@ -1,7 +1,7 @@
 use crate::defs::Identity;
 use crate::download::{Download, DownloadEvent};
 use crate::peer::{PeerCommands, PeerEvent, PeerHandle};
-use crate::settings::{CHOKING_ROUND_INTERVAL, MAX_UNCHOKED_PEERS, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS};
+use crate::settings::{CHOKING_ROUND_INTERVAL, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::wire::{BitField, Piece, shake_hands};
@@ -701,13 +701,19 @@ pub(crate) struct PeerFactory {
 }
 
 impl PeerFactory {
-    pub(crate) fn accept(&self, tcp_stream: TcpStream, remote_peer_id: [u8; 20]) -> PeerHandle {
+    pub(crate) fn accept(
+        &self,
+        tcp_stream: TcpStream,
+        remote_peer_id: [u8; 20],
+        remote_supports_extensions: bool,
+    ) -> PeerHandle {
         PeerHandle::new(
             tcp_stream,
             remote_peer_id,
             self.event_tx.clone(),
             self.stat_snapshot_rx.clone(),
             &self.torrent,
+            remote_supports_extensions,
         )
     }
 }
@@ -1077,6 +1083,22 @@ impl TorrentSwarm {
                     info!("{} disconnected, removed from active peers", from);
                 }
             }
+            PeerEvent::MetadataRequested { piece } => {
+                // BEP 9: we always have the full metadata (started from a .torrent file, not
+                // a magnet link), so we can serve any in-range piece unconditionally
+                let start = piece as usize * METADATA_PIECE_SIZE;
+                if start >= self.torrent.raw_info.len() {
+                    return;
+                }
+                let end = (start + METADATA_PIECE_SIZE).min(self.torrent.raw_info.len());
+                let data: Box<[u8]> = Box::from(&self.torrent.raw_info[start..end]);
+                let total_size = self.torrent.metadata_size();
+
+                let Ok(peer_idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) else {
+                    return;
+                };
+                let _ = self.active_peers[peer_idx].send_metadata_piece(piece, total_size, data).await;
+            }
         }
     }
 
@@ -1269,7 +1291,14 @@ impl TorrentSwarm {
                 .with_context(|| format!("Failed to complete handshake with {}", remote_addr))?;
             info!("Peer connection to {} established", remote_addr);
 
-            let handle = PeerHandle::new(tcp, handshake.peer_id, event_tx, stat_snapshot_rx, &torrent);
+            let handle = PeerHandle::new(
+                tcp,
+                handshake.peer_id,
+                event_tx,
+                stat_snapshot_rx,
+                &torrent,
+                crate::wire::supports_extensions(&handshake.extensions),
+            );
             Ok(handle)
         }
     }

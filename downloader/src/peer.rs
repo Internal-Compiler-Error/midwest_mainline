@@ -2,12 +2,13 @@ use crate::settings::{KEEPALIVE_INTERVAL, PEER_TIMEOUT};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{TorrentSwarmCommand, TorrentSwarmStats};
 use crate::wire::{
-    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Have, Interested, KeepAlive, NotInterested, Piece, Request,
-    Unchoke,
+    BitField, BtDecoder, BtEncoder, BtMessage, Choke, Extended, Have, Interested, KeepAlive, NotInterested, Piece,
+    Request, Unchoke,
 };
 use derive_more::{Eq, PartialEq};
 use futures::SinkExt;
 use futures::StreamExt;
+use juicy_bencode::BencodeItemView;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;
@@ -24,6 +25,10 @@ use tracing::info;
 
 use derive_more::{Display, Error};
 
+/// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
+/// since it's entirely our own choice -- only the id the *remote* wants is negotiated.
+const UT_METADATA_ID: u8 = 1;
+
 /// It's not great that this is pub(crate) instead of fully private
 #[derive(Debug)]
 pub(crate) enum PeerCommands {
@@ -37,6 +42,12 @@ pub(crate) enum PeerCommands {
     SendWeHave(u32),
     BitField(BitField),
     SendData(Piece),
+    /// BEP 9: reply to a ut_metadata request with one piece (up to 16KiB) of the raw info dict.
+    SendMetadataPiece {
+        piece: u32,
+        total_size: u32,
+        data: Box<[u8]>,
+    },
 }
 
 pub enum PeerEvent {
@@ -45,6 +56,10 @@ pub enum PeerEvent {
     /// because the socket/command channel closed outright. Lets the swarm drop this peer
     /// from `active_peers` instead of holding a dead handle forever.
     Disconnected,
+    /// BEP 9: the peer asked (via ut_metadata) for one piece of our info dict. TorrentSwarm
+    /// has the actual bytes (`Arc<Torrent>::raw_info`); this connection only knows how to
+    /// frame the reply once it's given the data.
+    MetadataRequested { piece: u32 },
 }
 
 // TODO: Should refactor the design so that a peer connection and handle can be constructed even
@@ -92,6 +107,7 @@ impl PeerHandle {
         event_tx: mpsc::Sender<TorrentSwarmCommand>,
         torrent_status: watch::Receiver<TorrentSwarmStats>,
         torrent: &Torrent,
+        remote_supports_extensions: bool,
     ) -> Self {
         let remote_addr = tcp_stream.peer_addr().unwrap();
         let SocketAddr::V4(remote_addr) = remote_addr else {
@@ -122,6 +138,8 @@ impl PeerHandle {
             state: state.clone(),
             state_tx,
             num_pieces,
+            metadata_size: torrent.metadata_size(),
+            their_ut_metadata_id: None,
 
             remote_addr,
             reader: FramedRead::new(reader, BtDecoder),
@@ -135,7 +153,7 @@ impl PeerHandle {
             torrent_stat: torrent_status,
         };
 
-        tokio::spawn(peer_ev_loop(peer));
+        tokio::spawn(peer_ev_loop(peer, remote_supports_extensions));
 
         Self {
             remote_peer_id,
@@ -220,6 +238,14 @@ impl PeerHandle {
         Ok(())
     }
 
+    pub async fn send_metadata_piece(&self, piece: u32, total_size: u32, data: Box<[u8]>) -> Result<(), PeerDied> {
+        self.peer_tx
+            .send(PeerCommands::SendMetadataPiece { piece, total_size, data })
+            .await
+            .map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
     pub fn state(&self) -> PeerState {
         self.state.borrow().clone()
     }
@@ -244,6 +270,11 @@ struct PeerConnection {
     state: PeerState,
     state_tx: watch::Sender<PeerState>,
     num_pieces: usize,
+    /// total size of the bencoded info dict, advertised in our BEP 10 extended handshake
+    metadata_size: u32,
+    /// the message id the remote wants us to use for ut_metadata messages, learned from
+    /// their extended handshake; `None` until then (or if they don't support it)
+    their_ut_metadata_id: Option<u8>,
 
     remote_addr: SocketAddrV4,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
@@ -262,7 +293,35 @@ struct PeerConnection {
     // connection_closed: bool,
 }
 
-async fn peer_ev_loop(mut peer: PeerConnection) {
+/// BEP 10 extended handshake payload: declares the message id we want the remote to use for
+/// ut_metadata, plus the total metadata size.
+fn build_extended_handshake(metadata_size: u32) -> Vec<u8> {
+    format!("d1:md11:ut_metadatai{UT_METADATA_ID}ee13:metadata_sizei{metadata_size}ee").into_bytes()
+}
+
+/// BEP 9 ut_metadata "data" message: a bencoded prefix (`msg_type`, `piece`, `total_size`)
+/// immediately followed by the raw metadata bytes for that piece -- there's no length-prefixed
+/// framing between the two, the dict's own encoding is how a parser knows where it ends.
+fn build_ut_metadata_data_message(piece: u32, total_size: u32, data: &[u8]) -> Vec<u8> {
+    let mut payload = format!("d8:msg_typei1e5:piecei{piece}e10:total_sizei{total_size}ee").into_bytes();
+    payload.extend_from_slice(data);
+    payload
+}
+
+async fn peer_ev_loop(mut peer: PeerConnection, remote_supports_extensions: bool) {
+    if remote_supports_extensions {
+        // BEP 10: send our extended handshake first, declaring the ut_metadata message id
+        // we want the remote to use when sending *us* ut_metadata messages
+        let payload = build_extended_handshake(peer.metadata_size);
+        let _ = peer
+            .writer
+            .send(BtMessage::Extended(Extended {
+                ext_id: 0,
+                payload: payload.into_boxed_slice(),
+            }))
+            .await;
+    }
+
     let mut keepalive_ticker = interval(KEEPALIVE_INTERVAL);
     keepalive_ticker.tick().await; // the first tick fires immediately; skip it
 
@@ -305,6 +364,48 @@ impl PeerConnection {
                 event,
             })
             .await;
+    }
+
+    /// BEP 10: the extended handshake dict looks like `{"m": {"ut_metadata": <their id>, ...},
+    /// "metadata_size": <n>, ...}`. We only care about the id they want for ut_metadata; a
+    /// malformed or unsupported payload is just ignored, not a protocol violation worth
+    /// disconnecting over (unlike Have/BitField, this is optional and best-effort).
+    fn handle_extended_handshake(&mut self, payload: &[u8]) {
+        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
+            return;
+        };
+        let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) else {
+            return;
+        };
+        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) {
+            self.their_ut_metadata_id = Some(*id as u8);
+        }
+    }
+
+    /// BEP 9: we only ever have the full metadata (we start from a .torrent file, not a magnet
+    /// link), so the only incoming message worth handling is a request (msg_type 0) for one
+    /// piece; the swarm has the actual bytes and builds the reply.
+    async fn handle_ut_metadata_message(&mut self, payload: &[u8]) {
+        // We reply using `their_ut_metadata_id`, negotiated via the extended handshake. Without
+        // it, any reply we build is unaddressable and silently dropped by `send_metadata_piece`
+        // -- so skip the parse/emit/swarm round-trip entirely rather than doing it for nothing
+        // (a peer that never sent a handshake could otherwise trigger this in a loop for free).
+        if self.their_ut_metadata_id.is_none() {
+            return;
+        }
+        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
+            return;
+        };
+        let Some(BencodeItemView::Integer(msg_type)) = dict.get(b"msg_type".as_slice()) else {
+            return;
+        };
+        let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
+            return;
+        };
+
+        if *msg_type == 0 {
+            self.emit_event(PeerEvent::MetadataRequested { piece: *piece as u32 }).await;
+        }
     }
 
     pub async fn request_data_from_peer(
@@ -380,6 +481,24 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict. A silent
+    /// no-op if the peer never declared ut_metadata support -- there's no sane id to send on.
+    async fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: Box<[u8]>) -> anyhow::Result<()> {
+        let Some(their_id) = self.their_ut_metadata_id else {
+            return Ok(());
+        };
+
+        let payload = build_ut_metadata_data_message(piece, total_size, &data);
+
+        self.writer
+            .send(BtMessage::Extended(Extended {
+                ext_id: their_id,
+                payload: payload.into_boxed_slice(),
+            }))
+            .await?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn process_command(&mut self, command: PeerCommands) {
         info!("Handling one {:?} command", command);
@@ -391,6 +510,9 @@ impl PeerConnection {
             PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await.unwrap(),
             PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
             PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
+            PeerCommands::SendMetadataPiece { piece, total_size, data } => {
+                self.send_metadata_piece(piece, total_size, data).await.unwrap()
+            }
         }
         // unlike process_message, nothing else publishes state after a command runs --
         // without this, choke/unchoke/interested changes made here are invisible to
@@ -479,6 +601,15 @@ impl PeerConnection {
                 let _ = syn.send(piece.data);
             }
             BtMessage::Cancel(_cancel) => return,
+            BtMessage::Extended(ext) => {
+                if ext.ext_id == 0 {
+                    self.handle_extended_handshake(&ext.payload);
+                } else if ext.ext_id == UT_METADATA_ID {
+                    self.handle_ut_metadata_message(&ext.payload).await;
+                } else {
+                    tracing::debug!("{} sent an unsupported extended message id {}", self.remote_addr, ext.ext_id);
+                }
+            }
             BtMessage::Unknown(msg_type, _) => {
                 tracing::warn!("Unsupported message type {msg_type}");
             }
@@ -571,5 +702,55 @@ impl PeerStatistics {
         } else {
             self.rx_speed_ucb(total_piece_requested)
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn extended_handshake_is_valid_bencode_with_expected_fields() {
+        let payload = build_extended_handshake(12345);
+        let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
+        assert!(remaining.is_empty(), "handshake payload must be exactly one bencoded dict");
+
+        let BencodeItemView::Dictionary(m) = dict.get(b"m".as_slice()).unwrap() else {
+            panic!("\"m\" must be a dict");
+        };
+        let BencodeItemView::Integer(ut_metadata_id) = m.get(b"ut_metadata".as_slice()).unwrap() else {
+            panic!("\"m\".\"ut_metadata\" must be an integer");
+        };
+        assert_eq!(*ut_metadata_id, UT_METADATA_ID as i64);
+
+        let BencodeItemView::Integer(metadata_size) = dict.get(b"metadata_size".as_slice()).unwrap() else {
+            panic!("\"metadata_size\" must be an integer");
+        };
+        assert_eq!(*metadata_size, 12345);
+    }
+
+    #[test]
+    fn ut_metadata_data_message_is_valid_bencode_followed_by_raw_bytes() {
+        let data = [9u8, 8, 7, 6];
+        let message = build_ut_metadata_data_message(3, 100, &data);
+
+        let (remaining, dict) = juicy_bencode::parse_bencode_dict(&message).unwrap();
+        // the raw metadata bytes for this piece follow the dict with no framing of their own
+        assert_eq!(remaining, &data);
+
+        let BencodeItemView::Integer(msg_type) = dict.get(b"msg_type".as_slice()).unwrap() else {
+            panic!("\"msg_type\" must be an integer");
+        };
+        assert_eq!(*msg_type, 1);
+
+        let BencodeItemView::Integer(piece) = dict.get(b"piece".as_slice()).unwrap() else {
+            panic!("\"piece\" must be an integer");
+        };
+        assert_eq!(*piece, 3);
+
+        let BencodeItemView::Integer(total_size) = dict.get(b"total_size".as_slice()).unwrap() else {
+            panic!("\"total_size\" must be an integer");
+        };
+        assert_eq!(*total_size, 100);
     }
 }

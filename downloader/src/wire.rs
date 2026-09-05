@@ -1,4 +1,3 @@
-use juicy_bencode::BencodeItemView;
 use midwest_mainline::types::InfoHash;
 use std::io;
 use std::io::ErrorKind;
@@ -167,15 +166,24 @@ impl Encode for Cancel {
     }
 }
 
-#[allow(dead_code)]
-pub struct Extended<'a> {
-    pub inner: BencodeItemView<'a>,
+/// BEP 10 extension protocol message: `<len><id=20><ext_id><payload>`. `ext_id` 0 is always the
+/// extended handshake itself; any other value is whatever the two peers negotiated for a given
+/// named extension (e.g. "ut_metadata") in their respective handshakes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extended {
+    pub ext_id: u8,
+    pub payload: Box<[u8]>,
 }
 
-#[allow(dead_code, unused)]
-impl Encode for Extended<'_> {
+impl Encode for Extended {
     fn encode(&self, buf: &mut [u8]) {
-        todo!()
+        let (length, header) = buf.split_at_mut(4);
+        let (header, body) = header.split_at_mut(1);
+        length.copy_from_slice(&((1 + 1 + self.payload.len()) as u32).to_be_bytes());
+        header.copy_from_slice(&[20u8]);
+        let (ext_id_byte, payload) = body.split_at_mut(1);
+        ext_id_byte[0] = self.ext_id;
+        payload.copy_from_slice(&self.payload);
     }
 }
 
@@ -191,6 +199,7 @@ pub(crate) enum BtMessage {
     Request(Request),
     Piece(Piece),
     Cancel(Cancel),
+    Extended(Extended),
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
 
@@ -213,6 +222,7 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::Request(_) => 17,
             BtMessage::Piece(piece) => 13 + piece.data.len(),
             BtMessage::Cancel(_) => 17,
+            BtMessage::Extended(ext) => 6 + ext.payload.len(),
             BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
         };
 
@@ -231,6 +241,7 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::Request(request) => request.encode(buf),
             BtMessage::Piece(piece) => piece.encode(buf),
             BtMessage::Cancel(cancel) => cancel.encode(buf),
+            BtMessage::Extended(ext) => ext.encode(buf),
             BtMessage::Unknown(..) => panic!(),
         }
 
@@ -304,6 +315,12 @@ impl Decoder for BtDecoder {
                     let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
                     BtMessage::Cancel(Cancel { index, begin, length })
                 }
+                20 => {
+                    // BEP 10: <ext_id><payload>, with no wire-level length field of its own
+                    let ext_id = buf[0];
+                    let payload = Box::from(&buf[1..]);
+                    BtMessage::Extended(Extended { ext_id, payload })
+                }
                 t => BtMessage::Unknown(t, Box::from(buf)),
             }
         };
@@ -316,7 +333,6 @@ impl Decoder for BtDecoder {
 #[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]
 pub(crate) struct Handshake {
-    #[allow(dead_code)]
     pub extensions: [u8; 8],
     pub info_hash: InfoHash,
     pub peer_id: [u8; 20],
@@ -325,11 +341,18 @@ pub(crate) struct Handshake {
 // pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
 pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
 
+/// BEP 10: bit 0x10 of reserved byte 5 (0-indexed from the start of the 8-byte reserved area)
+/// signals extension protocol support.
+pub(crate) fn supports_extensions(extensions: &[u8; 8]) -> bool {
+    extensions[5] & 0x10 != 0
+}
+
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
 /// we have a matching torrent).
 pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<()> {
-    let extensions = [0u8; 8];
+    let mut extensions = [0u8; 8];
+    extensions[5] |= 0x10; // BEP 10: we support the extension protocol
 
     let mut buf = vec![];
     buf.extend_from_slice(HANDSHAKE_STR);
@@ -502,6 +525,32 @@ mod test {
         assert_eq!(round_trip(BtMessage::Piece(piece.clone())), BtMessage::Piece(piece));
     }
 
+    #[test]
+    fn extended_round_trips() {
+        let ext = Extended {
+            ext_id: 3,
+            payload: Box::from(*b"d1:mi1ee"),
+        };
+        assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
+    }
+
+    #[test]
+    fn extended_handshake_uses_ext_id_zero() {
+        let ext = Extended {
+            ext_id: 0,
+            payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
+        };
+        assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
+    }
+
+    #[test]
+    fn supports_extensions_checks_bit_0x10_of_reserved_byte_5() {
+        let mut extensions = [0u8; 8];
+        assert!(!supports_extensions(&extensions));
+        extensions[5] |= 0x10;
+        assert!(supports_extensions(&extensions));
+    }
+
     /// The two frames back to back exercise that the decoder only consumes exactly one
     /// frame's worth of bytes and leaves the rest for the next call, per BEP 3 framing.
     #[test]
@@ -562,5 +611,18 @@ mod test {
             &buf[..],
             &[0, 0, 0, 12, 7, 0, 0, 0, 1, 0, 0, 0, 2, 9, 8, 7]
         );
+
+        // extended: <len=0002+X><id=20><ext_id><payload>, per BEP 10
+        let mut buf = BytesMut::new();
+        BtEncoder
+            .encode(
+                BtMessage::Extended(Extended {
+                    ext_id: 5,
+                    payload: Box::from([1u8, 2]),
+                }),
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 4, 20, 5, 1, 2]);
     }
 }

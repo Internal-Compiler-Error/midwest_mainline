@@ -2,6 +2,10 @@ use std::time::Duration;
 
 pub const BLOCK_SIZE: usize = 16 * 1024; // 16 KiB
 
+/// BEP 9: metadata (the info dict) is exchanged in fixed 16KiB pieces, same size as BLOCK_SIZE
+/// but conceptually distinct (one is torrent data, the other is the torrent's own metadata).
+pub const METADATA_PIECE_SIZE: usize = 16 * 1024;
+
 /// How long to wait for a peer that accepted a block request to actually send the block.
 /// A peer that goes silent mid-request (as opposed to disconnecting outright) is the common
 /// failure mode this guards against -- without it, a single unresponsive peer hangs a piece
