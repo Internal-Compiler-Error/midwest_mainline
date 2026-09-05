@@ -759,6 +759,7 @@ impl PeerFactory {
         tcp_stream: TcpStream,
         remote_peer_id: [u8; 20],
         remote_supports_extensions: bool,
+        remote_supports_fast: bool,
     ) -> PeerHandle {
         PeerHandle::new(
             tcp_stream,
@@ -767,6 +768,7 @@ impl PeerFactory {
             self.stat_snapshot_rx.clone(),
             &self.torrent,
             remote_supports_extensions,
+            remote_supports_fast,
         )
     }
 }
@@ -1118,33 +1120,31 @@ impl TorrentSwarm {
     async fn process_peer_event(&mut self, from: SocketAddr, event: PeerEvent) {
         match event {
             PeerEvent::Requested(request) => {
-                // never serve a piece we haven't hash-verified, and never serve more than
-                // the peer actually asked for
-                let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
-                if !verified {
-                    return;
-                }
-
-                let Ok(data) = self.storage.read_piece(request.index) else {
+                // the peer may have been dropped between emitting this event and it being
+                // processed here; that's a normal race, not an invariant violation. Looked up
+                // up front (rather than only on the success path) since BEP 6 (Fast Extension)
+                // requires telling the peer about every decline, not only serving successes.
+                let Ok(peer_idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) else {
                     return;
                 };
 
+                // never serve a piece we haven't hash-verified, and never serve more than
+                // the peer actually asked for
+                let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
+                let data = if verified { self.storage.read_piece(request.index).ok() } else { None };
                 let begin = request.begin as usize;
-                let end = begin.saturating_add(request.length as usize).min(data.len());
-                if begin >= end {
+                let end = data.as_ref().map(|d| begin.saturating_add(request.length as usize).min(d.len()));
+
+                let Some((data, end)) = data.zip(end).filter(|&(_, end)| begin < end) else {
+                    let _ = self.active_peers[peer_idx].send_reject(request).await;
                     return;
-                }
+                };
 
                 let resp = Piece {
                     index: request.index,
                     begin: request.begin,
                     length: (end - begin) as u32,
                     data: Box::from(&data[begin..end]),
-                };
-                // the peer may have been dropped between emitting this event and it being
-                // processed here; that's a normal race, not an invariant violation
-                let Ok(peer_idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) else {
-                    return;
                 };
                 let _ = self.active_peers[peer_idx].send_data(resp).await;
             }
@@ -1348,6 +1348,7 @@ impl TorrentSwarm {
                 stat_snapshot_rx,
                 &torrent,
                 crate::wire::supports_extensions(&handshake.extensions),
+                crate::wire::supports_fast_extension(&handshake.extensions),
             );
             Ok(handle)
         }
@@ -1394,9 +1395,18 @@ impl TorrentSwarm {
     }
 
     fn initialize_peer(&self, peer: &PeerHandle) -> anyhow::Result<()> {
-        let has = Box::from(self.stat.verified.clone().as_raw_slice());
-
-        peer.try_bitfield(BitField { has })?;
+        // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
+        // place of a BitField for the "I have everything"/"I have nothing" cases -- smaller
+        // than sending a full bitfield, and the actual reason those two messages exist. A
+        // partial bitfield still just goes out as BitField either way.
+        if peer.remote_supports_fast && self.stat.all_verified() {
+            peer.try_have_all()?;
+        } else if peer.remote_supports_fast && self.stat.verified_cnt() == 0 {
+            peer.try_have_none()?;
+        } else {
+            let has = Box::from(self.stat.verified.clone().as_raw_slice());
+            peer.try_bitfield(BitField { has })?;
+        }
         peer.try_fancy_peer()?;
         // BEP 3: connections start choked; whether to unchoke is the choking algorithm's
         // call (run periodically in work_loop), not an automatic grant on connect

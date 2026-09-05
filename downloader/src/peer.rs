@@ -43,7 +43,16 @@ pub(crate) enum PeerCommands {
     },
     SendWeHave(u32),
     BitField(BitField),
+    /// BEP 6: sent in place of `BitField` when we have every piece.
+    SendHaveAll,
+    /// BEP 6: sent in place of `BitField` when we have no pieces at all.
+    SendHaveNone,
     SendData(Piece),
+    /// BEP 6: we're declining a `Request`; tells the requester to stop waiting on it now
+    /// instead of idling out its own timeout. A no-op if the remote never advertised Fast
+    /// Extension support (there's no obligation, and nothing on the classic wire protocol to
+    /// send instead -- a plain drop is what a non-fast peer already expects).
+    RejectRequest(Request),
     /// BEP 9: reply to a ut_metadata request with one piece (up to 16KiB) of the raw info dict.
     SendMetadataPiece {
         piece: u32,
@@ -80,6 +89,11 @@ pub struct PeerHandle {
 
     pub remote_addr: SocketAddr,
 
+    /// BEP 6: whether the remote advertised Fast Extension support in its handshake. A fixed
+    /// fact about the connection (unlike ut_metadata/ut_pex ids, not renegotiated later), so
+    /// it's exposed here the same way `remote_addr`/`remote_peer_id` are.
+    pub remote_supports_fast: bool,
+
     #[eq(skip)]
     pub(crate) peer_tx: mpsc::Sender<PeerCommands>,
 
@@ -114,6 +128,7 @@ impl PeerHandle {
         torrent_status: watch::Receiver<TorrentSwarmStats>,
         torrent: &Torrent,
         remote_supports_extensions: bool,
+        remote_supports_fast: bool,
     ) -> Self {
         // `to_canonical()` collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a
         // v4 peer looks like when accepted on a dual-stack `[::]` listener) down to plain
@@ -135,8 +150,11 @@ impl PeerHandle {
         let state = PeerState {
             // BEP 3 bitfields are `ceil(num_pieces / 8)` bytes, not one byte per piece
             they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
-            choked_us: false,
-            choked_them: false,
+            // BEP 3: "At the start of the connection, both sides ... are choked." Starting
+            // these `false` meant we'd request from a peer before it ever unchoked us, and
+            // serve any peer's requests before the choking algorithm's first round ran.
+            choked_us: true,
+            choked_them: true,
             interested_them: false,
             interested_us: false,
         };
@@ -152,6 +170,7 @@ impl PeerHandle {
             metadata_size: torrent.metadata_size(),
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
+            remote_supports_fast,
 
             remote_addr,
             reader: FramedRead::new(reader, BtDecoder),
@@ -173,6 +192,7 @@ impl PeerHandle {
             stats: stats_rx,
             state: state_rx.clone(),
             remote_addr,
+            remote_supports_fast,
         }
     }
 
@@ -221,6 +241,25 @@ impl PeerHandle {
         self.peer_tx
             .try_send(PeerCommands::BitField(bit_field))
             .map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    /// BEP 6: like `try_bitfield`, but for the "we have everything" shorthand.
+    pub fn try_have_all(&self) -> Result<(), PeerDied> {
+        self.peer_tx.try_send(PeerCommands::SendHaveAll).map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    /// BEP 6: like `try_bitfield`, but for the "we have nothing" shorthand.
+    pub fn try_have_none(&self) -> Result<(), PeerDied> {
+        self.peer_tx.try_send(PeerCommands::SendHaveNone).map_err(|_| PeerDied)?;
+        Ok(())
+    }
+
+    /// BEP 6: decline a `Request` this peer made. A no-op (from the wire's perspective) unless
+    /// the peer advertised Fast Extension support -- see `PeerConnection::send_reject`.
+    pub async fn send_reject(&self, req: Request) -> Result<(), PeerDied> {
+        self.peer_tx.send(PeerCommands::RejectRequest(req)).await.map_err(|_| PeerDied)?;
         Ok(())
     }
 
@@ -295,6 +334,10 @@ struct PeerConnection {
     their_ut_metadata_id: Option<u8>,
     /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
     their_ut_pex_id: Option<u8>,
+    /// BEP 6: whether the remote advertised Fast Extension support in its handshake. Unlike
+    /// `their_ut_metadata_id`/`their_ut_pex_id`, this is known at construction time (it's a
+    /// handshake reserved-bit, not something negotiated via a later extended handshake).
+    remote_supports_fast: bool,
 
     remote_addr: SocketAddr,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
@@ -557,6 +600,33 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// BEP 6: sent in place of `BitField` when we have every piece.
+    async fn send_have_all(&mut self) -> io::Result<()> {
+        self.writer.send(BtMessage::HaveAll(crate::wire::HaveAll)).await
+    }
+
+    /// BEP 6: sent in place of `BitField` when we have no pieces at all.
+    async fn send_have_none(&mut self) -> io::Result<()> {
+        self.writer.send(BtMessage::HaveNone(crate::wire::HaveNone)).await
+    }
+
+    /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
+    /// support -- the classic protocol has no "I'm declining this" message, a plain drop (what
+    /// happens if this is a no-op) is exactly what such a peer already expects.
+    async fn send_reject(&mut self, req: Request) -> anyhow::Result<()> {
+        if !self.remote_supports_fast {
+            return Ok(());
+        }
+        self.writer
+            .send(BtMessage::RejectRequest(crate::wire::RejectRequest {
+                index: req.index,
+                begin: req.begin,
+                length: req.length,
+            }))
+            .await?;
+        Ok(())
+    }
+
     /// BEP 3: `Have` announces possession of a piece; it isn't the piece's data and isn't
     /// subject to choking, so it must go out regardless of choke/interest state. This used to
     /// be gated on `!interested_us || choked_them`, which was masked back when every peer was
@@ -626,6 +696,9 @@ impl PeerConnection {
             PeerCommands::FancyPeer => self.fancy_peer().await.unwrap(),
             PeerCommands::SendWeHave(piece) => self.send_we_have(piece).await.unwrap(),
             PeerCommands::BitField(bitfield) => self.send_bitfield(bitfield).await.unwrap(),
+            PeerCommands::SendHaveAll => self.send_have_all().await.unwrap(),
+            PeerCommands::SendHaveNone => self.send_have_none().await.unwrap(),
+            PeerCommands::RejectRequest(req) => self.send_reject(req).await.unwrap(),
             PeerCommands::SendData(piece) => self.send_data(piece).await.unwrap(),
             PeerCommands::SendMetadataPiece { piece, total_size, data } => {
                 self.send_metadata_piece(piece, total_size, data).await.unwrap()
@@ -682,7 +755,39 @@ impl PeerConnection {
                 }
                 self.state.they_have = bit_field.has;
             }
+            BtMessage::HaveAll(_) => {
+                self.state.they_have = vec![0xFFu8; self.num_pieces.div_ceil(8)].into();
+            }
+            BtMessage::HaveNone(_) => {
+                self.state.they_have = vec![0u8; self.num_pieces.div_ceil(8)].into();
+            }
+            BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {
+                // BEP 6: both are advisory-only; acting on either is optional for the receiver
+                // and we don't implement request-while-choked, so there's nothing to do here
+                // beyond having parsed them instead of treating them as Unknown.
+            }
+            BtMessage::RejectRequest(reject) => {
+                // BEP 6: cancels a request we made, the same way a `Piece` fulfills one --
+                // dropping the oneshot sender fails the waiting `.await` immediately instead of
+                // leaving it to idle out BLOCK_REQUEST_TIMEOUT. A reject for a request we have
+                // no record of (already fulfilled, or the peer never had this data) is just
+                // ignored, not a protocol violation worth disconnecting over.
+                self.requested.remove(&Request {
+                    index: reject.index,
+                    begin: reject.begin,
+                    length: reject.length,
+                });
+            }
             BtMessage::Request(request) => {
+                // BEP 3: a choked peer isn't entitled to any data, full stop -- serving them
+                // anyway (which is what happened here before) bypasses the choking algorithm
+                // entirely. BEP 6 turns "ignore it" into "must say so": once Fast Extension is
+                // negotiated, a declined request needs an explicit RejectRequest rather than a
+                // silent drop, which `send_reject` already no-ops on its own if it isn't.
+                if self.state.choked_them {
+                    let _ = self.send_reject(request).await;
+                    return;
+                }
                 self.events
                     .send(TorrentSwarmCommand::ProcessPeerEvent {
                         from: self.remote_addr,

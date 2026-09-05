@@ -159,7 +159,12 @@ impl BtClient {
                     return;
                 }
 
-                let peer = factory.accept(tcp, handshake.peer_id, crate::wire::supports_extensions(&handshake.extensions));
+                let peer = factory.accept(
+                    tcp,
+                    handshake.peer_id,
+                    crate::wire::supports_extensions(&handshake.extensions),
+                    crate::wire::supports_fast_extension(&handshake.extensions),
+                );
                 if let Some(handle) = handles.get(&handshake.info_hash) {
                     handle.add_initialized_peer(peer).await;
                 }

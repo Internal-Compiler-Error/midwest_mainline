@@ -166,6 +166,83 @@ impl Encode for Cancel {
     }
 }
 
+/// BEP 6 (Fast Extension): an advisory hint that the sender suggests downloading this piece.
+/// Purely advisory -- a receiver is free to ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
+pub struct SuggestPiece {
+    pub piece: u32,
+}
+
+impl Encode for SuggestPiece {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        let (header, body) = header.split_at_mut(1);
+        length.copy_from_slice(&5u32.to_be_bytes());
+        header.copy_from_slice(&[13u8]);
+        body.copy_from_slice(&self.piece.to_be_bytes());
+    }
+}
+
+/// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has every piece --
+/// smaller than sending a full one-bits bitfield.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
+pub struct HaveAll;
+impl Encode for HaveAll {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        length.copy_from_slice(&1u32.to_be_bytes());
+        header.copy_from_slice(&[14u8]);
+    }
+}
+
+/// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has no pieces at all.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
+pub struct HaveNone;
+impl Encode for HaveNone {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        length.copy_from_slice(&1u32.to_be_bytes());
+        header.copy_from_slice(&[15u8]);
+    }
+}
+
+/// BEP 6 (Fast Extension): once the fast extension is enabled for a connection, a peer MUST
+/// send this for any `Request` it declines to service, instead of the classic protocol's
+/// silent drop -- lets the requester stop waiting immediately rather than idling out a timeout.
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
+pub struct RejectRequest {
+    pub index: u32,
+    pub begin: u32,
+    pub length: u32,
+}
+
+impl Encode for RejectRequest {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        let (header, body) = header.split_at_mut(1);
+        length.copy_from_slice(&(1 + 12u32).to_be_bytes());
+        header.copy_from_slice(&[16u8]);
+        body.copy_from_slice(&u32s_to_be_bytes!(self.index, self.begin, self.length));
+    }
+}
+
+/// BEP 6 (Fast Extension): a hint that the receiver may request this piece even while choked.
+/// Purely advisory -- acting on it is optional for the receiver.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
+pub struct AllowedFast {
+    pub piece: u32,
+}
+
+impl Encode for AllowedFast {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        let (header, body) = header.split_at_mut(1);
+        length.copy_from_slice(&5u32.to_be_bytes());
+        header.copy_from_slice(&[17u8]);
+        body.copy_from_slice(&self.piece.to_be_bytes());
+    }
+}
+
 /// BEP 10 extension protocol message: `<len><id=20><ext_id><payload>`. `ext_id` 0 is always the
 /// extended handshake itself; any other value is whatever the two peers negotiated for a given
 /// named extension (e.g. "ut_metadata") in their respective handshakes.
@@ -199,6 +276,11 @@ pub(crate) enum BtMessage {
     Request(Request),
     Piece(Piece),
     Cancel(Cancel),
+    SuggestPiece(SuggestPiece),
+    HaveAll(HaveAll),
+    HaveNone(HaveNone),
+    RejectRequest(RejectRequest),
+    AllowedFast(AllowedFast),
     Extended(Extended),
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
@@ -222,6 +304,11 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::Request(_) => 17,
             BtMessage::Piece(piece) => 13 + piece.data.len(),
             BtMessage::Cancel(_) => 17,
+            BtMessage::SuggestPiece(_) => 9,
+            BtMessage::HaveAll(_) => 5,
+            BtMessage::HaveNone(_) => 5,
+            BtMessage::RejectRequest(_) => 17,
+            BtMessage::AllowedFast(_) => 9,
             BtMessage::Extended(ext) => 6 + ext.payload.len(),
             BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
         };
@@ -241,6 +328,11 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::Request(request) => request.encode(buf),
             BtMessage::Piece(piece) => piece.encode(buf),
             BtMessage::Cancel(cancel) => cancel.encode(buf),
+            BtMessage::SuggestPiece(suggest) => suggest.encode(buf),
+            BtMessage::HaveAll(have_all) => have_all.encode(buf),
+            BtMessage::HaveNone(have_none) => have_none.encode(buf),
+            BtMessage::RejectRequest(reject) => reject.encode(buf),
+            BtMessage::AllowedFast(allowed_fast) => allowed_fast.encode(buf),
             BtMessage::Extended(ext) => ext.encode(buf),
             BtMessage::Unknown(..) => panic!(),
         }
@@ -315,6 +407,20 @@ impl Decoder for BtDecoder {
                     let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
                     BtMessage::Cancel(Cancel { index, begin, length })
                 }
+                13 => BtMessage::SuggestPiece(SuggestPiece {
+                    piece: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                }),
+                14 => BtMessage::HaveAll(HaveAll),
+                15 => BtMessage::HaveNone(HaveNone),
+                16 => {
+                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+                    BtMessage::RejectRequest(RejectRequest { index, begin, length })
+                }
+                17 => BtMessage::AllowedFast(AllowedFast {
+                    piece: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                }),
                 20 => {
                     // BEP 10: <ext_id><payload>, with no wire-level length field of its own
                     let ext_id = buf[0];
@@ -347,12 +453,18 @@ pub(crate) fn supports_extensions(extensions: &[u8; 8]) -> bool {
     extensions[5] & 0x10 != 0
 }
 
+/// BEP 6: bit 0x04 of reserved byte 7 signals Fast Extension support.
+pub(crate) fn supports_fast_extension(extensions: &[u8; 8]) -> bool {
+    extensions[7] & 0x04 != 0
+}
+
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
 /// we have a matching torrent).
 pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<()> {
     let mut extensions = [0u8; 8];
     extensions[5] |= 0x10; // BEP 10: we support the extension protocol
+    extensions[7] |= 0x04; // BEP 6: we support the fast extension
 
     let mut buf = vec![];
     buf.extend_from_slice(HANDSHAKE_STR);
@@ -551,6 +663,46 @@ mod test {
         assert!(supports_extensions(&extensions));
     }
 
+    #[test]
+    fn supports_fast_extension_checks_bit_0x04_of_reserved_byte_7() {
+        let mut extensions = [0u8; 8];
+        assert!(!supports_fast_extension(&extensions));
+        extensions[7] |= 0x04;
+        assert!(supports_fast_extension(&extensions));
+    }
+
+    #[test]
+    fn suggest_piece_round_trips() {
+        let suggest = SuggestPiece { piece: 42 };
+        assert_eq!(round_trip(BtMessage::SuggestPiece(suggest)), BtMessage::SuggestPiece(suggest));
+    }
+
+    #[test]
+    fn have_all_round_trips() {
+        assert_eq!(round_trip(BtMessage::HaveAll(HaveAll)), BtMessage::HaveAll(HaveAll));
+    }
+
+    #[test]
+    fn have_none_round_trips() {
+        assert_eq!(round_trip(BtMessage::HaveNone(HaveNone)), BtMessage::HaveNone(HaveNone));
+    }
+
+    #[test]
+    fn reject_request_round_trips() {
+        let reject = RejectRequest {
+            index: 1,
+            begin: 2,
+            length: 3,
+        };
+        assert_eq!(round_trip(BtMessage::RejectRequest(reject)), BtMessage::RejectRequest(reject));
+    }
+
+    #[test]
+    fn allowed_fast_round_trips() {
+        let allowed = AllowedFast { piece: 9 };
+        assert_eq!(round_trip(BtMessage::AllowedFast(allowed)), BtMessage::AllowedFast(allowed));
+    }
+
     /// The two frames back to back exercise that the decoder only consumes exactly one
     /// frame's worth of bytes and leaves the rest for the next call, per BEP 3 framing.
     #[test]
@@ -624,5 +776,28 @@ mod test {
             )
             .unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 4, 20, 5, 1, 2]);
+
+        // have all / have none: <len=0001><id>, no payload, per BEP 6
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(BtMessage::HaveAll(HaveAll), &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 1, 14]);
+
+        let mut buf = BytesMut::new();
+        BtEncoder.encode(BtMessage::HaveNone(HaveNone), &mut buf).unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 1, 15]);
+
+        // reject request: <len=0013><id=16><index><begin><length>, per BEP 6
+        let mut buf = BytesMut::new();
+        BtEncoder
+            .encode(
+                BtMessage::RejectRequest(RejectRequest {
+                    index: 1,
+                    begin: 2,
+                    length: 3,
+                }),
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(&buf[..], &[0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
     }
 }
