@@ -68,12 +68,14 @@ pub struct PeerDied;
 
 impl PartialOrd for PeerHandle {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.remote_peer_id.partial_cmp(&other.remote_peer_id)
+        Some(self.cmp(other))
     }
 }
 impl Ord for PeerHandle {
+    // every lookup into `TorrentSwarm::active_peers` searches by `remote_addr` (there's only
+    // ever one connection per address), so the sort key here must match, not `remote_peer_id`
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        self.remote_addr.cmp(&other.remote_addr)
     }
 }
 
@@ -96,8 +98,10 @@ impl PeerHandle {
         let initial_stats = PeerStatistics::default();
         let (stats_tx, stats_rx) = watch::channel(initial_stats);
 
+        let num_pieces = torrent.pieces.len();
         let state = PeerState {
-            they_have: vec![0u8; torrent.pieces.len()].into(),
+            // BEP 3 bitfields are `ceil(num_pieces / 8)` bytes, not one byte per piece
+            they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
             choked_us: false,
             choked_them: false,
             interested_them: false,
@@ -111,6 +115,7 @@ impl PeerHandle {
 
             state: state.clone(),
             state_tx,
+            num_pieces,
 
             remote_addr,
             reader: FramedRead::new(reader, BtDecoder),
@@ -226,6 +231,7 @@ struct PeerConnection {
 
     state: PeerState,
     state_tx: watch::Sender<PeerState>,
+    num_pieces: usize,
 
     remote_addr: SocketAddrV4,
     reader: FramedRead<OwnedReadHalf, BtDecoder>,
@@ -367,6 +373,12 @@ impl PeerConnection {
             }
             BtMessage::NotInterested(_) => self.state.interested_us = false,
             BtMessage::Have(have) => {
+                if have.checked as usize >= self.num_pieces {
+                    tracing::warn!("{} sent Have for out-of-range piece {}", self.remote_addr, have.checked);
+                    let _ = self.writer.close().await;
+                    return;
+                }
+
                 let index = have.checked / 8;
                 let offset = have.checked % 8;
 
@@ -375,6 +387,18 @@ impl PeerConnection {
                 self.state.they_have[index as usize] |= flag;
             }
             BtMessage::BitField(bit_field) => {
+                // BEP 3: a bitfield of the wrong length is a protocol violation; drop the
+                // connection rather than risk an out-of-bounds index later
+                if bit_field.has.len() != self.num_pieces.div_ceil(8) {
+                    tracing::warn!(
+                        "{} sent a bitfield of length {} for {} pieces",
+                        self.remote_addr,
+                        bit_field.has.len(),
+                        self.num_pieces
+                    );
+                    let _ = self.writer.close().await;
+                    return;
+                }
                 self.state.they_have = bit_field.has;
             }
             BtMessage::Request(request) => {

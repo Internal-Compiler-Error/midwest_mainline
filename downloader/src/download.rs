@@ -15,7 +15,9 @@ use tokio::time::sleep;
 use tracing::{info, trace};
 
 pub enum DownloadEvent {
-    PieceCompleted(u32),
+    /// `resp` reports back whether the piece actually hash-verified, so a corrupt piece can
+    /// be re-requested instead of silently counted as done.
+    PieceCompleted { piece: u32, resp: oneshot::Sender<bool> },
 }
 
 /// Runs as its own task alongside `TorrentSwarm`. It only holds owned/shared state (Arcs, a
@@ -90,12 +92,18 @@ impl Download {
             }
 
             tokio::select! {
-                Some(piece) = piece_completed.next() => {
-                    info!("piece {} is completed", piece);
-                    downloaded += 1;
-
+                Some((piece, succeeded)) = piece_completed.next() => {
                     in_flight.remove(&piece);
-                    missing_pieces.retain(|missing| *missing != piece);
+
+                    if succeeded {
+                        info!("piece {} is completed", piece);
+                        downloaded += 1;
+                        missing_pieces.retain(|missing| *missing != piece);
+                    } else {
+                        // a peer disconnected mid-request, or the piece failed hash
+                        // verification -- either way it's still missing and gets retried
+                        info!("piece {} failed, will retry", piece);
+                    }
 
                     if in_flight.len() <= self.max_inflight {
                         unblocked.notify_one();
@@ -113,9 +121,9 @@ impl Download {
 
                         piece_completed.push(async move {
                             info!("Started downloading piece {}", piece);
-                            self.download_piece(piece, peer.clone()).await.expect("Oh this is wrong for sure, download can absolutely fail");
+                            let succeeded = self.download_piece(piece, peer.clone()).await.is_ok();
 
-                            piece
+                            (piece, succeeded)
                         });
 
                     } else {
@@ -149,20 +157,24 @@ impl Download {
                     section,
                 )
                 .await
-                .expect("implement retries?");
             });
         }
 
-        // TODO: need to ensure they all succeeded
-        let _: () = join_all(download_blocks).await.into_iter().collect();
+        // propagate the first block failure (e.g. the peer disconnected mid-piece) instead of
+        // panicking the whole download task over what's a routine, retriable failure
+        join_all(download_blocks).await.into_iter().collect::<anyhow::Result<Vec<()>>>()?;
         self.storage.write_piece(piece, buf.into_boxed_slice())?;
 
         // hand off to the swarm: it hash-verifies, updates the verified bitset, and
-        // broadcasts Have to every active peer
-        let _ = self
-            .command_tx
-            .send(TorrentSwarmCommand::ProcessDownloadEvent(DownloadEvent::PieceCompleted(piece)))
-            .await;
+        // broadcasts Have to every active peer; it reports back whether the hash actually
+        // matched so a corrupt piece can be retried rather than counted as done
+        let (resp, rx) = oneshot::channel();
+        self.command_tx
+            .send(TorrentSwarmCommand::ProcessDownloadEvent(DownloadEvent::PieceCompleted { piece, resp }))
+            .await?;
+        if !rx.await.unwrap_or(false) {
+            anyhow::bail!("piece {piece} failed hash verification");
+        }
 
         Ok(())
     }

@@ -904,10 +904,11 @@ impl TorrentSwarm {
                     length: (end - begin) as u32,
                     data: Box::from(&data[begin..end]),
                 };
-                let peer_idx = self
-                    .active_peers
-                    .binary_search_by(|h| h.remote_addr.cmp(&from))
-                    .expect("Only us remove peers, how could it be gone");
+                // the peer may have been dropped between emitting this event and it being
+                // processed here; that's a normal race, not an invariant violation
+                let Ok(peer_idx) = self.active_peers.binary_search_by(|h| h.remote_addr.cmp(&from)) else {
+                    return;
+                };
                 let _ = self.active_peers[peer_idx].send_data(resp).await;
             }
         }
@@ -915,8 +916,9 @@ impl TorrentSwarm {
 
     async fn process_download_event(&mut self, event: DownloadEvent) {
         match event {
-            DownloadEvent::PieceCompleted(piece) => {
+            DownloadEvent::PieceCompleted { piece, resp } => {
                 let valid = self.verify_hash(piece);
+                let _ = resp.send(valid);
                 if !valid {
                     return;
                 }
