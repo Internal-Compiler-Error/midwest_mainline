@@ -1,5 +1,5 @@
 use crate::peer::PeerHandle;
-use crate::settings::BLOCK_SIZE;
+use crate::settings::{BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE};
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{TorrentSwarm, TorrentSwarmCommand, TorrentSwarmSelfCommand};
@@ -100,17 +100,20 @@ impl Download {
                         downloaded += 1;
                         missing_pieces.retain(|missing| *missing != piece);
                     } else {
-                        // a peer disconnected mid-request, or the piece failed hash
-                        // verification -- either way it's still missing and gets retried
+                        // a peer disconnected mid-request, timed out, or the piece failed
+                        // hash verification -- either way it's still missing and gets retried
                         info!("piece {} failed, will retry", piece);
                     }
 
-                    if in_flight.len() <= self.max_inflight {
-                        unblocked.notify_one();
-                    }
+                    // there's now room for one more in-flight piece
+                    unblocked.notify_one();
                 }
                 // TODO: suprious wakeups?
                 _ = unblocked.notified() => {
+                    if in_flight.len() >= self.max_inflight {
+                        continue;
+                    }
+
                     let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
                     let Some(piece) = piece_to_request else {
                         continue;
@@ -180,7 +183,22 @@ impl Download {
     }
 
     async fn download_block(&self, req: Request, peer: PeerHandle, buffer: &mut [u8]) -> anyhow::Result<()> {
-        let data = peer.request_data_from_peer(req).await?;
+        // a peer that accepts a request and then just goes quiet (as opposed to disconnecting
+        // outright) would otherwise hang this block, the piece it belongs to, and everything
+        // joined alongside it, forever
+        let data = tokio::time::timeout(BLOCK_REQUEST_TIMEOUT, peer.request_data_from_peer(req))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for block {req:?} from {}", peer.remote_addr))??;
+
+        // the block length is remote-controlled; a mismatched length must not panic via
+        // copy_from_slice
+        anyhow::ensure!(
+            data.len() == buffer.len(),
+            "peer {} returned {} bytes for a {}-byte block request",
+            peer.remote_addr,
+            data.len(),
+            buffer.len()
+        );
         buffer.copy_from_slice(&data);
 
         Ok(())
