@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Sleep, interval, sleep_until};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
@@ -41,10 +42,50 @@ struct HttpAnnouncer {
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
     #[eq(skip)]
     events: mpsc::Sender<TorrentSwarmCommand>,
+    #[eq(skip)]
+    sent_started: bool,
+    #[eq(skip)]
+    sent_completed: bool,
+    #[eq(skip)]
+    shutdown: CancellationToken,
 }
 
 pub enum AnnouncerEvent {
     DiscoveredPeers(Vec<SocketAddrV4>),
+}
+
+/// The tracker `event` parameter (BEP 3 for HTTP, BEP 15 for UDP). The first announce to a
+/// tracker must be Started; a single announce reporting Completed should follow the download
+/// finishing; Stopped is a courtesy announce on graceful shutdown so the tracker can drop us
+/// immediately instead of waiting out the interval. Anything else is a regular periodic announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceEvent {
+    Regular,
+    Started,
+    Completed,
+    Stopped,
+}
+
+impl AnnounceEvent {
+    fn http_str(self) -> Option<&'static str> {
+        match self {
+            AnnounceEvent::Regular => None,
+            AnnounceEvent::Started => Some("started"),
+            AnnounceEvent::Completed => Some("completed"),
+            AnnounceEvent::Stopped => Some("stopped"),
+        }
+    }
+
+    /// BEP 15's UDP tracker protocol encodes the same event as an int, with this (not the
+    /// obvious 0/1/2/3-in-declaration-order) mapping.
+    fn udp_code(self) -> i32 {
+        match self {
+            AnnounceEvent::Regular => Event::None as i32,
+            AnnounceEvent::Completed => Event::Completed as i32,
+            AnnounceEvent::Started => Event::Started as i32,
+            AnnounceEvent::Stopped => Event::Stopped as i32,
+        }
+    }
 }
 
 impl HttpAnnouncer {
@@ -54,6 +95,7 @@ impl HttpAnnouncer {
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         events: mpsc::Sender<TorrentSwarmCommand>,
+        shutdown: CancellationToken,
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
 
@@ -64,6 +106,9 @@ impl HttpAnnouncer {
             next_ready: Instant::now() + Duration::from_millis(10),
             swarm_stat,
             events,
+            sent_started: false,
+            sent_completed: false,
+            shutdown,
         }
     }
 
@@ -74,7 +119,7 @@ impl HttpAnnouncer {
 
     /// Perform a single announce and return the interval and discovered peers
     #[tracing::instrument(skip(self))]
-    async fn announce(&mut self) -> anyhow::Result<Vec<SocketAddrV4>> {
+    async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddrV4>> {
         // percent encode info_hash and peer_id
         let info_hash_encoded: String = form_urlencoded::byte_serialize(&self.torrent.info_hash.0).collect();
         let peer_id_encoded: String = form_urlencoded::byte_serialize(&self.identity.peer_id).collect();
@@ -83,7 +128,7 @@ impl HttpAnnouncer {
 
         // Build the announce URL
         let url = format!(
-            "{tracker_url}?info_hash={info_hash}&peer_id={peer_id}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1",
+            "{tracker_url}?info_hash={info_hash}&peer_id={peer_id}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1{event}",
             tracker_url = self.tracker,
             info_hash = info_hash_encoded,
             peer_id = peer_id_encoded,
@@ -91,6 +136,7 @@ impl HttpAnnouncer {
             uploaded = swarm_stat.uploaded,
             downloaded = swarm_stat.downloaded,
             left = swarm_stat.left,
+            event = event.http_str().map(|e| format!("&event={e}")).unwrap_or_default(),
         );
 
         // fn percent_encode(bytes: &[u8]) -> String {
@@ -172,22 +218,43 @@ impl HttpAnnouncer {
     }
 
     async fn ev_loop(mut self) {
-        // TODO: make a way for it to die gracefully
         loop {
-            self.ready().await;
-            match self.announce().await {
-                Ok(result) => {
-                    let _ = self
-                        .events
-                        .send(TorrentSwarmCommand::ProcessAnnounceEvent(
-                            AnnouncerEvent::DiscoveredPeers(result),
-                        ))
-                        .await;
+            tokio::select! {
+                _ = self.ready() => {
+                    // BEP 3: the first announce to a tracker must carry event=started
+                    let event = if self.sent_started { AnnounceEvent::Regular } else { AnnounceEvent::Started };
+                    match self.announce(event).await {
+                        Ok(result) => {
+                            self.sent_started = true;
+                            let _ = self
+                                .events
+                                .send(TorrentSwarmCommand::ProcessAnnounceEvent(
+                                    AnnouncerEvent::DiscoveredPeers(result),
+                                ))
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("{:?}", e);
+                            // TODO: use exponential backoff
+                            self.next_ready = Instant::now() + Duration::from_mins(1);
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("{:?}", e);
-                    // TODO: use exponential backoff
-                    self.next_ready = Instant::now() + Duration::from_mins(1);
+                // BEP 3: a single announce reporting event=completed should follow the
+                // download finishing; watch the shared stats for that transition rather
+                // than waiting for the next periodic announce, which could be minutes away
+                Ok(()) = self.swarm_stat.changed(), if !self.sent_completed => {
+                    if self.swarm_stat.borrow().completed && self.announce(AnnounceEvent::Completed).await.is_ok() {
+                        self.sent_started = true;
+                        self.sent_completed = true;
+                    }
+                }
+                // BEP 3: send a courtesy event=stopped on graceful shutdown so the tracker
+                // drops us immediately instead of waiting out the interval; best-effort,
+                // since we're on our way out regardless of whether it succeeds
+                _ = self.shutdown.cancelled() => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), self.announce(AnnounceEvent::Stopped)).await;
+                    break;
                 }
             }
         }
@@ -212,6 +279,13 @@ struct UdpAnnouncer {
     // TODO: Maybe this should be a weak sender?
     #[eq(skip)]
     event: mpsc::Sender<TorrentSwarmCommand>,
+
+    #[eq(skip)]
+    sent_started: bool,
+    #[eq(skip)]
+    sent_completed: bool,
+    #[eq(skip)]
+    shutdown: CancellationToken,
 }
 
 #[repr(i32)]
@@ -242,6 +316,7 @@ impl UdpAnnouncer {
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         event: mpsc::Sender<TorrentSwarmCommand>,
+        shutdown: CancellationToken,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
         UdpAnnouncer {
@@ -253,6 +328,9 @@ impl UdpAnnouncer {
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
             // haven't done anything
             event,
+            sent_started: false,
+            sent_completed: false,
+            shutdown,
         }
     }
 
@@ -359,7 +437,7 @@ impl UdpAnnouncer {
 
     /// Perform a single announce and return the interval and discovered peers
     #[tracing::instrument(skip(self))]
-    async fn announce(&mut self, socket: &mut UdpSocket) -> anyhow::Result<Vec<SocketAddrV4>> {
+    async fn announce(&mut self, socket: &mut UdpSocket, event: AnnounceEvent) -> anyhow::Result<Vec<SocketAddrV4>> {
         macro_rules! udp_log {
             ($level:ident, $fmt:literal $(, $args:expr)* $(,)?) => {
                 $level!(
@@ -407,7 +485,7 @@ impl UdpAnnouncer {
             downloaded: downloaded.into(),
             left: left.into(),
             uploaded: uploaded.into(),
-            event: (Event::None as i32).into(),
+            event: event.udp_code().into(),
             ip: 0.into(), // i.e. let the tracker infer from the source packet
             key: key.into(),
             num_want: (-1).into(), // -1 is the default
@@ -530,21 +608,49 @@ impl UdpAnnouncer {
         self.connect(&mut socket).await.inspect_err(|e| warn!("{:?}", e))?;
 
         loop {
-            self.ready().await;
-            // TODO: should retry instead of stopping at first failure
-            let peers = self
-                .announce(&mut socket)
-                .await
-                .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
+            tokio::select! {
+                _ = self.ready() => {
+                    // TODO: should retry instead of stopping at first failure
+                    // BEP 15: the first announce to a tracker must carry event=started
+                    let event = if self.sent_started { AnnounceEvent::Regular } else { AnnounceEvent::Started };
+                    let peers = self
+                        .announce(&mut socket, event)
+                        .await
+                        .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
+                    self.sent_started = true;
 
-            // TODO: should we send events directly or use the handle
-            let _ = self
-                .event
-                .send(TorrentSwarmCommand::ProcessAnnounceEvent(
-                    AnnouncerEvent::DiscoveredPeers(peers),
-                ))
-                .await;
+                    // TODO: should we send events directly or use the handle
+                    let _ = self
+                        .event
+                        .send(TorrentSwarmCommand::ProcessAnnounceEvent(
+                            AnnouncerEvent::DiscoveredPeers(peers),
+                        ))
+                        .await;
+                }
+                // BEP 15: a single announce reporting event=completed should follow the
+                // download finishing, rather than waiting for the next periodic announce
+                Ok(()) = self.swarm_stat.changed(), if !self.sent_completed => {
+                    if self.swarm_stat.borrow().completed
+                        && self.announce(&mut socket, AnnounceEvent::Completed).await.is_ok()
+                    {
+                        self.sent_started = true;
+                        self.sent_completed = true;
+                    }
+                }
+                // BEP 15: send a courtesy event=stopped on graceful shutdown so the tracker
+                // drops us immediately instead of waiting out the interval; best-effort
+                _ = self.shutdown.cancelled() => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.announce(&mut socket, AnnounceEvent::Stopped),
+                    )
+                    .await;
+                    break;
+                }
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -686,7 +792,12 @@ impl Ord for PendingPeer {
 }
 
 impl TorrentSwarm {
-    pub fn new(torrent: Arc<Torrent>, storage: Arc<TorrentStorage>, id: Arc<Identity>) -> TorrentSwarm {
+    pub fn new(
+        torrent: Arc<Torrent>,
+        storage: Arc<TorrentStorage>,
+        id: Arc<Identity>,
+        shutdown: CancellationToken,
+    ) -> TorrentSwarm {
         let verified = vec![false; torrent.pieces.len()];
         let verified: BitBox<u8, Msb0> = BitBox::from_iter(verified.iter());
         // TODO: this only works for fresh downloads
@@ -709,11 +820,29 @@ impl TorrentSwarm {
         let http_announcers: Vec<_> = trackers
             .clone()
             .filter(|t| t.scheme() == "http" || t.scheme() == "https")
-            .map(|t| HttpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone(), command_tx.clone()))
+            .map(|t| {
+                HttpAnnouncer::new(
+                    t,
+                    torrent.clone(),
+                    id.clone(),
+                    stat_rx.clone(),
+                    command_tx.clone(),
+                    shutdown.clone(),
+                )
+            })
             .collect();
         let udp_announcers: Vec<_> = trackers
             .filter(|t| t.scheme() == "udp")
-            .map(|t| UdpAnnouncer::new(t, torrent.clone(), id.clone(), stat_rx.clone(), command_tx.clone()))
+            .map(|t| {
+                UdpAnnouncer::new(
+                    t,
+                    torrent.clone(),
+                    id.clone(),
+                    stat_rx.clone(),
+                    command_tx.clone(),
+                    shutdown.clone(),
+                )
+            })
             .collect();
 
         TorrentSwarm {
@@ -934,6 +1063,10 @@ impl TorrentSwarm {
                     .nth_piece_size(piece)
                     .expect("we control download task, it's not malicious");
                 self.stat.left = self.torrent.total_size as usize - self.stat.written;
+                self.stat.completed = self.stat.all_verified();
+                // announcers watch this to send a prompt event=completed rather than
+                // waiting for their next periodic announce, which could be minutes away
+                let _ = self.stat_snapshot_tx.send(self.stat.clone());
 
                 let mut work = vec![];
                 for p in self.active_peers.iter() {

@@ -10,12 +10,16 @@ use std::fs;
 use std::fs::File;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 pub struct BtClient {
     id: Arc<Identity>,
     swarms: HashMap<InfoHash, TorrentSwarm>,
     handles: HashMap<InfoHash, TorrentSwarmHandle>,
     peer_factories: HashMap<InfoHash, PeerFactory>,
+    /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
+    /// event=stopped announce before the process exits
+    shutdown: CancellationToken,
 }
 
 impl BtClient {
@@ -25,7 +29,13 @@ impl BtClient {
             swarms: HashMap::new(),
             handles: HashMap::new(),
             peer_factories: HashMap::new(),
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// A handle the caller can cancel (e.g. on Ctrl+C) to trigger a graceful shutdown.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     pub fn add_torrent(&mut self, mut torrent: Torrent) -> anyhow::Result<()> {
@@ -43,7 +53,7 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let task = TorrentSwarm::new(torrent.clone(), storage, self.id.clone());
+        let task = TorrentSwarm::new(torrent.clone(), storage, self.id.clone(), self.shutdown.clone());
 
         self.handles.insert(torrent.info_hash, task.make_handle());
         self.peer_factories.insert(torrent.info_hash, task.peer_factory());
@@ -57,12 +67,14 @@ impl BtClient {
             mut swarms,
             handles,
             peer_factories,
+            shutdown,
         } = self;
 
         let mut tasks = vec![tokio::spawn(Self::accept_incoming(
             id,
             Arc::new(handles),
             Arc::new(peer_factories),
+            shutdown,
         ))];
         for (_info_hash, swarm) in swarms.drain() {
             tasks.push(tokio::spawn(swarm.work_loop()));
@@ -80,6 +92,7 @@ impl BtClient {
         id: Arc<Identity>,
         handles: Arc<HashMap<InfoHash, TorrentSwarmHandle>>,
         peer_factories: Arc<HashMap<InfoHash, PeerFactory>>,
+        shutdown: CancellationToken,
     ) {
         let listener = match TcpListener::bind(id.serving).await {
             Ok(listener) => listener,
@@ -91,12 +104,15 @@ impl BtClient {
         tracing::info!("listening for inbound peer connections on {}", id.serving);
 
         loop {
-            let (mut tcp, remote_addr) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    tracing::warn!("failed to accept an inbound connection: {e:?}");
-                    continue;
-                }
+            let (mut tcp, remote_addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::warn!("failed to accept an inbound connection: {e:?}");
+                        continue;
+                    }
+                },
+                _ = shutdown.cancelled() => break,
             };
 
             let id = id.clone();
