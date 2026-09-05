@@ -1,4 +1,4 @@
-use crate::settings::RATE_WINDOW;
+use crate::settings::{BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, RATE_WINDOW, REQUEST_PIPELINE_TARGET};
 use crate::wire::{
     BitField, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
     RejectRequest, Request, Unchoke,
@@ -101,6 +101,10 @@ impl Peer {
     /// Is the peer ready for more requests?
     pub fn ready(&self) -> bool {
         !self.choked_us
+    }
+
+    pub fn request_window(&self) -> usize {
+        self.stats.request_window()
     }
 
     /// Applies a message that only touches this connection's own state. Anything else (data
@@ -461,6 +465,13 @@ impl PeerStatistics {
         self.sent += length;
     }
 
+    /// How many block requests to keep outstanding at this peer: REQUEST_PIPELINE_TARGET
+    /// worth of its measured throughput, within MIN_REQUEST_WINDOW..=MAX_REQUEST_WINDOW.
+    pub fn request_window(&self) -> usize {
+        let bytes = self.rx_rate * REQUEST_PIPELINE_TARGET.as_secs_f64();
+        ((bytes / BLOCK_SIZE as f64) as usize).clamp(MIN_REQUEST_WINDOW, MAX_REQUEST_WINDOW)
+    }
+
     /// UCB1: the peer's download throughput plus an exploration bonus that shrinks the more
     /// often it's been picked, relative to how often *anyone* has been picked (`total_picks`,
     /// block requests to every peer so far). UCB1's bonus is sized for rewards in `0..=1`,
@@ -629,6 +640,21 @@ mod test {
             stats.score(10, stats.rx_rate) > 1.0,
             "the exploration bonus is positive"
         );
+    }
+
+    #[test]
+    fn request_window_follows_the_measured_rate_within_its_bounds() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        let mut stats = PeerStatistics::default();
+        assert_eq!(stats.request_window(), MIN_REQUEST_WINDOW, "no measurement yet");
+
+        stats.requests_started(t0);
+        stats.block_received(10 * BLOCK_SIZE, later);
+        assert_eq!(stats.request_window(), 10 * REQUEST_PIPELINE_TARGET.as_secs() as usize);
+
+        stats.block_received(10_000 * BLOCK_SIZE, later);
+        assert_eq!(stats.request_window(), MAX_REQUEST_WINDOW);
     }
 
     #[test]

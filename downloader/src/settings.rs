@@ -12,10 +12,20 @@ pub const METADATA_PIECE_SIZE: usize = 16 * 1024;
 /// also bounds how many peers are downloading from at once.
 pub const MAX_INFLIGHT_BYTES: usize = 128 * 1024 * 1024;
 
-/// Block requests outstanding to one peer before it's skipped for further pieces. Remote
-/// clients cap how many requests they'll queue (commonly 250-500) and reject or drop the rest,
-/// so asking one fast peer for everything at once only gets requests bounced back.
-pub const MAX_OUTSTANDING_BLOCKS_PER_PEER: usize = 256;
+/// How much of a peer's measured throughput to keep requested from it: its request window
+/// is this many seconds of data, in blocks (see `Peer::request_window`). The same idea as a
+/// TCP congestion window sized to the bandwidth-delay product, except both terms are
+/// measured directly. It must comfortably exceed the request-to-delivery latency, or the
+/// measured rate can never grow the window.
+pub const REQUEST_PIPELINE_TARGET: Duration = Duration::from_secs(3);
+
+/// Floor of the request window: what a peer with no measured rate yet is asked for, and
+/// enough that the queue can't empty between a delivery and the refill that follows it.
+pub const MIN_REQUEST_WINDOW: usize = 4;
+
+/// Ceiling of the request window. Remote clients cap how many requests they'll queue
+/// (commonly 250-500) and reject, drop, or disconnect past it.
+pub const MAX_REQUEST_WINDOW: usize = 128;
 
 /// How long to wait for a peer's TCP connection to come up. Most addresses a tracker hands
 /// out are behind NAT or gone, and the OS default (over a minute) would hold a dial slot that

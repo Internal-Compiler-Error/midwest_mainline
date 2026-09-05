@@ -3,8 +3,8 @@ use crate::defs::Identity;
 use crate::peer::{Peer, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request};
 use crate::settings::{
     BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
-    MAX_OUTSTANDING_BLOCKS_PER_PEER, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS,
-    PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS,
+    MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL,
+    PEX_MAX_ADDED_PEERS,
 };
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
@@ -117,6 +117,29 @@ struct InFlight {
     peer: SocketAddr,
     buf: Vec<u8>,
     blocks_left: usize,
+    /// offset of the first block not yet requested; blocks are requested in order as the
+    /// peer's window allows, not all at once
+    next_begin: usize,
+}
+
+impl InFlight {
+    fn next_request(&mut self, piece: u32) -> Option<Request> {
+        let size = self.buf.len();
+        if self.next_begin >= size {
+            return None;
+        }
+        let begin = self.next_begin;
+        self.next_begin += BLOCK_SIZE;
+        Some(Request {
+            index: piece,
+            begin: begin as u32,
+            length: (size - begin).min(BLOCK_SIZE) as u32,
+        })
+    }
+
+    fn unrequested_blocks(&self) -> usize {
+        self.buf.len().saturating_sub(self.next_begin).div_ceil(BLOCK_SIZE)
+    }
 }
 
 pub struct TorrentSwarm {
@@ -335,6 +358,14 @@ impl TorrentSwarm {
         self.publish_stats();
     }
 
+    fn pieces_held_by(&self, addr: SocketAddr) -> Vec<u32> {
+        self.in_flight
+            .iter()
+            .filter(|(_, f)| f.peer == addr)
+            .map(|(piece, _)| *piece)
+            .collect()
+    }
+
     fn peer_index(&self, addr: SocketAddr) -> Option<usize> {
         self.peers.binary_search_by_key(&addr, |p| p.remote_addr).ok()
     }
@@ -342,13 +373,7 @@ impl TorrentSwarm {
     /// Removes a peer and puts whatever it was downloading for us back up for grabs.
     fn drop_peer(&mut self, idx: usize) {
         let peer = self.peers.remove(idx);
-        let theirs: Vec<u32> = self
-            .in_flight
-            .iter()
-            .filter(|(_, f)| f.peer == peer.remote_addr)
-            .map(|(piece, _)| *piece)
-            .collect();
-        for piece in theirs {
+        for piece in self.pieces_held_by(peer.remote_addr) {
             self.in_flight.remove(&piece);
             self.missing.push(piece);
         }
@@ -386,8 +411,18 @@ impl TorrentSwarm {
 
     async fn on_peer_message(&mut self, idx: usize, msg: BtMessage) {
         let peer = &mut self.peers[idx];
+        let choked = matches!(msg, BtMessage::Choke(_));
         let msg = match peer.apply(msg) {
             Ok(None) => {
+                if choked {
+                    // BEP 3: a choke discards our outstanding requests, and nothing more
+                    // will be asked of the peer until it unchokes, so its pieces go back
+                    // on the pile now rather than after a stall timeout
+                    let addr = peer.remote_addr;
+                    for piece in self.pieces_held_by(addr) {
+                        self.fail_piece(piece);
+                    }
+                }
                 // a Have/BitField/Unchoke may have just made a piece requestable
                 self.schedule().await;
                 return;
@@ -557,6 +592,7 @@ impl TorrentSwarm {
         in_flight.buf[begin..end].copy_from_slice(&block.data);
         in_flight.blocks_left -= 1;
         if in_flight.blocks_left > 0 {
+            self.refill(idx).await;
             return;
         }
 
@@ -588,7 +624,8 @@ impl TorrentSwarm {
 
     /// Keeps up to `MAX_INFLIGHT_BYTES` of pieces on the wire. Rarest-first picks *which piece*
     /// to go after next; UCB scoring separately picks *which peer* to ask -- the two compose
-    /// rather than compete.
+    /// rather than compete. A piece is assigned whole to one peer, but its blocks are only
+    /// requested as that peer's window allows (see `refill`).
     async fn schedule(&mut self) {
         loop {
             let in_flight: usize = self.in_flight.values().map(|f| f.buf.len()).sum();
@@ -603,31 +640,53 @@ impl TorrentSwarm {
             };
 
             let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
-            let blocks: Vec<Request> = (0..size)
-                .step_by(BLOCK_SIZE)
-                .map(|begin| Request {
-                    index: piece,
-                    begin: begin as u32,
-                    length: (size - begin).min(BLOCK_SIZE) as u32,
-                })
-                .collect();
             self.missing.retain(|p| *p != piece);
             self.in_flight.insert(
                 piece,
                 InFlight {
                     peer: self.peers[idx].remote_addr,
                     buf: vec![0u8; size],
-                    blocks_left: blocks.len(),
+                    blocks_left: size.div_ceil(BLOCK_SIZE),
+                    next_begin: 0,
                 },
             );
-            info!("requesting piece {piece} from {}", self.peers[idx].remote_addr);
-            self.total_picks += blocks.len();
-            for req in blocks {
-                if self.peers[idx].request_block(req).await.is_err() {
-                    self.drop_peer(idx);
-                    return;
+            info!(
+                "requesting piece {piece} from {} (window {})",
+                self.peers[idx].remote_addr,
+                self.peers[idx].request_window()
+            );
+        }
+        for idx in (0..self.peers.len()).rev() {
+            self.refill(idx).await;
+        }
+    }
+
+    /// Tops the peer's outstanding requests up to its window from the pieces assigned to it.
+    /// The peer is dropped if a send fails, so callers must not hold an index past this.
+    async fn refill(&mut self, idx: usize) {
+        let peer = &mut self.peers[idx];
+        if !peer.ready() {
+            return;
+        }
+        let addr = peer.remote_addr;
+        let mut room = peer.request_window().saturating_sub(peer.requested.len());
+        let mut failed = false;
+        'pieces: for (&piece, f) in self.in_flight.iter_mut().filter(|(_, f)| f.peer == addr) {
+            while room > 0 {
+                let Some(req) = f.next_request(piece) else {
+                    continue 'pieces;
+                };
+                self.total_picks += 1;
+                if peer.request_block(req).await.is_err() {
+                    failed = true;
+                    break 'pieces;
                 }
+                room -= 1;
             }
+            break;
+        }
+        if failed {
+            self.drop_peer(idx);
         }
     }
 
@@ -649,15 +708,21 @@ impl TorrentSwarm {
         by_availability.choose(&mut rand::rng()).map(|&(piece, _)| piece)
     }
 
-    /// UCB peer selection: of the peers that have `piece`, aren't choking us, and aren't
-    /// already loaded up to `MAX_OUTSTANDING_BLOCKS_PER_PEER`, the one with the highest upper
-    /// confidence bound on its download speed.
+    /// UCB peer selection: of the peers that have `piece`, aren't choking us, and have room
+    /// in their request window for more work, the one with the highest upper confidence
+    /// bound on its download speed.
     fn best_peer(&self, piece: u32) -> Option<usize> {
         let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
+        let mut backlog: BTreeMap<SocketAddr, usize> = BTreeMap::new();
+        for f in self.in_flight.values() {
+            *backlog.entry(f.peer).or_default() += f.unrequested_blocks();
+        }
+        let has_room =
+            |p: &Peer| p.requested.len() + backlog.get(&p.remote_addr).copied().unwrap_or(0) < p.request_window();
         self.peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.ready() && p.they_have(piece) && p.requested.len() < MAX_OUTSTANDING_BLOCKS_PER_PEER)
+            .filter(|(_, p)| p.ready() && p.they_have(piece) && has_room(p))
             .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
@@ -858,6 +923,7 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
 mod test {
     use super::*;
     use crate::metadata::build_torrent_file;
+    use crate::settings::MIN_REQUEST_WINDOW;
     use crate::torrent::parse_torrent;
     use crate::wire::BtCodec;
     use futures::SinkExt;
@@ -946,6 +1012,11 @@ mod test {
     /// The fake peer's side of the opening exchange: it expects our BitField and Interested,
     /// then declares it has everything and unchokes us.
     async fn open_as_seeder(peer: &mut Framed<TcpStream, BtCodec>) {
+        open_with(peer, 0xFF).await;
+    }
+
+    /// Like `open_as_seeder`, but the peer declares only the pieces set in `bitfield`.
+    async fn open_with(peer: &mut Framed<TcpStream, BtCodec>, bitfield: u8) {
         let Some(Ok(BtMessage::BitField(_))) = peer.next().await else {
             panic!("expected our bitfield first");
         };
@@ -953,7 +1024,7 @@ mod test {
             panic!("expected Interested after the bitfield");
         };
         peer.send(BtMessage::BitField(BitField {
-            has: vec![0xFF; 1].into(),
+            has: vec![bitfield; 1].into(),
         }))
         .await
         .unwrap();
@@ -1018,9 +1089,42 @@ mod test {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// Requests are pipelined: a peer with no measured rate yet gets MIN_REQUEST_WINDOW
+    /// requests and nothing more until it delivers, rather than every block of every
+    /// assigned piece landing on it at once.
+    #[tokio::test]
+    async fn requests_are_paced_by_the_peers_window() {
+        let (swarm, handle, path) = swarm("window");
+        tokio::spawn(swarm.work_loop());
+
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+
+        let mut requests = Vec::new();
+        for _ in 0..MIN_REQUEST_WINDOW {
+            let Some(Ok(BtMessage::Request(req))) = seeder.next().await else {
+                panic!("expected a request");
+            };
+            requests.push(req);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), seeder.next())
+                .await
+                .is_err(),
+            "nothing more until a block is delivered"
+        );
+
+        // a delivery both frees a slot and gives the peer a measured rate, which over
+        // localhost is enormous, so the window opens up from here
+        seeder.send(block(requests[0])).await.unwrap();
+        let Some(Ok(BtMessage::Request(_))) = seeder.next().await else {
+            panic!("a delivery makes room for more requests");
+        };
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// A peer that vanishes mid-piece must not keep that piece's slot: another peer has to be
-    /// asked for it. With only 3 pieces and room for 100 in flight, all of them are in flight
-    /// with the first peer when it hangs up.
+    /// asked for it.
     #[tokio::test]
     async fn pieces_abandoned_by_a_dead_peer_are_requested_from_another() {
         let (swarm, handle, path) = swarm("dead");
@@ -1201,25 +1305,19 @@ mod test {
         let (swarm, handle, path) = swarm("reject");
         tokio::spawn(swarm.work_loop());
 
-        // a is ready first, so it gets all three pieces; b is ready before a rejects anything
+        // a is ready first, so it gets the work; b only has the piece a is about to reject,
+        // and is ready before a rejects it
         let mut a = fake_peer(&handle, "10.0.0.6:6881").await;
         open_as_seeder(&mut a).await;
-        let mut first = None;
-        let mut asked_a = BTreeSet::new();
-        while asked_a.len() < 3 {
-            let Some(Ok(BtMessage::Request(req))) = a.next().await else {
-                panic!("expected a request");
-            };
-            first.get_or_insert(req);
-            asked_a.insert(req.index);
-        }
+        let Some(Ok(BtMessage::Request(rejected))) = a.next().await else {
+            panic!("expected a request");
+        };
         let mut b = fake_peer(&handle, "10.0.0.7:6881").await;
-        open_as_seeder(&mut b).await;
+        open_with(&mut b, 0x80 >> rejected.index).await;
         // b's bitfield and unchoke travel on a different socket than a's reject below; give
         // the swarm a moment to have seen them, or a is the only ready peer when it reschedules
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let rejected = first.unwrap();
         a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
             index: rejected.index,
             begin: rejected.begin,

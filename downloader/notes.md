@@ -202,3 +202,22 @@ second (millions) it was invisible, so exploration ended with each peer's first 
 one peer that happened to measure fastest took every request it had room for. `best_peer`
 now divides each rate by the fastest rate in the swarm, so a peer at 80% of the best speed
 with far fewer picks still wins some. Test: `a_rarely_picked_peer_can_outscore_the_fastest_one`.
+
+# Requests are pipelined through a per-peer window, 2026-09-05
+A piece used to be requested in one burst: all of its blocks at once, 256 requests for a
+4 MiB piece, at the edge of what many clients tolerate (libtorrent-based ones queue 500,
+some cap at 250 and reject or disconnect past it). Now `InFlight` keeps a cursor over the
+blocks not yet requested and `TorrentSwarm::refill` tops each peer up to its
+`request_window`: `REQUEST_PIPELINE_TARGET` seconds of its measured throughput in blocks,
+clamped to `MIN_REQUEST_WINDOW..=MAX_REQUEST_WINDOW`. It's a congestion window sized to the
+bandwidth-delay product, with both terms measured rather than probed for. A fresh peer gets
+the floor, its first deliveries give it a rate, and the window grows from there. `best_peer`
+only hands a peer another piece when its window has room for more than what it already holds
+(outstanding plus not yet requested), so the top-scored peer can't be given the whole budget
+at startup. A choke now fails the peer's pieces immediately, since BEP 3 says a choke
+discards outstanding requests and refill won't ask a choked peer for more; before, they idled
+out the stall timeout. Tests: `requests_are_paced_by_the_peers_window`,
+`request_window_follows_the_measured_rate_within_its_bounds`.
+
+The net is only as wide as `MAX_INFLIGHT_BYTES / piece size` busy peers (32 on a 4 MiB
+piece torrent); the window doesn't change that bound.
