@@ -6,7 +6,6 @@ use crate::torrent_swarm::{TorrentSwarm, TorrentSwarmCommand, TorrentSwarmSelfCo
 use crate::wire::Request;
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
-use rand::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +67,21 @@ impl Download {
         }
         rx.await.unwrap_or(true)
     }
+
+    /// Rarest-first piece selection: asks the swarm which of `candidates` the fewest active
+    /// peers have. This picks *which piece* to go after next; `best_peer`'s UCB scoring
+    /// separately picks *which peer* to request it from.
+    async fn rarest_missing_piece(&self, candidates: Vec<u32>) -> Option<u32> {
+        let (resp, rx) = oneshot::channel();
+        self.command_tx
+            .send(TorrentSwarmCommand::SelfCommand(TorrentSwarmSelfCommand::PickRarestPiece {
+                candidates,
+                resp,
+            }))
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
 }
 
 impl Download {
@@ -76,7 +90,6 @@ impl Download {
         // the number of pieces downloaded *in* this session, already download pieces don't count
         let mut downloaded = 0;
         let mut missing_pieces: Vec<u32> = (0..self.torrent.pieces.len()).map(|p| p.try_into().unwrap()).collect();
-        missing_pieces.shuffle(&mut rand::rng());
         let mut in_flight = HashSet::new();
 
         let mut piece_completed = FuturesUnordered::new();
@@ -114,8 +127,17 @@ impl Download {
                         continue;
                     }
 
-                    let piece_to_request = missing_pieces.iter().find(|&&p| !in_flight.contains(&p)).copied();
-                    let Some(piece) = piece_to_request else {
+                    let candidates: Vec<u32> = missing_pieces.iter().filter(|&&p| !in_flight.contains(&p)).copied().collect();
+                    if candidates.is_empty() {
+                        continue;
+                    }
+
+                    // rarest-first: pick which piece to go after based on swarm-wide
+                    // availability; best_peer's UCB scoring separately picks who to ask
+                    let Some(piece) = self.rarest_missing_piece(candidates).await else {
+                        trace!("No connected peer has any of our missing pieces, sleep for 1000ms");
+                        sleep(Duration::from_millis(1000)).await;
+                        unblocked.notify_one();
                         continue;
                     };
 

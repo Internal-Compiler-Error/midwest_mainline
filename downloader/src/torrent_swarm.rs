@@ -750,6 +750,14 @@ pub(crate) enum TorrentSwarmSelfCommand {
         resp: oneshot::Sender<Option<PeerHandle>>,
     },
     QueryAllVerified { resp: oneshot::Sender<bool> },
+    /// Rarest-first piece selection: pick whichever of `candidates` the fewest active peers
+    /// have (ties broken randomly), so swarm-wide availability stays balanced. This decides
+    /// *which piece* to request next; `ChooseBestPeer`'s UCB scoring separately decides *which
+    /// peer* to request it from -- the two compose rather than compete.
+    PickRarestPiece {
+        candidates: Vec<u32>,
+        resp: oneshot::Sender<Option<u32>>,
+    },
 }
 
 pub struct TorrentSwarm {
@@ -963,6 +971,21 @@ impl TorrentSwarm {
             .into_iter()
             .max_by(|(_, lscore), (_, rscore)| lscore.total_cmp(rscore))
             .map(|(handle, _)| handle.clone())
+    }
+
+    /// Rarest-first piece selection: among `candidates`, pick the one held by the fewest
+    /// active peers (ties broken randomly, so many peers starting at once don't all pile
+    /// onto the same single rarest piece). Returns `None` if none of the candidates are
+    /// available from any connected peer.
+    fn rarest_piece(&self, candidates: &[u32]) -> Option<u32> {
+        let availability = |piece: u32| self.active_peers.iter().filter(|p| p.state().they_have(piece)).count();
+
+        let mut by_availability: Vec<(u32, usize)> =
+            candidates.iter().map(|&p| (p, availability(p))).filter(|&(_, count)| count > 0).collect();
+        let rarest_count = by_availability.iter().map(|&(_, count)| count).min()?;
+        by_availability.retain(|&(_, count)| count == rarest_count);
+
+        by_availability.choose(&mut rand::rng()).map(|&(piece, _)| piece)
     }
 
     async fn process_command(&mut self, command: TorrentSwarmCommand) {
@@ -1196,6 +1219,9 @@ impl TorrentSwarm {
             }
             TorrentSwarmSelfCommand::QueryAllVerified { resp } => {
                 let _ = resp.send(self.all_verified());
+            }
+            TorrentSwarmSelfCommand::PickRarestPiece { candidates, resp } => {
+                let _ = resp.send(self.rarest_piece(&candidates));
             }
         }
 
