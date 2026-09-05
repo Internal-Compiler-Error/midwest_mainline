@@ -4,7 +4,7 @@ use crate::torrent::Torrent;
 use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
 use anyhow::{Context, bail};
 use bitvec::prelude::*;
-use futures::future::{join_all, select_all};
+use futures::future::select_all;
 use midwest_mainline::types::InfoHash;
 use std::collections::HashMap;
 use std::fs;
@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 pub struct BtClient {
     id: Arc<Identity>,
-    swarms: HashMap<InfoHash, TorrentSwarm>,
-    handles: HashMap<InfoHash, TorrentSwarmHandle>,
-    stats: HashMap<InfoHash, watch::Receiver<TorrentSwarmStats>>,
+    /// each swarm runs on its own task from the moment it's added; the handle is all there is
+    /// of it here, and dropping it is what stops it (see `TorrentSwarmHandle`)
+    swarms: HashMap<InfoHash, TorrentSwarmHandle>,
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
     shutdown: CancellationToken,
@@ -38,8 +38,6 @@ impl BtClient {
         Self {
             id: Arc::new(id),
             swarms: HashMap::new(),
-            handles: HashMap::new(),
-            stats: HashMap::new(),
             shutdown,
         }
     }
@@ -54,7 +52,7 @@ impl BtClient {
     /// `work()` has taken ownership of this `BtClient` -- the receiver only depends on the
     /// underlying channel, not on anything reachable through `self`.
     pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
-        self.stats.get(&torrent.info_hash).cloned()
+        self.swarms.get(&torrent.info_hash).map(TorrentSwarmHandle::stats)
     }
 
     /// Starts `torrent` from scratch under `root`: target files are created (or truncated)
@@ -126,37 +124,22 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let (task, handle) = TorrentSwarm::new_with_verified(torrent.clone(), storage, self.id.clone(), verified);
-
-        self.handles.insert(torrent.info_hash, handle);
-        self.stats.insert(torrent.info_hash, task.subscribe_stats());
-        self.swarms.insert(torrent.info_hash, task);
+        let handle = TorrentSwarm::spawn(torrent.clone(), storage, self.id.clone(), verified);
+        self.swarms.insert(torrent.info_hash, handle);
         Ok(())
     }
 
     pub async fn work(self) -> anyhow::Result<()> {
-        let BtClient {
-            id,
-            mut swarms,
-            handles,
-            stats: _,
-            shutdown,
-        } = self;
+        let BtClient { id, swarms, shutdown } = self;
 
-        let handles = Arc::new(handles);
-        let listener = tokio::spawn(Self::accept_incoming(id, handles.clone(), shutdown.clone()));
-        let swarms: Vec<_> = swarms
-            .drain()
-            .map(|(_, swarm)| tokio::spawn(swarm.work_loop()))
-            .collect();
+        let swarms = Arc::new(swarms);
+        let listener = tokio::spawn(Self::accept_incoming(id, swarms.clone(), shutdown.clone()));
 
-        // a swarm runs for as long as a handle to it exists (see `TorrentSwarmHandle`); this
-        // frame holds them until shutdown, so a listener that fails early doesn't take the
-        // swarms down with it
+        // the swarms are already running; they stop when their handles go, which this frame
+        // holds until shutdown so a listener that fails early doesn't take them down with it
         shutdown.cancelled().await;
-        drop(handles);
+        drop(swarms);
         let _ = listener.await;
-        join_all(swarms).await;
         Ok(())
     }
 

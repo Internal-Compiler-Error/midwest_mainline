@@ -759,9 +759,17 @@ impl TorrentSwarmStats {
 #[derive(Debug, Clone)]
 pub struct TorrentSwarmHandle {
     tx: mpsc::Sender<SwarmEvent>,
+    stats: watch::Receiver<TorrentSwarmStats>,
 }
 
 impl TorrentSwarmHandle {
+    /// A live view of the torrent's aggregate progress (uploaded/downloaded/left/written/
+    /// verified/completed). Keeps updating for as long as the swarm runs, and outlives this
+    /// handle -- it only depends on the channel, not on the swarm still being reachable.
+    pub fn stats(&self) -> watch::Receiver<TorrentSwarmStats> {
+        self.stats.clone()
+    }
+
     /// Hands a freshly handshaken socket to the swarm, which owns it from here on. Used by both
     /// the inbound listener (`BtClient::accept_incoming`) and the swarm's own dial tasks.
     pub(crate) async fn peer_connected(&self, connected: ConnectedPeer) {
@@ -838,29 +846,27 @@ pub struct TorrentSwarm {
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
-    /// Cloned out via `subscribe_stats` before `work_loop(self)` takes ownership of the swarm
-    /// -- the clone stays valid (and keeps updating) after that, since it's independent of
-    /// `TorrentSwarm` itself, just backed by the same channel `stat_snapshot_tx` publishes to.
-    stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
 
     /// cancels the announcers' token when the swarm goes away, so they get to say goodbye
     _stop_announcers: DropGuard,
 }
 
 impl TorrentSwarm {
-    /// Also returns the handle that keeps the swarm alive; see `TorrentSwarmHandle`.
-    pub fn new(
+    /// Starts a swarm for `torrent` on the current runtime and returns the handle that is its
+    /// entire interface (see `TorrentSwarmHandle`). Pieces set in `verified` are taken to be on
+    /// disk and correct already: they won't be requested again and count as had for `left`.
+    pub(crate) fn spawn(
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
-    ) -> (TorrentSwarm, TorrentSwarmHandle) {
-        let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-        Self::new_with_verified(torrent, storage, id, verified)
+        verified: BitBox<u8, Msb0>,
+    ) -> TorrentSwarmHandle {
+        let (swarm, handle) = Self::new(torrent, storage, id, verified);
+        tokio::spawn(swarm.work_loop());
+        handle
     }
 
-    /// Like `new`, but starting from pieces that are already on disk and hash-verified (a
-    /// resumed download). Those pieces won't be requested again and count as had for `left`.
-    pub fn new_with_verified(
+    fn new(
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
@@ -890,7 +896,10 @@ impl TorrentSwarm {
         let trackers = trackers.into_iter().map(|s| Url::parse(&s)).filter_map(Result::ok);
 
         let (events_tx, events_rx) = mpsc::channel(512);
-        let handle = TorrentSwarmHandle { tx: events_tx };
+        let handle = TorrentSwarmHandle {
+            tx: events_tx,
+            stats: stat_rx.clone(),
+        };
         let events_tx = handle.tx.downgrade();
         let children = CancellationToken::new();
 
@@ -938,19 +947,9 @@ impl TorrentSwarm {
             pieces_done: 0,
             stat,
             stat_snapshot_tx: stat_tx,
-            stat_snapshot_rx: stat_rx,
             _stop_announcers: children.drop_guard(),
         };
         (swarm, handle)
-    }
-
-    /// A live view of this torrent's aggregate progress (uploaded/downloaded/left/written/
-    /// verified/completed). Must be called before `work_loop(self)` takes ownership of the
-    /// swarm (e.g. right after `TorrentSwarm::new`, which is what `BtClient::add_torrent` does)
-    /// -- the returned receiver keeps working after that, since it only depends on the
-    /// underlying channel, not on `TorrentSwarm` itself still being reachable.
-    pub(crate) fn subscribe_stats(&self) -> watch::Receiver<TorrentSwarmStats> {
-        self.stat_snapshot_rx.clone()
     }
 
     fn publish_stats(&self) {
@@ -968,7 +967,7 @@ impl TorrentSwarm {
     /// reach it. The flip side, chosen deliberately: a write to one peer that blocks (its
     /// kernel send buffer is full because it stopped reading) stalls this whole loop, every
     /// other peer included, until it drains or the socket dies.
-    pub(crate) async fn work_loop(mut self) {
+    async fn work_loop(mut self) {
         let http_announcers = mem::take(&mut self.http_announcers);
         for http_announcer in http_announcers {
             tokio::spawn(http_announcer.ev_loop());
@@ -1644,7 +1643,7 @@ mod test {
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
-        let (swarm, handle) = TorrentSwarm::new_with_verified(torrent, storage, id, verified);
+        let (swarm, handle) = TorrentSwarm::new(torrent, storage, id, verified);
         (swarm, handle, path)
     }
 
@@ -1709,7 +1708,7 @@ mod test {
     #[tokio::test]
     async fn downloads_pieces_from_a_peer_and_announces_them() {
         let (swarm, handle, path) = swarm("happy");
-        let mut stats = swarm.subscribe_stats();
+        let mut stats = handle.stats();
         tokio::spawn(swarm.work_loop());
 
         let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
@@ -1750,7 +1749,7 @@ mod test {
     #[tokio::test]
     async fn pieces_abandoned_by_a_dead_peer_are_requested_from_another() {
         let (swarm, handle, path) = swarm("dead");
-        let mut stats = swarm.subscribe_stats();
+        let mut stats = handle.stats();
         tokio::spawn(swarm.work_loop());
 
         let mut flaky = fake_peer(&handle, "10.0.0.1:6881").await;
@@ -1824,7 +1823,7 @@ mod test {
     #[tokio::test]
     async fn serves_blocks_to_an_unchoked_peer() {
         let (swarm, handle, path) = swarm_with("seed", true);
-        let mut stats = swarm.subscribe_stats();
+        let mut stats = handle.stats();
         tokio::spawn(swarm.work_loop());
 
         let mut leech = fake_peer_with(&handle, "10.0.0.4:6881", true).await;
