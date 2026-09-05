@@ -419,12 +419,14 @@ impl PeerStatistics {
         self.sent += length;
     }
 
-    /// Calculate the peer's download's upper confidence bound based on how many pieces have been
-    /// requested
-    pub fn rx_speed_ucb(&self, total_piece_requested: usize) -> f64 {
-        // Upper Confidence Bound
+    /// UCB1: the peer's mean download speed plus an exploration bonus that shrinks the more
+    /// often it's been picked, relative to how often *anyone* has been picked (`total_picks`,
+    /// block requests to every peer so far).
+    pub fn rx_speed_ucb(&self, total_picks: usize) -> f64 {
         let c = 1f64;
-        let t = total_piece_requested as f64;
+        // ln(0) is -inf and sqrt of that is NaN, which `total_cmp` sorts *above* infinity --
+        // so the first peer picked used to win every pick until a piece completed
+        let t = (total_picks.max(1)) as f64;
         let n_t = self.picked_count as f64;
         self.mean_rx + c * (t.ln() / n_t).sqrt()
     }
@@ -432,11 +434,11 @@ impl PeerStatistics {
     // In UCB, when an arm hasn't been played yet, it should be picked first, instead of doing an
     // if check every time we choose a peer, we just assign infinite score to peers who haven't
     // been requested yet
-    pub fn score(&self, total_piece_requested: usize) -> f64 {
+    pub fn score(&self, total_picks: usize) -> f64 {
         if self.picked_count == 0 {
             f64::INFINITY
         } else {
-            self.rx_speed_ucb(total_piece_requested)
+            self.rx_speed_ucb(total_picks)
         }
     }
 }
@@ -565,5 +567,21 @@ mod test {
             !dict.contains_key(b"added6".as_slice()),
             "a v4-only added list shouldn't carry an empty added6 key"
         );
+    }
+
+    #[test]
+    fn ucb_score_is_never_nan() {
+        let mut stats = PeerStatistics::default();
+        assert_eq!(stats.score(0), f64::INFINITY, "an unpicked peer is picked first");
+        stats.block_requested();
+        // one pick, nothing completed yet: used to be NaN, which sorted above infinity
+        assert!(!stats.score(0).is_nan());
+        assert!(
+            stats.score(0) < f64::INFINITY,
+            "a picked peer must lose to an unpicked one"
+        );
+        assert!(!stats.score(1).is_nan());
+        stats.block_received(16_384, Duration::from_millis(100));
+        assert!(stats.score(10) > stats.mean_rx, "the exploration bonus is positive");
     }
 }

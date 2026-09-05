@@ -2,8 +2,9 @@ use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
 use crate::peer::{Peer, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request};
 use crate::settings::{
-    BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, KEEPALIVE_INTERVAL, MAX_UNCHOKED_PEERS,
-    METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS,
+    BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
+    MAX_OUTSTANDING_BLOCKS_PER_PEER, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS,
+    PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS,
 };
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
@@ -118,9 +119,6 @@ struct InFlight {
     blocks_left: usize,
 }
 
-/// How many pieces to keep in flight across all peers.
-const MAX_INFLIGHT_PIECES: usize = 100;
-
 pub struct TorrentSwarm {
     /// sorted by `remote_addr`; there's only ever one connection per address
     peers: Vec<Peer>,
@@ -143,8 +141,8 @@ pub struct TorrentSwarm {
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
     in_flight: BTreeMap<u32, InFlight>,
-    /// pieces completed in this session, UCB's `t`
-    pieces_done: usize,
+    /// block requests sent to any peer this session, UCB's `t`
+    total_picks: usize,
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
@@ -221,7 +219,7 @@ impl TorrentSwarm {
             events_tx,
             missing,
             in_flight: BTreeMap::new(),
-            pieces_done: 0,
+            total_picks: 0,
             stat,
             stat_snapshot_tx: stat_tx,
             _stop_announcers: announcers.drop_guard(),
@@ -417,6 +415,11 @@ impl TorrentSwarm {
                     length: reject.length,
                 };
                 if peer.requested.remove(&req).is_some() {
+                    tracing::debug!(
+                        "{} rejected {req:?}, piece {} goes back on the pile",
+                        peer.remote_addr,
+                        req.index
+                    );
                     self.fail_piece(req.index);
                     self.schedule().await;
                 }
@@ -575,7 +578,6 @@ impl TorrentSwarm {
         }
 
         info!("piece {piece} is completed");
-        self.pieces_done += 1;
         self.stat.written += self.torrent.nth_piece_size(piece).expect("piece index in range");
         self.stat.left = self.torrent.total_size as usize - self.stat.written;
         self.stat.completed = self.stat.all_verified();
@@ -587,11 +589,15 @@ impl TorrentSwarm {
         self.schedule().await;
     }
 
-    /// Keeps up to `MAX_INFLIGHT_PIECES` pieces on the wire. Rarest-first picks *which piece*
+    /// Keeps up to `MAX_INFLIGHT_BYTES` of pieces on the wire. Rarest-first picks *which piece*
     /// to go after next; UCB scoring separately picks *which peer* to ask -- the two compose
     /// rather than compete.
     async fn schedule(&mut self) {
-        while self.in_flight.len() < MAX_INFLIGHT_PIECES {
+        loop {
+            let in_flight: usize = self.in_flight.values().map(|f| f.buf.len()).sum();
+            if in_flight >= MAX_INFLIGHT_BYTES {
+                break;
+            }
             let Some(piece) = self.rarest_piece() else {
                 break;
             };
@@ -618,6 +624,7 @@ impl TorrentSwarm {
                 },
             );
             info!("requesting piece {piece} from {}", self.peers[idx].remote_addr);
+            self.total_picks += blocks.len();
             for req in blocks {
                 if self.peers[idx].request_block(req).await.is_err() {
                     self.drop_peer(idx);
@@ -645,14 +652,15 @@ impl TorrentSwarm {
         by_availability.choose(&mut rand::rng()).map(|&(piece, _)| piece)
     }
 
-    /// UCB peer selection: of the peers that have `piece` and aren't choking us, the one with
-    /// the highest upper confidence bound on its download speed.
+    /// UCB peer selection: of the peers that have `piece`, aren't choking us, and aren't
+    /// already loaded up to `MAX_OUTSTANDING_BLOCKS_PER_PEER`, the one with the highest upper
+    /// confidence bound on its download speed.
     fn best_peer(&self, piece: u32) -> Option<usize> {
         self.peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.ready() && p.they_have(piece))
-            .map(|(idx, p)| (idx, p.stats.score(self.pieces_done)))
+            .filter(|(_, p)| p.ready() && p.they_have(piece) && p.requested.len() < MAX_OUTSTANDING_BLOCKS_PER_PEER)
+            .map(|(idx, p)| (idx, p.stats.score(self.total_picks)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
     }
@@ -1184,6 +1192,56 @@ mod test {
         tokio::time::timeout(Duration::from_secs(5), closed)
             .await
             .expect("peer socket stayed open after the swarm stopped");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A piece one peer rejects must be re-requested from the *other* ready peer. This used to
+    /// fail: after its first request the picked peer's UCB score was NaN, which sorts above the
+    /// fresh peer's infinity, so it was picked again and again.
+    #[tokio::test]
+    async fn a_rejected_piece_goes_to_another_ready_peer() {
+        let (swarm, handle, path) = swarm("reject");
+        tokio::spawn(swarm.work_loop());
+
+        // a is ready first, so it gets all three pieces; b is ready before a rejects anything
+        let mut a = fake_peer(&handle, "10.0.0.6:6881").await;
+        open_as_seeder(&mut a).await;
+        let mut first = None;
+        let mut asked_a = BTreeSet::new();
+        while asked_a.len() < 3 {
+            let Some(Ok(BtMessage::Request(req))) = a.next().await else {
+                panic!("expected a request");
+            };
+            first.get_or_insert(req);
+            asked_a.insert(req.index);
+        }
+        let mut b = fake_peer(&handle, "10.0.0.7:6881").await;
+        open_as_seeder(&mut b).await;
+        // b's bitfield and unchoke travel on a different socket than a's reject below; give
+        // the swarm a moment to have seen them, or a is the only ready peer when it reschedules
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let rejected = first.unwrap();
+        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
+            index: rejected.index,
+            begin: rejected.begin,
+            length: rejected.length,
+        }))
+        .await
+        .unwrap();
+
+        let b_gets_it = async {
+            loop {
+                match b.next().await {
+                    Some(Ok(BtMessage::Request(req))) if req.index == rejected.index => break,
+                    Some(Ok(_)) => {}
+                    other => panic!("b's socket ended: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), b_gets_it)
+            .await
+            .expect("the rejected piece was never offered to the other peer");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

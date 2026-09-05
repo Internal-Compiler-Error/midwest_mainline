@@ -6,6 +6,16 @@ pub const BLOCK_SIZE: usize = 16 * 1024; // 16 KiB
 /// but conceptually distinct (one is torrent data, the other is the torrent's own metadata).
 pub const METADATA_PIECE_SIZE: usize = 16 * 1024;
 
+/// Total bytes of pieces being downloaded at once, across all peers. In bytes rather than
+/// pieces because piece sizes range from 16 KiB to several MiB, and each in-flight piece is
+/// held in memory until it completes.
+pub const MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Block requests outstanding to one peer before it's skipped for further pieces. Remote
+/// clients cap how many requests they'll queue (commonly 250-500) and reject or drop the rest,
+/// so asking one fast peer for everything at once only gets requests bounced back.
+pub const MAX_OUTSTANDING_BLOCKS_PER_PEER: usize = 256;
+
 /// How long to wait for a peer that accepted a block request to actually send the block.
 /// A peer that goes silent mid-request (as opposed to disconnecting outright) is the common
 /// failure mode this guards against -- without it, a single unresponsive peer hangs a piece
