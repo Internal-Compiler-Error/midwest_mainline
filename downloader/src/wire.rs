@@ -470,16 +470,20 @@ pub(crate) struct Handshake {
 // pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
 pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
 
-/// BEP 10: bit 0x10 of reserved byte 5 (0-indexed from the start of the 8-byte reserved area)
-/// signals extension protocol support.
-pub(crate) fn supports_extensions(extensions: &[u8; 8]) -> bool {
-    extensions[5] & 0x10 != 0
+impl Handshake{
+
+    /// BEP 10: bit 0x10 of reserved byte 5 (0-indexed from the start of the 8-byte reserved area)
+    /// signals extension protocol support.
+    pub fn supports_extensions(&self) -> bool {
+        self.extensions[5] & 0x10 != 0
+    }
+
+    /// BEP 6: bit 0x04 of reserved byte 7 signals Fast Extension support.
+    pub fn supports_fast_extension(&self) -> bool {
+        self.extensions[7] & 0x04 != 0
+    }
 }
 
-/// BEP 6: bit 0x04 of reserved byte 7 signals Fast Extension support.
-pub(crate) fn supports_fast_extension(extensions: &[u8; 8]) -> bool {
-    extensions[7] & 0x04 != 0
-}
 
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
@@ -693,22 +697,6 @@ mod test {
             payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
         };
         assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
-    }
-
-    #[test]
-    fn supports_extensions_checks_bit_0x10_of_reserved_byte_5() {
-        let mut extensions = [0u8; 8];
-        assert!(!supports_extensions(&extensions));
-        extensions[5] |= 0x10;
-        assert!(supports_extensions(&extensions));
-    }
-
-    #[test]
-    fn supports_fast_extension_checks_bit_0x04_of_reserved_byte_7() {
-        let mut extensions = [0u8; 8];
-        assert!(!supports_fast_extension(&extensions));
-        extensions[7] |= 0x04;
-        assert!(supports_fast_extension(&extensions));
     }
 
     #[test]

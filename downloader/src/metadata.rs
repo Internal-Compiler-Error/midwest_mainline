@@ -17,7 +17,7 @@ use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
-use crate::wire::{BtDecoder, BtEncoder, BtMessage, Extended, shake_hands, supports_extensions};
+use crate::wire::{BtDecoder, BtEncoder, BtMessage, Extended, shake_hands};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
@@ -170,7 +170,7 @@ async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20
         .await
         .with_context(|| format!("handshake with {addr}"))?;
     ensure!(
-        supports_extensions(&handshake.extensions),
+        handshake.supports_extensions(),
         "{addr} doesn't support the extension protocol, so it can't serve metadata"
     );
 

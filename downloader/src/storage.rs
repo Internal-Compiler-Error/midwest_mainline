@@ -83,7 +83,6 @@ impl TorrentStorage {
         let mut read = 0;
         for (file, interval) in self.file_segments(range) {
             let len = interval.len();
-            // propagate rather than unwrap: a panic here takes the whole torrent down with it
             file.read_exact_at(&mut buf[read..read + len], interval.start as u64)?;
             read += len;
         }

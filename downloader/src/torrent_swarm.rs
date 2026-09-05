@@ -848,8 +848,8 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
     Ok(ConnectedPeer {
         tcp,
         remote_addr: addr,
-        remote_supports_extensions: crate::wire::supports_extensions(&handshake.extensions),
-        remote_supports_fast: crate::wire::supports_fast_extension(&handshake.extensions),
+        remote_supports_extensions: handshake.supports_extensions(),
+        remote_supports_fast: handshake.supports_fast_extension(),
     })
 }
 

@@ -440,18 +440,15 @@ impl PeerStatistics {
     /// block requests to every peer so far).
     pub fn rx_speed_ucb(&self, total_picks: usize) -> f64 {
         let c = 1f64;
-        // ln(0) is -inf and sqrt of that is NaN, which `total_cmp` sorts *above* infinity --
-        // so the first peer picked used to win every pick until a piece completed
-        let t = (total_picks.max(1)) as f64;
+        let t = total_picks as f64;
         let n_t = self.picked_count as f64;
         self.mean_rx + c * (t.ln() / n_t).sqrt()
     }
 
-    // In UCB, when an arm hasn't been played yet, it should be picked first, instead of doing an
-    // if check every time we choose a peer, we just assign infinite score to peers who haven't
-    // been requested yet
     pub fn score(&self, total_picks: usize) -> f64 {
-        if self.picked_count == 0 {
+        // In UCB, when an arm hasn't been played yet, it should be picked first, we just assign an
+        // infinite score to peers who haven't been requested yet
+        if total_picks == 0 || self.picked_count == 0 {
             f64::INFINITY
         } else {
             self.rx_speed_ucb(total_picks)

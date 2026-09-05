@@ -84,21 +84,21 @@ struct LineWriter<'a> {
 }
 
 impl Visit for LineWriter<'_> {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" && !self.message_written {
-            let _ = write!(self.line, "{value:?}");
-            self.message_written = true;
-        } else {
-            let _ = write!(self.line, " {}={value:?}", field.name());
-        }
-    }
-
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" && !self.message_written {
             self.line.push_str(value);
             self.message_written = true;
         } else {
             let _ = write!(self.line, " {}={value}", field.name());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" && !self.message_written {
+            let _ = write!(self.line, "{value:?}");
+            self.message_written = true;
+        } else {
+            let _ = write!(self.line, " {}={value:?}", field.name());
         }
     }
 }
