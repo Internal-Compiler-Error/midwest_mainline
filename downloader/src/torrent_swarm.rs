@@ -581,6 +581,29 @@ pub struct TorrentSwarmHandle {
     tx: mpsc::Sender<TorrentSwarmCommand>,
 }
 
+/// Builds `PeerHandle`s for a specific torrent's swarm without holding a reference into
+/// `TorrentSwarm` itself -- everything it needs (an `Arc<Torrent>`, a command-channel sender,
+/// a stats watch) is cheap to clone and hands off safely across tasks. Used by the inbound
+/// connection listener, which accepts a socket before it knows which swarm it belongs to.
+#[derive(Clone)]
+pub(crate) struct PeerFactory {
+    torrent: Arc<Torrent>,
+    event_tx: mpsc::Sender<TorrentSwarmCommand>,
+    stat_snapshot_rx: watch::Receiver<TorrentSwarmStats>,
+}
+
+impl PeerFactory {
+    pub(crate) fn accept(&self, tcp_stream: TcpStream, remote_peer_id: [u8; 20]) -> PeerHandle {
+        PeerHandle::new(
+            tcp_stream,
+            remote_peer_id,
+            self.event_tx.clone(),
+            self.stat_snapshot_rx.clone(),
+            &self.torrent,
+        )
+    }
+}
+
 impl TorrentSwarmHandle {
     pub async fn add_initialized_peer(&self, peer: PeerHandle) {
         let _ = self
@@ -733,6 +756,16 @@ impl TorrentSwarm {
     /// need to talk to the swarm without holding a reference into it.
     pub(crate) fn command_sender(&self) -> mpsc::Sender<TorrentSwarmCommand> {
         self.outbound_msgs.clone()
+    }
+
+    /// A cloneable factory for building `PeerHandle`s for this swarm's torrent, for the
+    /// inbound connection listener (which accepts a socket before it knows which swarm it's for).
+    pub(crate) fn peer_factory(&self) -> PeerFactory {
+        PeerFactory {
+            torrent: self.torrent.clone(),
+            event_tx: self.outbound_msgs.clone(),
+            stat_snapshot_rx: self.stat_snapshot_rx.clone(),
+        }
     }
 
     pub(crate) async fn work_loop(mut self) {
@@ -927,14 +960,22 @@ impl TorrentSwarm {
                     // very important, not async, this ensures once
                     self.initialize_peer(&peer)?;
                     let remote_addr = peer.remote_addr;
-                    let peer_idx = self
+                    // a connection we dialed out ourselves has a pending-peer entry with any
+                    // Have messages queued up while it was connecting; an inbound connection
+                    // (accepted by the listener) has none -- it gets caught up by the
+                    // initial bitfield `initialize_peer` just sent instead
+                    let pending_peer = self
                         .pending_peers
                         .binary_search_by_key(&remote_addr, |p| p.socket_addr)
-                        .expect("a connection can only be made when it has been placed onto the pending list");
-                    let pending_peer = self.pending_peers.remove(peer_idx);
+                        .ok()
+                        .map(|idx| self.pending_peers.remove(idx));
                     let readied_peer = peer.clone();
 
                     tokio::spawn(async move {
+                        let Some(pending_peer) = pending_peer else {
+                            return;
+                        };
+
                         // From tokio's doc on sync::mpsc::Sender::send:
                         // ---
                         // This channel uses a queue to ensure that calls to send and reserve

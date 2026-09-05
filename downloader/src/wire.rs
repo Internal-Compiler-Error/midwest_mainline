@@ -325,12 +325,10 @@ pub(crate) struct Handshake {
 // pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
 pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
 
-#[tracing::instrument(skip(peer))]
-pub(crate) async fn shake_hands(
-    peer: &mut TcpStream,
-    info_hash: &InfoHash,
-    local_id: &[u8; 20],
-) -> io::Result<Handshake> {
+/// Sends our half of the handshake. Used both when we dial out (before reading the remote's
+/// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
+/// we have a matching torrent).
+pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<()> {
     let extensions = [0u8; 8];
 
     let mut buf = vec![];
@@ -340,23 +338,19 @@ pub(crate) async fn shake_hands(
     buf.extend_from_slice(local_id);
 
     debug_assert!(buf.len() == 68);
-    peer.write_all(&*buf).await?;
+    peer.write_all(&buf).await
+}
 
+/// Reads the remote's half of the handshake, without checking which info hash it names --
+/// the accept path needs to read this first to find out which torrent (if any) the connection
+/// is for, before it knows what to check against.
+pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake> {
     let mut read_buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
     let Ok(_) = peer.read_exact(&mut read_buf).await else {
-        let str = String::from_utf8_lossy(&buf);
-        info!("Peer didn't send enough bytes? {:?} {}", buf, str);
-        return Err(io::Error::new(ErrorKind::Other, "Early EOF???????"));
+        info!("Peer didn't send enough bytes for a handshake");
+        return Err(io::Error::new(ErrorKind::Other, "early EOF during handshake"));
     };
 
-    // let read = peer.read(&mut read_buf).await?;
-    // if read == 0 {
-    //     return Err(io::Error::new(ErrorKind::Other, "EOF"));
-    // } else {
-    //     debug!("{:?}", read_buf);
-    // }
-    // Forgive me, networking gods
-    //
     if read_buf[..HANDSHAKE_STR.len()] != *HANDSHAKE_STR {
         warn!(
             "protocol initiation string didn't match, expected {:?}, got {:?} from {}",
@@ -369,6 +363,18 @@ pub(crate) async fn shake_hands(
     }
 
     let handshake = Handshake::ref_from_bytes(&read_buf[HANDSHAKE_STR.len()..]).expect("shit should work");
+    Ok(handshake.clone())
+}
+
+/// Performs the outbound side of a handshake: send ours, then read and validate theirs.
+#[tracing::instrument(skip(peer))]
+pub(crate) async fn shake_hands(
+    peer: &mut TcpStream,
+    info_hash: &InfoHash,
+    local_id: &[u8; 20],
+) -> io::Result<Handshake> {
+    send_handshake(peer, info_hash, local_id).await?;
+    let handshake = read_handshake(peer).await?;
 
     if &handshake.info_hash != info_hash {
         warn!(
@@ -379,13 +385,41 @@ pub(crate) async fn shake_hands(
         return Err(io::Error::new(ErrorKind::Other, "handshake hash info didn't match"));
     }
 
-    Ok(handshake.clone())
+    Ok(handshake)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use tokio::net::TcpListener;
     use tokio_util::bytes::BytesMut;
+
+    /// Exercises the outbound (`shake_hands`) and inbound (`read_handshake` then
+    /// `send_handshake`) halves against each other over a real loopback socket, since
+    /// splitting them apart is the change most likely to silently break framing.
+    #[tokio::test]
+    async fn handshake_round_trips_over_a_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let info_hash = InfoHash::from_bytes(&[7u8; 20]);
+        let dialer_id = [1u8; 20];
+        let acceptor_id = [2u8; 20];
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let handshake = read_handshake(&mut sock).await.unwrap();
+            assert_eq!(handshake.info_hash, info_hash);
+            assert_eq!(handshake.peer_id, dialer_id);
+            send_handshake(&mut sock, &info_hash, &acceptor_id).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let handshake = shake_hands(&mut client, &info_hash, &dialer_id).await.unwrap();
+        assert_eq!(handshake.peer_id, acceptor_id);
+
+        server.await.unwrap();
+    }
 
     fn round_trip(msg: BtMessage) -> BtMessage {
         let mut buf = BytesMut::new();

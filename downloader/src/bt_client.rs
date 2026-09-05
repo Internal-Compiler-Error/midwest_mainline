@@ -1,25 +1,30 @@
+use crate::defs::Identity;
+use crate::storage::TorrentStorage;
+use crate::torrent::Torrent;
+use crate::torrent_swarm::{PeerFactory, TorrentSwarm, TorrentSwarmHandle};
+use anyhow::bail;
+use futures::future::join_all;
+use midwest_mainline::types::InfoHash;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::sync::Arc;
-use anyhow::bail;
-use futures::future::join_all;
-use midwest_mainline::types::InfoHash;
-use crate::defs::Identity;
-use crate::storage::TorrentStorage;
-use crate::torrent::Torrent;
-use crate::torrent_swarm::TorrentSwarm;
+use tokio::net::TcpListener;
 
 pub struct BtClient {
     id: Arc<Identity>,
     swarms: HashMap<InfoHash, TorrentSwarm>,
+    handles: HashMap<InfoHash, TorrentSwarmHandle>,
+    peer_factories: HashMap<InfoHash, PeerFactory>,
 }
 
 impl BtClient {
     pub fn new(id: Identity) -> Self {
-      Self {
+        Self {
             id: Arc::new(id),
             swarms: HashMap::new(),
+            handles: HashMap::new(),
+            peer_factories: HashMap::new(),
         }
     }
 
@@ -40,17 +45,87 @@ impl BtClient {
 
         let task = TorrentSwarm::new(torrent.clone(), storage, self.id.clone());
 
+        self.handles.insert(torrent.info_hash, task.make_handle());
+        self.peer_factories.insert(torrent.info_hash, task.peer_factory());
         self.swarms.insert(torrent.info_hash, task);
         Ok(())
     }
 
-    pub(crate) async fn work(mut self) -> anyhow::Result<()> {
-        let mut vec = vec![];
-        for (_info_hash, share) in self.swarms.drain() {
-            vec.push(tokio::spawn(share.work_loop()));
+    pub(crate) async fn work(self) -> anyhow::Result<()> {
+        let BtClient {
+            id,
+            mut swarms,
+            handles,
+            peer_factories,
+        } = self;
+
+        let mut tasks = vec![tokio::spawn(Self::accept_incoming(
+            id,
+            Arc::new(handles),
+            Arc::new(peer_factories),
+        ))];
+        for (_info_hash, swarm) in swarms.drain() {
+            tasks.push(tokio::spawn(swarm.work_loop()));
         }
 
-        join_all(vec).await;
+        join_all(tasks).await;
         Ok(())
+    }
+
+    /// Listens for and accepts inbound peer connections (BEP 3 requires this: we advertise a
+    /// listening port to trackers, so we must actually accept connections on it, not only dial
+    /// out). The remote's info hash isn't known until after we read their handshake, so this
+    /// reads first and only replies once we've matched it to a torrent we're serving.
+    async fn accept_incoming(
+        id: Arc<Identity>,
+        handles: Arc<HashMap<InfoHash, TorrentSwarmHandle>>,
+        peer_factories: Arc<HashMap<InfoHash, PeerFactory>>,
+    ) {
+        let listener = match TcpListener::bind(id.serving).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!("failed to bind inbound listen address {}: {e:?}", id.serving);
+                return;
+            }
+        };
+        tracing::info!("listening for inbound peer connections on {}", id.serving);
+
+        loop {
+            let (mut tcp, remote_addr) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!("failed to accept an inbound connection: {e:?}");
+                    continue;
+                }
+            };
+
+            let id = id.clone();
+            let handles = handles.clone();
+            let peer_factories = peer_factories.clone();
+            tokio::spawn(async move {
+                let handshake = match crate::wire::read_handshake(&mut tcp).await {
+                    Ok(handshake) => handshake,
+                    Err(e) => {
+                        tracing::debug!("bad handshake from {remote_addr}: {e:?}");
+                        return;
+                    }
+                };
+
+                let Some(factory) = peer_factories.get(&handshake.info_hash) else {
+                    tracing::debug!("inbound connection from {remote_addr} named a torrent we're not serving");
+                    return;
+                };
+
+                if let Err(e) = crate::wire::send_handshake(&mut tcp, &handshake.info_hash, &id.peer_id).await {
+                    tracing::debug!("failed to reply to handshake from {remote_addr}: {e:?}");
+                    return;
+                }
+
+                let peer = factory.accept(tcp, handshake.peer_id);
+                if let Some(handle) = handles.get(&handshake.info_hash) {
+                    handle.add_initialized_peer(peer).await;
+                }
+            });
+        }
     }
 }
