@@ -1,10 +1,12 @@
 use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
-use crate::peer::{Peer, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request};
+use crate::peer::{
+    Peer, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
+};
 use crate::settings::{
-    BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
-    MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL,
-    PEX_MAX_ADDED_PEERS,
+    BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
+    FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE,
+    OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS,
 };
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
@@ -19,7 +21,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
@@ -142,11 +144,65 @@ impl InFlight {
     }
 }
 
+/// What the swarm remembers about an address between connections to it. Trackers and PEX
+/// hand out the same addresses over and over, so what happened last time decides whether
+/// it's worth dialing again, and a returning peer resumes with the statistics UCB built up
+/// on it rather than as a stranger to be explored from scratch.
+#[derive(Default)]
+struct KnownPeer {
+    stats: PeerStatistics,
+    consecutive_dial_failures: u32,
+    dial_after: Option<Instant>,
+    banned_until: Option<Instant>,
+}
+
+impl KnownPeer {
+    fn dial_failed(&mut self, now: Instant) {
+        self.consecutive_dial_failures += 1;
+        let backoff = DIAL_BACKOFF.saturating_mul(1 << (self.consecutive_dial_failures - 1).min(16));
+        self.dial_after = Some(now + backoff.min(DIAL_BACKOFF_MAX));
+    }
+
+    fn connected(&mut self) {
+        self.consecutive_dial_failures = 0;
+        self.dial_after = None;
+    }
+
+    fn disconnected(&mut self, stats: &PeerStatistics, now: Instant) {
+        if stats.received + stats.sent == 0 {
+            self.dial_after = Some(now + FRUITLESS_PEER_COOLDOWN);
+        }
+        self.stats = stats.for_reconnect();
+    }
+
+    fn ban(&mut self, now: Instant) {
+        self.banned_until = Some(now + BAD_PEER_BAN);
+    }
+
+    fn banned(&self, now: Instant) -> bool {
+        self.banned_until.is_some_and(|until| until > now)
+    }
+
+    fn may_dial(&self, now: Instant) -> bool {
+        !self.banned(now) && !self.dial_after.is_some_and(|after| after > now)
+    }
+}
+
+/// An IPv4 peer accepted on a dual-stack `[::]` listener shows up as `::ffff:a.b.c.d`;
+/// collapsing that to plain `a.b.c.d` gives the peer the same address whether we dialed it or
+/// it dialed us, which everything keyed by address depends on.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 pub struct TorrentSwarm {
     /// sorted by `remote_addr`; there's only ever one connection per address
     peers: Vec<Peer>,
     /// addresses with a dial in progress, so the same peer isn't dialed twice
     dialing: BTreeSet<SocketAddr>,
+    /// every address that ever connected, disconnected, or failed to dial; not pruned, a
+    /// swarm sees a few thousand at most
+    known: BTreeMap<SocketAddr, KnownPeer>,
     /// rotates the order peers' sockets are polled in, so a chatty peer at the front of the
     /// list can't starve the rest (`select_all` returns the first ready future in order)
     poll_offset: usize,
@@ -234,6 +290,7 @@ impl TorrentSwarm {
         let swarm = TorrentSwarm {
             peers: vec![],
             dialing: BTreeSet::new(),
+            known: BTreeMap::new(),
             poll_offset: 0,
             torrent,
             storage,
@@ -320,6 +377,10 @@ impl TorrentSwarm {
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::DialFailed(addr) => {
                 self.dialing.remove(&addr);
+                self.known
+                    .entry(canonical(addr))
+                    .or_default()
+                    .dial_failed(Instant::now());
             }
         }
     }
@@ -358,6 +419,10 @@ impl TorrentSwarm {
         self.publish_stats();
     }
 
+    fn ban(&mut self, addr: SocketAddr) {
+        self.known.entry(addr).or_default().ban(Instant::now());
+    }
+
     fn pieces_held_by(&self, addr: SocketAddr) -> Vec<u32> {
         self.in_flight
             .iter()
@@ -373,6 +438,10 @@ impl TorrentSwarm {
     /// Removes a peer and puts whatever it was downloading for us back up for grabs.
     fn drop_peer(&mut self, idx: usize) {
         let peer = self.peers.remove(idx);
+        self.known
+            .entry(peer.remote_addr)
+            .or_default()
+            .disconnected(&peer.stats, Instant::now());
         for piece in self.pieces_held_by(peer.remote_addr) {
             self.in_flight.remove(&piece);
             self.missing.push(piece);
@@ -430,7 +499,9 @@ impl TorrentSwarm {
             Ok(Some(msg)) => msg,
             Err(ProtocolViolation(what)) => {
                 warn!("{} sent {what}, disconnecting", peer.remote_addr);
+                let addr = peer.remote_addr;
                 self.drop_peer(idx);
+                self.ban(addr);
                 return;
             }
         };
@@ -597,17 +668,29 @@ impl TorrentSwarm {
         }
 
         let piece = block.index;
-        let buf = self.in_flight.remove(&piece).expect("checked above").buf;
+        let InFlight { peer: from, buf, .. } = self.in_flight.remove(&piece).expect("checked above");
         if let Err(e) = self.storage.write_piece(piece, buf.into_boxed_slice()) {
             warn!("couldn't write piece {piece}: {e:#}");
             self.missing.push(piece);
             return;
         }
-        if !self.verify_hash(piece) {
-            info!("piece {piece} failed hash verification, will retry");
-            self.missing.push(piece);
-            self.schedule().await;
-            return;
+        match self.verify_hash(piece) {
+            Some(true) => {}
+            Some(false) => {
+                warn!("piece {piece} from {from} failed hash verification, banning the peer");
+                self.missing.push(piece);
+                if let Some(idx) = self.peer_index(from) {
+                    self.drop_peer(idx);
+                }
+                self.ban(from);
+                self.schedule().await;
+                return;
+            }
+            None => {
+                self.missing.push(piece);
+                self.schedule().await;
+                return;
+            }
         }
 
         info!("piece {piece} is completed");
@@ -728,35 +811,37 @@ impl TorrentSwarm {
             .map(|(idx, _)| idx)
     }
 
-    fn verify_hash(&mut self, piece: u32) -> bool {
-        // a read failure means we can't confirm the piece, so treat it as unverified and let
-        // it be retried -- never panic, this runs on the swarm's own event loop
+    /// `None` when the piece couldn't be read back: unverified, but through no fault of the
+    /// peer that sent it. Never panics, this runs on the swarm's own event loop.
+    fn verify_hash(&mut self, piece: u32) -> Option<bool> {
         let Ok(written_data) = self.storage.read_piece(piece) else {
             warn!("couldn't read piece {piece} back off disk to verify it");
-            return false;
+            return None;
         };
 
         let valid_piece = self.torrent.valid_piece(piece, &written_data);
         if valid_piece {
             self.stat.verified.set(piece as usize, true);
         }
-        valid_piece
+        Some(valid_piece)
     }
 
     /// Takes ownership of a handshaken socket. Sends our side of the opening exchange (BEP 10
     /// extended handshake, then BitField/HaveAll/HaveNone, then Interested) before the peer
     /// joins `peers`, so nothing else can be written to it first.
     async fn add_peer(&mut self, connected: ConnectedPeer) {
-        // `to_canonical()` collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a v4
-        // peer looks like when accepted on a dual-stack `[::]` listener) down to plain
-        // `a.b.c.d`, so the same peer gets the same `remote_addr` whether we dialed it or it
-        // dialed us
-        let remote_addr = SocketAddr::new(connected.remote_addr.ip().to_canonical(), connected.remote_addr.port());
+        let remote_addr = canonical(connected.remote_addr);
         self.dialing.remove(&remote_addr);
         let Err(insert_at) = self.peers.binary_search_by_key(&remote_addr, |p| p.remote_addr) else {
             info!("{remote_addr} is already connected, dropping the duplicate");
             return;
         };
+        let known = self.known.entry(remote_addr).or_default();
+        if known.banned(Instant::now()) {
+            info!("{remote_addr} is banned, refusing it");
+            return;
+        }
+        known.connected();
 
         let mut peer = Peer::new(
             connected.tcp,
@@ -764,6 +849,7 @@ impl TorrentSwarm {
             self.torrent.pieces.len(),
             connected.remote_supports_fast,
         );
+        peer.stats = known.stats.clone();
         let opening = async {
             if connected.remote_supports_extensions {
                 peer.send_extended_handshake(self.torrent.metadata_size(), self.torrent.private)
@@ -785,6 +871,10 @@ impl TorrentSwarm {
         };
         if let Err(e) = opening.await {
             info!("{remote_addr} went away during the opening exchange ({e})");
+            self.known
+                .entry(remote_addr)
+                .or_default()
+                .disconnected(&peer.stats, Instant::now());
             return;
         }
 
@@ -795,8 +885,10 @@ impl TorrentSwarm {
     /// Dials every address in `peers` we're not already connected to or dialing. Shared by
     /// tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
     fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
-        for addr in peers {
-            if self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
+        let now = Instant::now();
+        for addr in peers.into_iter().map(canonical) {
+            let worth_it = self.known.get(&addr).is_none_or(|k| k.may_dial(now));
+            if !worth_it || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
                 continue;
             }
             let events = self.events_tx.clone();
@@ -1120,6 +1212,136 @@ mod test {
         let Some(Ok(BtMessage::Request(_))) = seeder.next().await else {
             panic!("a delivery makes room for more requests");
         };
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn known_peer_backs_off_failed_dials_and_forgets_on_connect() {
+        let t0 = Instant::now();
+        let mut k = KnownPeer::default();
+        assert!(k.may_dial(t0), "nothing known against it");
+
+        k.dial_failed(t0);
+        assert!(!k.may_dial(t0 + DIAL_BACKOFF / 2));
+        assert!(k.may_dial(t0 + DIAL_BACKOFF));
+        k.dial_failed(t0);
+        assert!(!k.may_dial(t0 + DIAL_BACKOFF), "the second failure waits twice as long");
+        assert!(k.may_dial(t0 + 2 * DIAL_BACKOFF));
+        for _ in 0..40 {
+            k.dial_failed(t0);
+        }
+        assert!(k.may_dial(t0 + DIAL_BACKOFF_MAX), "the backoff is capped");
+
+        k.connected();
+        assert!(k.may_dial(t0));
+    }
+
+    #[test]
+    fn known_peer_cools_down_after_a_fruitless_connection_and_bans_block_dialing() {
+        let t0 = Instant::now();
+        let mut k = KnownPeer::default();
+        k.disconnected(&PeerStatistics::default(), t0);
+        assert!(!k.may_dial(t0 + FRUITLESS_PEER_COOLDOWN / 2));
+        assert!(k.may_dial(t0 + FRUITLESS_PEER_COOLDOWN));
+
+        let mut useful = PeerStatistics::default();
+        useful.block_received(16_384, t0);
+        let mut k = KnownPeer::default();
+        k.disconnected(&useful, t0);
+        assert!(k.may_dial(t0), "a peer that delivered is welcome straight back");
+        assert_eq!(k.stats.received, 0, "only the rate and pick count carry over");
+
+        k.ban(t0);
+        assert!(k.banned(t0 + BAD_PEER_BAN / 2));
+        assert!(!k.may_dial(t0 + BAD_PEER_BAN / 2));
+        assert!(!k.banned(t0 + BAD_PEER_BAN));
+    }
+
+    /// Trackers and PEX keep handing out the same addresses. One that connected and then hung
+    /// up without a block exchanged isn't dialed again for a while; one that delivered is.
+    #[tokio::test]
+    async fn fruitless_peers_are_not_redialed_but_useful_ones_are() {
+        let (swarm, handle, path) = swarm("redial");
+        tokio::spawn(swarm.work_loop());
+
+        let fruitless_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fruitless_addr = fruitless_listener.local_addr().unwrap();
+        let mut fruitless = fake_peer_with(&handle, &fruitless_addr.to_string(), false).await;
+        open_as_seeder(&mut fruitless).await;
+        let Some(Ok(BtMessage::Request(_))) = fruitless.next().await else {
+            panic!("expected a request");
+        };
+        drop(fruitless);
+
+        let useful_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let useful_addr = useful_listener.local_addr().unwrap();
+        let mut useful = fake_peer_with(&handle, &useful_addr.to_string(), false).await;
+        open_as_seeder(&mut useful).await;
+        let Some(Ok(BtMessage::Request(req))) = useful.next().await else {
+            panic!("expected a request");
+        };
+        useful.send(block(req)).await.unwrap();
+        // let the swarm take the block before the socket goes away under it
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(useful);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle
+            .tx
+            .send(SwarmEvent::PeersDiscovered(vec![fruitless_addr, useful_addr]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), useful_listener.accept())
+            .await
+            .expect("a peer that delivered is dialed again")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), fruitless_listener.accept())
+                .await
+                .is_err(),
+            "a peer that delivered nothing is left alone"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A piece is downloaded whole from one peer, so a piece that fails its hash convicts its
+    /// sender: it's dropped, and refused when it comes back.
+    #[tokio::test]
+    async fn a_peer_that_sends_a_bad_piece_is_banned() {
+        let (swarm, handle, path) = swarm("banned");
+        tokio::spawn(swarm.work_loop());
+
+        let mut liar = fake_peer(&handle, "10.0.0.9:6881").await;
+        open_as_seeder(&mut liar).await;
+        let cut_off = async {
+            loop {
+                match liar.next().await {
+                    Some(Ok(BtMessage::Request(req))) => {
+                        let garbage = Piece {
+                            index: req.index,
+                            begin: req.begin,
+                            length: req.length,
+                            data: vec![0u8; req.length as usize].into(),
+                        };
+                        if liar.send(BtMessage::Piece(garbage)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(other)) => panic!("unexpected {other:?}"),
+                    Some(Err(_)) | None => break,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), cut_off)
+            .await
+            .expect("the swarm should have hung up on the liar");
+
+        let mut again = fake_peer(&handle, "10.0.0.9:6881").await;
+        let refused = tokio::time::timeout(Duration::from_secs(5), again.next()).await;
+        assert!(
+            matches!(refused, Ok(None) | Ok(Some(Err(_)))),
+            "the banned peer should be refused without an opening exchange, got {refused:?}"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

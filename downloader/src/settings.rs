@@ -32,6 +32,21 @@ pub const MAX_REQUEST_WINDOW: usize = 128;
 /// long for each of them.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to leave an address alone after a failed dial. Doubles with each consecutive
+/// failure up to DIAL_BACKOFF_MAX; trackers and PEX keep handing out the same dead
+/// addresses, and without this each one is redialed every time it comes around.
+pub const DIAL_BACKOFF: Duration = Duration::from_secs(2 * 60);
+pub const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How long to leave a peer alone after it disconnected without a single block exchanged
+/// in either direction. A connection that produced nothing is likely to do so again.
+pub const FRUITLESS_PEER_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// How long a peer stays banned after sending a piece that failed its hash, or breaking the
+/// protocol. Inbound connections from it are refused too. Pieces are assigned whole to one
+/// peer, so a bad piece identifies its sender exactly.
+pub const BAD_PEER_BAN: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// How long a peer that owes us blocks may go without delivering any before the pieces it's
 /// working on are taken back (see `Peer::stalled`). A peer that goes silent mid-request, as
 /// opposed to disconnecting outright, is the failure mode this guards against.

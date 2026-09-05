@@ -221,3 +221,27 @@ out the stall timeout. Tests: `requests_are_paced_by_the_peers_window`,
 
 The net is only as wide as `MAX_INFLIGHT_BYTES / piece size` busy peers (32 on a 4 MiB
 piece torrent); the window doesn't change that bound.
+
+# Peers are remembered across connections, 2026-09-05
+Until now a peer was forgotten the moment it went away: its statistics lived on the `Peer`
+and died with the socket, a failed dial was retried every time a tracker or PEX handed the
+address out again, and a peer that hung up after delivering nothing, or that sent garbage,
+was welcome straight back with the infinite UCB score of a stranger. `TorrentSwarm::known`
+maps every address with a history to a `KnownPeer`:
+
+- a failed dial backs the address off for `DIAL_BACKOFF`, doubling per consecutive failure
+  up to `DIAL_BACKOFF_MAX`; a successful connection clears it
+- a disconnect with nothing exchanged in either direction (`received + sent == 0`) puts the
+  address on `FRUITLESS_PEER_COOLDOWN`
+- a piece that fails its hash, or a protocol violation, bans the peer for `BAD_PEER_BAN`;
+  inbound connections from a banned peer are refused before the opening exchange. Pieces
+  are assigned whole to one peer, so a bad piece convicts exactly one sender.
+- a returning peer starts with `PeerStatistics::for_reconnect()` of its last connection:
+  the measured rate and pick count, so UCB treats it as the peer it already knows, and its
+  request window opens at the size it earned
+
+Backoff and cooldown only gate our dials; inbound from such a peer is accepted, since
+failing to reach them says nothing about them reaching us. The table is keyed by the
+canonical address (`canonical()`, v4-mapped v6 collapsed) and never pruned. The metadata
+fetcher dials on its own path and doesn't consult it. Tests: `known_peer_*`,
+`fruitless_peers_are_not_redialed_but_useful_ones_are`, `a_peer_that_sends_a_bad_piece_is_banned`.

@@ -465,6 +465,16 @@ impl PeerStatistics {
         self.sent += length;
     }
 
+    /// What to carry over to a new connection with the same peer: the measured rate and the
+    /// pick count, UCB's memory of it, but not the deliveries of a connection that's gone.
+    pub fn for_reconnect(&self) -> Self {
+        Self {
+            rx_rate: self.rx_rate,
+            picked_count: self.picked_count,
+            ..Self::default()
+        }
+    }
+
     /// How many block requests to keep outstanding at this peer: REQUEST_PIPELINE_TARGET
     /// worth of its measured throughput, within MIN_REQUEST_WINDOW..=MAX_REQUEST_WINDOW.
     pub fn request_window(&self) -> usize {
