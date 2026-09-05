@@ -1,6 +1,7 @@
 mod announcer;
 mod bt_client;
 mod defs;
+pub mod logs;
 pub mod magnet;
 pub mod metadata;
 mod peer;
@@ -14,6 +15,7 @@ mod wire;
 
 pub use bt_client::BtClient;
 pub use defs::Identity;
+pub use logs::LogBuffer;
 pub use magnet::{MagnetLink, is_magnet_uri, parse_magnet};
 pub use resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
 pub use session::{Progress, Session, TorrentId, TorrentState, human_bytes};

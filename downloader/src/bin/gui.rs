@@ -8,7 +8,7 @@
 //! *finding* resume files: this one keeps them in `RESUME_DIR` and lists whatever is there.
 
 use downloader::{
-    Progress, ResumeSummary, Session, TorrentId, TorrentState, human_bytes, is_magnet_uri, list_resume_files,
+    LogBuffer, Progress, ResumeSummary, Session, TorrentId, TorrentState, human_bytes, is_magnet_uri, list_resume_files,
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 const RESUME_DIR: &str = "resume";
 
 fn main() -> eframe::Result {
+    // installed before anything that logs; the console panel shows what lands here
+    let logs = LogBuffer::install(5_000).expect("failed to install the log buffer");
     let mut session = Session::new(random_peer_id(), 6881).expect("failed to start a session");
     session.set_resume_dir(RESUME_DIR);
     let download_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -39,6 +41,8 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             Ok(Box::new(App {
                 session,
+                logs,
+                show_console: true,
                 input: String::new(),
                 download_dir,
                 selected: None,
@@ -58,6 +62,8 @@ fn random_peer_id() -> [u8; 20] {
 
 struct App {
     session: Session,
+    logs: LogBuffer,
+    show_console: bool,
     input: String,
     /// where the next torrent goes; the folder picker starts here and updates it
     download_dir: PathBuf,
@@ -121,6 +127,11 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
+        egui::TopBottomPanel::bottom("console")
+            .resizable(true)
+            .default_height(180.0)
+            .show(ctx, |ui| draw_console(ui, &self.logs, &mut self.show_console));
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let torrents = self.session.torrents();
             if torrents.is_empty() {
@@ -162,6 +173,43 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.session.shutdown();
     }
+}
+
+/// The library's tracing output, newest at the bottom. Rows are virtualised, so a full buffer
+/// costs the same to draw as an empty one.
+fn draw_console(ui: &mut egui::Ui, logs: &LogBuffer, open: &mut bool) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.toggle_value(open, "Console");
+        ui.weak(format!("{} lines", logs.len()));
+        if *open && ui.small_button("clear").clicked() {
+            logs.clear();
+        }
+    });
+    if !*open {
+        return;
+    }
+
+    let lines = logs.lines();
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    egui::ScrollArea::both()
+        .stick_to_bottom(true)
+        .auto_shrink(false)
+        .show_rows(ui, row_height, lines.len(), |ui, rows| {
+            for line in &lines[rows] {
+                let color = if line.contains(" ERROR ") {
+                    egui::Color32::from_rgb(220, 80, 80)
+                } else if line.contains("  WARN ") {
+                    egui::Color32::from_rgb(220, 170, 60)
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).monospace().color(color))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        });
 }
 
 /// One row per torrent. Returns what the user did this frame: a torrent to remove, a torrent
