@@ -52,17 +52,13 @@ struct HttpAnnouncer {
     #[eq(skip)]
     swarm_stat: watch::Receiver<TorrentSwarmStats>,
     #[eq(skip)]
-    events: mpsc::Sender<TorrentSwarmCommand>,
+    events: mpsc::Sender<SwarmEvent>,
     #[eq(skip)]
     sent_started: bool,
     #[eq(skip)]
     sent_completed: bool,
     #[eq(skip)]
     shutdown: CancellationToken,
-}
-
-pub enum AnnouncerEvent {
-    DiscoveredPeers(Vec<SocketAddr>),
 }
 
 /// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
@@ -74,7 +70,7 @@ pub(crate) fn spawn_announcers(
     info_hash: InfoHash,
     identity: Arc<Identity>,
     stat_rx: watch::Receiver<TorrentSwarmStats>,
-    events: mpsc::Sender<TorrentSwarmCommand>,
+    events: mpsc::Sender<SwarmEvent>,
     shutdown: CancellationToken,
 ) {
     for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
@@ -146,7 +142,7 @@ impl HttpAnnouncer {
         info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        events: mpsc::Sender<TorrentSwarmCommand>,
+        events: mpsc::Sender<SwarmEvent>,
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
@@ -276,9 +272,7 @@ impl HttpAnnouncer {
                             self.sent_started = true;
                             let _ = self
                                 .events
-                                .send(TorrentSwarmCommand::ProcessAnnounceEvent(
-                                    AnnouncerEvent::DiscoveredPeers(result),
-                                ))
+                                .send(SwarmEvent::PeersDiscovered(result))
                                 .await;
                         }
                         Err(e) => {
@@ -325,7 +319,7 @@ struct UdpAnnouncer {
 
     // TODO: Maybe this should be a weak sender?
     #[eq(skip)]
-    event: mpsc::Sender<TorrentSwarmCommand>,
+    event: mpsc::Sender<SwarmEvent>,
 
     #[eq(skip)]
     sent_started: bool,
@@ -358,7 +352,7 @@ impl UdpAnnouncer {
         info_hash: InfoHash,
         identity: Arc<Identity>,
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        event: mpsc::Sender<TorrentSwarmCommand>,
+        event: mpsc::Sender<SwarmEvent>,
         shutdown: CancellationToken,
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
@@ -699,9 +693,7 @@ impl UdpAnnouncer {
 
                     let _ = self
                         .event
-                        .send(TorrentSwarmCommand::ProcessAnnounceEvent(
-                            AnnouncerEvent::DiscoveredPeers(peers),
-                        ))
+                        .send(SwarmEvent::PeersDiscovered(peers))
                         .await;
                 }
                 // BEP 15: a single announce reporting event=completed should follow the
@@ -765,18 +757,18 @@ impl TorrentSwarmStats {
 
 #[derive(Debug, Clone)]
 pub struct TorrentSwarmHandle {
-    tx: mpsc::Sender<TorrentSwarmCommand>,
+    tx: mpsc::Sender<SwarmEvent>,
 }
 
 impl TorrentSwarmHandle {
     /// Hands a freshly handshaken socket to the swarm, which owns it from here on. Used by both
     /// the inbound listener (`BtClient::accept_incoming`) and the swarm's own dial tasks.
     pub(crate) async fn peer_connected(&self, connected: ConnectedPeer) {
-        let _ = self.tx.send(TorrentSwarmCommand::PeerConnected(connected)).await;
+        let _ = self.tx.send(SwarmEvent::PeerConnected(connected)).await;
     }
 
     async fn dial_failed(&self, addr: SocketAddr) {
-        let _ = self.tx.send(TorrentSwarmCommand::DialFailed(addr)).await;
+        let _ = self.tx.send(SwarmEvent::DialFailed(addr)).await;
     }
 }
 
@@ -788,8 +780,13 @@ pub(crate) struct ConnectedPeer {
     pub remote_supports_fast: bool,
 }
 
-pub(crate) enum TorrentSwarmCommand {
-    ProcessAnnounceEvent(AnnouncerEvent),
+/// Everything that reaches the swarm's event loop from outside it: things that happened in
+/// tasks it doesn't poll itself (tracker announcers, dial tasks, the inbound listener). The
+/// swarm decides what to do about each; the sender never asks it for anything.
+pub(crate) enum SwarmEvent {
+    /// a tracker answered with peers
+    PeersDiscovered(Vec<SocketAddr>),
+    /// a socket finished its handshake and is ours to own
     PeerConnected(ConnectedPeer),
     /// A dial spawned by `connect_to_discovered_peers` failed. Without this the address would
     /// sit in `dialing` forever, and since dedup against re-discovering the same address checks
@@ -826,9 +823,9 @@ pub struct TorrentSwarm {
     http_announcers: Vec<HttpAnnouncer>,
     udp_announcers: Vec<UdpAnnouncer>,
 
-    inbound_msgs: mpsc::Receiver<TorrentSwarmCommand>,
-    /// we keep a sender so we can clone it and give it to objects that generate on run time who need it
-    outbound_msgs: mpsc::Sender<TorrentSwarmCommand>,
+    events_rx: mpsc::Receiver<SwarmEvent>,
+    /// cloned into every task that reports back to the swarm (announcers, dials, the listener)
+    events_tx: mpsc::Sender<SwarmEvent>,
 
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
@@ -889,7 +886,7 @@ impl TorrentSwarm {
         let trackers = torrent.all_trackers();
         let trackers = trackers.into_iter().map(|s| Url::parse(&s)).filter_map(Result::ok);
 
-        let (command_tx, command_rx) = mpsc::channel(512);
+        let (events_tx, events_rx) = mpsc::channel(512);
 
         let http_announcers: Vec<_> = trackers
             .clone()
@@ -900,7 +897,7 @@ impl TorrentSwarm {
                     torrent.info_hash,
                     id.clone(),
                     stat_rx.clone(),
-                    command_tx.clone(),
+                    events_tx.clone(),
                     shutdown.clone(),
                 )
             })
@@ -913,7 +910,7 @@ impl TorrentSwarm {
                     torrent.info_hash,
                     id.clone(),
                     stat_rx.clone(),
-                    command_tx.clone(),
+                    events_tx.clone(),
                     shutdown.clone(),
                 )
             })
@@ -928,8 +925,8 @@ impl TorrentSwarm {
             id,
             http_announcers,
             udp_announcers,
-            inbound_msgs: command_rx,
-            outbound_msgs: command_tx,
+            events_rx,
+            events_tx,
             missing,
             in_flight: BTreeMap::new(),
             pieces_done: 0,
@@ -942,7 +939,7 @@ impl TorrentSwarm {
 
     pub fn make_handle(&self) -> TorrentSwarmHandle {
         TorrentSwarmHandle {
-            tx: self.outbound_msgs.clone(),
+            tx: self.events_tx.clone(),
         }
     }
 
@@ -1004,7 +1001,7 @@ impl TorrentSwarm {
                         }
                     }
                 }
-                Some(command) = self.inbound_msgs.recv() => self.process_command(command).await,
+                Some(event) = self.events_rx.recv() => self.process_event(event).await,
                 _ = housekeeping_ticker.tick() => self.housekeeping().await,
                 _ = keepalive_ticker.tick() => {
                     self.broadcast(|peer| Box::pin(peer.send_keepalive())).await;
@@ -1019,13 +1016,11 @@ impl TorrentSwarm {
         }
     }
 
-    async fn process_command(&mut self, command: TorrentSwarmCommand) {
-        match command {
-            TorrentSwarmCommand::ProcessAnnounceEvent(AnnouncerEvent::DiscoveredPeers(peers)) => {
-                self.connect_to_discovered_peers(peers);
-            }
-            TorrentSwarmCommand::PeerConnected(connected) => self.add_peer(connected).await,
-            TorrentSwarmCommand::DialFailed(addr) => {
+    async fn process_event(&mut self, event: SwarmEvent) {
+        match event {
+            SwarmEvent::PeersDiscovered(peers) => self.connect_to_discovered_peers(peers),
+            SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
+            SwarmEvent::DialFailed(addr) => {
                 self.dialing.remove(&addr);
             }
         }

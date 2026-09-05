@@ -15,7 +15,7 @@ use crate::defs::Identity;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::torrent::{Torrent, parse_torrent};
-use crate::torrent_swarm::{AnnouncerEvent, TorrentSwarmCommand, TorrentSwarmStats, spawn_announcers};
+use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats, spawn_announcers};
 use crate::wire::{BtDecoder, BtEncoder, BtMessage, Extended, shake_hands, supports_extensions};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
@@ -134,8 +134,8 @@ pub async fn fetch(
             }
             _ = shutdown.cancelled() => bail!("cancelled while fetching metadata"),
 
-            Some(command) = event_rx.recv() => {
-                let TorrentSwarmCommand::ProcessAnnounceEvent(AnnouncerEvent::DiscoveredPeers(peers)) = command else {
+            Some(event) = event_rx.recv() => {
+                let SwarmEvent::PeersDiscovered(peers) = event else {
                     continue;
                 };
                 // queue every peer we haven't already tried; the loop head dials as many as
@@ -160,7 +160,9 @@ pub async fn fetch(
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
 async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20]) -> anyhow::Result<Vec<u8>> {
-    let mut tcp = TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
+    let mut tcp = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connect to {addr}"))?;
     let handshake = shake_hands(&mut tcp, &info_hash, &peer_id)
         .await
         .with_context(|| format!("handshake with {addr}"))?;
@@ -178,7 +180,9 @@ async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20
     writer
         .send(BtMessage::Extended(Extended {
             ext_id: 0,
-            payload: format!("d1:md11:ut_metadatai{UT_METADATA_ID}eee").into_bytes().into_boxed_slice(),
+            payload: format!("d1:md11:ut_metadatai{UT_METADATA_ID}eee")
+                .into_bytes()
+                .into_boxed_slice(),
         }))
         .await?;
 
@@ -212,14 +216,19 @@ async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20
         writer
             .send(BtMessage::Extended(Extended {
                 ext_id: their_id,
-                payload: format!("d8:msg_typei0e5:piecei{piece}ee").into_bytes().into_boxed_slice(),
+                payload: format!("d8:msg_typei0e5:piecei{piece}ee")
+                    .into_bytes()
+                    .into_boxed_slice(),
             }))
             .await?;
     }
 
     while have.iter().any(|got| !got) {
         let Some(msg) = reader.next().await else {
-            bail!("{addr} disconnected with {} metadata pieces still missing", have.iter().filter(|g| !**g).count());
+            bail!(
+                "{addr} disconnected with {} metadata pieces still missing",
+                have.iter().filter(|g| !**g).count()
+            );
         };
         let BtMessage::Extended(ext) = msg? else { continue };
         if ext.ext_id != UT_METADATA_ID {
@@ -269,7 +278,10 @@ fn parse_their_handshake(payload: &[u8]) -> anyhow::Result<(u8, usize)> {
     let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) else {
         bail!("peer doesn't advertise ut_metadata, so it can't serve metadata");
     };
-    ensure!(*id > 0 && *id <= u8::MAX as i64, "peer advertised an invalid ut_metadata id {id}");
+    ensure!(
+        *id > 0 && *id <= u8::MAX as i64,
+        "peer advertised an invalid ut_metadata id {id}"
+    );
 
     let Some(BencodeItemView::Integer(size)) = dict.get(b"metadata_size".as_slice()) else {
         bail!("peer advertises ut_metadata but no metadata_size");
@@ -444,7 +456,10 @@ mod test {
 
         let info_hash = InfoHash::from_bytes(Sha1::digest(&raw_info).as_slice());
         let metadata_size = raw_info.len();
-        assert!(metadata_size > METADATA_PIECE_SIZE * 2, "want a genuinely multi-piece fetch");
+        assert!(
+            metadata_size > METADATA_PIECE_SIZE * 2,
+            "want a genuinely multi-piece fetch"
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -453,7 +468,9 @@ mod test {
         let server = tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let their_handshake = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &their_handshake.info_hash, &[9u8; 20]).await.unwrap();
+            send_handshake(&mut tcp, &their_handshake.info_hash, &[9u8; 20])
+                .await
+                .unwrap();
 
             let (reader, writer) = tcp.into_split();
             let mut reader = FramedRead::new(reader, BtDecoder);
@@ -463,9 +480,12 @@ mod test {
             writer
                 .send(BtMessage::Extended(Extended {
                     ext_id: 0,
-                    payload: format!("d1:md11:ut_metadatai{THEIR_UT_METADATA_ID}ee13:metadata_sizei{}ee", served.len())
-                        .into_bytes()
-                        .into_boxed_slice(),
+                    payload: format!(
+                        "d1:md11:ut_metadatai{THEIR_UT_METADATA_ID}ee13:metadata_sizei{}ee",
+                        served.len()
+                    )
+                    .into_bytes()
+                    .into_boxed_slice(),
                 }))
                 .await
                 .unwrap();
@@ -473,12 +493,17 @@ mod test {
             let total_pieces = served.len().div_ceil(METADATA_PIECE_SIZE);
             let mut answered = 0;
             while answered < total_pieces {
-                let Some(Ok(BtMessage::Extended(ext))) = reader.next().await else { continue };
+                let Some(Ok(BtMessage::Extended(ext))) = reader.next().await else {
+                    continue;
+                };
                 // ext_id 0 is the fetcher's own extended handshake, not a metadata request
                 if ext.ext_id == 0 {
                     continue;
                 }
-                assert_eq!(ext.ext_id, THEIR_UT_METADATA_ID, "fetcher must use the id we advertised");
+                assert_eq!(
+                    ext.ext_id, THEIR_UT_METADATA_ID,
+                    "fetcher must use the id we advertised"
+                );
 
                 let (_, dict) = juicy_bencode::parse_bencode_dict(&ext.payload).unwrap();
                 let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
@@ -488,8 +513,7 @@ mod test {
 
                 let start = piece * METADATA_PIECE_SIZE;
                 let end = (start + METADATA_PIECE_SIZE).min(served.len());
-                let payload =
-                    build_ut_metadata_data_message(piece as u32, served.len() as u32, &served[start..end]);
+                let payload = build_ut_metadata_data_message(piece as u32, served.len() as u32, &served[start..end]);
 
                 writer
                     .send(BtMessage::Extended(Extended {
@@ -606,8 +630,12 @@ mod test {
                         if ext.ext_id == 0 {
                             continue;
                         }
-                        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(&ext.payload) else { continue };
-                        let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else { continue };
+                        let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(&ext.payload) else {
+                            continue;
+                        };
+                        let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
+                            continue;
+                        };
 
                         let start = *piece as usize * METADATA_PIECE_SIZE;
                         let end = (start + METADATA_PIECE_SIZE).min(served.len());
@@ -638,7 +666,9 @@ mod test {
 
         let mut compact = Vec::new();
         for peer in peers {
-            let SocketAddr::V4(peer_v4) = peer else { panic!("test peer must be v4") };
+            let SocketAddr::V4(peer_v4) = peer else {
+                panic!("test peer must be v4")
+            };
             compact.extend_from_slice(&peer_v4.ip().octets());
             compact.extend_from_slice(&peer_v4.port().to_be_bytes());
         }
