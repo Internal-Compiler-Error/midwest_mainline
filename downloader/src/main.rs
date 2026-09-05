@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
     };
 
-    let mut client = BtClient::new(identity);
+    let client = BtClient::new(identity);
     let (torrent, root) = if Path::new(&source)
         .extension()
         .is_some_and(|ext| ext == downloader::resume::EXTENSION)
@@ -115,17 +115,13 @@ async fn main() -> anyhow::Result<()> {
         client.shutdown_token(),
     ));
 
-    let shutdown = client.shutdown_token();
-    tokio::select! {
-        result = client.work() => result?,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down, sending a farewell announce to trackers...");
-            shutdown.cancel();
-            // give background announcer tasks a moment to get their event=stopped out
-            // before the runtime drops them on exit
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-    }
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down, sending a farewell announce to trackers...");
+    client.shutdown_token().cancel();
+    // dropping the client stops the swarm; give the announcer tasks a moment to get their
+    // event=stopped out before the runtime drops them on exit
+    drop(client);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     Ok(())
 }

@@ -74,6 +74,17 @@ pub struct Torrent {
 }
 
 impl Torrent {
+    /// The single entry a download root gains from this torrent: the file itself for a
+    /// single-file torrent, the directory holding everything for a multi-file one. Deleting
+    /// `root.join(self.top_level())` removes all of the torrent's data.
+    pub fn top_level(&self) -> PathBuf {
+        self.files
+            .first()
+            .and_then(|(_, path)| path.components().next())
+            .map(|component| PathBuf::from(component.as_os_str()))
+            .unwrap_or_default()
+    }
+
     /// Validates that a piece matches its expected hash
     pub fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
         let expected_hash = self.pieces[piece as usize];

@@ -149,3 +149,16 @@ single file, `<name>/<path...>` otherwise) and the root is an argument to
 cwd), the way every mainstream client asks per torrent. The GUI asks with a folder picker on
 every add, starting from the last answer. The resume file records the root so resuming never
 asks again -- `Session::resume` takes only the resume file.
+
+# Many torrents, add and remove at runtime, 2026-09-05
+`BtClient` is no longer consumed by a `work()`: it starts its inbound listener when created
+(so it must be created on a runtime) and keeps the swarm handles in a map the listener reads
+through a `Weak`, so dropping the last clone of the client stops every swarm and the listener.
+`add_torrent`/`remove_torrent` take `&self`; a second add of the same info hash is refused
+before any file is touched.
+
+`Session` is a list keyed by a session-local `TorrentId`. Each torrent is one task that
+resolves, adds, runs the resume saver, then waits for either session shutdown (files and
+resume data kept) or removal. Removal, per the user's decision, deletes both the resume file
+and the data (`root/<top level>`), after the saver has finished so the two can't race. The
+entry leaves `torrents()` immediately; deletion finishes in the background.

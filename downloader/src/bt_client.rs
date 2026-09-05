@@ -11,22 +11,29 @@ use std::fs;
 use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+/// The set of torrents being served, plus the one inbound listener they share. Torrents can be
+/// added and removed at any time; each runs as its own swarm from the moment it's added.
+///
+/// Cheap to clone: clones share the same torrents. The swarms live for as long as any clone
+/// does -- the listener only holds a weak reference to them, so dropping the last clone stops
+/// every swarm and the listener with it.
+#[derive(Clone)]
 pub struct BtClient {
     id: Arc<Identity>,
-    /// each swarm runs on its own task from the moment it's added; the handle is all there is
-    /// of it here, and dropping it is what stops it (see `TorrentSwarmHandle`)
-    swarms: HashMap<InfoHash, TorrentSwarmHandle>,
+    /// the handle is all there is of a swarm here; dropping it stops the swarm
+    swarms: Arc<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
     shutdown: CancellationToken,
 }
 
 impl BtClient {
+    /// Must be called on a tokio runtime: the inbound listener starts right away.
     pub fn new(id: Identity) -> Self {
         Self::new_with_shutdown(id, CancellationToken::new())
     }
@@ -35,11 +42,17 @@ impl BtClient {
     /// cancellation scope (see `session::Session`) can stop the client along with everything
     /// else it started, rather than having to reach in for `shutdown_token` afterwards.
     pub fn new_with_shutdown(id: Identity, shutdown: CancellationToken) -> Self {
-        Self {
+        let client = Self {
             id: Arc::new(id),
-            swarms: HashMap::new(),
+            swarms: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
-        }
+        };
+        tokio::spawn(Self::accept_incoming(
+            client.id.clone(),
+            Arc::downgrade(&client.swarms),
+            client.shutdown.clone(),
+        ));
+        client
     }
 
     /// A handle the caller can cancel (e.g. on Ctrl+C) to trigger a graceful shutdown.
@@ -47,18 +60,26 @@ impl BtClient {
         self.shutdown.clone()
     }
 
-    /// A live view of `torrent`'s aggregate progress, if it's been added via `add_torrent`.
-    /// Keeps updating for as long as the torrent's swarm task is running, including after
-    /// `work()` has taken ownership of this `BtClient` -- the receiver only depends on the
-    /// underlying channel, not on anything reachable through `self`.
+    /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as
+    /// long as the torrent's swarm runs -- the receiver only depends on the underlying channel.
     pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
-        self.swarms.get(&torrent.info_hash).map(TorrentSwarmHandle::stats)
+        self.swarms
+            .lock()
+            .unwrap()
+            .get(&torrent.info_hash)
+            .map(TorrentSwarmHandle::stats)
+    }
+
+    /// Stops serving `info_hash`: its swarm ends, and every connection to its peers closes.
+    /// The files and any resume data are left where they are. Returns whether it was there.
+    pub fn remove_torrent(&self, info_hash: &InfoHash) -> bool {
+        self.swarms.lock().unwrap().remove(info_hash).is_some()
     }
 
     /// Starts `torrent` from scratch under `root`: target files are created (or truncated)
     /// and sized. A single-file torrent becomes `root/<name>`, a multi-file one
     /// `root/<name>/...`, the way every mainstream client lays a download out.
-    pub fn add_torrent(&mut self, torrent: Torrent, root: &Path) -> anyhow::Result<()> {
+    pub fn add_torrent(&self, torrent: Torrent, root: &Path) -> anyhow::Result<()> {
         let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
         self.add_torrent_with(torrent, root, verified, true)
     }
@@ -67,12 +88,7 @@ impl BtClient {
     /// taken to be on disk and correct, so they're neither downloaded nor re-hashed. Target
     /// files are opened in place and must already be their full size -- a missing or
     /// wrong-sized file is an error, since the bitfield can't be trusted against it.
-    pub fn add_torrent_resumed(
-        &mut self,
-        torrent: Torrent,
-        root: &Path,
-        verified: BitBox<u8, Msb0>,
-    ) -> anyhow::Result<()> {
+    pub fn add_torrent_resumed(&self, torrent: Torrent, root: &Path, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
         if verified.len() != torrent.pieces.len() {
             bail!(
                 "resume bitfield covers {} pieces but the torrent has {}",
@@ -84,14 +100,17 @@ impl BtClient {
     }
 
     fn add_torrent_with(
-        &mut self,
+        &self,
         torrent: Torrent,
         root: &Path,
         verified: BitBox<u8, Msb0>,
         fresh: bool,
     ) -> anyhow::Result<()> {
-        if self.swarms.contains_key(&torrent.info_hash) {
-            bail!("task with this info hash already exists");
+        // held while the files are opened too: a second add of the same torrent must not get
+        // as far as truncating files the first one is downloading into
+        let mut swarms = self.swarms.lock().unwrap();
+        if swarms.contains_key(&torrent.info_hash) {
+            bail!("{} is already added", torrent.name);
         }
 
         let mut files = vec![];
@@ -125,21 +144,7 @@ impl BtClient {
         let storage = Arc::new(storage);
 
         let handle = TorrentSwarm::spawn(torrent.clone(), storage, self.id.clone(), verified);
-        self.swarms.insert(torrent.info_hash, handle);
-        Ok(())
-    }
-
-    pub async fn work(self) -> anyhow::Result<()> {
-        let BtClient { id, swarms, shutdown } = self;
-
-        let swarms = Arc::new(swarms);
-        let listener = tokio::spawn(Self::accept_incoming(id, swarms.clone(), shutdown.clone()));
-
-        // the swarms are already running; they stop when their handles go, which this frame
-        // holds until shutdown so a listener that fails early doesn't take them down with it
-        shutdown.cancelled().await;
-        drop(swarms);
-        let _ = listener.await;
+        swarms.insert(torrent.info_hash, handle);
         Ok(())
     }
 
@@ -149,7 +154,7 @@ impl BtClient {
     /// reads first and only replies once we've matched it to a torrent we're serving.
     async fn accept_incoming(
         id: Arc<Identity>,
-        handles: Arc<HashMap<InfoHash, TorrentSwarmHandle>>,
+        swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
         shutdown: CancellationToken,
     ) {
         // Listen on both families independently rather than relying on a single dual-stack
@@ -189,6 +194,10 @@ impl BtClient {
         }
 
         loop {
+            // the client is gone: nothing to route connections to
+            if swarms.strong_count() == 0 {
+                break;
+            }
             let (mut tcp, remote_addr) = tokio::select! {
                 (accepted, _idx, _rest) = select_all(listeners.iter().map(|l| Box::pin(l.accept()))) => match accepted {
                     Ok(accepted) => accepted,
@@ -201,7 +210,7 @@ impl BtClient {
             };
 
             let id = id.clone();
-            let handles = handles.clone();
+            let swarms = swarms.clone();
             tokio::spawn(async move {
                 let handshake = match crate::wire::read_handshake(&mut tcp).await {
                     Ok(handshake) => handshake,
@@ -211,7 +220,11 @@ impl BtClient {
                     }
                 };
 
-                let Some(handle) = handles.get(&handshake.info_hash) else {
+                // cloned out so the lock isn't held across the awaits below
+                let handle = swarms
+                    .upgrade()
+                    .and_then(|swarms| swarms.lock().unwrap().get(&handshake.info_hash).cloned());
+                let Some(handle) = handle else {
                     tracing::debug!("inbound connection from {remote_addr} named a torrent we're not serving");
                     return;
                 };

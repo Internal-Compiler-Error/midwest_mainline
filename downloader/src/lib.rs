@@ -15,7 +15,7 @@ pub use bt_client::BtClient;
 pub use defs::Identity;
 pub use magnet::{MagnetLink, is_magnet_uri, parse_magnet};
 pub use resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
-pub use session::{Progress, Session, SessionState, human_bytes};
+pub use session::{Progress, Session, TorrentId, TorrentState, human_bytes};
 pub use torrent::{Torrent, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
 
