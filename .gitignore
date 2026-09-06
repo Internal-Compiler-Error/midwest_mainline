@@ -4,3 +4,6 @@
 .idea/
 .DS_Store
 dht.db
+
+# Tauri build output
+/gui/src-tauri/gen

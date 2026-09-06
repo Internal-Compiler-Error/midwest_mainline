@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
@@ -17,6 +18,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub struct LogBuffer {
     lines: Arc<Mutex<VecDeque<String>>>,
     capacity: usize,
+    /// lines ever pushed, so a reader can ask for "everything after the N-th"
+    pushed: Arc<AtomicU64>,
 }
 
 impl LogBuffer {
@@ -27,6 +30,7 @@ impl LogBuffer {
         let buffer = Self {
             lines: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity,
+            pushed: Arc::new(AtomicU64::new(0)),
         };
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         tracing_subscriber::registry()
@@ -39,6 +43,16 @@ impl LogBuffer {
     /// A snapshot of the buffered lines, oldest first.
     pub fn lines(&self) -> Vec<String> {
         self.lines.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// The lines pushed after the first `seen`, oldest first, and the new count to pass back
+    /// next time. Lines that have already fallen out of the buffer are skipped.
+    pub fn lines_since(&self, seen: u64) -> (u64, Vec<String>) {
+        let lines = self.lines.lock().unwrap();
+        let total = self.pushed.load(Ordering::Acquire);
+        let oldest = total - lines.len() as u64;
+        let skip = seen.saturating_sub(oldest) as usize;
+        (total, lines.iter().skip(skip).cloned().collect())
     }
 
     pub fn len(&self) -> usize {
@@ -59,6 +73,7 @@ impl LogBuffer {
             lines.pop_front();
         }
         lines.push_back(line);
+        self.pushed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -123,6 +138,7 @@ mod test {
         let buffer = LogBuffer {
             lines: Arc::new(Mutex::new(VecDeque::new())),
             capacity: 2,
+            pushed: Arc::new(AtomicU64::new(0)),
         };
         // a local subscriber rather than the global one, so tests don't fight over it
         let subscriber = tracing_subscriber::registry().with(BufferLayer(buffer.clone()));
@@ -145,6 +161,13 @@ mod test {
             lines[1]
         );
         assert_eq!(&lines[1][2..3], ":", "starts with an HH:MM:SS clock");
+
+        let (seen, new) = buffer.lines_since(0);
+        assert_eq!(seen, 3, "three were pushed even though only two are kept");
+        assert_eq!(new, lines, "asking from the start skips what fell out of the buffer");
+        let (seen, new) = buffer.lines_since(2);
+        assert_eq!((seen, new.len()), (3, 1), "only the third is new after the second");
+        assert!(buffer.lines_since(3).1.is_empty());
 
         buffer.clear();
         assert!(buffer.is_empty());

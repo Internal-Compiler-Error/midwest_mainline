@@ -294,3 +294,24 @@ failure bans only when every block came from one peer. `release_claim` replaced
 `fail_piece`: a choke, reject, stall, malformed block, or disconnect takes that peer off
 the piece, and the piece goes back on the pile only when nobody else holds it. Test:
 `the_last_pieces_are_raced_and_the_loser_is_cancelled`.
+
+# The GUI is a Tauri 2 + Svelte 5 app, 2026-09-06
+`gui/` at the workspace root: `gui/src` is the Svelte frontend (Vite, TypeScript, runes),
+`gui/src-tauri` is the Rust shell, a workspace member named `downloader-gui`. The shell
+holds a `Mutex<Session>` in Tauri state and exposes one command per `Session` method plus
+`resumable`, `logs_since`/`clear_logs` and `default_download_dir`; the DTOs mirror
+`TorrentState`/`Progress` so the library stays free of serde. The frontend polls `torrents`
+and `logs_since` every 250 ms (the `LogBuffer` grew a monotonic `pushed` counter for that)
+rather than using Tauri events: simpler, and it survives a hot reload. Folder and file
+pickers come from the dialog plugin, which must be both registered in `main.rs` and allowed
+in `capabilities/default.json`. The session is shut down from the run-event callback on
+`ExitRequested`, on the main thread, because it owns a tokio runtime that can't be dropped
+from inside Tauri's own runtime.
+
+Run it with `pnpm tauri dev` in `gui/` (needs `pnpm install` once); `pnpm check` type-checks
+the Svelte side. The chosen framework is for growing into a full client UI with component
+libraries later; for now the styling is hand-written CSS in `app.css` and per-component.
+
+Known gap: like the CLI, it resolves `resume/` and the default download dir against the
+current directory, which is `/` when launched from Finder. A proper data directory is the
+next thing to decide.
