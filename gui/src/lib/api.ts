@@ -23,6 +23,7 @@ export interface Progress {
 export type TorrentRow = { id: TorrentId } & (
   | { kind: 'resolving'; source: string; elapsed_ms: number }
   | ({ kind: 'downloading' } & Progress)
+  | ({ kind: 'paused' } & Progress)
   | { kind: 'failed'; source: string; error: string }
 )
 
@@ -33,6 +34,7 @@ export interface Resumable {
   verified_pieces: number
   total_pieces: number
   total_size: number
+  paused: boolean
 }
 
 export interface LogChunk {
@@ -43,7 +45,10 @@ export interface LogChunk {
 export const torrents = () => invoke<TorrentRow[]>('torrents')
 export const addTorrent = (source: string, root: string) => invoke<TorrentId>('add_torrent', { source, root })
 export const resumeTorrent = (path: string) => invoke<TorrentId>('resume_torrent', { path })
-export const removeTorrent = (id: TorrentId) => invoke<void>('remove_torrent', { id })
+export const removeTorrent = (id: TorrentId, deleteFiles: boolean) =>
+  invoke<void>('remove_torrent', { id, deleteFiles })
+export const pauseTorrent = (id: TorrentId) => invoke<void>('pause_torrent', { id })
+export const unpauseTorrent = (id: TorrentId) => invoke<void>('unpause_torrent', { id })
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })
 export const clearLogs = () => invoke<void>('clear_logs')

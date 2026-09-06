@@ -51,6 +51,23 @@ pub struct TorrentSwarmStats {
 }
 
 impl TorrentSwarmStats {
+    /// The stats of a swarm that has `verified` on disk and hasn't transferred anything yet.
+    pub fn for_verified(torrent: &Torrent, verified: BitBox<u8, Msb0>) -> Self {
+        let written: usize = verified
+            .iter_ones()
+            .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
+            .sum();
+        Self {
+            uploaded: 0,
+            downloaded: 0,
+            wasted: 0,
+            left: torrent.total_size as usize - written,
+            written,
+            completed: verified.all(),
+            verified,
+        }
+    }
+
     pub fn verified_cnt(&self) -> usize {
         self.verified.count_ones()
     }
@@ -346,21 +363,9 @@ impl TorrentSwarm {
             torrent.pieces.len(),
             "verified bitfield must have one bit per piece"
         );
-        let written: usize = verified
-            .iter_ones()
-            .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
-            .sum();
         let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
         let subsample_size = (missing.len() as f64).sqrt().ceil() as usize;
-        let stat = TorrentSwarmStats {
-            uploaded: 0,
-            downloaded: 0,
-            wasted: 0,
-            left: torrent.total_size as usize - written,
-            written,
-            completed: verified.all(),
-            verified,
-        };
+        let stat = TorrentSwarmStats::for_verified(&torrent, verified);
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
         let (events_tx, events_rx) = mpsc::channel(512);

@@ -23,7 +23,9 @@
     <div class="text-destructive">⚠ {torrent.error}</div>
   {:else}
     <div class="flex items-center gap-3">
-      <h2 class="text-base font-semibold">{torrent.completed ? 'Seeding' : 'Downloading'}</h2>
+      <h2 class="text-base font-semibold">
+        {torrent.kind === 'paused' ? 'Paused' : torrent.completed ? 'Seeding' : 'Downloading'}
+      </h2>
       {#if torrent.completed}<span class="text-emerald-600 dark:text-emerald-400">✔ complete</span>{/if}
     </div>
     <ProgressBar fraction={fraction(torrent.verified_pieces, torrent.total_pieces)} done={torrent.completed} tall />

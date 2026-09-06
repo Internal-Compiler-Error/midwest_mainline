@@ -10,8 +10,8 @@ survives context resets; re-read before acting.
 - [ ] DHT crate rework (user: "very badly designed, change it however you wish"): learn the
       external IP from BEP 42 responses instead of public-ip; lookups that don't wait for a
       whole round; drop SQLite for an in-memory table saved to a file?
-- [ ] Auto-resume every torrent in the data dir on startup
-- [ ] Pause/resume per torrent; remove with files vs remove keeping files
+- [x] Auto-resume every torrent in the data dir on startup
+- [x] Pause/resume per torrent; remove with files vs remove keeping files
 - [ ] Peer list in the GUI (address, client, rates, progress, flags)
 - [ ] Persisted settings (listen port, default download dir, max peers) + settings dialog
 - [ ] Global speed limits
@@ -22,7 +22,9 @@ survives context resets; re-read before acting.
 - [ ] uTP: evaluate crates; skip if nothing maintained
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
 
-Decisions made without the user (to report): data dir location; remove semantics.
+Decisions made without the user (to report): data dir location; remove now asks (keep files
+or delete files) instead of always deleting; the endgame raced-piece cap should be bytes, not
+a piece fraction (2% waste on the 3068-piece Arch ISO vs 0.2% on Silo).
 
 # Thoughts on actors in rust
 An actor should probably do the following
@@ -378,3 +380,17 @@ too, for the CLI and the GUI alike. Existing `./resume` files aren't migrated.
 
 `DOWNLOADER_LOG_ADDR=host:port` makes the GUI's `LogBuffer` also stream every line to a TCP
 listener (`nc -l 9999`), so its console can be watched from a terminal.
+
+# Pause, unpause, remove with or without files, auto-resume, 2026-09-06
+`Session` torrents are driven by a `TorrentTask` per torrent with a command channel
+(`Pause`, `Unpause`, `Remove { delete_files }`), replacing the one-shot remove. Running means
+the torrent is in the `BtClient` with a resume-file saver alongside; pausing takes it out of
+the client (connections and announces stop, files stay), publishes `TorrentState::Paused`
+with the last stats, and writes the resume file with a `paused` flag (format unchanged
+otherwise: the key is simply absent when false) so a restart brings it back paused.
+Unpausing adds it back as a resumed torrent from the verified bits the swarm reported when
+it left. Remove takes the resume file always and the data only when asked; the GUI's row
+menu offers both. `Session::resume_all` resumes every file in the resume dir that isn't
+already in the session, and `Session::resumable` is that same filtered list, so the GUI
+starts with everything from last time and only offers what isn't running. Tests:
+`pause_survives_a_restart_and_unpause_starts_again`, `remove_can_keep_the_files`.

@@ -9,18 +9,19 @@
 
 use crate::defs::Identity;
 use crate::dht::Dht;
-use crate::resume::{ResumeData, keep_saving};
+use crate::resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
 use bitvec::prelude::*;
-use std::collections::BTreeMap;
+use midwest_mainline::types::InfoHash;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Identifies a torrent within one session, from `add`/`resume` until `remove`.
@@ -37,6 +38,8 @@ pub enum TorrentState {
         elapsed: Duration,
     },
     Downloading(Progress),
+    /// Stopped by the user: no connections, files and progress kept, ready to `unpause`
+    Paused(Progress),
     Failed {
         source: String,
         error: String,
@@ -79,9 +82,193 @@ struct Resolved {
     torrent: Torrent,
     root: PathBuf,
     verified: BitBox<u8, Msb0>,
+    /// the files are expected to exist already (checked, not created)
     resumed: bool,
+    /// start paused rather than downloading
+    paused: bool,
     /// peers already known for it, handed to the swarm right away
     peers: Vec<std::net::SocketAddr>,
+}
+
+/// The task that owns one torrent for its whole life in the session: resolves the source,
+/// puts the torrent in the client and takes it out again on pause, unpause, remove, and
+/// shutdown, and keeps the resume file current in between.
+struct TorrentTask {
+    client: BtClient,
+    resume_dir: PathBuf,
+    cancel: CancellationToken,
+    phase: watch::Sender<Phase>,
+    commands: mpsc::UnboundedReceiver<Command>,
+}
+
+/// What ended a running or paused stretch of a torrent's life.
+enum Stop {
+    Pause,
+    Unpause,
+    Remove { delete_files: bool },
+    Shutdown,
+}
+
+impl TorrentTask {
+    async fn run<F, Fut>(mut self, resolve: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = anyhow::Result<Resolved>>,
+    {
+        let resolved = tokio::select! {
+            resolved = resolve(self.cancel.clone()) => resolved,
+            _ = self.cancel.cancelled() => return,
+            // removed while still resolving: nothing was written yet
+            _ = self.commands.recv() => return,
+        };
+        let Resolved {
+            torrent,
+            root,
+            mut verified,
+            mut resumed,
+            mut paused,
+            mut peers,
+        } = match resolved {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                let _ = self.phase.send(Phase::Failed {
+                    error: format!("{e:#}"),
+                });
+                return;
+            }
+        };
+        let torrent = Arc::new(torrent);
+
+        let stop = loop {
+            let stop = if paused {
+                self.wait_while_paused(&torrent, &root, &verified).await
+            } else {
+                self.run_until_stopped(&torrent, &root, &mut verified, &mut resumed, &mut peers)
+                    .await
+            };
+            match stop {
+                Ok(Stop::Pause) => paused = true,
+                Ok(Stop::Unpause) => paused = false,
+                Ok(stop) => break stop,
+                Err(e) => {
+                    let _ = self.phase.send(Phase::Failed {
+                        error: format!("{e:#}"),
+                    });
+                    return;
+                }
+            }
+        };
+
+        if let Stop::Remove { delete_files } = stop {
+            let _ = std::fs::remove_file(self.resume_dir.join(ResumeData::file_name(&torrent.info_hash)));
+            if delete_files {
+                let data = root.join(torrent.top_level());
+                let deleted = if data.is_dir() {
+                    std::fs::remove_dir_all(&data)
+                } else {
+                    std::fs::remove_file(&data)
+                };
+                if let Err(e) = deleted {
+                    tracing::warn!("couldn't delete {}: {e}", data.display());
+                }
+            }
+        }
+    }
+
+    /// Puts the torrent in the client and keeps its resume file current until something
+    /// stops it, then takes it out again. `verified` is updated to what's on disk by then.
+    async fn run_until_stopped(
+        &mut self,
+        torrent: &Arc<Torrent>,
+        root: &Path,
+        verified: &mut BitBox<u8, Msb0>,
+        resumed: &mut bool,
+        peers: &mut Vec<std::net::SocketAddr>,
+    ) -> anyhow::Result<Stop> {
+        if *resumed {
+            self.client
+                .add_torrent_resumed((**torrent).clone(), root, verified.clone())?;
+        } else {
+            self.client.add_torrent((**torrent).clone(), root)?;
+        }
+        // whatever happens next, the files exist
+        *resumed = true;
+        self.client.add_peers(&torrent.info_hash, std::mem::take(peers));
+        let stats = self
+            .client
+            .stats(torrent)
+            .ok_or_else(|| anyhow::anyhow!("torrent was added but reported no stats"))?;
+        let stop_saving = self.cancel.child_token();
+        let saver = tokio::spawn(keep_saving(
+            torrent.clone(),
+            root.to_path_buf(),
+            stats.clone(),
+            self.resume_dir.clone(),
+            stop_saving.clone(),
+        ));
+        let _ = self.phase.send(Phase::Downloading {
+            torrent: torrent.clone(),
+            root: root.to_path_buf(),
+            stats: stats.clone(),
+        });
+
+        let stop = loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break Stop::Shutdown,
+                command = self.commands.recv() => match command {
+                    Some(Command::Pause) => break Stop::Pause,
+                    Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
+                    Some(Command::Unpause) => {}
+                    None => break Stop::Shutdown,
+                },
+            }
+        };
+        // the torrent leaves the client; the saver gets its final write in before anything
+        // is deleted, or the deletion would race it
+        self.client.remove_torrent(&torrent.info_hash);
+        stop_saving.cancel();
+        let _ = saver.await;
+        *verified = stats.borrow().verified.clone();
+        if let Stop::Pause = stop {
+            let _ = self.phase.send(Phase::Paused {
+                torrent: torrent.clone(),
+                root: root.to_path_buf(),
+                stats: stats.borrow().clone(),
+            });
+        }
+        Ok(stop)
+    }
+
+    /// Marks the resume file paused, so a restart brings the torrent back paused, and waits
+    /// to be unpaused or removed.
+    async fn wait_while_paused(
+        &mut self,
+        torrent: &Arc<Torrent>,
+        root: &Path,
+        verified: &BitBox<u8, Msb0>,
+    ) -> anyhow::Result<Stop> {
+        let _ = self.phase.send(Phase::Paused {
+            torrent: torrent.clone(),
+            root: root.to_path_buf(),
+            stats: TorrentSwarmStats::for_verified(torrent, verified.clone()),
+        });
+        let mut data = ResumeData::from_torrent(torrent, root, verified);
+        data.paused = true;
+        if let Err(e) = data.write(&self.resume_dir.join(ResumeData::file_name(&torrent.info_hash))) {
+            tracing::warn!("couldn't mark {} paused in its resume file: {e:#}", torrent.name);
+        }
+        Ok(loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break Stop::Shutdown,
+                command = self.commands.recv() => match command {
+                    Some(Command::Unpause) => break Stop::Unpause,
+                    Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
+                    Some(Command::Pause) => {}
+                    None => break Stop::Shutdown,
+                },
+            }
+        })
+    }
 }
 
 /// What a torrent's task publishes; `Session::torrents` turns this into a `TorrentState`.
@@ -95,17 +282,32 @@ enum Phase {
         root: PathBuf,
         stats: watch::Receiver<TorrentSwarmStats>,
     },
+    Paused {
+        torrent: Arc<Torrent>,
+        root: PathBuf,
+        /// the last stats before the swarm was stopped
+        stats: TorrentSwarmStats,
+    },
     Failed {
         error: String,
     },
 }
 
+/// What a front end can do to a torrent once it's running; the torrent's task carries it out.
+enum Command {
+    Pause,
+    Unpause,
+    Remove { delete_files: bool },
+}
+
 /// The session's side of one torrent; the task that actually runs it holds the other side.
 struct Entry {
     source: String,
+    /// known up front for a resume file or a magnet, so `resumable` can leave running
+    /// torrents out; a `.torrent` file's is only known once it has been parsed
+    info_hash: Option<InfoHash>,
     phase: watch::Receiver<Phase>,
-    /// tells the task to take the torrent out of the client and delete everything it wrote
-    remove: Option<oneshot::Sender<()>>,
+    commands: mpsc::UnboundedSender<Command>,
     rates: Rates,
 }
 
@@ -188,7 +390,8 @@ impl Session {
         let root = root.into();
         let identity = self.identity.clone();
         let dht = self.client.dht();
-        self.launch(source.clone(), |cancel| async move {
+        let info_hash = crate::magnet::parse_magnet(&source).ok().map(|m| m.info_hash);
+        self.launch(source.clone(), info_hash, |cancel| async move {
             let loaded = load_source(&source, identity, cancel, dht).await?;
             let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
             Ok(Resolved {
@@ -196,45 +399,79 @@ impl Session {
                 root,
                 verified: nothing,
                 resumed: false,
+                paused: false,
                 peers: loaded.peers,
             })
         })
     }
 
     /// Picks a download back up from a resume file (see `ResumeData`), in the root it was
-    /// started in.
+    /// started in. A torrent that was paused when its file was last written comes back paused.
     pub fn resume(&mut self, path: impl AsRef<Path>) -> TorrentId {
         let path = path.as_ref().to_path_buf();
-        self.launch(path.display().to_string(), |_cancel| async move {
+        let info_hash = ResumeSummary::read(&path).ok().map(|s| s.info_hash);
+        self.launch(path.display().to_string(), info_hash, |_cancel| async move {
             let data = ResumeData::read(&path)?;
             Ok(Resolved {
                 torrent: data.to_torrent()?,
                 root: data.root,
                 verified: data.verified,
                 resumed: true,
+                paused: data.paused,
                 peers: vec![],
             })
         })
     }
 
-    /// Removes a torrent: its connections close, and its resume file and every file it
-    /// downloaded are deleted. The entry is gone from [`Session::torrents`] immediately; the
-    /// deletion itself finishes in the background. Unknown ids are ignored.
-    pub fn remove(&mut self, id: TorrentId) {
-        if let Some(mut entry) = self.torrents.remove(&id) {
-            if let Some(remove) = entry.remove.take() {
-                let _ = remove.send(());
-            }
+    /// Resumes every torrent that has a resume file in this session's resume dir and isn't
+    /// already in the session. What a client does at startup.
+    pub fn resume_all(&mut self) -> Vec<TorrentId> {
+        let files = self.resumable();
+        files.into_iter().map(|f| self.resume(f.path)).collect()
+    }
+
+    /// The resume files in this session's resume dir for torrents it isn't running.
+    pub fn resumable(&self) -> Vec<ResumeSummary> {
+        let running: HashSet<InfoHash> = self.torrents.values().filter_map(Entry::info_hash).collect();
+        list_resume_files(&self.resume_dir)
+            .into_iter()
+            .filter(|f| !running.contains(&f.info_hash))
+            .collect()
+    }
+
+    /// Stops a torrent's connections and announces, keeping its files and progress. Only a
+    /// torrent that's downloading or seeding can be paused; anything else is left alone.
+    pub fn pause(&mut self, id: TorrentId) {
+        self.command(id, Command::Pause);
+    }
+
+    pub fn unpause(&mut self, id: TorrentId) {
+        self.command(id, Command::Unpause);
+    }
+
+    /// Removes a torrent: its connections close and its resume file is deleted, and with
+    /// `delete_files` so is everything it downloaded. The entry is gone from
+    /// [`Session::torrents`] immediately; the deletion itself finishes in the background.
+    /// Unknown ids are ignored.
+    pub fn remove(&mut self, id: TorrentId, delete_files: bool) {
+        if let Some(entry) = self.torrents.remove(&id) {
+            let _ = entry.commands.send(Command::Remove { delete_files });
+        }
+    }
+
+    fn command(&mut self, id: TorrentId, command: Command) {
+        if let Some(entry) = self.torrents.get(&id) {
+            let _ = entry.commands.send(command);
         }
     }
 
     /// Shared tail of `add`/`resume`: `resolve` produces the torrent, where its files go,
     /// which pieces are already had, and whether the target files are expected to exist. The
     /// task it spawns owns the torrent for the rest of its life, including its removal.
-    fn launch<F, Fut>(&mut self, source: String, resolve: F) -> TorrentId
+    fn launch<F, Fut>(&mut self, source: String, info_hash: Option<InfoHash>, resolve: F) -> TorrentId
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<Resolved>> + Send,
+        Fut: Future<Output = anyhow::Result<Resolved>> + Send + 'static,
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -243,98 +480,26 @@ impl Session {
         let (phase_tx, phase_rx) = watch::channel(Phase::Resolving {
             started: Instant::now(),
         });
-        let (remove_tx, mut remove_rx) = oneshot::channel::<()>();
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         self.torrents.insert(
             id,
             Entry {
                 source,
+                info_hash,
                 phase: phase_rx,
-                remove: Some(remove_tx),
+                commands: commands_tx,
                 rates: Rates::new(),
             },
         );
 
-        let client = self.client.clone();
-        let resume_dir = self.resume_dir.clone();
-        self.handle.spawn(async move {
-            let resolved = tokio::select! {
-                resolved = resolve(cancel.clone()) => resolved,
-                // removed while still resolving: nothing was written yet
-                _ = &mut remove_rx => return,
-            };
-            let Resolved {
-                torrent,
-                root,
-                verified,
-                resumed,
-                peers,
-            } = match resolved {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    let _ = phase_tx.send(Phase::Failed {
-                        error: format!("{e:#}"),
-                    });
-                    return;
-                }
-            };
-
-            let added = if resumed {
-                client.add_torrent_resumed(torrent.clone(), &root, verified)
-            } else {
-                client.add_torrent(torrent.clone(), &root)
-            };
-            if let Err(e) = added {
-                let _ = phase_tx.send(Phase::Failed {
-                    error: format!("{e:#}"),
-                });
-                return;
-            }
-            client.add_peers(&torrent.info_hash, peers);
-            let Some(stats) = client.stats(&torrent) else {
-                let _ = phase_tx.send(Phase::Failed {
-                    error: "torrent was added but reported no stats".to_string(),
-                });
-                return;
-            };
-
-            let torrent = Arc::new(torrent);
-            let stop_saving = cancel.child_token();
-            let saver = tokio::spawn(keep_saving(
-                torrent.clone(),
-                root.clone(),
-                stats.clone(),
-                resume_dir.clone(),
-                stop_saving.clone(),
-            ));
-            let _ = phase_tx.send(Phase::Downloading {
-                torrent: torrent.clone(),
-                root: root.clone(),
-                stats,
-            });
-
-            let removed = tokio::select! {
-                _ = cancel.cancelled() => false,
-                _ = &mut remove_rx => true,
-            };
-
-            // either way the torrent leaves the client; the saver gets its final write in
-            // before anything is deleted, or the deletion would race it
-            client.remove_torrent(&torrent.info_hash);
-            stop_saving.cancel();
-            let _ = saver.await;
-            if removed {
-                let _ = std::fs::remove_file(resume_dir.join(ResumeData::file_name(&torrent.info_hash)));
-                let data = root.join(torrent.top_level());
-                let deleted = if data.is_dir() {
-                    std::fs::remove_dir_all(&data)
-                } else {
-                    std::fs::remove_file(&data)
-                };
-                if let Err(e) = deleted {
-                    tracing::warn!("couldn't delete {}: {e}", data.display());
-                }
-            }
-        });
+        let task = TorrentTask {
+            client: self.client.clone(),
+            resume_dir: self.resume_dir.clone(),
+            cancel,
+            phase: phase_tx,
+            commands: commands_rx,
+        };
+        self.handle.spawn(task.run(resolve));
         id
     }
 
@@ -364,6 +529,14 @@ impl Drop for Session {
 }
 
 impl Entry {
+    /// Known up front for a magnet or a resume file, and for anything else once it's running.
+    fn info_hash(&self) -> Option<InfoHash> {
+        self.info_hash.or_else(|| match &*self.phase.borrow() {
+            Phase::Downloading { torrent, .. } | Phase::Paused { torrent, .. } => Some(torrent.info_hash),
+            _ => None,
+        })
+    }
+
     fn state(&mut self) -> TorrentState {
         match self.phase.borrow_and_update().clone() {
             Phase::Failed { error } => TorrentState::Failed {
@@ -377,23 +550,31 @@ impl Entry {
             Phase::Downloading { torrent, root, stats } => {
                 let stats = stats.borrow().clone();
                 self.rates.update(&stats);
-                TorrentState::Downloading(Progress {
-                    name: torrent.name.clone(),
-                    root: root.display().to_string(),
-                    files: torrent.files.iter().map(|(_, p)| p.display().to_string()).collect(),
-                    total_size: torrent.total_size,
-                    downloaded: stats.downloaded,
-                    wasted: stats.wasted,
-                    uploaded: stats.uploaded,
-                    left: stats.left as u64,
-                    verified_pieces: stats.verified_cnt(),
-                    total_pieces: stats.total_pieces(),
-                    completed: stats.completed,
-                    download_bps: self.rates.download_bps,
-                    upload_bps: self.rates.upload_bps,
-                })
+                TorrentState::Downloading(progress(&torrent, &root, &stats, &self.rates))
+            }
+            Phase::Paused { torrent, root, stats } => {
+                self.rates = Rates::new();
+                TorrentState::Paused(progress(&torrent, &root, &stats, &self.rates))
             }
         }
+    }
+}
+
+fn progress(torrent: &Torrent, root: &Path, stats: &TorrentSwarmStats, rates: &Rates) -> Progress {
+    Progress {
+        name: torrent.name.clone(),
+        root: root.display().to_string(),
+        files: torrent.files.iter().map(|(_, p)| p.display().to_string()).collect(),
+        total_size: torrent.total_size,
+        downloaded: stats.downloaded,
+        wasted: stats.wasted,
+        uploaded: stats.uploaded,
+        left: stats.left as u64,
+        verified_pieces: stats.verified_cnt(),
+        total_pieces: stats.total_pieces(),
+        completed: stats.completed,
+        download_bps: rates.download_bps,
+        upload_bps: rates.upload_bps,
     }
 }
 
@@ -570,9 +751,9 @@ mod test {
         };
         assert!(error.contains("already added"), "{error}");
         assert_eq!(std::fs::metadata(&data).unwrap().len(), 40);
-        session.remove(dup);
+        session.remove(dup, true);
 
-        session.remove(id);
+        session.remove(id, true);
         wait_for(&mut session, id, |s| s.is_none());
         let deadline = Instant::now() + Duration::from_secs(5);
         while data.exists() || std::fs::read_dir(&resume_dir).map(|d| d.count()).unwrap_or(0) > 0 {
@@ -583,6 +764,72 @@ mod test {
             std::thread::sleep(Duration::from_millis(20));
         }
 
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Pausing takes the torrent out of the client but keeps its files; the resume file says
+    /// paused, so a fresh session brings it back paused, and unpausing starts it again.
+    #[test]
+    fn pause_survives_a_restart_and_unpause_starts_again() {
+        let dir = scratch("pause");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        assert!(root.join("session.bin").exists(), "pausing keeps the files");
+        let Some((_, TorrentState::Paused(progress))) = session.torrents().into_iter().find(|(i, _)| *i == id) else {
+            panic!()
+        };
+        assert_eq!((progress.total_pieces, progress.download_bps), (3, 0.0));
+        let files = session.resumable();
+        assert!(files.is_empty(), "a paused torrent is still in the session: {files:?}");
+        session.shutdown();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let files = session.resumable();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].paused);
+        let ids = session.resume_all();
+        assert_eq!(ids.len(), 1);
+        wait_for(&mut session, ids[0], |s| matches!(s, Some(TorrentState::Paused(_))));
+        assert!(session.resumable().is_empty(), "resumed torrents aren't offered again");
+
+        session.unpause(ids[0]);
+        wait_for(&mut session, ids[0], |s| {
+            matches!(s, Some(TorrentState::Downloading(_)))
+        });
+        session.shutdown();
+
+        let session = Session::new(test_config(&dir)).unwrap();
+        assert!(!session.resumable()[0].paused, "unpausing clears the flag");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Removing without deleting files leaves the data behind and takes only the resume file.
+    #[test]
+    fn remove_can_keep_the_files() {
+        let dir = scratch("keep");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        let resume_dir = dir.join("resume");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.remove(id, false);
+        wait_for(&mut session, id, |s| s.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_dir(&resume_dir).map(|d| d.count()).unwrap_or(0) > 0 {
+            assert!(Instant::now() < deadline, "resume file still there after remove");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(root.join("session.bin").exists(), "the data stays");
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

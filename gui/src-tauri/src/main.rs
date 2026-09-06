@@ -6,9 +6,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::{LogBuffer, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir, list_resume_files};
+use downloader::{LogBuffer, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir};
 use serde::Serialize;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent, State};
 
@@ -30,6 +29,7 @@ struct TorrentRow {
 enum StateDto {
     Resolving { source: String, elapsed_ms: u64 },
     Downloading(ProgressDto),
+    Paused(ProgressDto),
     Failed { source: String, error: String },
 }
 
@@ -79,6 +79,7 @@ impl From<TorrentState> for StateDto {
                 elapsed_ms: elapsed.as_millis() as u64,
             },
             TorrentState::Downloading(progress) => StateDto::Downloading(progress.into()),
+            TorrentState::Paused(progress) => StateDto::Paused(progress.into()),
             TorrentState::Failed { source, error } => StateDto::Failed { source, error },
         }
     }
@@ -92,6 +93,7 @@ struct ResumableDto {
     verified_pieces: usize,
     total_pieces: usize,
     total_size: u64,
+    paused: bool,
 }
 
 #[derive(Serialize)]
@@ -124,14 +126,26 @@ fn resume_torrent(app: State<App>, path: String) -> TorrentId {
 }
 
 #[tauri::command]
-fn remove_torrent(app: State<App>, id: TorrentId) {
-    app.session.lock().unwrap().remove(id);
+fn remove_torrent(app: State<App>, id: TorrentId, delete_files: bool) {
+    app.session.lock().unwrap().remove(id, delete_files);
+}
+
+#[tauri::command]
+fn pause_torrent(app: State<App>, id: TorrentId) {
+    app.session.lock().unwrap().pause(id);
+}
+
+#[tauri::command]
+fn unpause_torrent(app: State<App>, id: TorrentId) {
+    app.session.lock().unwrap().unpause(id);
 }
 
 #[tauri::command]
 fn resumable(app: State<App>) -> Vec<ResumableDto> {
-    let dir = app.session.lock().unwrap().resume_dir().to_path_buf();
-    list_resume_files(&dir)
+    app.session
+        .lock()
+        .unwrap()
+        .resumable()
         .into_iter()
         .map(|r| ResumableDto {
             path: r.path.display().to_string(),
@@ -140,6 +154,7 @@ fn resumable(app: State<App>) -> Vec<ResumableDto> {
             verified_pieces: r.verified_pieces,
             total_pieces: r.total_pieces,
             total_size: r.total_size,
+            paused: r.paused,
         })
         .collect()
 }
@@ -177,6 +192,8 @@ fn main() {
         dht: true,
     })
     .expect("failed to start a session");
+    // everything from last time comes back, paused ones paused
+    session.resume_all();
     if let Some(source) = std::env::args().nth(1) {
         session.add(source, default_download_dir());
     }
@@ -192,6 +209,8 @@ fn main() {
             add_torrent,
             resume_torrent,
             remove_torrent,
+            pause_torrent,
+            unpause_torrent,
             resumable,
             logs_since,
             clear_logs,

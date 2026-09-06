@@ -37,6 +37,8 @@ pub struct ResumeData {
     pub root: PathBuf,
     /// same layout as `TorrentSwarmStats::verified` (piece 0 is the high bit of byte 0)
     pub verified: BitBox<u8, Msb0>,
+    /// the user paused it; resuming the session leaves it paused rather than starting it
+    pub paused: bool,
 }
 
 impl ResumeData {
@@ -48,6 +50,7 @@ impl ResumeData {
             // happens to start in later, not necessarily where it was written
             root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
             verified: verified.to_bitvec().into_boxed_bitslice(),
+            paused: false,
         }
     }
 
@@ -76,6 +79,10 @@ impl ResumeData {
         let mut out = vec![b'd'];
         out.extend_from_slice(&bstr(b"info"));
         out.extend_from_slice(&self.raw_info);
+        if self.paused {
+            out.extend_from_slice(&bstr(b"paused"));
+            out.extend_from_slice(b"i1e");
+        }
         out.extend_from_slice(&bstr(b"root"));
         out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
         out.extend_from_slice(&bstr(b"trackers"));
@@ -118,6 +125,7 @@ impl ResumeData {
             bail!("missing 'root' path");
         };
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
+        let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
 
         let raw_info = raw_info_bytes(bytes)?;
 
@@ -142,6 +150,7 @@ impl ResumeData {
             trackers,
             root,
             verified: verified.into_boxed_bitslice(),
+            paused,
         })
     }
 
@@ -219,6 +228,7 @@ pub struct ResumeSummary {
     pub verified_pieces: usize,
     pub total_pieces: usize,
     pub total_size: u64,
+    pub paused: bool,
 }
 
 impl ResumeSummary {
@@ -232,6 +242,7 @@ impl ResumeSummary {
             info_hash: torrent.info_hash,
             verified_pieces: data.verified.count_ones(),
             total_pieces: data.verified.len(),
+            paused: data.paused,
             total_size: torrent.total_size,
         })
     }
@@ -367,6 +378,10 @@ mod test {
         assert_eq!(decoded.verified.len(), 5);
         assert_eq!(decoded.verified.count_ones(), 2);
         assert_eq!(decoded.to_torrent().unwrap(), torrent);
+        assert!(!decoded.paused, "the flag is absent unless set");
+
+        let paused = ResumeData { paused: true, ..data };
+        assert!(ResumeData::decode(&paused.encode()).unwrap().paused);
     }
 
     #[test]

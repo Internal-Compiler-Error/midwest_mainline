@@ -58,8 +58,8 @@
     selected = await api.addTorrent(source, dir)
   }
 
-  async function remove(id: TorrentId) {
-    await api.removeTorrent(id)
+  async function remove(id: TorrentId, deleteFiles: boolean) {
+    await api.removeTorrent(id, deleteFiles)
     if (selected === id) selected = null
     rescanSoon()
   }
@@ -86,7 +86,14 @@
         {#if torrents.length === 0}
           <p class="text-muted-foreground">Open a .torrent file, or paste a magnet link above.</p>
         {:else}
-          <TorrentList {torrents} {selected} onselect={(id) => (selected = id)} onremove={remove} />
+          <TorrentList
+            {torrents}
+            {selected}
+            onselect={(id) => (selected = id)}
+            onpause={api.pauseTorrent}
+            onunpause={api.unpauseTorrent}
+            onremove={remove}
+          />
         {/if}
 
         {#if selectedTorrent}
