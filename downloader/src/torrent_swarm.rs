@@ -1,4 +1,5 @@
 use crate::announcer::spawn_announcers;
+use crate::config::SettingsWatch;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::peer::{
@@ -313,6 +314,8 @@ pub struct TorrentSwarm {
     id: Arc<Identity>,
     /// the client's DHT node, if it has one, for pinging the nodes peers tell us about
     dht: DhtWatch,
+    /// live user settings: the connection cap and the rate limits
+    settings: SettingsWatch,
 
     events_rx: mpsc::Receiver<SwarmEvent>,
     /// for the tasks the swarm spawns for itself (announcers, dials, block reads) to report
@@ -354,8 +357,9 @@ impl TorrentSwarm {
         id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
         dht: DhtWatch,
+        settings: SettingsWatch,
     ) -> TorrentSwarmHandle {
-        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht);
+        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht, settings);
         tokio::spawn(swarm.work_loop());
         handle
     }
@@ -366,6 +370,7 @@ impl TorrentSwarm {
         id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
         dht: DhtWatch,
+        settings: SettingsWatch,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
         assert_eq!(
             verified.len(),
@@ -407,6 +412,7 @@ impl TorrentSwarm {
             storage,
             id,
             dht,
+            settings,
             events_rx,
             events_tx,
             missing,
@@ -1075,6 +1081,10 @@ impl TorrentSwarm {
             return;
         }
         known.connected();
+        if self.peers.len() >= self.settings.borrow().max_peers_per_torrent {
+            tracing::debug!("{remote_addr} refused, at the connection cap");
+            return;
+        }
 
         let mut peer = Peer::new(
             connected.tcp,
@@ -1120,7 +1130,11 @@ impl TorrentSwarm {
     /// tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
     fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
         let now = Instant::now();
+        let cap = self.settings.borrow().max_peers_per_torrent;
         for addr in peers.into_iter().map(canonical) {
+            if self.peers.len() + self.dialing.len() >= cap {
+                break;
+            }
             // trackers and PEX both hand out port 0 for peers whose port they don't know
             if addr.port() == 0 {
                 continue;
@@ -1315,7 +1329,14 @@ mod test {
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
-        let (swarm, handle) = TorrentSwarm::new(torrent, storage, id, verified, crate::dht::Dht::none());
+        let (swarm, handle) = TorrentSwarm::new(
+            torrent,
+            storage,
+            id,
+            verified,
+            crate::dht::Dht::none(),
+            crate::bt_client::default_settings(),
+        );
         (swarm, handle, path)
     }
 

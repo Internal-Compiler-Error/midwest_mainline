@@ -1241,6 +1241,8 @@ dependencies = [
  "public-ip",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "serde",
+ "serde_json",
  "sha1",
  "tokio",
  "tokio-util",

@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::{LogBuffer, PeerInfo, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir};
+use downloader::{LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState, data_dir};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent, State};
@@ -200,8 +200,61 @@ fn clear_logs(app: State<App>) {
 }
 
 #[tauri::command]
-fn default_download_dir() -> String {
-    downloader::default_download_dir().display().to_string()
+fn default_download_dir(app: State<App>) -> String {
+    app.session.lock().unwrap().settings().download_dir.display().to_string()
+}
+
+/// `Settings` field for field, in the units the dialog edits.
+#[derive(Serialize, serde::Deserialize)]
+struct SettingsDto {
+    listen_port: u16,
+    download_dir: String,
+    dht: bool,
+    max_peers_per_torrent: usize,
+    download_limit: u64,
+    upload_limit: u64,
+}
+
+impl From<Settings> for SettingsDto {
+    fn from(s: Settings) -> Self {
+        Self {
+            listen_port: s.listen_port,
+            download_dir: s.download_dir.display().to_string(),
+            dht: s.dht,
+            max_peers_per_torrent: s.max_peers_per_torrent,
+            download_limit: s.download_limit,
+            upload_limit: s.upload_limit,
+        }
+    }
+}
+
+impl From<SettingsDto> for Settings {
+    fn from(s: SettingsDto) -> Self {
+        Self {
+            listen_port: s.listen_port,
+            download_dir: s.download_dir.into(),
+            dht: s.dht,
+            max_peers_per_torrent: s.max_peers_per_torrent,
+            download_limit: s.download_limit,
+            upload_limit: s.upload_limit,
+        }
+    }
+}
+
+#[tauri::command]
+fn settings(app: State<App>) -> SettingsDto {
+    app.session.lock().unwrap().settings().into()
+}
+
+/// Returns whether a restart is needed for everything to take effect.
+#[tauri::command]
+fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, String> {
+    let mut session = app.session.lock().unwrap();
+    let before = session.settings();
+    let settings: Settings = settings.into();
+    let restart = settings.listen_port != before.listen_port || settings.dht != before.dht;
+    session.update_settings(settings).map_err(|e| format!("{e:#}"))?;
+    Ok(restart)
 }
 
 /// A fully random peer id, Azureus-style ("-DL0100-" + 12 random bytes).
@@ -214,17 +267,18 @@ fn random_peer_id() -> [u8; 20] {
 fn main() {
     // installed before anything that logs; the console panel shows what lands here
     let logs = LogBuffer::install(5_000).expect("failed to install the log buffer");
+    let data_dir = data_dir();
     let mut session = Session::new(SessionConfig {
         peer_id: random_peer_id(),
-        port: 6881,
-        data_dir: data_dir(),
-        dht: true,
+        settings: Settings::load(&data_dir),
+        data_dir,
     })
     .expect("failed to start a session");
     // everything from last time comes back, paused ones paused
     session.resume_all();
     if let Some(source) = std::env::args().nth(1) {
-        session.add(source, default_download_dir());
+        let root = session.settings().download_dir;
+        session.add(source, root);
     }
 
     tauri::Builder::default()
@@ -244,6 +298,8 @@ fn main() {
             logs_since,
             clear_logs,
             default_download_dir,
+            settings,
+            update_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the tauri application")

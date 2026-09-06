@@ -66,6 +66,20 @@ export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen
 export const clearLogs = () => invoke<void>('clear_logs')
 export const defaultDownloadDir = () => invoke<string>('default_download_dir')
 
+export interface Settings {
+  listen_port: number
+  download_dir: string
+  dht: boolean
+  max_peers_per_torrent: number
+  /** bytes per second, 0 for no limit */
+  download_limit: number
+  upload_limit: number
+}
+
+export const settings = () => invoke<Settings>('settings')
+/** resolves to whether a restart is needed for everything to take effect */
+export const updateSettings = (settings: Settings) => invoke<boolean>('update_settings', { settings })
+
 export const isMagnetUri = (s: string) => s.trim().toLowerCase().startsWith('magnet:?')
 
 export function fraction(verified: number, total: number): number {

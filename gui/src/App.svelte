@@ -11,6 +11,7 @@
   import Console from './lib/Console.svelte'
   import Details from './lib/Details.svelte'
   import ResumableList from './lib/Resumable.svelte'
+  import SettingsDialog from './lib/SettingsDialog.svelte'
   import Toolbar from './lib/Toolbar.svelte'
   import TorrentList from './lib/TorrentList.svelte'
 
@@ -21,6 +22,7 @@
   let downloadDir = $state('')
   let resumable = $state<Resumable[]>([])
   let showConsole = $state(true)
+  let showSettings = $state(false)
   let logLines = $state<string[]>([])
   let logSeen = 0
 
@@ -78,7 +80,8 @@
 <ModeWatcher />
 
 <div class="flex h-screen flex-col text-sm select-none">
-  <Toolbar onadd={add} />
+  <Toolbar onadd={add} onsettings={() => (showSettings = true)} />
+  <SettingsDialog bind:open={showSettings} onsaved={(s) => (downloadDir = s.download_dir)} />
 
   <Resizable.PaneGroup direction="vertical" class="flex-1">
     <Resizable.Pane defaultSize={70} minSize={25}>

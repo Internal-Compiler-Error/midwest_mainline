@@ -1,5 +1,6 @@
 mod announcer;
 mod bt_client;
+pub mod config;
 mod defs;
 pub mod dht;
 pub mod logs;
@@ -16,6 +17,7 @@ pub mod torrent_swarm;
 mod wire;
 
 pub use bt_client::BtClient;
+pub use config::{Settings, SettingsWatch};
 pub use defs::Identity;
 pub use dht::{Dht, DhtWatch};
 pub use logs::LogBuffer;

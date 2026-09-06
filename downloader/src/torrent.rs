@@ -99,7 +99,7 @@ impl Torrent {
             return None;
         }
 
-        let last_piece_index = (self.pieces.len() - 1).try_into().unwrap();
+        let last_piece_index: u64 = (self.pieces.len() - 1).try_into().unwrap();
         if i == last_piece_index {
             Some(self.last_piece_size.try_into().unwrap())
         } else {

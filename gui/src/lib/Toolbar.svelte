@@ -1,13 +1,14 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog'
   import FolderOpen from '@lucide/svelte/icons/folder-open'
+  import SettingsIcon from '@lucide/svelte/icons/settings'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
   import { Separator } from '$lib/components/ui/separator'
   import { isMagnetUri } from './api'
 
   // `onadd` gets a .torrent path or a magnet link; the parent asks where it should go
-  let { onadd }: { onadd: (source: string) => void } = $props()
+  let { onadd, onsettings }: { onadd: (source: string) => void; onsettings: () => void } = $props()
   let magnet = $state('')
   let ready = $derived(isMagnetUri(magnet))
 
@@ -35,4 +36,6 @@
     onkeydown={(e) => e.key === 'Enter' && addMagnet()}
   />
   <Button size="sm" disabled={!ready} onclick={addMagnet}>Add</Button>
+  <Separator orientation="vertical" class="h-5!" />
+  <Button variant="ghost" size="icon-sm" title="settings" onclick={onsettings}><SettingsIcon /></Button>
 </div>

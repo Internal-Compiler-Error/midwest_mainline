@@ -1,3 +1,4 @@
+use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::peer::PeerSnapshot;
@@ -35,6 +36,8 @@ pub struct BtClient {
     shutdown: CancellationToken,
     /// the client's DHT node, shared by every swarm
     dht: DhtWatch,
+    /// live settings, read by every swarm
+    settings: SettingsWatch,
 }
 
 impl BtClient {
@@ -45,18 +48,24 @@ impl BtClient {
     }
 
     pub fn new(id: Identity, dht: DhtWatch) -> Self {
-        Self::new_with_shutdown(id, CancellationToken::new(), dht)
+        Self::new_with_shutdown(id, CancellationToken::new(), dht, default_settings())
     }
 
     /// Like `new`, but driven by a caller-supplied token, so an owner that already has its own
     /// cancellation scope (see `session::Session`) can stop the client along with everything
     /// else it started, rather than having to reach in for `shutdown_token` afterwards.
-    pub fn new_with_shutdown(id: Identity, shutdown: CancellationToken, dht: DhtWatch) -> Self {
+    pub fn new_with_shutdown(
+        id: Identity,
+        shutdown: CancellationToken,
+        dht: DhtWatch,
+        settings: SettingsWatch,
+    ) -> Self {
         let client = Self {
             id: Arc::new(id),
             swarms: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             dht,
+            settings,
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),
@@ -172,7 +181,14 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let handle = TorrentSwarm::spawn(torrent.clone(), storage, self.id.clone(), verified, self.dht.clone());
+        let handle = TorrentSwarm::spawn(
+            torrent.clone(),
+            storage,
+            self.id.clone(),
+            verified,
+            self.dht.clone(),
+            self.settings.clone(),
+        );
         swarms.insert(torrent.info_hash, handle);
         Ok(())
     }
@@ -275,4 +291,11 @@ impl BtClient {
             });
         }
     }
+}
+
+/// A settings watch that stays at the defaults, for a client with nobody to change them.
+pub fn default_settings() -> SettingsWatch {
+    let (tx, rx) = watch::channel(Settings::default());
+    std::mem::forget(tx);
+    rx
 }

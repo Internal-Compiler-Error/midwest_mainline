@@ -7,6 +7,7 @@
 //! [`Session::torrents`] whenever it wants to draw, and renders the [`TorrentState`]s it gets
 //! back.
 
+use crate::config::Settings;
 use crate::defs::Identity;
 use crate::dht::Dht;
 use crate::peer::PeerSnapshot;
@@ -350,18 +351,18 @@ pub struct Session {
     resume_dir: PathBuf,
     /// the DHT node, kept so it lives as long as the session; none if it was turned off
     _dht: Option<Dht>,
+    data_dir: PathBuf,
+    settings: watch::Sender<Settings>,
 }
 
 /// What a session needs to start.
 pub struct SessionConfig {
     pub peer_id: [u8; 20],
-    /// TCP port for inbound peers, and the DHT node's UDP port
-    pub port: u16,
-    /// where the session keeps its own files: resume data and the DHT database. See
-    /// `paths::data_dir` for the usual answer.
+    /// where the session keeps its own files: resume data, the DHT database, and the
+    /// settings. See `paths::data_dir` for the usual answer.
     pub data_dir: PathBuf,
-    /// whether to run a DHT node; off means peers come from trackers and PEX only
-    pub dht: bool,
+    /// the settings to start with; `Settings::load(&data_dir)` for what the user saved
+    pub settings: Settings,
 }
 
 impl Session {
@@ -373,19 +374,25 @@ impl Session {
         let resume_dir = config.data_dir.join("resume");
         std::fs::create_dir_all(&resume_dir)?;
         let rt = Runtime::new()?;
+        let port = config.settings.listen_port;
         let identity = Identity {
             peer_id: config.peer_id,
-            serving: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, config.port).into(),
+            serving: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port).into(),
         };
         let shutdown = CancellationToken::new();
+        let (settings_tx, settings_rx) = watch::channel(config.settings.clone());
         // the client and the DHT node start on whatever runtime is current
         let (client, dht) = {
             let _on_runtime = rt.enter();
             let dht = config
+                .settings
                 .dht
-                .then(|| Dht::start(config.data_dir.join("dht.db"), config.port));
+                .then(|| Dht::start(config.data_dir.join("dht.db"), port));
             let watch = dht.as_ref().map_or_else(Dht::none, Dht::watch);
-            (BtClient::new_with_shutdown(identity, shutdown.clone(), watch), dht)
+            (
+                BtClient::new_with_shutdown(identity, shutdown.clone(), watch, settings_rx),
+                dht,
+            )
         };
         Ok(Self {
             handle: rt.handle().clone(),
@@ -397,7 +404,22 @@ impl Session {
             next_id: 1,
             resume_dir,
             _dht: dht,
+            data_dir: config.data_dir,
+            settings: settings_tx,
         })
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings.borrow().clone()
+    }
+
+    /// Saves and applies new settings. The connection cap and rate limits take effect at
+    /// once; the listen port and the DHT switch need a restart, which is the caller's to
+    /// arrange.
+    pub fn update_settings(&mut self, settings: Settings) -> anyhow::Result<()> {
+        settings.save(&self.data_dir)?;
+        let _ = self.settings.send(settings);
+        Ok(())
     }
 
     /// Where this session writes resume files.
@@ -757,9 +779,12 @@ mod test {
     fn test_config(dir: &Path) -> SessionConfig {
         SessionConfig {
             peer_id: *b"-DL0100-session-tst.",
-            port: 0,
             data_dir: dir.to_path_buf(),
-            dht: false,
+            settings: Settings {
+                listen_port: 0,
+                dht: false,
+                ..Settings::default()
+            },
         }
     }
 
