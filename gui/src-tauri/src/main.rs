@@ -12,7 +12,8 @@ use downloader::{
 };
 use serde::Serialize;
 use std::sync::Mutex;
-use tauri::{Manager, RunEvent, State};
+use std::time::Duration;
+use tauri::{Emitter, Manager, RunEvent, State};
 
 struct App {
     session: Mutex<Session>,
@@ -309,6 +310,12 @@ fn clear_logs(app: State<App>) {
     app.logs.clear();
 }
 
+/// A front-end exception, logged where they can be seen (see `gui/src/main.ts`).
+#[tauri::command]
+fn report_error(message: String) {
+    tracing::error!("front end: {message}");
+}
+
 #[tauri::command]
 fn default_download_dir(app: State<App>) -> String {
     app.session
@@ -399,6 +406,26 @@ fn random_peer_id() -> [u8; 20] {
     id
 }
 
+/// How long to gather library events before handing them to the webview as one batch: a
+/// busy swarm emits hundreds a second, and one IPC message per event would swamp it.
+const EVENT_BATCH_EVERY: Duration = Duration::from_millis(100);
+
+/// Pumps the library's event bus into the webview as batches on the `events` channel; the
+/// Svelte side (`lib/bus.svelte.ts`) accumulates them into its charts.
+fn forward_events(app: tauri::AppHandle) {
+    let mut events = app.state::<App>().session.lock().unwrap().subscribe();
+    tauri::async_runtime::spawn(async move {
+        while let Some(first) = events.next().await {
+            tokio::time::sleep(EVENT_BATCH_EVERY).await;
+            let mut batch = vec![first];
+            batch.extend(events.drain());
+            if app.emit("events", &batch).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn main() {
     // installed before anything that logs; the console panel shows what lands here
     let logs = LogBuffer::install(5_000).expect("failed to install the log buffer");
@@ -438,10 +465,23 @@ fn main() {
             resumable,
             logs_since,
             clear_logs,
+            report_error,
             default_download_dir,
             settings,
             update_settings,
         ])
+        .setup(|app| {
+            forward_events(app.handle().clone());
+            // a window launched from a script opens behind whatever is in front, and WebKit
+            // stops painting a fully covered window, so a screenshot of it comes out blank;
+            // the run driver sets this to keep the window on top while it captures
+            if std::env::var_os("DOWNLOADER_WINDOW_ON_TOP").is_some()
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.set_always_on_top(true);
+            }
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building the tauri application")
         .run(|app, event| {

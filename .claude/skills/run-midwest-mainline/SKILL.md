@@ -133,6 +133,12 @@ Tests use free ports and no DHT, so they run offline.
 
 ## Gotchas
 
+- **The screenshot is blank (dark, no UI) when another window covers the app.** WebKit
+  stops painting a fully covered window, and an app launched from a script opens behind
+  whatever is in front, typically a full-screen terminal. The driver sets
+  `DOWNLOADER_WINDOW_ON_TOP=1`, which makes the app keep its window on top for the run.
+  Diagnosed with `/tmp/midwest-mainline-run/windowid --list` (front to back). Front-end
+  exceptions are reported to the backend log as `front end: ...` (see `gui/src/main.ts`).
 - **A debug GUI binary shows a blank window unless Vite is running.** Tauri's debug profile
   loads `build.devUrl` (http://localhost:5173) from `gui/src-tauri/tauri.conf.json`, not the
   embedded bundle. The driver starts `pnpm dev` when nothing listens there and stops it

@@ -22,7 +22,8 @@ for window in windows {
     let layer = window[kCGWindowLayer as String] as? Int ?? 0
     let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
     let height = bounds["Height"] as? Double ?? 0
-    if name == owner && layer == 0 && height > 50, let id = window[kCGWindowNumber as String] as? Int {
+    // layer 0 is a normal window, 5 one kept on top (DOWNLOADER_WINDOW_ON_TOP)
+    if name == owner && (0...5).contains(layer) && height > 50, let id = window[kCGWindowNumber as String] as? Int {
         print(id)
         exit(0)
     }

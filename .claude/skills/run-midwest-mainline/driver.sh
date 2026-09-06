@@ -80,7 +80,10 @@ case ${1:-} in
     # it at the scratch dir so a test run never writes into the user's own folders
     mkdir -p "$DATA_DIR" "$RUN_DIR/gui-download"
     [[ -f $DATA_DIR/settings.json ]] || printf '{"download_dir": "%s"}\n' "$RUN_DIR/gui-download" > "$DATA_DIR/settings.json"
-    DOWNLOADER_DATA_DIR=$DATA_DIR DOWNLOADER_LOG_ADDR=127.0.0.1:$LOG_PORT RUST_LOG=${RUST_LOG:-info} RUST_BACKTRACE=0 \
+    # DOWNLOADER_WINDOW_ON_TOP: the window opens behind whatever is in front (a full-screen
+    # terminal, say) and WebKit stops painting a covered window, which screenshots as blank
+    DOWNLOADER_DATA_DIR=$DATA_DIR DOWNLOADER_LOG_ADDR=127.0.0.1:$LOG_PORT DOWNLOADER_WINDOW_ON_TOP=1 \
+      RUST_LOG=${RUST_LOG:-info} RUST_BACKTRACE=0 \
       "$ROOT/target/debug/downloader-gui" ${source:+"$source"} > "$RUN_DIR/gui.stderr" 2>&1 &
     gui_pid=$!
     sleep "$secs"

@@ -13,6 +13,9 @@
   import { humanBytes } from './lib/api'
   import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
+  import Insights from './lib/Insights.svelte'
+  import { Insights as InsightsStore } from './lib/bus.svelte'
+  import { subscribe as subscribeEvents } from './lib/events'
   import Details from './lib/Details.svelte'
   import ResumableList from './lib/Resumable.svelte'
   import SettingsDialog from './lib/SettingsDialog.svelte'
@@ -25,7 +28,22 @@
   /// where the next torrent goes; the folder picker starts here and updates it
   let downloadDir = $state('')
   let resumable = $state<Resumable[]>([])
-  let showConsole = $state(true)
+  type Pane = 'console' | 'insights' | null
+  /// what the bottom pane shows; the choice survives a restart
+  let pane = $state<Pane>(rememberedPane())
+  function rememberedPane(): Pane {
+    try {
+      const saved = localStorage.getItem('pane')
+      if (saved === 'console' || saved === 'insights' || saved === 'none') return saved === 'none' ? null : saved
+    } catch {}
+    return 'insights'
+  }
+  $effect(() => {
+    try {
+      localStorage.setItem('pane', pane ?? 'none')
+    } catch {}
+  })
+  const insights = new InsightsStore()
   let showSettings = $state(false)
   let logLines = $state<string[]>([])
   let logSeen = 0
@@ -121,6 +139,8 @@
     })
     refresh()
     const timer = setInterval(refresh, 250)
+    // the library's event bus feeds the insights panel, whether or not it's showing
+    const unlistenEvents = subscribeEvents((batch) => insights.ingest(batch))
     // .torrent files dropped on the window are added to the default download dir
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === 'drop') {
@@ -130,6 +150,7 @@
     return () => {
       clearInterval(timer)
       unlisten.then((stop) => stop())
+      unlistenEvents.then((stop) => stop())
     }
   })
 
@@ -197,21 +218,30 @@
         {/if}
       </main>
     </Resizable.Pane>
-    {#if showConsole}
+    {#if pane !== null}
       <Resizable.Handle withHandle />
-      <Resizable.Pane defaultSize={30} minSize={10}>
-        <Console lines={logLines} />
+      <Resizable.Pane defaultSize={pane === 'insights' ? 55 : 30} minSize={10}>
+        {#if pane === 'console'}
+          <Console lines={logLines} />
+        {:else}
+          <Insights {insights} />
+        {/if}
       </Resizable.Pane>
     {/if}
   </Resizable.PaneGroup>
 
   <footer class="flex items-center gap-3 border-t bg-card px-3 py-1">
-    <Button variant={showConsole ? 'secondary' : 'ghost'} size="xs" onclick={() => (showConsole = !showConsole)}>
+    <Button variant={pane === 'console' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'console' ? null : 'console')}>
       Console
     </Button>
-    <span class="text-xs text-muted-foreground">{logLines.length} lines</span>
-    {#if showConsole}
+    <Button variant={pane === 'insights' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'insights' ? null : 'insights')}>
+      Insights
+    </Button>
+    {#if pane === 'console'}
+      <span class="text-xs text-muted-foreground">{logLines.length} lines</span>
       <Button variant="ghost" size="xs" onclick={clearLogs}>clear</Button>
+    {:else if pane === 'insights'}
+      <span class="text-xs text-muted-foreground">{insights.received} events</span>
     {/if}
     {#if status}
       <span class="ml-auto flex gap-4 text-xs text-muted-foreground tabular-nums">
