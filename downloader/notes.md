@@ -15,7 +15,7 @@ survives context resets; re-read before acting.
 - [x] Peer list in the GUI (address, client, rates, progress, flags)
 - [x] Persisted settings (listen port, default download dir, max peers) + settings dialog
 - [x] Global speed limits
-- [ ] File selection / priorities
+- [x] File selection (priorities not done: the scheduler is rarest-first, a priority order would fight it)
 - [ ] Local Service Discovery (BEP 14)
 - [ ] Seeding ratio / stop seeding
 - [ ] MSE encryption
@@ -421,3 +421,18 @@ in `held_uploads`, which housekeeping drains as the bucket allows. Granularity i
 about a second, and a bucket holds at most one second's worth, so a quiet spell can't bank a
 burst. On the Arch ISO with a 500 KiB/s limit the mean over 30 s was 443 KiB/s and the
 worst second 640 KiB/s. Test: `the_download_limit_paces_requests`.
+
+# File selection, 2026-09-06
+`Torrent::wanted_pieces(selected)` marks every piece holding a byte of a selected file (a
+piece shared with an unselected file is still wanted, so both files' bytes in it are
+correct). `TorrentSwarmStats` carries that `wanted` bitfield next to `verified`: `left`,
+`completed`, `verified_cnt` and `total_pieces` all count wanted pieces only, so announces,
+the progress bar and "complete" mean "what the user asked for". `SwarmEvent::FilesSelected`
+rebuilds `missing` from the new selection (pieces in flight finish either way). The
+selection travels as one flag per file: `Session::select_files`, a `watch` in the torrent
+task that the resume saver reads (stored as the `skip` list of file indices, absent when
+everything is selected) and that the phase exposes for `Progress::files`, which now carries
+path, size and the flag; the GUI's file list has a checkbox per file. Priorities (this file
+first) were left out on purpose: the scheduler is rarest-first with UCB peer choice, and a
+priority order would fight both; sequential download is the same story. Test:
+`deselected_files_pieces_are_not_requested`.

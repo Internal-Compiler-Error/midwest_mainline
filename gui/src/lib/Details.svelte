@@ -1,12 +1,20 @@
 <script lang="ts">
   import LoaderCircle from '@lucide/svelte/icons/loader-circle'
+  import { Checkbox } from '$lib/components/ui/checkbox'
   import { ScrollArea } from '$lib/components/ui/scroll-area'
   import * as Table from '$lib/components/ui/table'
   import type { TorrentRow } from './api'
   import { fraction, humanBytes, isMagnetUri } from './api'
   import ProgressBar from './ProgressBar.svelte'
 
-  let { torrent }: { torrent: TorrentRow } = $props()
+  let { torrent, onselectfiles }: { torrent: TorrentRow; onselectfiles: (selected: boolean[]) => void } = $props()
+
+  function toggleFile(index: number, checked: boolean) {
+    if (torrent.kind !== 'downloading' && torrent.kind !== 'paused') return
+    const selected = torrent.files.map((f) => f.selected)
+    selected[index] = checked
+    onselectfiles(selected)
+  }
 </script>
 
 <div class="flex flex-col gap-3">
@@ -48,9 +56,17 @@
 
     <div class="font-medium">Files ({torrent.files.length})</div>
     <ScrollArea class="max-h-40 rounded-md border">
-      <ul class="p-2 select-text">
-        {#each torrent.files as file (file)}
-          <li class="truncate" title={file}>{file}</li>
+      <ul class="p-2">
+        {#each torrent.files as file, i (file.path)}
+          <li class="flex items-center gap-2">
+            <Checkbox
+              checked={file.selected}
+              onCheckedChange={(checked) => toggleFile(i, checked === true)}
+              title={file.selected ? 'skip this file' : 'download this file'}
+            />
+            <span class="truncate select-text" title={file.path}>{file.path}</span>
+            <span class="ml-auto text-muted-foreground tabular-nums">{humanBytes(file.size)}</span>
+          </li>
         {/each}
       </ul>
     </ScrollArea>

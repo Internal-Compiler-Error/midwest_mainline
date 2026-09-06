@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail};
 use bendy::decoding::Object;
+use bitvec::prelude::*;
 use juicy_bencode::BencodeItemView;
 use midwest_mainline::types::InfoHash;
 use sha1::{Digest, Sha1};
@@ -90,6 +91,31 @@ impl Torrent {
         let expected_hash = self.pieces[piece as usize];
         let got = Sha1::digest(data);
         *got == expected_hash
+    }
+
+    /// The pieces holding any byte of file `index`; empty for an empty file.
+    pub fn pieces_of_file(&self, index: usize) -> std::ops::Range<u32> {
+        let start: u64 = self.files[..index].iter().map(|(len, _)| *len as u64).sum();
+        let end = start + self.files[index].0 as u64;
+        if end == start {
+            return 0..0;
+        }
+        let piece = self.piece_size as u64;
+        (start / piece) as u32..end.div_ceil(piece) as u32
+    }
+
+    /// One bit per piece: set if the piece holds any byte of a selected file. A piece
+    /// shared by a selected and an unselected file is wanted.
+    pub fn wanted_pieces(&self, selected: &[bool]) -> BitBox<u8, Msb0> {
+        let mut wanted = bitvec![u8, Msb0; 0; self.pieces.len()];
+        for (index, _) in self.files.iter().enumerate() {
+            if selected.get(index).copied().unwrap_or(true) {
+                for piece in self.pieces_of_file(index) {
+                    wanted.set(piece as usize, true);
+                }
+            }
+        }
+        wanted.into_boxed_bitslice()
     }
 
     /// Returns the size of the ith piece in bytes

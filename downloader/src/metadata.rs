@@ -76,6 +76,7 @@ pub async fn fetch(
         left: UNKNOWN_BYTES_LEFT,
         written: 0,
         verified: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
+        wanted: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
         completed: false,
     };
     let (_stat_tx, stat_rx) = watch::channel(placeholder_stats);

@@ -103,6 +103,15 @@ impl BtClient {
             .map(TorrentSwarmHandle::stats)
     }
 
+    /// Downloads only the selected files of a torrent from now on (one flag per file, in
+    /// `Torrent::files` order). Unknown torrents are ignored.
+    pub fn select_files(&self, info_hash: &InfoHash, selected: Vec<bool>) {
+        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
+        if let Some(handle) = handle {
+            tokio::spawn(async move { handle.select_files(selected).await });
+        }
+    }
+
     /// Tells a torrent's swarm about peers found some other way than its own announces, such
     /// as the ones a magnet's metadata fetch met. Unknown torrents are ignored.
     pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {

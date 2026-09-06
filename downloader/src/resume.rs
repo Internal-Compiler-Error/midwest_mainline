@@ -39,6 +39,8 @@ pub struct ResumeData {
     pub verified: BitBox<u8, Msb0>,
     /// the user paused it; resuming the session leaves it paused rather than starting it
     pub paused: bool,
+    /// indices into the torrent's files of the ones the user doesn't want
+    pub skip: Vec<u32>,
 }
 
 impl ResumeData {
@@ -51,7 +53,13 @@ impl ResumeData {
             root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
+            skip: vec![],
         }
+    }
+
+    /// One flag per file from `skip`.
+    pub fn selected(&self, files: usize) -> Vec<bool> {
+        (0..files).map(|i| !self.skip.contains(&(i as u32))).collect()
     }
 
     pub fn info_hash(&self) -> InfoHash {
@@ -85,6 +93,14 @@ impl ResumeData {
         }
         out.extend_from_slice(&bstr(b"root"));
         out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
+        if !self.skip.is_empty() {
+            out.extend_from_slice(&bstr(b"skip"));
+            out.push(b'l');
+            for i in &self.skip {
+                out.extend_from_slice(format!("i{i}e").as_bytes());
+            }
+            out.push(b'e');
+        }
         out.extend_from_slice(&bstr(b"trackers"));
         out.push(b'l');
         for t in &self.trackers {
@@ -126,6 +142,16 @@ impl ResumeData {
         };
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
         let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
+        let skip: Vec<u32> = match dict.remove(b"skip".as_slice()) {
+            Some(BencodeItemView::List(items)) => items
+                .into_iter()
+                .filter_map(|i| match i {
+                    BencodeItemView::Integer(i) => u32::try_from(i).ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
 
         let raw_info = raw_info_bytes(bytes)?;
 
@@ -151,6 +177,7 @@ impl ResumeData {
             root,
             verified: verified.into_boxed_bitslice(),
             paused,
+            skip,
         })
     }
 
@@ -170,6 +197,16 @@ impl ResumeData {
     }
 }
 
+/// The file indices a selection leaves out, as the resume file stores them.
+pub fn skipped(selected: &[bool]) -> Vec<u32> {
+    selected
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !**s)
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
 /// Keeps `dir/<info hash>.resume` up to date with `stats` until `shutdown` fires, then writes
 /// it one last time. Meant to be spawned alongside `BtClient::work`.
 ///
@@ -180,6 +217,7 @@ pub async fn keep_saving(
     torrent: Arc<Torrent>,
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
+    selected: watch::Receiver<Vec<bool>>,
     dir: PathBuf,
     shutdown: CancellationToken,
 ) {
@@ -187,7 +225,8 @@ pub async fn keep_saving(
 
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
     let save = |stats: &watch::Receiver<TorrentSwarmStats>| {
-        let data = ResumeData::from_torrent(&torrent, &root, &stats.borrow().verified);
+        let mut data = ResumeData::from_torrent(&torrent, &root, &stats.borrow().verified);
+        data.skip = skipped(&selected.borrow());
         let written = std::fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| data.write(&path));
@@ -382,6 +421,14 @@ mod test {
 
         let paused = ResumeData { paused: true, ..data };
         assert!(ResumeData::decode(&paused.encode()).unwrap().paused);
+
+        let skipping = ResumeData {
+            skip: vec![0, 2],
+            ..paused
+        };
+        let decoded = ResumeData::decode(&skipping.encode()).unwrap();
+        assert_eq!(decoded.skip, vec![0, 2]);
+        assert_eq!(decoded.selected(4), vec![false, true, false, true]);
     }
 
     #[test]
@@ -551,14 +598,17 @@ mod test {
             left: 100,
             written: 0,
             verified: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
+            wanted: bitvec![u8, Msb0; 1; 7].into_boxed_bitslice(),
             completed: false,
         };
         let (tx, rx) = watch::channel(stats.clone());
+        let (_selected_tx, selected_rx) = watch::channel(vec![true]);
         let shutdown = CancellationToken::new();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
             dir.clone(),
             rx,
+            selected_rx,
             dir.join("nested"),
             shutdown.clone(),
         ));

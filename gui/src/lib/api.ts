@@ -7,7 +7,7 @@ export type TorrentId = number
 export interface Progress {
   name: string
   root: string
-  files: string[]
+  files: TorrentFile[]
   total_size: number
   downloaded: number
   wasted: number
@@ -19,6 +19,12 @@ export interface Progress {
   download_bps: number
   upload_bps: number
   peers: Peer[]
+}
+
+export interface TorrentFile {
+  path: string
+  size: number
+  selected: boolean
 }
 
 export interface Peer {
@@ -60,6 +66,7 @@ export const resumeTorrent = (path: string) => invoke<TorrentId>('resume_torrent
 export const removeTorrent = (id: TorrentId, deleteFiles: boolean) =>
   invoke<void>('remove_torrent', { id, deleteFiles })
 export const pauseTorrent = (id: TorrentId) => invoke<void>('pause_torrent', { id })
+export const selectFiles = (id: TorrentId, selected: boolean[]) => invoke<void>('select_files', { id, selected })
 export const unpauseTorrent = (id: TorrentId) => invoke<void>('unpause_torrent', { id })
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })

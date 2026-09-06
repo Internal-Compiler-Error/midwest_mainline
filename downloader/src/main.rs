@@ -112,10 +112,12 @@ async fn main() -> anyhow::Result<()> {
         resume_dir.join(ResumeData::file_name(&torrent.info_hash)).display()
     );
     let stats = client.stats(&torrent).expect("torrent was just added");
+    let (_all_files, all_files) = tokio::sync::watch::channel(vec![true; torrent.files.len()]);
     tokio::spawn(keep_saving(
         Arc::new(torrent),
         root,
         stats,
+        all_files,
         resume_dir,
         client.shutdown_token(),
     ));

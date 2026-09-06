@@ -101,7 +101,7 @@
 
         {#if selectedTorrent}
           <Separator class="my-3" />
-          <Details torrent={selectedTorrent} />
+          <Details torrent={selectedTorrent} onselectfiles={(files) => selected !== null && api.selectFiles(selected, files)} />
         {/if}
 
         {#if resumable.length > 0 || torrents.length === 0}

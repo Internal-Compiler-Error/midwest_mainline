@@ -6,7 +6,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::{LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState, data_dir};
+use downloader::{
+    FileInfo, LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState, data_dir,
+};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent, State};
@@ -38,7 +40,7 @@ enum StateDto {
 struct ProgressDto {
     name: String,
     root: String,
-    files: Vec<String>,
+    files: Vec<FileDto>,
     total_size: u64,
     downloaded: u64,
     wasted: u64,
@@ -50,6 +52,23 @@ struct ProgressDto {
     download_bps: f64,
     upload_bps: f64,
     peers: Vec<PeerDto>,
+}
+
+#[derive(Serialize)]
+struct FileDto {
+    path: String,
+    size: u64,
+    selected: bool,
+}
+
+impl From<FileInfo> for FileDto {
+    fn from(f: FileInfo) -> Self {
+        Self {
+            path: f.path,
+            size: f.size,
+            selected: f.selected,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -84,7 +103,7 @@ impl From<Progress> for ProgressDto {
         Self {
             name: p.name,
             root: p.root,
-            files: p.files,
+            files: p.files.into_iter().map(FileDto::from).collect(),
             total_size: p.total_size,
             downloaded: p.downloaded,
             wasted: p.wasted,
@@ -157,6 +176,11 @@ fn resume_torrent(app: State<App>, path: String) -> TorrentId {
 #[tauri::command]
 fn remove_torrent(app: State<App>, id: TorrentId, delete_files: bool) {
     app.session.lock().unwrap().remove(id, delete_files);
+}
+
+#[tauri::command]
+fn select_files(app: State<App>, id: TorrentId, selected: Vec<bool>) {
+    app.session.lock().unwrap().select_files(id, selected);
 }
 
 #[tauri::command]
@@ -294,6 +318,7 @@ fn main() {
             remove_torrent,
             pause_torrent,
             unpause_torrent,
+            select_files,
             resumable,
             logs_since,
             clear_logs,

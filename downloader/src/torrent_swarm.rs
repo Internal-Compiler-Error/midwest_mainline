@@ -49,34 +49,53 @@ pub struct TorrentSwarmStats {
     /// stored MSB-first (`Msb0`) so `as_raw_slice()` matches BEP 3's bitfield byte layout
     /// directly: piece 0 is the high bit of byte 0.
     pub verified: BitBox<u8, Msb0>,
+    /// pieces that belong to a selected file (see `Torrent::wanted_pieces`); `left` and
+    /// `completed` only count these
+    pub wanted: BitBox<u8, Msb0>,
 
     pub completed: bool,
 }
 
 impl TorrentSwarmStats {
     /// The stats of a swarm that has `verified` on disk and hasn't transferred anything yet.
-    pub fn for_verified(torrent: &Torrent, verified: BitBox<u8, Msb0>) -> Self {
+    pub fn for_verified(torrent: &Torrent, verified: BitBox<u8, Msb0>, wanted: BitBox<u8, Msb0>) -> Self {
         let written: usize = verified
             .iter_ones()
             .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
             .sum();
-        Self {
+        let mut stats = Self {
             uploaded: 0,
             downloaded: 0,
             wasted: 0,
-            left: torrent.total_size as usize - written,
+            left: 0,
             written,
-            completed: verified.all(),
+            completed: false,
             verified,
-        }
+            wanted,
+        };
+        stats.refresh(torrent);
+        stats
     }
 
+    /// Recomputes `left` and `completed` from `verified` and `wanted`.
+    pub fn refresh(&mut self, torrent: &Torrent) {
+        self.left = self
+            .wanted
+            .iter_ones()
+            .filter(|&p| !self.verified[p])
+            .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
+            .sum();
+        self.completed = self.wanted.iter_ones().all(|p| self.verified[p]);
+    }
+
+    /// Verified pieces that are wanted; unwanted pieces aren't progress towards anything.
     pub fn verified_cnt(&self) -> usize {
-        self.verified.count_ones()
+        self.wanted.iter_ones().filter(|&p| self.verified[p]).count()
     }
 
+    /// Wanted pieces, what `verified_cnt` is out of.
     pub fn total_pieces(&self) -> usize {
-        self.verified.len()
+        self.wanted.count_ones()
     }
 
     pub fn all_verified(&self) -> bool {
@@ -118,6 +137,11 @@ impl TorrentSwarmHandle {
     pub(crate) async fn peers_discovered(&self, peers: Vec<SocketAddr>) {
         let _ = self.tx.send(SwarmEvent::PeersDiscovered(peers)).await;
     }
+
+    /// One flag per file; only pieces of selected files are downloaded.
+    pub(crate) async fn select_files(&self, selected: Vec<bool>) {
+        let _ = self.tx.send(SwarmEvent::FilesSelected(selected)).await;
+    }
 }
 
 /// A socket that has completed the BitTorrent handshake and is ready to become a `Peer`.
@@ -135,6 +159,8 @@ pub(crate) struct ConnectedPeer {
 pub(crate) enum SwarmEvent {
     /// a tracker answered with peers
     PeersDiscovered(Vec<SocketAddr>),
+    /// one flag per file, see `TorrentSwarmHandle::select_files`
+    FilesSelected(Vec<bool>),
     /// a socket finished its handshake and is ours to own
     PeerConnected(ConnectedPeer),
     /// a block a peer asked for has been read off disk (or couldn't be), see `serve_request`
@@ -387,7 +413,8 @@ impl TorrentSwarm {
         );
         let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
         let subsample_size = (missing.len() as f64).sqrt().ceil() as usize;
-        let stat = TorrentSwarmStats::for_verified(&torrent, verified);
+        let wanted = bitvec![u8, Msb0; 1; torrent.pieces.len()].into_boxed_bitslice();
+        let stat = TorrentSwarmStats::for_verified(&torrent, verified, wanted);
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
         let (events_tx, events_rx) = mpsc::channel(512);
@@ -502,6 +529,7 @@ impl TorrentSwarm {
     async fn process_event(&mut self, event: SwarmEvent) {
         match event {
             SwarmEvent::PeersDiscovered(peers) => self.connect_to_discovered_peers(peers),
+            SwarmEvent::FilesSelected(selected) => self.select_files(&selected).await,
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::DialFailed(addr) => {
@@ -512,6 +540,23 @@ impl TorrentSwarm {
                     .dial_failed(Instant::now());
             }
         }
+    }
+
+    /// Wants only the pieces of the selected files from now on. Pieces that stopped being
+    /// wanted leave the pile, and ones in flight are allowed to finish; newly wanted pieces
+    /// join the pile. Completion and `left` follow the new selection.
+    async fn select_files(&mut self, selected: &[bool]) {
+        self.stat.wanted = self.torrent.wanted_pieces(selected);
+        self.missing = self
+            .stat
+            .wanted
+            .iter_ones()
+            .filter(|&p| !self.stat.verified[p] && !self.in_flight.contains_key(&(p as u32)))
+            .map(|p| p as u32)
+            .collect();
+        self.stat.refresh(&self.torrent);
+        self.publish_stats();
+        self.schedule().await;
     }
 
     /// Once a second: time out stalled requests, drop silent peers, keep the request pipeline
@@ -882,9 +927,9 @@ impl TorrentSwarm {
 
         info!("piece {piece} is completed");
         self.stat.written += self.torrent.nth_piece_size(piece).expect("piece index in range");
-        self.stat.left = self.torrent.total_size as usize - self.stat.written;
-        self.stat.completed = self.stat.all_verified();
-        if self.stat.completed {
+        let was_complete = self.stat.completed;
+        self.stat.refresh(&self.torrent);
+        if self.stat.completed && !was_complete {
             info!("download complete, {} bytes were received twice", self.stat.wasted);
         }
         // announcers watch this to send a prompt event=completed rather than waiting for
@@ -1488,6 +1533,109 @@ mod test {
         assert_eq!(stats.downloaded, TOTAL as u64);
         assert_eq!(std::fs::read(&path).unwrap(), content());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Two files over three pieces: `a` is pieces 0 and 1, `b` is pieces 1 and 2. Deselecting
+    /// `b` means piece 2 is never asked for and the torrent completes with two pieces; selecting
+    /// it again fetches the third.
+    #[tokio::test]
+    async fn deselected_files_pieces_are_not_requested() {
+        let bytes = content();
+        let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
+        let mut info = format!(
+            "d5:filesld6:lengthi60000e4:pathl1:aeed6:lengthi40000e4:pathl1:beee4:name5:multi12:piece lengthi{PIECE}e6:pieces{}:",
+            pieces.len()
+        )
+        .into_bytes();
+        info.extend_from_slice(&pieces);
+        info.push(b'e');
+        let mut torrent = parse_torrent(&build_torrent_file(&info, &[])).unwrap();
+        assert_eq!((torrent.pieces_of_file(0), torrent.pieces_of_file(1)), (0..2, 1..3));
+
+        let dir = std::env::temp_dir().join(format!("downloader-swarm-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut handles = vec![];
+        for (size, path) in &mut torrent.files {
+            *path = dir.join(path.file_name().unwrap());
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(*size as u64).unwrap();
+            handles.push(file);
+        }
+        let torrent = Arc::new(torrent);
+        let storage = Arc::new(TorrentStorage::new(torrent.clone(), handles));
+        let id = Arc::new(Identity {
+            peer_id: *b"-DL0100-swarm-test..",
+            serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+        });
+        let (swarm, handle) = TorrentSwarm::new(
+            torrent,
+            storage,
+            id,
+            bitvec![u8, Msb0; 0; 3].into_boxed_bitslice(),
+            crate::dht::Dht::none(),
+            crate::bt_client::default_settings(),
+            Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
+        );
+        let mut stats = handle.stats();
+        tokio::spawn(swarm.work_loop());
+        handle.select_files(vec![true, false]).await;
+
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+        let mut asked = BTreeSet::new();
+        let serving = async {
+            loop {
+                match seeder.next().await {
+                    Some(Ok(BtMessage::Request(req))) => {
+                        asked.insert(req.index);
+                        seeder.send(block(req)).await.unwrap();
+                    }
+                    Some(Ok(BtMessage::Have(_))) => {
+                        if stats.borrow().completed {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), serving).await.unwrap();
+        assert_eq!(
+            asked,
+            BTreeSet::from([0, 1]),
+            "piece 2 belongs to the unwanted file only"
+        );
+        let snapshot = stats.borrow().clone();
+        assert_eq!((snapshot.verified_cnt(), snapshot.total_pieces()), (2, 2));
+        assert_eq!(snapshot.left, 0);
+
+        handle.select_files(vec![true, true]).await;
+        let third = async {
+            loop {
+                match seeder.next().await {
+                    Some(Ok(BtMessage::Request(req))) => {
+                        assert_eq!(req.index, 2);
+                        seeder.send(block(req)).await.unwrap();
+                    }
+                    Some(Ok(BtMessage::Have(have))) if have.checked == 2 => break,
+                    Some(Ok(_)) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), third)
+            .await
+            .expect("selecting the file again fetches its piece");
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), &content()[..60_000]);
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), &content()[60_000..]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A download limit of two blocks a second lets two requests out at once, then nothing
