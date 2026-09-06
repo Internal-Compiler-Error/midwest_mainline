@@ -95,17 +95,17 @@
           <Tabs.Trigger value="trackers">Trackers ({torrent.trackers.length})</Tabs.Trigger>
         </Tabs.List>
         <Tabs.Content value="trackers" class="max-h-64 overflow-auto rounded-md border">
-        <Table.Root>
+        <Table.Root class="table-fixed">
           <Table.Body>
             {#each torrent.trackers as tracker (tracker.url)}
               <Table.Row>
-                <Table.Cell class="max-w-0 truncate select-text" title={tracker.url}>{tracker.url}</Table.Cell>
+                <Table.Cell class="truncate select-text" title={tracker.url}>{tracker.url}</Table.Cell>
                 <Table.Cell
-                  class="max-w-64 truncate {tracker.status === 'working' ? '' : tracker.status === 'waiting' ? 'text-muted-foreground' : 'text-destructive'}"
+                  class="w-64 truncate {tracker.status === 'working' ? '' : tracker.status === 'waiting' ? 'text-muted-foreground' : 'text-destructive'}"
                   title={tracker.status}>{tracker.status}</Table.Cell
                 >
-                <Table.Cell class="whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
-                <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">
+                <Table.Cell class="w-24 whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
+                <Table.Cell class="w-36 whitespace-nowrap text-muted-foreground tabular-nums">
                   {tracker.next_announce_secs === null ? '' : `next in ${Math.floor(tracker.next_announce_secs / 60)}m ${tracker.next_announce_secs % 60}s`}
                 </Table.Cell>
               </Table.Row>
@@ -114,15 +114,17 @@
         </Table.Root>
         </Tabs.Content>
         <Tabs.Content value="peers" class="max-h-64 overflow-auto rounded-md border">
-        <Table.Root class="text-xs">
+        <!-- fixed layout: the numeric columns keep their width as values come and go, so
+             the rest of the row doesn't shift every second -->
+        <Table.Root class="table-fixed text-xs">
           <Table.Header>
             <Table.Row>
-              <Table.Head>Address</Table.Head>
+              <Table.Head class="w-52">Address</Table.Head>
               <Table.Head>Client</Table.Head>
-              <Table.Head class="text-right">Has</Table.Head>
-              <Table.Head class="text-right">Down</Table.Head>
-              <Table.Head class="text-right">Up</Table.Head>
-              <Table.Head title="D/d: we download from it (d: choked). U/u: it downloads from us (u: we choke it)">
+              <Table.Head class="w-14 text-right">Has</Table.Head>
+              <Table.Head class="w-28 text-right">Down</Table.Head>
+              <Table.Head class="w-28 text-right">Up</Table.Head>
+              <Table.Head class="w-16" title="D/d: we download from it (d: choked). U/u: it downloads from us (u: we choke it)">
                 Flags
               </Table.Head>
             </Table.Row>
@@ -130,8 +132,8 @@
           <Table.Body>
             {#each torrent.peers as peer (peer.addr)}
               <Table.Row>
-                <Table.Cell class="font-mono select-text">{peer.addr}</Table.Cell>
-                <Table.Cell class="max-w-40 truncate" title={peer.client}>{peer.client}</Table.Cell>
+                <Table.Cell class="truncate font-mono select-text" title={peer.addr}>{peer.addr}</Table.Cell>
+                <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
                 <Table.Cell class="text-right tabular-nums">{Math.round(peer.progress * 100)}%</Table.Cell>
                 <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
                   {humanBytes(peer.download_bps)}/s
