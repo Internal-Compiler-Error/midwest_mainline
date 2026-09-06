@@ -29,6 +29,8 @@ survives context resets; re-read before acting.
 - [x] Tracker status in the details panel; announce retries with backoff
 - [x] GUI conveniences: pause/resume all, Show in Finder, drop .torrent files on the window,
       completion notifications, first torrent selected by itself
+- [x] PEX `added.f` flags both ways; dial hints (uTP first, plaintext) from peer memory
+- [x] Dependencies upgraded to the latest (user's request)
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -505,9 +507,9 @@ key. The policy lives on `Identity`, so like the port it takes effect at the nex
 The whole opening (connect, MSE, handshake) is bounded by `HANDSHAKE_TIMEOUT`, which it
 wasn't before.
 
-A `Prefer` fallback costs one extra connection per peer that doesn't speak MSE. `KnownPeer`
-could remember which peers those are and skip the encrypted try; not done, since nearly
-every client accepts it. Peers show `E` in their flags when encrypted.
+A `Prefer` fallback costs one extra connection per peer that doesn't speak MSE, so
+`KnownPeer` remembers a dialled peer that came up plaintext (`plaintext_only`) and the next
+dial goes straight to plaintext (`DialHints`). Peers show `E` in their flags when encrypted.
 
 Tests: RC4 known answer, DH agreement, both handshake sides over an in-memory pipe (several
 served torrents, a pre-read head, a torrent we don't serve), and `stream::connect` against
@@ -523,10 +525,10 @@ listener. Peers show `T` in their flags.
 
 Dial order: TCP first; uTP only when TCP can't *connect* (refused, unreachable, timed out).
 A peer TCP reaches but that rejects the handshake is reachable and just didn't want us, so
-it isn't retried over uTP. That means outbound uTP fires rarely; inbound uTP is where most
-of it happens, and on a VPN without a port forward there is none. libtorrent prefers uTP
-for peers PEX flagged uTP-capable (`added.f` bit 0x04), which this PEX neither sends nor
-reads; that's the refinement if uTP is ever wanted more often. The whole dial (both
+it isn't retried over uTP. That means outbound uTP fires rarely on its own; inbound uTP is
+where most of it happens, and on a VPN without a port forward there is none. Like
+libtorrent, a peer PEX flagged uTP-capable (`added.f` bit 0x04) is dialled over uTP first
+(`KnownPeer::prefers_utp`), and our PEX messages carry the flags too. The whole dial (both
 transports, an MSE attempt, a plaintext retry) is bounded by `HANDSHAKE_TIMEOUT`, now 30 s.
 While here, `Prefer` no longer opens two TCP connections to a dead peer: the first connect
 happens once, and only the plaintext retry dials again.
