@@ -98,10 +98,10 @@ fn spawn_forwarder(addr: String) -> std::sync::mpsc::Sender<String> {
                 if conn.is_none() {
                     conn = std::net::TcpStream::connect(&addr).ok();
                 }
-                if let Some(stream) = &mut conn {
-                    if writeln!(stream, "{line}").is_err() {
-                        conn = None;
-                    }
+                if let Some(stream) = &mut conn
+                    && writeln!(stream, "{line}").is_err()
+                {
+                    conn = None;
                 }
             }
         })

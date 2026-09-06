@@ -123,7 +123,7 @@ impl Encode for Request {
     fn encode(&self, buf: &mut [u8]) {
         let (length, header) = buf.split_at_mut(4);
         let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&(1 + 12 as u32).to_be_bytes());
+        length.copy_from_slice(&(1 + 12_u32).to_be_bytes());
         header.copy_from_slice(&[6u8]);
         body.copy_from_slice(&u32s_to_be_bytes!(self.index, self.begin, self.length));
     }
@@ -491,7 +491,7 @@ pub(crate) struct Handshake {
 }
 
 // pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
-pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
+pub const HANDSHAKE_STR: &[u8] = b"\x13BitTorrent protocol";
 
 impl Handshake {
     /// BEP 10: bit 0x10 of reserved byte 5 (0-indexed from the start of the 8-byte reserved area)
@@ -531,7 +531,7 @@ pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake
     let mut read_buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
     let Ok(_) = peer.read_exact(&mut read_buf).await else {
         info!("Peer didn't send enough bytes for a handshake");
-        return Err(io::Error::new(ErrorKind::Other, "early EOF during handshake"));
+        return Err(io::Error::other("early EOF during handshake"));
     };
 
     if read_buf[..HANDSHAKE_STR.len()] != *HANDSHAKE_STR {
@@ -542,11 +542,11 @@ pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake
             peer.peer_addr().unwrap(),
         );
         peer.shutdown().await?;
-        return Err(io::Error::new(ErrorKind::Other, "protocol string didn't match"));
+        return Err(io::Error::other("protocol string didn't match"));
     }
 
     let handshake = Handshake::ref_from_bytes(&read_buf[HANDSHAKE_STR.len()..]).expect("shit should work");
-    Ok(handshake.clone())
+    Ok(*handshake)
 }
 
 /// Performs the outbound side of a handshake: send ours, then read and validate theirs.
@@ -573,7 +573,7 @@ pub(crate) async fn shake_hands(
             info_hash, handshake.info_hash,
         );
         peer.shutdown().await?;
-        return Err(io::Error::new(ErrorKind::Other, "handshake hash info didn't match"));
+        return Err(io::Error::other("handshake hash info didn't match"));
     }
 
     Ok(handshake)

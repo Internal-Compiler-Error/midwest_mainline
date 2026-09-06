@@ -47,7 +47,7 @@ impl TorrentStorage {
         Ok(start..start + piece_size)
     }
 
-    pub fn write_piece(&self, piece: u32, complete_piece: Box<[u8]>) -> anyhow::Result<()> {
+    pub fn write_piece(&self, piece: u32, complete_piece: &[u8]) -> anyhow::Result<()> {
         let mut written = 0;
         for (file, range) in self.file_segments(self.piece_range(piece)?) {
             let size = range.end - range.start;

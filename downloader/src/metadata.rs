@@ -218,10 +218,10 @@ async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20
         let Some(msg) = reader.next().await else {
             bail!("{addr} disconnected before sending an extended handshake");
         };
-        if let BtMessage::Extended(ext) = msg? {
-            if ext.ext_id == 0 {
-                break parse_their_handshake(&ext.payload)?;
-            }
+        if let BtMessage::Extended(ext) = msg?
+            && ext.ext_id == 0
+        {
+            break parse_their_handshake(&ext.payload)?;
         }
     };
 

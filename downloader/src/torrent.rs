@@ -89,7 +89,7 @@ impl Torrent {
     pub fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
         let expected_hash = self.pieces[piece as usize];
         let got = Sha1::digest(data);
-        &*got == &expected_hash
+        *got == expected_hash
     }
 
     /// Returns the size of the ith piece in bytes
@@ -214,7 +214,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
 
     let pieces = pieces.chunks(20).map(|e| e.try_into().unwrap()).collect();
     let total_size = files.iter().map(|(len, _f)| *len as u64).sum();
-    let piece_len: u64 = piece_len.try_into()?;
+    let piece_len = u64::from(piece_len);
     // an evenly-divisible torrent has a "remainder" of 0, but the last piece is still
     // full-sized in that case
     let last_piece_len = match total_size % piece_len {

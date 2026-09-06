@@ -787,7 +787,7 @@ impl TorrentSwarm {
         let begin = block.begin as usize;
         let end = begin + block.data.len();
         // the block length is remote-controlled; a mismatch must not panic via copy_from_slice
-        if block.data.len() != block.length as usize || end > in_flight.buf.len() || begin % BLOCK_SIZE != 0 {
+        if block.data.len() != block.length as usize || end > in_flight.buf.len() || !begin.is_multiple_of(BLOCK_SIZE) {
             warn!(
                 "{from} sent a malformed block for piece {}, giving up on it there",
                 block.index
@@ -813,7 +813,7 @@ impl TorrentSwarm {
         let in_flight = self.in_flight.remove(&piece).expect("checked above");
         self.cancel_losers(piece, &in_flight).await;
         let senders = in_flight.senders();
-        if let Err(e) = self.storage.write_piece(piece, in_flight.buf.into_boxed_slice()) {
+        if let Err(e) = self.storage.write_piece(piece, &in_flight.buf) {
             warn!("couldn't write piece {piece}: {e:#}");
             self.missing.push(piece);
             return;
@@ -1164,7 +1164,7 @@ impl TorrentSwarm {
 
         let mut to_unchoke: Vec<SocketAddr> = interested.iter().take(MAX_UNCHOKED_PEERS).map(|p| p.0).collect();
 
-        if round % OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS == 0 {
+        if round.is_multiple_of(OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS) {
             let candidates: Vec<_> = interested.iter().filter(|p| !to_unchoke.contains(&p.0)).collect();
             if let Some(pick) = candidates.choose(&mut rand::rng()) {
                 to_unchoke.push(pick.0);

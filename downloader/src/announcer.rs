@@ -443,7 +443,7 @@ impl UdpAnnouncer {
         info!("Resolving {}", query);
         let mut addresses: Vec<_> = lookup_host(&query)
             .await
-            .with_context(|| format!("Failed to resolve {}", &query))?
+            .with_context(|| format!("Failed to resolve {}", query))?
             .collect();
 
         info!("Looking up {} came back with {:?}", query, &addresses);
