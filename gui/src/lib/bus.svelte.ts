@@ -245,7 +245,8 @@ export class Insights {
         break
       }
       case 'peer_picked': {
-        // a first pick has an infinite bonus, which JSON carries as null
+        // a first pick has no finite bonus (the peer is picked first regardless); shown as
+        // a bar taller than any real one
         const explore = e.explore ?? 1.5
         const p = this.peers.get(e.addr)
         if (p) this.peers.set(e.addr, { ...p, picks: e.picked_count, exploit: e.exploit, explore })

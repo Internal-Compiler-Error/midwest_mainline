@@ -1262,9 +1262,10 @@ impl TorrentSwarm {
         let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
         let peer = &self.peers[idx];
         let (exploit, explore) = if self.total_picks == 0 || peer.stats.picked_count == 0 {
-            (0.0, f64::INFINITY)
+            (0.0, None)
         } else {
-            peer.stats.ucb_terms(self.total_picks, rate_scale)
+            let (exploit, explore) = peer.stats.ucb_terms(self.total_picks, rate_scale);
+            (exploit, Some(explore))
         };
         self.bus.emit(Event::PeerPicked {
             info_hash: self.torrent.info_hash,

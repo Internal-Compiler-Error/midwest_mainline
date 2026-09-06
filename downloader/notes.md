@@ -697,6 +697,11 @@ a failed hash; pieces are binned above 6000), peers found by source, clients (ro
 transport rings (TCP/uTP x plain/encrypted, dialed/inbound), why peers left, announces,
 lifecycle, and a filterable raw feed with per-kind counts. The bottom pane is now
 Console | Insights (footer buttons), the choice remembered in localStorage, Insights by
-default. ECharts was chosen over LayerChart (shadcn's pick) because it animates by itself
+default, and the default window grew to 1280x900 so the pane shows more than one row of
+cards. Events emitted before the page listens would be dropped by Tauri's `emit`, so the
+Rust side subscribes before the first torrent is resumed and holds the stream until the
+page calls `events_ready` after registering its listener; a resumed torrent's
+`torrent_resolved` and `pieces_known` therefore reach the panel. A first pick has no finite
+exploration bonus and is sent as `null`; a `Lagged` notice keeps the last sequence number. ECharts was chosen over LayerChart (shadcn's pick) because it animates by itself
 and has every chart type needed, and over hand-rolled SVG on the user's "don't reinvent the
 wheel".

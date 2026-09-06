@@ -5,6 +5,8 @@ import { invoke } from '@tauri-apps/api/core'
 export type TorrentId = number
 
 export interface Progress {
+  /** 40 hex digits, how the event bus names the torrent */
+  info_hash: string
   name: string
   root: string
   files: TorrentFile[]

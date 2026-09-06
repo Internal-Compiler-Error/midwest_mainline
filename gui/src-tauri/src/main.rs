@@ -7,17 +7,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use downloader::{
-    Encryption, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId,
-    TorrentState, TrackerInfo, data_dir,
+    Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
+    TorrentId, TorrentState, TrackerInfo, data_dir,
 };
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager, RunEvent, State};
+use tokio::sync::Notify;
 
 struct App {
     session: Mutex<Session>,
     logs: LogBuffer,
+    /// the bus subscription, taken before the first torrent starts so nothing is missed;
+    /// `forward_events` takes it out
+    events: Mutex<Option<Events>>,
+    /// the page has its listener up (see `events_ready`); until then the forwarder holds back
+    page_ready: Arc<Notify>,
 }
 
 #[derive(Serialize)]
@@ -52,6 +58,8 @@ enum StateDto {
 /// `Progress` field for field; the library stays free of serde.
 #[derive(Serialize)]
 struct ProgressDto {
+    /// 40 hex digits, how the event bus names the torrent
+    info_hash: String,
     name: String,
     root: String,
     files: Vec<FileDto>,
@@ -136,6 +144,7 @@ impl From<PeerInfo> for PeerDto {
 impl From<Progress> for ProgressDto {
     fn from(p: Progress) -> Self {
         Self {
+            info_hash: p.info_hash.clone(),
             name: p.name,
             root: p.root,
             files: p.files.into_iter().map(FileDto::from).collect(),
@@ -316,6 +325,12 @@ fn report_error(message: String) {
     tracing::error!("front end: {message}");
 }
 
+/// The page is listening on the `events` channel; what happened since startup can flow.
+#[tauri::command]
+fn events_ready(app: State<App>) {
+    app.page_ready.notify_one();
+}
+
 #[tauri::command]
 fn default_download_dir(app: State<App>) -> String {
     app.session
@@ -411,10 +426,17 @@ fn random_peer_id() -> [u8; 20] {
 const EVENT_BATCH_EVERY: Duration = Duration::from_millis(100);
 
 /// Pumps the library's event bus into the webview as batches on the `events` channel; the
-/// Svelte side (`lib/bus.svelte.ts`) accumulates them into its charts.
+/// Svelte side (`lib/bus.svelte.ts`) accumulates them into its charts. Nothing is sent
+/// before the page says it's listening (an emit with no listener is dropped); the bus
+/// buffers what happens meanwhile, including every resumed torrent's start.
 fn forward_events(app: tauri::AppHandle) {
-    let mut events = app.state::<App>().session.lock().unwrap().subscribe();
+    let state = app.state::<App>();
+    let Some(mut events) = state.events.lock().unwrap().take() else {
+        return;
+    };
+    let page_ready = state.page_ready.clone();
     tauri::async_runtime::spawn(async move {
+        page_ready.notified().await;
         while let Some(first) = events.next().await {
             tokio::time::sleep(EVENT_BATCH_EVERY).await;
             let mut batch = vec![first];
@@ -436,6 +458,7 @@ fn main() {
         data_dir,
     })
     .expect("failed to start a session");
+    let events = session.subscribe();
     // everything from last time comes back, paused ones paused
     session.resume_all();
     if let Some(source) = std::env::args().nth(1) {
@@ -450,6 +473,8 @@ fn main() {
         .manage(App {
             session: Mutex::new(session),
             logs,
+            events: Mutex::new(Some(events)),
+            page_ready: Arc::new(Notify::new()),
         })
         .invoke_handler(tauri::generate_handler![
             torrents,
@@ -466,6 +491,7 @@ fn main() {
             logs_since,
             clear_logs,
             report_error,
+            events_ready,
             default_download_dir,
             settings,
             update_settings,

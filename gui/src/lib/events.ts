@@ -2,6 +2,7 @@
 // channel: batches of stamped events, serialized straight from the Rust enum. Keep the
 // union in step with `Event` there.
 import { listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 
 export type MappingState =
   | { state: 'off' }
@@ -50,9 +51,12 @@ export type Kind = Event['kind']
 
 export type Stamped = { seq: number; at_ms: number } & Event
 
-/** Calls `handler` with every batch the backend sends; returns the unsubscribe. */
-export function subscribe(handler: (batch: Stamped[]) => void): Promise<() => void> {
-  return listen<Stamped[]>('events', (e) => handler(e.payload))
+/** Calls `handler` with every batch the backend sends, from the start of the session (the
+ * backend holds everything back until the listener is up); returns the unsubscribe. */
+export async function subscribe(handler: (batch: Stamped[]) => void): Promise<() => void> {
+  const stop = await listen<Stamped[]>('events', (e) => handler(e.payload))
+  await invoke('events_ready')
+  return stop
 }
 
 export function sourceLabel(source: PeerSource): string {

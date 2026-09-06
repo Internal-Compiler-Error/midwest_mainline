@@ -133,7 +133,11 @@ Tests use free ports and no DHT, so they run offline.
 
 ## Gotchas
 
-- **The screenshot is blank (dark, no UI) when another window covers the app.** WebKit
+- **The screenshot is blank (dark, no UI) when the screen is locked.** WebKit paints nothing
+  behind the lock screen; check with
+  `ioreg -n Root -d1 -a | grep -A1 CGSSessionScreenIsLocked` (a `<true/>` means locked) and
+  wait for the user. Same symptom, different cause, below.
+- **The screenshot is blank when another window covers the app.** WebKit
   stops painting a fully covered window, and an app launched from a script opens behind
   whatever is in front, typically a full-screen terminal. The driver sets
   `DOWNLOADER_WINDOW_ON_TOP=1`, which makes the app keep its window on top for the run.

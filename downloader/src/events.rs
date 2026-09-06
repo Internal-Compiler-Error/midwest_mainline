@@ -156,14 +156,15 @@ pub enum Event {
         by_us: bool,
     },
     /// UCB chose a peer to request a piece from. `exploit` is its measured rate relative to
-    /// the fastest peer, `explore` the confidence bonus; the pick is the highest sum.
+    /// the fastest peer, `explore` the confidence bonus; the pick is the highest sum. A peer
+    /// never picked before has no finite bonus (it's picked first no matter what): `None`.
     PeerPicked {
         #[serde(serialize_with = "hex")]
         info_hash: InfoHash,
         addr: SocketAddr,
         piece: u32,
         exploit: f64,
-        explore: f64,
+        explore: Option<f64>,
         picked_count: usize,
         total_picks: usize,
     },
@@ -295,6 +296,7 @@ impl EventBus {
     pub fn subscribe(&self) -> Events {
         Events {
             rx: self.tx.subscribe(),
+            last_seq: 0,
         }
     }
 }
@@ -302,6 +304,8 @@ impl EventBus {
 /// One subscriber's view of the stream, from the moment it subscribed.
 pub struct Events {
     rx: broadcast::Receiver<Stamped>,
+    /// of the last event delivered, so a synthesized `Lagged` doesn't reset the order
+    last_seq: u64,
 }
 
 impl Events {
@@ -309,12 +313,8 @@ impl Events {
     /// and then carries on from the oldest event still buffered.
     pub async fn next(&mut self) -> Option<Stamped> {
         match self.rx.recv().await {
-            Ok(event) => Some(event),
-            Err(broadcast::error::RecvError::Lagged(missed)) => Some(Stamped {
-                seq: 0,
-                at_ms: now_ms(),
-                event: Event::Lagged { missed },
-            }),
+            Ok(event) => Some(self.seen(event)),
+            Err(broadcast::error::RecvError::Lagged(missed)) => Some(self.lagged(missed)),
             Err(broadcast::error::RecvError::Closed) => None,
         }
     }
@@ -324,14 +324,23 @@ impl Events {
         let mut out = Vec::new();
         loop {
             match self.rx.try_recv() {
-                Ok(event) => out.push(event),
-                Err(broadcast::error::TryRecvError::Lagged(missed)) => out.push(Stamped {
-                    seq: 0,
-                    at_ms: now_ms(),
-                    event: Event::Lagged { missed },
-                }),
+                Ok(event) => out.push(self.seen(event)),
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => out.push(self.lagged(missed)),
                 Err(_) => return out,
             }
+        }
+    }
+
+    fn seen(&mut self, event: Stamped) -> Stamped {
+        self.last_seq = event.seq;
+        event
+    }
+
+    fn lagged(&self, missed: u64) -> Stamped {
+        Stamped {
+            seq: self.last_seq,
+            at_ms: now_ms(),
+            event: Event::Lagged { missed },
         }
     }
 }
@@ -376,6 +385,13 @@ mod tests {
         assert_eq!(first.event, Event::Lagged { missed: 10 });
         let rest = events.drain();
         assert_eq!(rest.len(), CAPACITY);
+        // a lag notice after real events keeps their place in the order
+        for _ in 0..CAPACITY + 1 {
+            bus.emit(Event::Lagged { missed: 0 });
+        }
+        let notice = events.next().await.unwrap();
+        assert_eq!(notice.event, Event::Lagged { missed: 1 });
+        assert_eq!(notice.seq, rest.last().unwrap().seq);
     }
 
     #[test]
