@@ -178,7 +178,10 @@ impl Mapper {
                 Protocol::Tcp => InternetProtocol::Tcp,
                 Protocol::Udp => InternetProtocol::Udp,
             };
-            match PortMapping::new(gateway, local_ip, ip_protocol, NonZeroU16::new(port)?, options).await {
+            let Some(internal_port) = NonZeroU16::new(port) else {
+                continue;
+            };
+            match PortMapping::new(gateway, local_ip, ip_protocol, internal_port, options).await {
                 Ok(mapping) => {
                     info!(
                         "mapped {protocol} {} -> {port} on the gateway with {} ({}s lease)",

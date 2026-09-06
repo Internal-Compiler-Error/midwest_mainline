@@ -189,6 +189,8 @@ impl TorrentTask {
         let mut resolve = std::pin::pin!(resolve(self.cancel.clone()));
         // a pause asked for while still resolving applies once resolved
         let mut pause_asked = false;
+        // a sequential switch flipped while resolving wins over what the resume file says
+        let mut sequential_asked = None;
         let resolved = loop {
             tokio::select! {
                 resolved = &mut resolve => break resolved,
@@ -198,7 +200,9 @@ impl TorrentTask {
                     Some(Command::Remove { .. }) | None => return,
                     Some(Command::Pause) => pause_asked = true,
                     Some(Command::Unpause) => pause_asked = false,
-                    Some(Command::SelectFiles(_) | Command::Recheck | Command::Sequential(_)) => {}
+                    Some(Command::Sequential(on)) => sequential_asked = Some(on),
+                    // the files aren't known yet, and there's nothing on disk to check
+                    Some(Command::SelectFiles(_) | Command::Recheck) => {}
                 },
             }
         };
@@ -221,7 +225,7 @@ impl TorrentTask {
         };
         let torrent = Arc::new(torrent);
         let _ = self.selected.send(selected);
-        let _ = self.sequential.send(sequential);
+        let _ = self.sequential.send(sequential_asked.unwrap_or(sequential));
         self.uploaded_before = uploaded;
         paused |= pause_asked;
 
@@ -242,7 +246,12 @@ impl TorrentTask {
                 Ok((Stop::Unpause, _)) => paused = false,
                 // back to whichever of the two it was in, with what the disk really holds
                 Ok((Stop::Recheck, _)) => match self.check(&torrent, &root, &mut verified).await {
-                    Ok(()) => resumed = true,
+                    Ok(pause_asked) => {
+                        resumed = true;
+                        if let Some(pause) = pause_asked {
+                            paused = pause;
+                        }
+                    }
                     Err(stop) => break stop,
                 },
                 Ok((stop, _)) => break stop,
@@ -259,13 +268,15 @@ impl TorrentTask {
     }
 
     /// Re-hashes the files off the runtime, publishing progress meanwhile. Only removal and
-    /// shutdown interrupt it; the hashing itself runs to its end regardless.
+    /// shutdown interrupt it; the hashing itself runs to its end regardless. A pause or
+    /// unpause asked for meanwhile is returned for the caller to apply afterwards; the
+    /// selection switches take effect at once, for when the torrent restarts.
     async fn check(
         &mut self,
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &mut BitBox<u8, Msb0>,
-    ) -> Result<(), Stop> {
+    ) -> Result<Option<bool>, Stop> {
         let (progress, checked) = watch::channel(0);
         let _ = self.phase.send(Phase::Checking {
             torrent: torrent.clone(),
@@ -281,6 +292,7 @@ impl TorrentTask {
             })
         };
         tokio::pin!(hashing);
+        let mut pause_asked = None;
         loop {
             tokio::select! {
                 result = &mut hashing => {
@@ -291,13 +303,21 @@ impl TorrentTask {
                         }
                         Err(e) => tracing::warn!("rechecking {} failed: {e}", torrent.name),
                     }
-                    return Ok(());
+                    return Ok(pause_asked);
                 }
                 _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
                 command = self.commands.recv() => match command {
                     Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
                     None => return Err(Stop::Shutdown),
-                    Some(_) => {}
+                    Some(Command::Pause) => pause_asked = Some(true),
+                    Some(Command::Unpause) => pause_asked = Some(false),
+                    Some(Command::SelectFiles(selected)) => {
+                        let _ = self.selected.send(selected);
+                    }
+                    Some(Command::Sequential(on)) => {
+                        let _ = self.sequential.send(on);
+                    }
+                    Some(Command::Recheck) => {}
                 },
             }
         }
