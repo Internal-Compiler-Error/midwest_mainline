@@ -13,8 +13,8 @@ survives context resets; re-read before acting.
 - [x] Auto-resume every torrent in the data dir on startup
 - [x] Pause/resume per torrent; remove with files vs remove keeping files
 - [x] Peer list in the GUI (address, client, rates, progress, flags)
-- [ ] Persisted settings (listen port, default download dir, max peers) + settings dialog
-- [ ] Global speed limits
+- [x] Persisted settings (listen port, default download dir, max peers) + settings dialog
+- [x] Global speed limits
 - [ ] File selection / priorities
 - [ ] Local Service Discovery (BEP 14)
 - [ ] Seeding ratio / stop seeding
@@ -403,3 +403,21 @@ the `Peer` and `peer::client_name` turns it into "qBittorrent 5.1.0.0" and frien
 (Azureus and Shadow styles, printable prefix otherwise). The session adds per-peer rates
 from deltas (same `Rates` as the torrent's) and the usual `D/d U/u` flags, and the GUI
 shows a table under the details.
+
+# Settings and rate limits, 2026-09-06
+`config::Settings` is `<data dir>/settings.json` (serde, missing keys default): listen
+port, default download dir, DHT on/off, peers per torrent, download and upload limits.
+`Session::new` takes them in `SessionConfig`; `Session::update_settings` saves and pushes
+them through a `watch` that every swarm holds. The connection cap applies to inbound and
+outbound alike; the port and the DHT switch only apply at the next start, and the GUI's
+dialog says so. The library grew serde for this, so the GUI's DTO for settings is a
+field-for-field copy in the units the dialog edits (limits in KiB/s).
+
+Limits are one `limiter::RateLimiter` per client, a token bucket per direction that reads
+its rate from the settings watch on every take (0 = unlimited). Download: `refill` asks for
+a block's worth before each request and stops when refused; housekeeping's `schedule()`
+retries a second later. Upload: `send_block` asks before sending and parks refused blocks
+in `held_uploads`, which housekeeping drains as the bucket allows. Granularity is therefore
+about a second, and a bucket holds at most one second's worth, so a quiet spell can't bank a
+burst. On the Arch ISO with a 500 KiB/s limit the mean over 30 s was 443 KiB/s and the
+worst second 640 KiB/s. Test: `the_download_limit_paces_requests`.

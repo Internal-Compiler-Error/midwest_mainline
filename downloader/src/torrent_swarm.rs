@@ -2,6 +2,7 @@ use crate::announcer::spawn_announcers;
 use crate::config::SettingsWatch;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::limiter::RateLimiter;
 use crate::peer::{
     Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
     parse_ut_metadata_request,
@@ -20,7 +21,7 @@ use bitvec::prelude::*;
 use futures::StreamExt;
 use futures::future::select_all;
 use rand::seq::IndexedRandom;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
@@ -314,8 +315,13 @@ pub struct TorrentSwarm {
     id: Arc<Identity>,
     /// the client's DHT node, if it has one, for pinging the nodes peers tell us about
     dht: DhtWatch,
-    /// live user settings: the connection cap and the rate limits
+    /// live user settings: the connection cap
     settings: SettingsWatch,
+    /// the client-wide download and upload limits
+    limiter: Arc<RateLimiter>,
+    /// blocks read off disk that the upload limit didn't allow out yet, oldest first;
+    /// housekeeping sends what the limit allows
+    held_uploads: VecDeque<(SocketAddr, Piece)>,
 
     events_rx: mpsc::Receiver<SwarmEvent>,
     /// for the tasks the swarm spawns for itself (announcers, dials, block reads) to report
@@ -358,8 +364,9 @@ impl TorrentSwarm {
         verified: BitBox<u8, Msb0>,
         dht: DhtWatch,
         settings: SettingsWatch,
+        limiter: Arc<RateLimiter>,
     ) -> TorrentSwarmHandle {
-        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht, settings);
+        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht, settings, limiter);
         tokio::spawn(swarm.work_loop());
         handle
     }
@@ -371,6 +378,7 @@ impl TorrentSwarm {
         verified: BitBox<u8, Msb0>,
         dht: DhtWatch,
         settings: SettingsWatch,
+        limiter: Arc<RateLimiter>,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
         assert_eq!(
             verified.len(),
@@ -413,6 +421,8 @@ impl TorrentSwarm {
             id,
             dht,
             settings,
+            limiter,
+            held_uploads: VecDeque::new(),
             events_rx,
             events_tx,
             missing,
@@ -535,10 +545,29 @@ impl TorrentSwarm {
         }
 
         self.schedule().await;
+        self.send_held_uploads().await;
         self.publish_stats();
         let _ = self
             .peers_snapshot_tx
             .send(self.peers.iter().map(Peer::snapshot).collect());
+    }
+
+    /// Sends blocks the upload limit held back, as far as it allows now. A block for a peer
+    /// that has since gone is dropped.
+    async fn send_held_uploads(&mut self) {
+        while let Some((to, block)) = self.held_uploads.pop_front() {
+            let Some(idx) = self.peer_index(to) else {
+                continue;
+            };
+            if !self.limiter.take_upload(block.length as usize) {
+                self.held_uploads.push_front((to, block));
+                break;
+            }
+            self.stat.uploaded += block.length as u64;
+            if self.peers[idx].send_block(block).await.is_err() {
+                self.drop_peer(idx);
+            }
+        }
     }
 
     fn ban(&mut self, addr: SocketAddr) {
@@ -759,6 +788,10 @@ impl TorrentSwarm {
         let peer = &mut self.peers[idx];
         let sent = match block {
             Ok(block) if !peer.choked_them => {
+                if !self.limiter.take_upload(block.length as usize) {
+                    self.held_uploads.push_back((to, block));
+                    return;
+                }
                 self.stat.uploaded += block.length as u64;
                 peer.send_block(block).await
             }
@@ -969,6 +1002,10 @@ impl TorrentSwarm {
         let mut failed = false;
         'pieces: for (&piece, f) in self.in_flight.iter_mut().filter(|(_, f)| f.claims.contains_key(&addr)) {
             while room > 0 {
+                if !self.limiter.take_download(BLOCK_SIZE) {
+                    // over the download limit for now; housekeeping's schedule() retries
+                    break 'pieces;
+                }
                 let Some(req) = f.next_request(piece, addr) else {
                     continue 'pieces;
                 };
@@ -1293,6 +1330,14 @@ mod test {
 
     /// `seeding`: the file already holds `content()` and every piece counts as verified.
     fn swarm_with(name: &str, seeding: bool) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
+        swarm_with_settings(name, seeding, crate::config::Settings::default())
+    }
+
+    fn swarm_with_settings(
+        name: &str,
+        seeding: bool,
+        settings: crate::config::Settings,
+    ) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
         let bytes = content();
         let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
         let mut info = format!(
@@ -1329,13 +1374,16 @@ mod test {
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
+        let (settings_tx, settings_rx) = watch::channel(settings);
+        std::mem::forget(settings_tx);
         let (swarm, handle) = TorrentSwarm::new(
             torrent,
             storage,
             id,
             verified,
             crate::dht::Dht::none(),
-            crate::bt_client::default_settings(),
+            settings_rx.clone(),
+            Arc::new(RateLimiter::new(settings_rx)),
         );
         (swarm, handle, path)
     }
@@ -1439,6 +1487,39 @@ mod test {
         assert_eq!((stats.left, stats.written), (0, TOTAL));
         assert_eq!(stats.downloaded, TOTAL as u64);
         assert_eq!(std::fs::read(&path).unwrap(), content());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A download limit of two blocks a second lets two requests out at once, then nothing
+    /// until the next second's allowance.
+    #[tokio::test]
+    async fn the_download_limit_paces_requests() {
+        let settings = crate::config::Settings {
+            download_limit: 2 * BLOCK_SIZE as u64,
+            ..crate::config::Settings::default()
+        };
+        let (swarm, handle, path) = swarm_with_settings("limit", false, settings);
+        tokio::spawn(swarm.work_loop());
+
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+        for _ in 0..2 {
+            let Some(Ok(BtMessage::Request(_))) = seeder.next().await else {
+                panic!("expected a request");
+            };
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), seeder.next())
+                .await
+                .is_err(),
+            "the second's allowance is spent"
+        );
+        let Some(Ok(BtMessage::Request(_))) = tokio::time::timeout(Duration::from_secs(3), seeder.next())
+            .await
+            .expect("the next second brings more")
+        else {
+            panic!("expected a request");
+        };
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

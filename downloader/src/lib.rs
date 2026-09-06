@@ -3,6 +3,7 @@ mod bt_client;
 pub mod config;
 mod defs;
 pub mod dht;
+mod limiter;
 pub mod logs;
 pub mod magnet;
 pub mod metadata;

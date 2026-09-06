@@ -1,6 +1,7 @@
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::limiter::RateLimiter;
 use crate::peer::PeerSnapshot;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
@@ -38,6 +39,8 @@ pub struct BtClient {
     dht: DhtWatch,
     /// live settings, read by every swarm
     settings: SettingsWatch,
+    /// the download and upload limits, shared by every swarm
+    limiter: Arc<RateLimiter>,
 }
 
 impl BtClient {
@@ -65,6 +68,7 @@ impl BtClient {
             swarms: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             dht,
+            limiter: Arc::new(RateLimiter::new(settings.clone())),
             settings,
         };
         tokio::spawn(Self::accept_incoming(
@@ -188,6 +192,7 @@ impl BtClient {
             verified,
             self.dht.clone(),
             self.settings.clone(),
+            self.limiter.clone(),
         );
         swarms.insert(torrent.info_hash, handle);
         Ok(())
