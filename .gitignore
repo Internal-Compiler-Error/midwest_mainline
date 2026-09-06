@@ -7,3 +7,8 @@ dht.db
 
 # Tauri build output
 /gui/src-tauri/gen
+
+# downloaded media must never be committed again
+*.mkv
+*.mp4
+*.iso

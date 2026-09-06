@@ -18,8 +18,12 @@ survives context resets; re-read before acting.
 - [x] File selection (priorities not done: the scheduler is rarest-first, a priority order would fight it)
 - [x] Local Service Discovery (BEP 14)
 - [x] Seeding ratio / stop seeding
-- [ ] MSE encryption
-- [ ] uTP: evaluate crates; skip if nothing maintained
+- [ ] Peer stream abstraction (`PeerStream`: Tcp | Encrypted | Utp), no behaviour change
+- [ ] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
+      settings Disabled/Prefer/Require with plaintext fallback
+- [ ] uTP via `librqbit-utp` (maintained, tokio, has a `Transport` trait), sharing UDP
+      6881 with the DHT through a demux: KRPC starts with `d`, uTP with `0x?1`; the DHT
+      crate's `RpcManager` gets a datagram trait instead of owning the `UdpSocket`
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
 
 Decisions made without the user (to report): data dir location; remove now asks (keep files
