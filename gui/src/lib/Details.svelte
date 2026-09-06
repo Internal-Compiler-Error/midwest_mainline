@@ -1,7 +1,6 @@
 <script lang="ts">
   import LoaderCircle from '@lucide/svelte/icons/loader-circle'
   import { Checkbox } from '$lib/components/ui/checkbox'
-  import { ScrollArea } from '$lib/components/ui/scroll-area'
   import { Switch } from '$lib/components/ui/switch'
   import { Label } from '$lib/components/ui/label'
   import * as Table from '$lib/components/ui/table'
@@ -72,7 +71,7 @@
     </div>
 
     <div class="font-medium">Files ({torrent.files.length})</div>
-    <ScrollArea class="max-h-40 rounded-md border">
+    <div class="max-h-40 overflow-auto rounded-md border">
       <ul class="p-2">
         {#each torrent.files as file, i (file.path)}
           <li class="flex items-center gap-2">
@@ -86,11 +85,11 @@
           </li>
         {/each}
       </ul>
-    </ScrollArea>
+    </div>
 
     {#if torrent.kind === 'downloading'}
       <div class="font-medium">Trackers ({torrent.trackers.length})</div>
-      <ScrollArea class="max-h-32 rounded-md border">
+      <div class="max-h-32 overflow-auto rounded-md border">
         <Table.Root>
           <Table.Body>
             {#each torrent.trackers as tracker (tracker.url)}
@@ -108,10 +107,10 @@
             {/each}
           </Table.Body>
         </Table.Root>
-      </ScrollArea>
+      </div>
 
       <div class="font-medium">Peers ({torrent.peers.length})</div>
-      <ScrollArea class="max-h-64 rounded-md border">
+      <div class="max-h-64 overflow-auto rounded-md border">
         <Table.Root class="text-xs">
           <Table.Header>
             <Table.Row>
@@ -142,7 +141,7 @@
             {/each}
           </Table.Body>
         </Table.Root>
-      </ScrollArea>
+      </div>
     {/if}
   {/if}
 </div>
