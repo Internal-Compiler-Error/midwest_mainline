@@ -46,7 +46,7 @@ impl ToKrpcBody for KrpcError {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_list(|e| {
-            e.emit(&self.code)?;
+            e.emit(self.code)?;
             e.emit(&self.message)
         })
         .unwrap()

@@ -7,9 +7,9 @@ survives context resets; re-read before acting.
       for dht.db and resume files, CLI and GUI alike
 - [x] DHT (BEP 5) via the sibling `dht` crate: embedded migrations in the crate, session
       started in the background, announcer for swarms and the metadata fetcher, Port message
-- [ ] DHT crate rework (user: "very badly designed, change it however you wish"): learn the
-      external IP from BEP 42 responses instead of public-ip; lookups that don't wait for a
-      whole round; drop SQLite for an in-memory table saved to a file?
+- [x] DHT crate: external IP learned from BEP 42 responses instead of `public-ip`
+- [ ] DHT crate rework (user: "very badly designed, change it however you wish"): lookups
+      that don't wait for a whole round; drop SQLite for an in-memory table saved to a file?
 - [x] Auto-resume every torrent in the data dir on startup
 - [x] Pause/resume per torrent; remove with files vs remove keeping files
 - [x] Peer list in the GUI (address, client, rates, progress, flags)
@@ -371,10 +371,9 @@ next thing to decide.
 # DHT, 2026-09-06
 The client runs one BEP 5 node (`dht.rs`, on the sibling `midwest_mainline` crate) per
 process, on UDP port 6881 or any free port if that's taken, with its routing table in
-`<data dir>/dht.db`. It starts in the background: bind, learn the external IP for the
-BEP 42 node id (`public-ip`, 5 s, else 0.0.0.0 and a warning), open the database, spawn the
-node's tasks, bootstrap from five well-known routers, then publish a `DhtHandle` through a
-`watch` that consumers hold as `DhtWatch`. `Dht::none()` is the watch for a client without
+`<data dir>/dht.db`. It starts in the background: bind, open the database (which decides
+the BEP 42 node id, see below), spawn the node's tasks, bootstrap from five well-known
+routers, then publish a `DhtHandle` through a `watch` that consumers hold as `DhtWatch`. `Dht::none()` is the watch for a client without
 DHT (tests). `spawn_announcers` gained a DHT announcer next to the tracker ones: every
 `DHT_ANNOUNCE_INTERVAL` it runs `get_peers`, emits `PeersDiscovered`, and announces our TCP
 port to the nodes that issued tokens (implied_port only when UDP and TCP ports match). Both
@@ -389,6 +388,25 @@ fetch met are handed to the swarm (`Loaded::peers`, `BtClient::add_peers`) so it
 start cold. In the crate: embedded migrations, a lenient parser (unsorted keys are common
 in the wild), 3 s request timeout and 8 queries per round (a lookup went from 90 s to
 about 20 s).
+
+## Our external address, from the nodes we talk to
+The node id is tied to our external IP (BEP 42), and the crate used to ask an HTTP service
+for it at every start (`public-ip`, a 5 s stall, and one more dependency). Every node that
+answers a query also tells us the address it saw us at, in the response's `ip` field, so the
+crate now tallies those (`dht/external_ip.rs`: one vote per responding node, private and
+CGNAT addresses ignored, five agreeing votes make a consensus) and stores the winner in the
+database (`misc.observed_ip`). The next start derives the id from it; a changed address mints
+a new id and recomputes the buckets as before. Only answers to our own queries count, since
+anyone can send a query claiming anything. The id can't follow the address while the node
+runs because every bucket hangs off it, so a first start with an empty database runs with an
+id for 0.0.0.0 (a warning says so) and the second start is compliant; nodes still answer a
+non-compliant id, they just may not store its announces. `with_stable_id` takes
+`Option<Ipv4Addr>` for a caller that knows better. Responses we send carry `ip` as well
+(they did before, via the encoder's extra fields; now it's a `Krpc` field either way).
+
+Also on the way: contacts at 0.0.0.0 or port 0 are dropped at parse time (nodes in the wild
+do send them, and the send failed with a warning every time), and a `find_node` answered
+without `nodes` is a debug line rather than a warning.
 
 The data directory (`paths::data_dir`, `DOWNLOADER_DATA_DIR` to override) came with it,
 since the database needed a home that isn't the current directory: resume files moved there

@@ -45,7 +45,7 @@ impl DhtServer {
             // the server is a cheap handle (one refcount on the shared state), so each
             // response task just gets its own clone
             let this = self.clone();
-            let _ = TskBuilder::new().name(&*format!("responding to {socket_addr}")).spawn(
+            let _ = TskBuilder::new().name(&format!("responding to {socket_addr}")).spawn(
                 async move {
                     trace!("Handling request from {socket_addr}");
                     let response = this.generate_response(&inbound_msg.body, socket_addr);
@@ -102,7 +102,7 @@ impl DhtServer {
         if !peers.is_empty() {
             let res = ResBuilder::new(self.state.our_id)
                 .with_token(token)
-                .with_values(&*peers)
+                .with_values(&peers)
                 .build();
             KrpcBody::FindNodeGetPeersResponse(res)
         } else {

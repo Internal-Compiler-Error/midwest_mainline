@@ -100,7 +100,7 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
             use bendy::value::Value;
             use std::borrow::Cow;
 
-            enc.emit_pair(b"id", &self.queried);
+            enc.emit_pair(b"id", self.queried);
             if let Some(ref token) = self.token {
                 enc.emit_pair(b"token", token);
             }
@@ -139,7 +139,7 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
                     let combined: Vec<u8> = self
                         .nodes
                         .iter()
-                        .map(|peer| {
+                        .flat_map(|peer| {
                             let node_id = &peer.id();
 
                             let octets = peer.end_point().ip().octets();
@@ -157,7 +157,6 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
 
                             arr
                         })
-                        .flatten()
                         .collect();
 
                     e.emit_bytes(&combined)
@@ -184,15 +183,15 @@ mod tests {
     fn can_encode_has_peers_example() {
         use std::str;
 
-        let txn_id = TransactionId::from_bytes(*&b"aa");
-        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789"))
-            .with_token(Token::from_bytes(*&b"aoeusnth"))
+        let txn_id = TransactionId::from_bytes(b"aa");
+        let response = Builder::new(NodeId::from_bytes(b"abcdefghij0123456789"))
+            .with_token(Token::from_bytes(b"aoeusnth"))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893))
             .with_value(SocketAddrV4::new(Ipv4Addr::new(105, 100, 104, 116), 28269))
             .build();
 
         let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
-        let encoded = str::from_utf8(&*encoded).unwrap();
+        let encoded = str::from_utf8(&encoded).unwrap();
 
         let expected = "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:axje.u6:idhtnmee1:t2:aa1:y1:re";
 
@@ -203,17 +202,17 @@ mod tests {
     fn can_encode_no_peers() {
         use std::str;
 
-        let txn_id = TransactionId::from_bytes(*&b"aa");
-        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789"))
-            .with_token(Token::from_bytes(*&b"aoeusnth"))
+        let txn_id = TransactionId::from_bytes(b"aa");
+        let response = Builder::new(NodeId::from_bytes(b"abcdefghij0123456789"))
+            .with_token(Token::from_bytes(b"aoeusnth"))
             .with_node(NodeInfo::new(
-                NodeId::from_bytes(*&b"lmnopqrstuvxyz098765"),
+                NodeId::from_bytes(b"lmnopqrstuvxyz098765"),
                 SocketAddrV4::new(Ipv4Addr::new(97, 120, 106, 101), 11893),
             ))
             .build();
 
         let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
-        let encoded = str::from_utf8(&*encoded).unwrap();
+        let encoded = str::from_utf8(&encoded).unwrap();
 
         let expected =
             "d1:rd2:id20:abcdefghij01234567895:nodes26:lmnopqrstuvxyz098765axje.u5:token8:aoeusnthe1:t2:aa1:y1:re";
@@ -225,11 +224,11 @@ mod tests {
     fn empty_response_still_carries_the_nodes_key() {
         use std::str;
 
-        let txn_id = TransactionId::from_bytes(*&b"aa");
-        let response = Builder::new(NodeId::from_bytes(*&b"abcdefghij0123456789")).build();
+        let txn_id = TransactionId::from_bytes(b"aa");
+        let response = Builder::new(NodeId::from_bytes(b"abcdefghij0123456789")).build();
 
         let encoded = Krpc::new_with_body(txn_id, KrpcBody::FindNodeGetPeersResponse(response)).encode();
-        let encoded = str::from_utf8(&*encoded).unwrap();
+        let encoded = str::from_utf8(&encoded).unwrap();
 
         let expected = "d1:rd2:id20:abcdefghij01234567895:nodes0:e1:t2:aa1:y1:re";
 

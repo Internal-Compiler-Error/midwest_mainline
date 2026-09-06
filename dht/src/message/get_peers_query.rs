@@ -28,8 +28,8 @@ impl ToKrpcBody for GetPeersQuery {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_unsorted_dict(|enc| {
-            enc.emit_pair(b"id", &self.requestor)?;
-            enc.emit_pair(b"info_hash", &self.info_hash)
+            enc.emit_pair(b"id", self.requestor)?;
+            enc.emit_pair(b"info_hash", self.info_hash)
         })
         .unwrap()
     }
@@ -48,10 +48,10 @@ mod tests {
     fn can_encode_exmaple() {
         use std::str;
 
-        let txn_id = TransactionId::from_bytes(*&b"aa");
+        let txn_id = TransactionId::from_bytes(b"aa");
         let query = GetPeersQuery::new(
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
-            InfoHash::from_bytes(*&b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
         );
 
         let encoded = Krpc::new_with_body(txn_id, KrpcBody::GetPeersQuery(query)).encode();

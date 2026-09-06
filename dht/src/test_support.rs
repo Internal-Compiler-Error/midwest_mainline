@@ -1,9 +1,9 @@
 //! Test-only helpers. The DDL below mirrors `migrations/` — when a migration changes the
 //! schema, change it here once instead of in every test module.
 
+use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::r2d2::{ConnectionManager, Pool};
-use diesel::SqliteConnection;
 
 use crate::dht::SensibleOptions;
 

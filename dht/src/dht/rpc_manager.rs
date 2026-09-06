@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -24,10 +24,15 @@ use crate::{
     message::{Krpc, KrpcBody, ParseKrpc},
     our_error::{OurError, naur},
     types::{NodeInfo, TransactionId},
-    utils::unix_timestmap_ms,
+    utils::{db_put, unix_timestmap_ms},
 };
 
-use super::{TxnIdGenerator, routing_table::update_last_sent};
+use super::{OBSERVED_IP_KEY, TxnIdGenerator, external_ip::ExternalIp, routing_table::update_last_sent};
+
+/// A message and who sent it
+pub type Inbound = (Krpc, SocketAddrV4);
+/// Who a query went to, and who is waiting for the answer
+type Pending = (SocketAddrV4, oneshot::Sender<Inbound>);
 
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
@@ -36,14 +41,15 @@ use super::{TxnIdGenerator, routing_table::update_last_sent};
 pub struct RpcManager {
     /// a map to keep track of the responses we await from the client; the address is the
     /// endpoint we queried, so responses from anywhere else are ignored
-    pending_responses: Arc<Mutex<HashMap<TransactionId, (SocketAddrV4, oneshot::Sender<(Krpc, SocketAddrV4)>)>>>,
+    pending_responses: Arc<Mutex<HashMap<TransactionId, Pending>>>,
 
     socket: Arc<UdpSocket>,
     txn_id_generator: Arc<TxnIdGenerator>,
 
     /// a SPMC-esque queue, each readers can progress indepednelty
-    inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<(Krpc, SocketAddrV4)>>>>,
+    inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<Inbound>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
+    external_ip: Arc<ExternalIp>,
 }
 
 pub trait Routable {
@@ -57,10 +63,12 @@ impl Routable for SocketAddrV4 {
 }
 
 impl RpcManager {
+    /// `external_ip` is the address other nodes reported for us last time, if any
     pub fn new(
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
+        external_ip: Option<Ipv4Addr>,
     ) -> RpcManager {
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
@@ -68,6 +76,7 @@ impl RpcManager {
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
             txn_id_generator,
+            external_ip: Arc::new(ExternalIp::new(external_ip)),
         }
     }
 
@@ -133,6 +142,11 @@ impl RpcManager {
                             let entry = pending_responses.lock().unwrap().remove(id);
                             if let Some((expected, sender)) = entry {
                                 if expected == socket_addr {
+                                    // only answers to our own queries get a say in what our
+                                    // external address is; anyone can send a query
+                                    if let Some(seen) = msg.ip {
+                                        this.record_external_ip(*socket_addr.ip(), *seen.ip());
+                                    }
                                     // failing means the receiver has dropped, meaning they are no
                                     // longer interested in the message, not a bug
                                     let _ = sender.send((msg, socket_addr));
@@ -178,6 +192,27 @@ impl RpcManager {
         rx
     }
 
+    /// A node answering our query told us the address it sees us at (BEP 42). Once enough
+    /// agree, the address is stored for the next start to derive the node id from.
+    fn record_external_ip(&self, voter: Ipv4Addr, seen: Ipv4Addr) {
+        let Some(agreed) = self.external_ip.vote(voter, seen) else {
+            return;
+        };
+        info!("other nodes see us at {agreed}; the node id follows it at the next start");
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = match db.get() {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!("could not check out a db connection to store the external address: {e}");
+                    return;
+                }
+            };
+            // db_put logs its own failures
+            let _ = db_put(OBSERVED_IP_KEY.to_string(), agreed.to_string(), &mut conn);
+        });
+    }
+
     /// Send a message, fires up a new stask in background
     fn send_msg_background(&self, msg: &Krpc, peer: SocketAddrV4) {
         let socket = self.socket.clone();
@@ -185,15 +220,15 @@ impl RpcManager {
         let mut additional = HashMap::new();
         // BEP 5: every message should carry our client version
         additional.insert(&b"v"[..], value::Value::Bytes(Cow::Borrowed(&b"MW01"[..])));
-        // BEP 42: in responses, tell the requester the external address we see for it
-        if !msg.body.is_query() {
-            let mut ip = [0u8; 6];
-            ip[..4].copy_from_slice(&peer.ip().octets());
-            ip[4..].copy_from_slice(&peer.port().to_be_bytes());
-            additional.insert(&b"ip"[..], value::Value::Bytes(Cow::Owned(ip.to_vec())));
-        }
 
-        let buf = msg.encode_with_additional(&additional);
+        let buf = if msg.body.is_query() {
+            msg.encode_with_additional(&additional)
+        } else {
+            // BEP 42: a response tells the querier the external address we see for it
+            let mut msg = msg.clone();
+            msg.ip = Some(peer);
+            msg.encode_with_additional(&additional)
+        };
 
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&buf, peer).await {
@@ -217,7 +252,10 @@ impl RpcManager {
         // no node_id means the reponse is a krpc error message, only error message omit the node
         // id
         let response_node_id = response.node_id().ok_or(naur!("node responded with error"))?;
-        let mut conn = self.db.get().map_err(|e| naur!("could not check out a db connection: {e}"))?;
+        let mut conn = self
+            .db
+            .get()
+            .map_err(|e| naur!("could not check out a db connection: {e}"))?;
         // it's a double update but that's issue for another day
         update_last_sent(&response_node_id, sent_time, &mut conn);
         Ok(response)
@@ -277,7 +315,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        RpcManager::new(socket, memory_pool(), Arc::new(TxnIdGenerator::new()))
+        RpcManager::new(socket, memory_pool(), Arc::new(TxnIdGenerator::new()), None)
     }
 
     #[tokio::test]

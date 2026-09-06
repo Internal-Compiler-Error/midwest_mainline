@@ -206,7 +206,10 @@ impl RoutingTable {
 
     pub fn full_bucket(&self, i: i32) -> bool {
         let size = self.bucket_size(i);
-        assert!(size <= self.bucket_capacity, "bucket managed to grow beyond the size limit");
+        assert!(
+            size <= self.bucket_capacity,
+            "bucket managed to grow beyond the size limit"
+        );
         size == self.bucket_capacity
     }
 
@@ -318,7 +321,7 @@ impl RoutingTable {
         let problematics = self.replacement_queue(i, &mut conn);
 
         let tasks = problematics.into_iter().map(|n| async move {
-            let id = NodeId::from_bytes(&*n.id);
+            let id = NodeId::from_bytes(&n.id);
             let ip: Ipv4Addr = n.ip_addr.parse().unwrap();
             let endpoint = SocketAddrV4::new(ip, n.port as u16);
             let target = NodeInfo::new(id, endpoint);
@@ -427,7 +430,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()));
+        let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
         RoutingTable::new(our_id, broker, pool)
     }
 

@@ -12,6 +12,7 @@
 //! Both halves share one `SharedState`; nothing is owned twice.
 
 pub mod client;
+mod external_ip;
 pub mod routing_table;
 pub mod rpc_manager;
 pub(crate) mod server;
@@ -33,7 +34,7 @@ use diesel::{
     sql_types,
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
-use tracing::info;
+use tracing::{info, warn};
 
 use rand::{Rng, RngExt};
 use routing_table::RoutingTable;
@@ -129,6 +130,9 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     NodeId(id)
 }
 
+/// `misc` row the vote in `external_ip` is stored under
+pub(crate) const OBSERVED_IP_KEY: &str = "observed_ip";
+
 /// Reuse last session's identity if our public IP is unchanged; otherwise mint a new
 /// one. BEP 42 binds the id to the IP, so keeping the old id across an IP change would
 /// make us present an id other nodes consider invalid — and every stored bucket index
@@ -149,10 +153,11 @@ fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<N
             let id_in_base64 =
                 prev_id.expect("if the public ip of last session matches this session, id should have been set");
             let id = base64_dec(id_in_base64);
-            Ok(NodeId::from_bytes(&*id))
+            Ok(NodeId::from_bytes(&id))
         } else {
             // IP changed, generate new ID
             let id = random_idv4(&public_ip, rand::rng().random::<u8>());
+            db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
             db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
             // every stored bucket was computed against the previous id; recompute
             recompute_buckets(&id, conn)?;
@@ -179,6 +184,11 @@ fn recompute_buckets(our_id: &NodeId, conn: &mut SqliteConnection) -> Result<(),
     Ok(())
 }
 
+/// The address other nodes saw us at last time, if enough of them agreed
+fn known_external_ip(conn: &mut SqliteConnection) -> Result<Option<Ipv4Addr>, diesel::result::Error> {
+    Ok(db_get(OBSERVED_IP_KEY, conn)?.and_then(|ip| ip.parse().ok()))
+}
+
 fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<NodeId, diesel::result::Error> {
     db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
     let id = random_idv4(&public_ip, rand::rng().random::<u8>());
@@ -187,14 +197,16 @@ fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<Node
 }
 
 impl DhtSession {
-    /// Create a new DHT service, if the external_addr matches what was used last time, then reuse
-    /// the previous identity, otherwise adopt a new id. Note there is no way to verify the external IP address
-    /// is correct and it's duty to make sure it's correct.
+    /// Create a node whose BEP 42 id is derived from our external address and kept across
+    /// starts while that address stays the same. Pass `None` to derive it from what other
+    /// nodes reported the address to be last time (see `external_ip`); a caller that knows
+    /// better passes the address. A first start with nothing known gets an id for 0.0.0.0,
+    /// and the next start fixes that.
     ///
     /// The UdpSocket must be already binded to an ipv4 address
     pub fn with_stable_id(
         listen_socket: UdpSocket,
-        external_addr: Ipv4Addr,
+        external_addr: Option<Ipv4Addr>,
         database_url: &str,
     ) -> Result<Self, OurError> {
         let local_addr = match listen_socket
@@ -212,15 +224,28 @@ impl DhtSession {
             .build(manager)
             .expect("Could not build DB connection pool");
 
-        let mut conn = db.get().map_err(|e| naur!("could not check out a db connection: {e}"))?;
+        let mut conn = db
+            .get()
+            .map_err(|e| naur!("could not check out a db connection: {e}"))?;
         // a fresh database file has no schema; WAL lets the routing table write while a
         // lookup reads
         conn.batch_execute("PRAGMA journal_mode = WAL")?;
         conn.run_pending_migrations(MIGRATIONS)
             .map_err(|e| naur!("could not migrate the database: {e}"))?;
+        let observed = known_external_ip(&mut conn)?;
+        let external_addr = match external_addr.or(observed) {
+            Some(ip) => {
+                info!("BEP 42 node id for external address {ip}");
+                ip
+            }
+            None => {
+                warn!("external address not known yet: the node id is not BEP 42 compliant until the next start");
+                Ipv4Addr::UNSPECIFIED
+            }
+        };
         let our_id = resume_identity(&mut conn, external_addr)?;
 
-        let rpc_manager = RpcManager::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()));
+        let rpc_manager = RpcManager::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()), observed);
 
         let routing_table = RoutingTable::new(our_id, rpc_manager.clone(), db.clone());
 
@@ -248,7 +273,7 @@ impl DhtSession {
         for contact in known_nodes {
             bootstrap_join_set
                 .build_task()
-                .name(&*format!("bootstrap with {contact}"))
+                .name(&format!("bootstrap with {contact}"))
                 .spawn(Self::bootstrap_from(self.handle(), contact))
                 .unwrap();
         }
@@ -280,7 +305,7 @@ impl DhtSession {
         let rpc_manager = self.rpc_manager.clone();
         join_set
             .build_task()
-            .name(&*format!("message broker for {}", self.addr))
+            .name(&format!("message broker for {}", self.addr))
             .spawn(async move {
                 let _ = rpc_manager.run().await;
             })
@@ -370,16 +395,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "integration test: needs network access, a public IP, DATABASE_URL, and live DHT bootstrap nodes"]
+    #[ignore = "integration test: needs network access, DATABASE_URL, and live DHT bootstrap nodes"]
     async fn bootstrap() -> color_eyre::Result<()> {
         TEST_INIT.call_once(set_up_tracing);
-
-        let external_ip = public_ip::addr_v4().await.unwrap();
 
         let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:44444").unwrap())
             .await
             .unwrap();
-        let dht = DhtSession::with_stable_id(socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
+        let dht = DhtSession::with_stable_id(socket, None, &env::var("DATABASE_URL").unwrap()).unwrap();
 
         let dht = Arc::new(dht);
         let dhtt = Arc::clone(&dht);
@@ -420,6 +443,7 @@ mod tests {
 #[cfg(test)]
 mod recompute_tests {
     use super::resume_identity;
+    use super::{OBSERVED_IP_KEY, known_external_ip};
     use crate::dht::routing_table::bucket_index;
     use crate::schema::node::dsl as node_dsl;
     use crate::test_support::memory_pool;
@@ -434,8 +458,8 @@ mod recompute_tests {
         let mut conn = pool.get().unwrap();
 
         // pretend we were 1.2.3.4 with the all-zero id last session
-        db_put("public_ip".to_string(), "1.2.3.4".to_string(), &mut *conn).unwrap();
-        db_put("id".to_string(), base64_enc(&[0u8; 20]), &mut *conn).unwrap();
+        db_put("public_ip".to_string(), "1.2.3.4".to_string(), &mut conn).unwrap();
+        db_put("id".to_string(), base64_enc([0u8; 20]), &mut conn).unwrap();
 
         // a node whose bucket was computed against that old identity
         let peer_node = NodeId([0xF0; 20]);
@@ -453,7 +477,7 @@ mod recompute_tests {
             .unwrap();
 
         // our IP changed: a new identity must be adopted and buckets recomputed against it
-        let new_id = resume_identity(&mut *conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
+        let new_id = resume_identity(&mut conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
         assert_ne!(new_id, NodeId([0; 20]), "a new identity must be adopted");
 
         let stored: i32 = node_dsl::node
@@ -462,6 +486,20 @@ mod recompute_tests {
             .first(&mut *conn)
             .unwrap();
         assert_eq!(stored, bucket_index(&new_id, &peer_node));
+
+        // the new address is remembered with the id, so the next start keeps this identity
+        let again = resume_identity(&mut conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
+        assert_eq!(again, new_id);
+    }
+
+    #[test]
+    fn what_other_nodes_saw_last_time_is_used_when_the_caller_knows_nothing() {
+        let pool = memory_pool();
+        let mut conn = pool.get().unwrap();
+        assert_eq!(known_external_ip(&mut conn).unwrap(), None);
+
+        db_put(OBSERVED_IP_KEY.to_string(), "5.6.7.8".to_string(), &mut conn).unwrap();
+        assert_eq!(known_external_ip(&mut conn).unwrap(), Some(Ipv4Addr::new(5, 6, 7, 8)));
     }
 }
 
@@ -475,7 +513,7 @@ mod migration_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("dht.db");
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let dht = DhtSession::with_stable_id(socket, Ipv4Addr::new(1, 2, 3, 4), db.to_str().unwrap()).unwrap();
+        let dht = DhtSession::with_stable_id(socket, Some(Ipv4Addr::new(1, 2, 3, 4)), db.to_str().unwrap()).unwrap();
         assert_eq!(dht.node_count(), 0, "the node table exists and is empty");
         std::fs::remove_dir_all(&dir).unwrap();
     }

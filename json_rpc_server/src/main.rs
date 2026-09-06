@@ -128,9 +128,8 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     set_up_tracing();
 
-    let external_ip = public_ip::addr_v4().await.unwrap();
     let dht_socket = UdpSocket::bind("0.0.0.0:44444".parse::<SocketAddr>()?).await?;
-    let dht = DhtSession::with_stable_id(dht_socket, external_ip, &env::var("DATABASE_URL").unwrap()).unwrap();
+    let dht = DhtSession::with_stable_id(dht_socket, None, &env::var("DATABASE_URL").unwrap()).unwrap();
 
     let mut event_loops = JoinSet::new();
 

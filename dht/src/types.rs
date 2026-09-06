@@ -51,8 +51,8 @@ impl NodeId {
 
     pub fn dist(&self, rhs: &Self) -> [u8; NODE_ID_LEN] {
         let mut dist = [0u8; NODE_ID_LEN];
-        for i in 0..NODE_ID_LEN {
-            dist[i] = self.0[i] ^ rhs.0[i]
+        for ((d, a), b) in dist.iter_mut().zip(self.0).zip(rhs.0) {
+            *d = a ^ b;
         }
         dist
     }
@@ -60,14 +60,14 @@ impl NodeId {
 
 /// Compare the xor distance between `lhs` and `rhs` with respect the reference point
 pub fn cmp_resp(lhs: &NodeId, rhs: &NodeId, reference: &NodeId) -> Ordering {
-    let lhs_dist = reference.dist(&lhs);
-    let rhs_dist = reference.dist(&rhs);
+    let lhs_dist = reference.dist(lhs);
+    let rhs_dist = reference.dist(rhs);
 
     lhs_dist.cmp(&rhs_dist)
 }
 
 impl ToBencode for NodeId {
-    const MAX_DEPTH: usize = 0 as usize;
+    const MAX_DEPTH: usize = 0_usize;
 
     fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         encoder.emit_bytes(&self.0)
@@ -110,7 +110,7 @@ impl Debug for InfoHash {
 }
 
 impl ToBencode for InfoHash {
-    const MAX_DEPTH: usize = 0 as usize;
+    const MAX_DEPTH: usize = 0_usize;
 
     fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         encoder.emit_bytes(&self.0)
@@ -141,7 +141,7 @@ impl Debug for Token {
 }
 
 impl ToBencode for Token {
-    const MAX_DEPTH: usize = 0 as usize;
+    const MAX_DEPTH: usize = 0_usize;
 
     fn encode(&self, encoder: bendy::encoding::SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         encoder.emit_bytes(&self.0)
@@ -176,7 +176,7 @@ impl Routable for NodeInfo {
 
 impl From<NodeNoMetaInfo> for NodeInfo {
     fn from(value: NodeNoMetaInfo) -> Self {
-        let idd = NodeId::from_bytes(&*value.id);
+        let idd = NodeId::from_bytes(&value.id);
         // TODO: add err msg
         let ip: Ipv4Addr = value.ip_addr.parse().unwrap();
         let portt = value.port;
@@ -201,7 +201,7 @@ impl TransactionId {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0.as_slice()
+        self.0.as_slice()
     }
 }
 

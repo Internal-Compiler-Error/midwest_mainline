@@ -41,7 +41,7 @@ pub trait ParseKrpc {
 }
 
 fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurError> {
-    let code = body.get(0).ok_or(OurError::DecodeError(eyre!(
+    let code = body.first().ok_or(OurError::DecodeError(eyre!(
         "Error message has no first elem/error code"
     )))?;
 
@@ -91,7 +91,7 @@ fn extract_ping(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Ping
     let node_id = extract_node_id(arguments)?;
     let ping = PingQuery::new(node_id);
 
-    report_unused_keys(&arguments, "Ping query body has unused keys");
+    report_unused_keys(arguments, "Ping query body has unused keys");
     Ok(ping)
 }
 
@@ -108,7 +108,7 @@ fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
     let target = NodeId::try_from_bytes(target).ok_or(OurError::DecodeError(eyre!("'target' key is not 20 bytes")))?;
     let find_node_request = FindNodeQuery::new(querier, target);
 
-    report_unused_keys(&arguments, "Find_node query body has unused keys");
+    report_unused_keys(arguments, "Find_node query body has unused keys");
     Ok(find_node_request)
 }
 
@@ -127,7 +127,7 @@ fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
     let get_peers = GetPeersQuery::new(querier, info_hash);
 
-    report_unused_keys(&arguments, "Get_peers query body has unused keys");
+    report_unused_keys(arguments, "Get_peers query body has unused keys");
     Ok(get_peers)
 }
 
@@ -167,7 +167,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
     let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port, info_hash, token);
 
-    report_unused_keys(&arguments, "Announce_peer query body has unused keys");
+    report_unused_keys(arguments, "Announce_peer query body has unused keys");
     Ok(announce_peer)
 }
 
@@ -197,6 +197,9 @@ fn extract_nodes(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
 
             let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
             let port = u16::from_be_bytes([contact[4], contact[5]]);
+            if ip.is_unspecified() || port == 0 {
+                return None;
+            }
             let contact = SocketAddrV4::new(ip, port);
 
             Some(NodeInfo::new(node_id, contact))
@@ -233,6 +236,9 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
 
             let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
             let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
+            if ip.is_unspecified() || port == 0 {
+                return None;
+            }
 
             Some(SocketAddrV4::new(ip, port))
         })
@@ -319,7 +325,7 @@ impl ParseKrpc for &[u8] {
             } else if &*query_type == b"announce_peer" {
                 KrpcBody::AnnouncePeerQuery(extract_announce_peer(&mut arguments)?)
             } else {
-                let query_type = String::from_utf8_lossy(&*query_type);
+                let query_type = String::from_utf8_lossy(&query_type);
                 info!("Unsupported query type: {query_type}");
                 return Err(OurError::UnsupportedQuery(txn_id));
             }
@@ -350,8 +356,7 @@ impl ParseKrpc for &[u8] {
 
             if nodes.is_none() && values.is_none() && token.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
-                let body = KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id));
-                return Ok(Krpc::new_with_body(txn_id, body));
+                KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id))
             } else {
                 // otherwise it's response to get_peers or find_node
                 let builder = Builder::new(target_id);
@@ -379,7 +384,14 @@ impl ParseKrpc for &[u8] {
             return Err(OurError::DecodeError(eyre!("Unknown message type: {message_type}")));
         };
 
-        let _ = parsed.remove(b"ip".as_slice()); // see https://bittorrent.org/beps/bep_0042.html
+        // ipv6 nodes send 18 bytes here; there's nothing to do with those
+        let ip = match parsed.remove(b"ip".as_slice()) {
+            Some(BencodeItemView::ByteString(raw)) if raw.len() == 6 => Some(SocketAddrV4::new(
+                Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]),
+                u16::from_be_bytes([raw[4], raw[5]]),
+            )),
+            _ => None,
+        };
         let _ = parsed.remove(b"v".as_slice()); // user agent string
 
         if !parsed.is_empty() {
@@ -390,7 +402,7 @@ impl ParseKrpc for &[u8] {
                 .join(",");
             info!("Message has unused fields at top level: {keys}");
         }
-        Ok(Krpc::new_with_body(txn_id, body))
+        Ok(Krpc { txn_id, body, ip })
     }
 }
 
@@ -398,6 +410,9 @@ impl ParseKrpc for &[u8] {
 pub struct Krpc {
     pub txn_id: TransactionId,
     pub body: KrpcBody,
+    /// BEP 42: the sender's view of the recipient's external address. In a message we
+    /// received it's what that node sees of us; in a response we send it's the querier.
+    pub ip: Option<SocketAddrV4>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -453,36 +468,64 @@ impl Krpc {
                 KrpcBody::AnnouncePeerQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "announce_peer")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
                 }
                 KrpcBody::FindNodeQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "find_node")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
                 }
                 KrpcBody::GetPeersQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "get_peers")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
                 }
                 KrpcBody::PingQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "ping")?;
-                    enc.emit_pair_with(b"a", |e| Ok(q.encode_body(e)))?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
                 }
 
                 KrpcBody::PingAnnouncePeerResponse(r) => {
                     enc.emit_pair(b"y", "r")?;
-                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))?;
+                    enc.emit_pair_with(b"r", |e| {
+                        let _: () = r.encode_body(e);
+                        Ok(())
+                    })?;
                 }
                 KrpcBody::FindNodeGetPeersResponse(r) => {
                     enc.emit_pair(b"y", "r")?;
-                    enc.emit_pair_with(b"r", |e| Ok(r.encode_body(e)))?;
+                    enc.emit_pair_with(b"r", |e| {
+                        let _: () = r.encode_body(e);
+                        Ok(())
+                    })?;
                 }
                 KrpcBody::ErrorResponse(err) => {
                     enc.emit_pair(b"y", "e")?;
-                    enc.emit_pair_with(b"e", |e| Ok(err.encode_body(e)))?;
+                    enc.emit_pair_with(b"e", |e| {
+                        let _: () = err.encode_body(e);
+                        Ok(())
+                    })?;
                 }
+            }
+
+            if let Some(ip) = self.ip {
+                let mut raw = [0u8; 6];
+                raw[..4].copy_from_slice(&ip.ip().octets());
+                raw[4..].copy_from_slice(&ip.port().to_be_bytes());
+                enc.emit_pair_with(b"ip", |enc| enc.emit_bytes(&raw))?;
             }
 
             for (k, v) in additional.iter() {
@@ -538,6 +581,7 @@ impl Krpc {
     pub fn new_ping_query(transaction_id: TransactionId, querying_id: NodeId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::PingQuery(PingQuery::new(querying_id)),
         }
     }
@@ -545,6 +589,7 @@ impl Krpc {
     pub fn new_find_node_query(transaction_id: TransactionId, querying_id: NodeId, target_id: NodeId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::FindNodeQuery(FindNodeQuery::new(querying_id, target_id)),
         }
     }
@@ -552,12 +597,13 @@ impl Krpc {
     pub fn new_get_peers_query(transaction_id: TransactionId, querying_id: NodeId, info_hash: InfoHash) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::GetPeersQuery(GetPeersQuery::new(querying_id, info_hash)),
         }
     }
 
     pub fn new_with_body(txn_id: TransactionId, body: KrpcBody) -> Self {
-        Self { txn_id, body }
+        Self { txn_id, body, ip: None }
     }
 
     pub fn new_announce_peer_query(
@@ -570,6 +616,7 @@ impl Krpc {
     ) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
                 querying_id,
                 implied_port,
@@ -583,6 +630,7 @@ impl Krpc {
     pub fn new_ping_response(transaction_id: TransactionId, responding_id: NodeId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
         }
     }
@@ -590,6 +638,7 @@ impl Krpc {
     pub fn new_announce_peer_response(transaction_id: TransactionId, responding_id: NodeId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
         }
     }
@@ -597,6 +646,7 @@ impl Krpc {
     pub fn new_standard_generic_error_response(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::ErrorResponse(KrpcError::new(201, "A Generic Error Occurred".to_string())),
         }
     }
@@ -604,6 +654,7 @@ impl Krpc {
     pub fn new_standard_server_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::ErrorResponse(KrpcError::new(202, "A Server Error Occurred".to_string())),
         }
     }
@@ -611,6 +662,7 @@ impl Krpc {
     pub fn new_standard_protocol_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::ErrorResponse(KrpcError::new(203, "A Protocol Error Occurred".to_string())),
         }
     }
@@ -618,6 +670,7 @@ impl Krpc {
     pub fn new_unsupported_error(transaction_id: TransactionId) -> Self {
         Self {
             txn_id: transaction_id,
+            ip: None,
             body: KrpcBody::ErrorResponse(KrpcError::new(204, "A Unsupported Method Error Occurred".to_string())),
         }
     }
@@ -633,8 +686,8 @@ mod test {
         let message = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe" as &[u8];
         let deserialized = message.parse().unwrap();
         let expected = Krpc::new_ping_query(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
+            TransactionId::from_bytes(b"aa"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
         );
         assert_eq!(deserialized, expected);
     }
@@ -646,9 +699,9 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_find_node_query(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
-            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
+            TransactionId::from_bytes(b"aa"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
         );
 
         assert_eq!(deserialized, expected);
@@ -661,9 +714,9 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_get_peers_query(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"abcdefghij0123456789"),
-            InfoHash::from_bytes(*&b"mnopqrstuvwxyz123456"),
+            TransactionId::from_bytes(b"aa"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
         );
 
         // taken directly from the spec
@@ -677,12 +730,12 @@ mod test {
         let deserialized = message.parse().unwrap();
 
         let expected = Krpc::new_announce_peer_query(
-            TransactionId::from_bytes(*&b"aa"),
-            InfoHash::from_bytes(&*b"mnopqrstuvwxyz123456"),
-            NodeId::from_bytes(&*b"abcdefghij0123456789"),
+            TransactionId::from_bytes(b"aa"),
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
             6881,
             true,
-            Token::from_bytes(*&b"aoeusnth"),
+            Token::from_bytes(b"aoeusnth"),
         );
 
         // taken directly from the spec
@@ -695,8 +748,8 @@ mod test {
         let decoded = message.parse().unwrap();
 
         let expected = Krpc::new_ping_response(
-            TransactionId::from_bytes(*&b"aa"),
-            NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
+            TransactionId::from_bytes(b"aa"),
+            NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
         );
         assert_eq!(decoded, expected);
     }
@@ -741,7 +794,12 @@ mod test {
             .with_nodes(&expected_nodes)
             .build();
         let body = KrpcBody::FindNodeGetPeersResponse(body);
-        let expected = Krpc::new_with_body(txn_id, body);
+        let expected = Krpc {
+            txn_id,
+            body,
+            // the responder's view of the querier's address, `434545f1c8d6` in the fixture
+            ip: Some(SocketAddrV4::new(Ipv4Addr::new(67, 69, 69, 241), 51414)),
+        };
 
         assert_eq!(decoded, expected);
     }
@@ -757,10 +815,10 @@ mod test {
         let decoded = message.parse().unwrap();
 
         use find_node_get_peers_response::Builder;
-        let txn_id = TransactionId::from_bytes(*&b"aa");
-        let expected = Builder::new(NodeId::from_bytes(*&b"0123456789abcdefghij"))
+        let txn_id = TransactionId::from_bytes(b"aa");
+        let expected = Builder::new(NodeId::from_bytes(b"0123456789abcdefghij"))
             .with_node(NodeInfo::new(
-                NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"),
+                NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
                 SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 6881),
             ))
             .build();
@@ -768,6 +826,34 @@ mod test {
         let expected = Krpc::new_with_body(txn_id, body);
 
         assert_eq!(expected, decoded);
+    }
+
+    #[test]
+    fn the_ip_field_is_parsed_and_encoded() {
+        let message = b"d2:ip6:\x05\x06\x07\x08\x1a\xe11:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
+        let decoded = message.parse().unwrap();
+        let seen = SocketAddrV4::new(Ipv4Addr::new(5, 6, 7, 8), 6881);
+        assert_eq!(decoded.ip, Some(seen));
+        assert!(matches!(decoded.body, KrpcBody::PingAnnouncePeerResponse(_)));
+
+        let again = decoded.encode();
+        assert_eq!(again.as_ref().parse().unwrap(), decoded);
+
+        // an ipv6 node reports 18 bytes, which we have no use for
+        let message = b"d2:ip18:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1a\xe11:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
+        assert_eq!(message.parse().unwrap().ip, None);
+    }
+
+    #[test]
+    fn unroutable_contacts_are_dropped() {
+        // a node at 0.0.0.0 and a peer on port 0 can't be reached, so they never get in
+        let message = b"d1:rd2:id20:0123456789abcdefghij5:nodes52:mnopqrstuvwxyz123456\x00\x00\x00\x00\x1a\xe1abcdefghijklmnopqrst\x01\x02\x03\x04\x1a\xe16:valuesl6:\x05\x06\x07\x08\x00\x006:\x05\x06\x07\x08\x1a\xe1ee1:t2:aa1:y1:re" as &[u8];
+        let decoded = message.parse().unwrap();
+        let KrpcBody::FindNodeGetPeersResponse(body) = decoded.body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(body.nodes().len(), 1);
+        assert_eq!(body.values().len(), 1);
     }
 
     #[test]
@@ -783,7 +869,7 @@ mod test {
         let message = b"d1:eli201e24:A Generic Error Occurrede1:t2:aa1:y1:ee" as &[u8];
         let decoded: Krpc = message.parse().unwrap();
 
-        let expected = Krpc::new_standard_generic_error_response(TransactionId::from_bytes(*&b"aa"));
+        let expected = Krpc::new_standard_generic_error_response(TransactionId::from_bytes(b"aa"));
         assert_eq!(expected, decoded);
     }
 

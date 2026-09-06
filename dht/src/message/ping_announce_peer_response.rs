@@ -22,7 +22,7 @@ impl PingAnnouncePeerResponse {
 impl ToKrpcBody for PingAnnouncePeerResponse {
     #[allow(unused_must_use)]
     fn encode_body(&self, enc: SingleItemEncoder) {
-        enc.emit_unsorted_dict(|enc| enc.emit_pair(b"id", &self.target_id))
+        enc.emit_unsorted_dict(|enc| enc.emit_pair(b"id", self.target_id))
             .unwrap()
     }
 }
@@ -40,8 +40,8 @@ mod tests {
     fn can_encode_example() {
         use std::str;
 
-        let txn_id = TransactionId::from_bytes(*&b"aa");
-        let ping_response = PingAnnouncePeerResponse::new(NodeId::from_bytes(*&b"mnopqrstuvwxyz123456"));
+        let txn_id = TransactionId::from_bytes(b"aa");
+        let ping_response = PingAnnouncePeerResponse::new(NodeId::from_bytes(b"mnopqrstuvwxyz123456"));
 
         let expected = "d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re";
         let encoded = Krpc::new_with_body(txn_id, KrpcBody::PingAnnouncePeerResponse(ping_response)).encode();

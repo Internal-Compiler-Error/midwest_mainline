@@ -87,9 +87,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let external_ip = public_ip::addr_v4().await.unwrap();
 //!     let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:51413")?).await?;
-//!     let dht = Arc::new(DhtSession::with_stable_id(socket, external_ip, &env::var("DATABASE_URL")?)?);
+//!     // `None`: derive the BEP 42 node id from the address other nodes reported last time
+//!     let dht = Arc::new(DhtSession::with_stable_id(socket, None, &env::var("DATABASE_URL")?)?);
 //!
 //!     let _event_loop = tokio::spawn({
 //!         let dht = Arc::clone(&dht);

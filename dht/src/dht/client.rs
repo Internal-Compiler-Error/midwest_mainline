@@ -6,7 +6,7 @@ use futures::future::join_all;
 use std::collections::HashSet;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
@@ -15,6 +15,9 @@ use crate::message::{
 };
 use crate::our_error::{OurError, naur};
 use crate::types::{InfoHash, NodeId, NodeInfo, Token, cmp_resp};
+
+/// What one node answers a `get_peers` with: a write token, closer nodes, and peers
+type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>);
 
 const ROUNDS_LIMIT: i32 = 8;
 /// Nodes queried per lookup round. BEP 5 suggests 3; more costs little on UDP and finishes
@@ -65,7 +68,7 @@ impl DhtClient {
         // error per se, it's still desirable to deliver these information to the caller somehow
 
         // if we already know the node, then no need for any network requests
-        if let Some(node) = (&self.state.routing_table).find_exact(&target) {
+        if let Some(node) = self.state.routing_table.find_exact(&target) {
             return vec![node];
         }
 
@@ -162,7 +165,7 @@ impl DhtClient {
 
             Ok(nodes)
         } else {
-            warn!("Did not get a find node response, got {:?}", body);
+            debug!("Did not get a find node response, got {:?}", body);
             Err(naur!("Did not get a find node response"))
         }
     }
@@ -270,11 +273,7 @@ impl DhtClient {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn send_get_peers_rpc(
-        &self,
-        dest: SocketAddrV4,
-        info_hash: InfoHash,
-    ) -> Result<(Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>), OurError> {
+    async fn send_get_peers_rpc(&self, dest: SocketAddrV4, info_hash: InfoHash) -> Result<GetPeersReply, OurError> {
         // construct the message to query our friends
         let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash));
 
@@ -300,7 +299,7 @@ impl DhtClient {
                 Ok((token, nodes, values))
             }
             other => {
-                warn!("Unexpected response to get peers: {:?}", other);
+                debug!("Unexpected response to get peers: {:?}", other);
                 Err(naur!("Unexpected response to get peers"))
             }
         };
@@ -377,7 +376,7 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let broker = RpcManager::new(socket, router_pool.clone(), Arc::new(TxnIdGenerator::new()));
+        let broker = RpcManager::new(socket, router_pool.clone(), Arc::new(TxnIdGenerator::new()), None);
         broker.run().await.unwrap();
         let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool);
         routing_table.add(NodeId([0xAA; 20]), addr_a);

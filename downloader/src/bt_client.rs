@@ -354,9 +354,12 @@ impl BtClient {
             let stream = tokio::select! {
                 accepted = socket.accept() => match accepted {
                     Ok(stream) => stream,
+                    // the only error is the socket being gone, so retrying would spin
                     Err(e) => {
-                        tracing::warn!("failed to accept an inbound uTP connection: {e}");
-                        continue;
+                        if !shutdown.is_cancelled() {
+                            tracing::warn!("no more inbound uTP connections: {e}");
+                        }
+                        break;
                     }
                 },
                 _ = shutdown.cancelled() => break,

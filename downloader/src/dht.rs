@@ -2,9 +2,8 @@
 //! client, shared by every torrent: swarms and the metadata fetcher ask it for peers and
 //! announce themselves through `announcer::dht_announcer`.
 //!
-//! Starting it takes a while (an external-IP lookup for the BEP 42 node id, then
-//! bootstrapping), so it happens in the background and consumers get a `watch` that turns
-//! from `None` to a handle once the node is up. A client with no DHT at all just gets a
+//! Bootstrapping takes a while, so starting happens in the background and consumers get a
+//! `watch` that turns from `None` to a handle once the node is up. A client with no DHT at all just gets a
 //! watch that stays `None` (`Dht::none`).
 
 use midwest_mainline::dht::DhtSession;
@@ -12,7 +11,6 @@ use midwest_mainline::dht::client::DhtClient;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::watch;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -26,9 +24,6 @@ const BOOTSTRAP_NODES: [&str; 5] = [
     "dht.libtorrent.org:25401",
     "dht.aelitis.com:6881",
 ];
-
-/// How long to wait to learn our external IP before giving up on a BEP 42 id
-const EXTERNAL_IP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct DhtHandle {
@@ -87,19 +82,10 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
     };
     let udp_port = socket.local_addr().map(|a| a.port()).unwrap_or(port);
 
-    // BEP 42 ties the node id to the external IP; without one the id is minted for 0.0.0.0
-    // and the crate replaces it as soon as a later start learns the real address
-    let external_ip = match tokio::time::timeout(EXTERNAL_IP_TIMEOUT, public_ip::addr_v4()).await {
-        Ok(Some(ip)) => ip,
-        _ => {
-            warn!("couldn't learn the external IP, the DHT node id won't be BEP 42 compliant");
-            Ipv4Addr::UNSPECIFIED
-        }
-    };
-
+    // the crate learns our external address from other nodes and derives the BEP 42 node id
+    // from it at the next start
     let db = db.display().to_string();
-    let session = match tokio::task::spawn_blocking(move || DhtSession::with_stable_id(socket, external_ip, &db)).await
-    {
+    let session = match tokio::task::spawn_blocking(move || DhtSession::with_stable_id(socket, None, &db)).await {
         Ok(Ok(session)) => Arc::new(session),
         Ok(Err(e)) => {
             warn!("no DHT: couldn't open its database ({e:#})");
