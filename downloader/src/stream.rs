@@ -84,24 +84,23 @@ pub(crate) async fn connect(
         }
     };
 
-    let plain = |mut stream: PeerStream| async move {
-        let handshake = shake_hands(&mut stream, info_hash, our_id).await?;
-        Ok((stream, handshake))
-    };
-    let encrypted = |stream: PeerStream| async move {
-        plain(PeerStream::Encrypted(Box::new(mse::initiate(stream, info_hash).await?))).await
-    };
-    match our_id.encryption {
-        Encryption::Disabled => plain(first).await,
-        Encryption::Require => encrypted(first).await,
-        Encryption::Prefer => match encrypted(first).await {
-            Ok(connected) => Ok(connected),
+    let encrypt =
+        |stream| async { io::Result::Ok(PeerStream::Encrypted(Box::new(mse::initiate(stream, info_hash).await?))) };
+    let mut stream = match our_id.encryption {
+        Encryption::Disabled => first,
+        Encryption::Require => encrypt(first).await?,
+        // only the MSE exchange itself failing means "try plaintext": a peer that completed
+        // it and then rejected the handshake has answered, and would reject again
+        Encryption::Prefer => match encrypt(first).await {
+            Ok(stream) => stream,
             Err(e) => {
                 tracing::debug!("{addr} didn't take an encrypted opening ({e}); retrying in plaintext");
-                plain(transport.dial(addr).await?).await
+                transport.dial(addr).await?
             }
         },
-    }
+    };
+    let handshake = shake_hands(&mut stream, info_hash, our_id).await?;
+    Ok((stream, handshake))
 }
 
 /// Reads an inbound connection's opening, which is either a plaintext BitTorrent handshake
@@ -256,6 +255,34 @@ mod test {
                 .is_err()
         );
         assert_eq!(task.await.unwrap(), [false]);
+    }
+
+    /// A peer that completes the MSE exchange and then names another torrent in its handshake
+    /// has answered; dialling it again in plaintext would only get the same answer.
+    #[tokio::test]
+    async fn a_handshake_refused_after_encryption_is_not_retried() {
+        let hash = InfoHash::from_bytes(&[9; 20]);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = accept(PeerStream::Tcp(tcp), Encryption::Prefer, || vec![hash])
+                .await
+                .unwrap();
+            let other = InfoHash::from_bytes(&[10; 20]);
+            send_handshake(&mut stream, &other, &identity(2, Encryption::Prefer))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                .await
+                .is_err()
+        });
+        assert!(
+            connect(addr, &hash, &identity(1, Encryption::Prefer), None)
+                .await
+                .is_err()
+        );
+        assert!(task.await.unwrap(), "no second connection");
     }
 
     /// A port with a uTP socket and no TCP listener refuses TCP at once; the dial goes over
