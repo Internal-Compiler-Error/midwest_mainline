@@ -276,3 +276,21 @@ only below-average known peers), no exploration bonus, no normalisation. The win
 mechanism keeps good peers saturated and the leftover budget flows to strangers, which is
 sequential greedy running in parallel across the in-flight slots. Try this if SS-UCB isn't
 enough.
+
+# Endgame, 2026-09-05
+The last pieces of a download used to wait on whichever peer happened to hold them, while
+faster peers sat idle with nothing left to assign. Now an in-flight piece can have several
+claimants (`InFlight::claims`, one request cursor each). When `missing` is empty after the
+normal assignment loop, `race_the_last_pieces` gives the in-flight pieces furthest from
+done (bytes left over the claimants' combined rate) to more peers, up to `ENDGAME_RACERS`
+per piece and with at most `ENDGAME_MAX_RACED_FRACTION` of the torrent's pieces raced at
+once. The trigger is "nothing left to assign and a peer has room", not a percentage: it
+fires at the right moment for any torrent size, and the fraction only caps the damage.
+The second claimant walks the piece from the end, so the two meet in the middle and the
+bytes fetched twice are about halved. Blocks record their sender; when the piece
+completes, every other claimant gets Cancel for what it still owed (`cancel_losers`), a
+duplicate block is counted in `TorrentSwarmStats::wasted` (shown in the GUI), and a hash
+failure bans only when every block came from one peer. `release_claim` replaced
+`fail_piece`: a choke, reject, stall, malformed block, or disconnect takes that peer off
+the piece, and the piece goes back on the pile only when nobody else holds it. Test:
+`the_last_pieces_are_raced_and_the_loser_is_cancelled`.

@@ -32,6 +32,16 @@ pub const MAX_REQUEST_WINDOW: usize = 128;
 /// long for each of them.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Endgame: once every missing piece is in flight and a peer still has room, the pieces
+/// furthest from done are also requested from other peers, in the opposite block order,
+/// and whoever finishes second gets Cancel for the rest. This many peers may hold the
+/// same piece at once.
+pub const ENDGAME_RACERS: usize = 2;
+
+/// Endgame: at most this fraction of the torrent's pieces (rounded up, so at least one)
+/// may be raced at any time, bounding the bytes downloaded twice.
+pub const ENDGAME_MAX_RACED_FRACTION: f64 = 0.05;
+
 /// How long to leave an address alone after a failed dial. Doubles with each consecutive
 /// failure up to DIAL_BACKOFF_MAX; trackers and PEX keep handing out the same dead
 /// addresses, and without this each one is redialed every time it comes around.

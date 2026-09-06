@@ -67,6 +67,7 @@ pub async fn fetch(
     let placeholder_stats = TorrentSwarmStats {
         uploaded: 0,
         downloaded: 0,
+        wasted: 0,
         left: UNKNOWN_BYTES_LEFT,
         written: 0,
         verified: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),

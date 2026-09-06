@@ -1,6 +1,6 @@
 use crate::settings::{BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, RATE_WINDOW, REQUEST_PIPELINE_TARGET};
 use crate::wire::{
-    BitField, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
+    BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
     RejectRequest, Request, Unchoke,
 };
 use futures::SinkExt;
@@ -255,6 +255,26 @@ impl Peer {
 
     /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
     /// support -- the classic protocol has no "I'm declining this" message, and a plain drop
+    /// Forgets every outstanding request for `piece`; the caller decides whether to tell the
+    /// peer (`send_cancel`) or whether the peer already knows (it choked or rejected us).
+    pub fn forget_piece(&mut self, piece: u32) -> Vec<Request> {
+        let dropped: Vec<Request> = self.requested.keys().filter(|r| r.index == piece).copied().collect();
+        for req in &dropped {
+            self.requested.remove(req);
+        }
+        dropped
+    }
+
+    pub async fn send_cancel(&mut self, req: Request) -> io::Result<()> {
+        self.socket
+            .send(BtMessage::Cancel(Cancel {
+                index: req.index,
+                begin: req.begin,
+                length: req.length,
+            }))
+            .await
+    }
+
     /// is exactly what such a peer already expects.
     pub async fn send_reject(&mut self, req: Request) -> io::Result<()> {
         if !self.remote_supports_fast {

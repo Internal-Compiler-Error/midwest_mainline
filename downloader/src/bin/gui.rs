@@ -366,6 +366,7 @@ fn draw_progress(ui: &mut egui::Ui, p: &Progress) {
                     "Uploaded",
                     format!("{}  ({}/s)", human_bytes(p.uploaded), human_bytes(p.upload_bps as u64)),
                 ),
+                ("Wasted", human_bytes(p.wasted)),
                 ("Remaining", human_bytes(p.left)),
                 ("Total size", human_bytes(p.total_size)),
             ] {

@@ -532,6 +532,7 @@ mod test {
         let stats = TorrentSwarmStats {
             uploaded: 0,
             downloaded: 0,
+            wasted: 0,
             left: 100,
             written: 0,
             verified: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
