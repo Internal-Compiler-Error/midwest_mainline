@@ -6,8 +6,11 @@
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
-  import { fraction, humanBytes, isMagnetUri } from './api'
+  import { fraction, humanBytes, humanBytesLike, isMagnetUri, perSecondLike } from './api'
+  import Flip from './Flip.svelte'
+  import Num from './Num.svelte'
   import ProgressBar from './ProgressBar.svelte'
+
 
   let {
     torrent,
@@ -39,30 +42,32 @@
   {:else if torrent.kind === 'checking'}
     <h2 class="text-base font-semibold">Checking files</h2>
     <ProgressBar fraction={fraction(torrent.checked_pieces, torrent.total_pieces)} done={false} tall />
-    <div class="text-muted-foreground">{torrent.checked_pieces} / {torrent.total_pieces} pieces hashed</div>
+    <div class="text-muted-foreground"><Num value={torrent.checked_pieces} /> / {torrent.total_pieces} pieces hashed</div>
   {:else}
     <div class="flex items-center gap-3">
       <h2 class="text-base font-semibold">
-        {torrent.kind === 'paused' ? 'Paused' : torrent.kind === 'queued' ? 'Queued' : torrent.completed ? 'Seeding' : 'Downloading'}
+        <Flip text={torrent.kind === 'paused' ? 'Paused' : torrent.kind === 'queued' ? 'Queued' : torrent.completed ? 'Seeding' : 'Downloading'} />
       </h2>
       {#if torrent.completed}<span class="text-emerald-600 dark:text-emerald-400">✔ complete</span>{/if}
     </div>
     <ProgressBar fraction={fraction(torrent.verified_pieces, torrent.total_pieces)} done={torrent.completed} tall />
-    <div class="text-muted-foreground">{torrent.verified_pieces} / {torrent.total_pieces} pieces verified</div>
+    <div class="text-muted-foreground"><Num value={torrent.verified_pieces} /> / {torrent.total_pieces} pieces verified</div>
 
     <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 select-text">
-      {#each [
-        ['Location', torrent.root],
-        ['Downloaded', `${humanBytes(torrent.downloaded)}  (${humanBytes(torrent.download_bps)}/s)`],
-        ['Uploaded', `${humanBytes(torrent.uploaded)}  (${humanBytes(torrent.upload_bps)}/s)`],
-        ['Ratio', (torrent.total_size ? torrent.uploaded / torrent.total_size : 0).toFixed(2)],
-        ['Wasted', humanBytes(torrent.wasted)],
-        ['Remaining', humanBytes(torrent.left)],
-        ['Total size', humanBytes(torrent.total_size)],
-      ] as [label, value] (label)}
-        <dt class="font-medium">{label}</dt>
-        <dd class="tabular-nums">{value}</dd>
-      {/each}
+      <dt class="font-medium">Location</dt>
+      <dd>{torrent.root}</dd>
+      <dt class="font-medium">Downloaded</dt>
+      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={perSecondLike} />)</dd>
+      <dt class="font-medium">Uploaded</dt>
+      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={perSecondLike} />)</dd>
+      <dt class="font-medium">Ratio</dt>
+      <dd class="tabular-nums"><Num value={torrent.total_size ? torrent.uploaded / torrent.total_size : 0} format={(n) => n.toFixed(2)} /></dd>
+      <dt class="font-medium">Wasted</dt>
+      <dd class="tabular-nums"><Num value={torrent.wasted} format={humanBytesLike} /></dd>
+      <dt class="font-medium">Remaining</dt>
+      <dd class="tabular-nums"><Num value={torrent.left} format={humanBytesLike} /></dd>
+      <dt class="font-medium">Total size</dt>
+      <dd class="tabular-nums">{humanBytes(torrent.total_size)}</dd>
     </dl>
 
     <div class="flex items-center gap-2">
@@ -134,12 +139,12 @@
               <Table.Row>
                 <Table.Cell class="truncate font-mono select-text" title={peer.addr}>{peer.addr}</Table.Cell>
                 <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
-                <Table.Cell class="text-right tabular-nums">{Math.round(peer.progress * 100)}%</Table.Cell>
+                <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>
                 <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
-                  {humanBytes(peer.download_bps)}/s
+                  <Num value={peer.download_bps} format={perSecondLike} />
                 </Table.Cell>
                 <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.uploaded)} in total">
-                  {humanBytes(peer.upload_bps)}/s
+                  <Num value={peer.upload_bps} format={perSecondLike} />
                 </Table.Cell>
                 <Table.Cell class="font-mono">{peer.flags}</Table.Cell>
               </Table.Row>

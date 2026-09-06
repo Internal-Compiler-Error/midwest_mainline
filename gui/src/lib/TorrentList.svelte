@@ -6,8 +6,11 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import * as Table from '$lib/components/ui/table'
   import type { TorrentId, TorrentRow } from './api'
-  import { fraction, humanBytes } from './api'
+  import { fraction, perSecondLike } from './api'
+  import Flip from './Flip.svelte'
+  import Num from './Num.svelte'
   import ProgressBar from './ProgressBar.svelte'
+
 
   let {
     torrents,
@@ -52,11 +55,7 @@
     }
   }
 
-  function rates(t: TorrentRow): string {
-    if (t.kind !== 'downloading') return ''
-    const up = `↑ ${humanBytes(t.upload_bps)}/s`
-    return t.completed ? up : `↓ ${humanBytes(t.download_bps)}/s  ${up}`
-  }
+
 </script>
 
 <Table.Root>
@@ -71,8 +70,12 @@
             <ProgressBar fraction={fraction(t.checked_pieces, t.total_pieces)} done={false} />
           {/if}
         </Table.Cell>
-        <Table.Cell class="w-28 min-w-28 whitespace-nowrap text-muted-foreground">{state(t)}</Table.Cell>
-        <Table.Cell class="w-44 min-w-44 whitespace-nowrap text-right text-muted-foreground tabular-nums">{rates(t)}</Table.Cell>
+        <Table.Cell class="w-28 min-w-28 whitespace-nowrap text-muted-foreground"><Flip text={state(t)} /></Table.Cell>
+        <Table.Cell class="w-44 min-w-44 whitespace-nowrap text-right text-muted-foreground tabular-nums">
+          {#if t.kind === 'downloading'}
+            {#if !t.completed}↓ <Num value={t.download_bps} format={perSecondLike} />&nbsp;&nbsp;{/if}↑ <Num value={t.upload_bps} format={perSecondLike} />
+          {/if}
+        </Table.Cell>
         <Table.Cell class="w-16 pr-1 whitespace-nowrap">
           {#if t.kind === 'downloading' || t.kind === 'queued'}
             <Button

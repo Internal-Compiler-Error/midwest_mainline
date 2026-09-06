@@ -136,11 +136,19 @@ export function fraction(verified: number, total: number): number {
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
 
 export function humanBytes(bytes: number): string {
-  let value = bytes
+  return humanBytesLike(bytes, bytes)
+}
+
+/** `bytes` in the unit `humanBytes(like)` would pick. An animated figure formats its
+ * in-between values like its destination, so only the digits move, never the unit. */
+export function humanBytesLike(bytes: number, like: number): string {
+  let scale = 1
   let unit = 0
-  while (value >= 1024 && unit < UNITS.length - 1) {
-    value /= 1024
+  while (like / scale >= 1024 && unit < UNITS.length - 1) {
+    scale *= 1024
     unit++
   }
-  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${UNITS[unit]}`
+  return unit === 0 ? `${Math.round(bytes)} B` : `${(bytes / scale).toFixed(1)} ${UNITS[unit]}`
 }
+
+export const perSecondLike = (bytes: number, like: number) => `${humanBytesLike(bytes, like)}/s`

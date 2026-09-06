@@ -10,13 +10,15 @@
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
-  import { humanBytes } from './lib/api'
+  import { perSecondLike } from './lib/api'
   import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
   import Insights from './lib/Insights.svelte'
   import { Insights as InsightsStore } from './lib/bus.svelte'
   import { subscribe as subscribeEvents } from './lib/events'
   import Details from './lib/Details.svelte'
+  import Flip from './lib/Flip.svelte'
+  import Num from './lib/Num.svelte'
   import ResumableList from './lib/Resumable.svelte'
   import SettingsDialog from './lib/SettingsDialog.svelte'
   import Toolbar from './lib/Toolbar.svelte'
@@ -252,9 +254,9 @@
     {/if}
     {#if status}
       <span class="ml-auto flex gap-4 text-xs text-muted-foreground tabular-nums">
-        <span>↓ {humanBytes(status.download_bps)}/s ↑ {humanBytes(status.upload_bps)}/s</span>
-        <span title="nodes in the DHT routing table">DHT {status.dht_nodes === null ? 'off' : `${status.dht_nodes} nodes`}</span>
-        <span title={mappingTitle(status)}>port {status.listen_port} · {mappingLabel(status)}</span>
+        <span>↓ <Num value={status.download_bps} format={perSecondLike} /> ↑ <Num value={status.upload_bps} format={perSecondLike} /></span>
+        <span title="nodes in the DHT routing table">DHT {#if status.dht_nodes === null}off{:else}<Num value={status.dht_nodes} /> nodes{/if}</span>
+        <span title={mappingTitle(status)}>port {status.listen_port} · <Flip text={mappingLabel(status)} /></span>
       </span>
     {/if}
   </footer>
