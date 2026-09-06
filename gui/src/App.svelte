@@ -7,6 +7,9 @@
   import * as Resizable from '$lib/components/ui/resizable'
   import { Separator } from '$lib/components/ui/separator'
   import * as api from './lib/api'
+  import { revealItemInDir } from '@tauri-apps/plugin-opener'
+  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+  import { getCurrentWebview } from '@tauri-apps/api/webview'
   import { humanBytes } from './lib/api'
   import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
@@ -28,9 +31,42 @@
   let logSeen = 0
   let status = $state<Status | null>(null)
 
+  /// ids seen complete already, so finishing is announced once
+  let announced = new Set<TorrentId>()
+  let notifyReady = false
+
+  async function notifyCompletions() {
+    for (const t of torrents) {
+      if (t.kind === 'downloading' && t.completed && !announced.has(t.id)) {
+        announced.add(t.id)
+        if (notifyReady) sendNotification({ title: 'Download complete', body: t.name })
+      }
+    }
+  }
+
+  function pauseAll() {
+    for (const t of torrents) if (t.kind === 'downloading' || t.kind === 'queued') api.pauseTorrent(t.id)
+  }
+
+  function resumeAll() {
+    for (const t of torrents) if (t.kind === 'paused') api.unpauseTorrent(t.id)
+  }
+
+  function reveal(id: TorrentId) {
+    const t = torrents.find((t) => t.id === id)
+    if (t && (t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued')) {
+      // a multi-file torrent is a directory named after it, a single-file one is the file
+      revealItemInDir(`${t.root}/${t.files.length > 1 ? t.name : t.files[0]?.path ?? t.name}`)
+    }
+  }
+
   async function refresh() {
     torrents = await api.torrents()
     status = await api.status()
+    notifyCompletions()
+    // torrents that were there at startup (resumed, or given on the command line) get the
+    // details panel too, without a click
+    if (selected === null && torrents.length > 0) selected = torrents[0].id
     const chunk = await api.logsSince(logSeen)
     if (chunk.lines.length) {
       logSeen = chunk.seen
@@ -76,9 +112,25 @@
   $effect(() => {
     api.defaultDownloadDir().then((dir) => (downloadDir = dir))
     rescan()
+    // torrents complete at startup were complete before; only later ones get a notification
+    api.torrents().then((initial) => {
+      for (const t of initial) if (t.kind !== 'resolving' && t.kind !== 'failed' && t.kind !== 'checking' && t.completed) announced.add(t.id)
+      isPermissionGranted()
+        .then((granted) => (granted ? 'granted' : requestPermission()))
+        .then((state) => (notifyReady = state === 'granted'))
+    })
     refresh()
     const timer = setInterval(refresh, 250)
-    return () => clearInterval(timer)
+    // .torrent files dropped on the window are added to the default download dir
+    const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === 'drop') {
+        for (const path of event.payload.paths) if (path.toLowerCase().endsWith('.torrent')) add(path)
+      }
+    })
+    return () => {
+      clearInterval(timer)
+      unlisten.then((stop) => stop())
+    }
   })
 
   /// Asks where this torrent should go, then adds it. Cancelling the picker cancels the add.
@@ -109,7 +161,7 @@
 <ModeWatcher />
 
 <div class="flex h-screen flex-col text-sm select-none">
-  <Toolbar onadd={add} onsettings={() => (showSettings = true)} />
+  <Toolbar onadd={add} onsettings={() => (showSettings = true)} onpauseall={pauseAll} onresumeall={resumeAll} />
   <SettingsDialog bind:open={showSettings} onsaved={(s) => (downloadDir = s.download_dir)} />
 
   <Resizable.PaneGroup direction="vertical" class="flex-1">
@@ -125,6 +177,7 @@
             onpause={api.pauseTorrent}
             onunpause={api.unpauseTorrent}
             onrecheck={api.recheckTorrent}
+            onreveal={reveal}
             onremove={remove}
           />
         {/if}

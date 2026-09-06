@@ -62,8 +62,10 @@ as its first argument), waits N seconds, screenshots the window, quits:
 # metadata: 0  dht up: 1  dht lookups: 2  peer connections: 67  pieces: 720  ...
 ```
 
-Look at `gui.png`: it should show the torrent row with a progress bar and rates, and the
-console pane with piece completions scrolling. The GUI's console is also streamed to
+Look at `gui.png`: it should show the torrent row with a progress bar and rates, the details
+panel (the first torrent is selected by itself), and the console pane with piece completions
+scrolling. The GUI downloads into `$RUN_DIR/gui-download` (the driver writes a scratch
+`settings.json` saying so; without it the app's default is `~/Downloads`). The GUI's console is also streamed to
 `/tmp/midwest-mainline-run/gui.log`, which is how the summary is computed ("metadata" stays
 0 there because only the CLI logs that line).
 

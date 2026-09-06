@@ -76,6 +76,10 @@ case ${1:-} in
       timeout 30 zsh -c 'until nc -z localhost 5173 2>/dev/null; do sleep 0.2; done' || { echo "Vite never came up, see $RUN_DIR/vite.log" >&2; exit 1; }
     fi
     echo "launching the GUI for ${secs}s, console at $RUN_DIR/gui.log"
+    # the GUI downloads into its settings' download_dir, which defaults to ~/Downloads: point
+    # it at the scratch dir so a test run never writes into the user's own folders
+    mkdir -p "$DATA_DIR" "$RUN_DIR/gui-download"
+    [[ -f $DATA_DIR/settings.json ]] || printf '{"download_dir": "%s"}\n' "$RUN_DIR/gui-download" > "$DATA_DIR/settings.json"
     DOWNLOADER_DATA_DIR=$DATA_DIR DOWNLOADER_LOG_ADDR=127.0.0.1:$LOG_PORT RUST_LOG=${RUST_LOG:-info} RUST_BACKTRACE=0 \
       "$ROOT/target/debug/downloader-gui" ${source:+"$source"} > "$RUN_DIR/gui.stderr" 2>&1 &
     gui_pid=$!

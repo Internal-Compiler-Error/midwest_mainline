@@ -16,6 +16,7 @@
     onpause,
     onunpause,
     onrecheck,
+    onreveal,
     onremove,
   }: {
     torrents: TorrentRow[]
@@ -24,6 +25,7 @@
     onpause: (id: TorrentId) => void
     onunpause: (id: TorrentId) => void
     onrecheck: (id: TorrentId) => void
+    onreveal: (id: TorrentId) => void
     onremove: (id: TorrentId, deleteFiles: boolean) => void
   } = $props()
 
@@ -94,6 +96,7 @@
             </DropdownMenu.Trigger>
             <DropdownMenu.Content align="end">
               {#if t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued'}
+                <DropdownMenu.Item onclick={() => onreveal(t.id)}>Show in Finder</DropdownMenu.Item>
                 <DropdownMenu.Item onclick={() => onrecheck(t.id)}>Force recheck</DropdownMenu.Item>
                 <DropdownMenu.Separator />
               {/if}

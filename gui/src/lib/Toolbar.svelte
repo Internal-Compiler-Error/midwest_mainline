@@ -1,6 +1,8 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog'
   import FolderOpen from '@lucide/svelte/icons/folder-open'
+  import Pause from '@lucide/svelte/icons/pause'
+  import Play from '@lucide/svelte/icons/play'
   import SettingsIcon from '@lucide/svelte/icons/settings'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
@@ -8,7 +10,17 @@
   import { isMagnetUri } from './api'
 
   // `onadd` gets a .torrent path or a magnet link; the parent asks where it should go
-  let { onadd, onsettings }: { onadd: (source: string) => void; onsettings: () => void } = $props()
+  let {
+    onadd,
+    onsettings,
+    onpauseall,
+    onresumeall,
+  }: {
+    onadd: (source: string) => void
+    onsettings: () => void
+    onpauseall: () => void
+    onresumeall: () => void
+  } = $props()
   let magnet = $state('')
   let ready = $derived(isMagnetUri(magnet))
 
@@ -36,6 +48,9 @@
     onkeydown={(e) => e.key === 'Enter' && addMagnet()}
   />
   <Button size="sm" disabled={!ready} onclick={addMagnet}>Add</Button>
+  <Separator orientation="vertical" class="h-5!" />
+  <Button variant="ghost" size="icon-sm" title="pause all" onclick={onpauseall}><Pause /></Button>
+  <Button variant="ghost" size="icon-sm" title="resume all" onclick={onresumeall}><Play /></Button>
   <Separator orientation="vertical" class="h-5!" />
   <Button variant="ghost" size="icon-sm" title="settings" onclick={onsettings}><SettingsIcon /></Button>
 </div>

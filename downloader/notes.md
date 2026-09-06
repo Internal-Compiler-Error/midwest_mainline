@@ -27,6 +27,8 @@ survives context resets; re-read before acting.
 - [x] Status bar: total rates, DHT node count, listen port, port mapping state
 - [x] Download queue: `max_active_downloads`, seeding doesn't count
 - [x] Tracker status in the details panel; announce retries with backoff
+- [x] GUI conveniences: pause/resume all, Show in Finder, drop .torrent files on the window,
+      completion notifications, first torrent selected by itself
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -608,3 +610,18 @@ at the first failure anywhere in resolve/bind/connect/announce (the `?`s in its 
 UDP tracker that was down when the torrent started never came back. The UDP loop now
 reconnects on a fresh socket after a failure. Tests: `retry_delay_doubles_and_caps`,
 `the_board_lists_every_announcer_up_front`.
+
+# GUI conveniences, 2026-09-06
+Small things every desktop client has, all on the Svelte side with two Tauri plugins:
+pause-all and resume-all buttons in the toolbar; "Show in Finder" in a row's menu
+(`tauri-plugin-opener`'s `revealItemInDir`, on the torrent's directory or its single file);
+`.torrent` files dropped on the window go through the same add flow as the Open button
+(the webview's drag-drop event); a system notification when a download finishes
+(`tauri-plugin-notification`, permission asked at startup; torrents already complete then
+aren't announced); and the first torrent is selected by itself so the details panel isn't
+empty after a restart.
+
+Found while screenshotting: the run skill's GUI runs were downloading into the real
+`~/Downloads`, since only the data dir was redirected. The driver now writes a scratch
+`settings.json` with `download_dir` under the run dir, and the stray partial ISO in
+`~/Downloads` (mtime matching the run) was deleted.
