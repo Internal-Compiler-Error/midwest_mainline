@@ -32,6 +32,7 @@ use diesel::{
     r2d2::{self, ConnectionManager, CustomizeConnection, Pool},
     sql_types,
 };
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tracing::info;
 
 use rand::{Rng, RngCore};
@@ -43,6 +44,8 @@ use std::{
 };
 use tokio::{net::UdpSocket, task::JoinSet};
 use txn_id_generator::TxnIdGenerator;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migrations");
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -210,6 +213,11 @@ impl DhtSession {
             .expect("Could not build DB connection pool");
 
         let mut conn = db.get().map_err(|e| naur!("could not check out a db connection: {e}"))?;
+        // a fresh database file has no schema; WAL lets the routing table write while a
+        // lookup reads
+        conn.batch_execute("PRAGMA journal_mode = WAL")?;
+        conn.run_pending_migrations(MIGRATIONS)
+            .map_err(|e| naur!("could not migrate the database: {e}"))?;
         let our_id = resume_identity(&mut conn, external_addr)?;
 
         let rpc_manager = RpcManager::new(listen_socket, db.clone(), Arc::new(TxnIdGenerator::new()));
@@ -454,5 +462,21 @@ mod recompute_tests {
             .first(&mut *conn)
             .unwrap();
         assert_eq!(stored, bucket_index(&new_id, &peer_node));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_fresh_database_file_gets_its_schema() {
+        let dir = std::env::temp_dir().join(format!("midwest-mainline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("dht.db");
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dht = DhtSession::with_stable_id(socket, Ipv4Addr::new(1, 2, 3, 4), db.to_str().unwrap()).unwrap();
+        assert_eq!(dht.node_count(), 0, "the node table exists and is empty");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
