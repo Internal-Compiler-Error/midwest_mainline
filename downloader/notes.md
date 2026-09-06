@@ -18,8 +18,8 @@ survives context resets; re-read before acting.
 - [x] File selection (priorities not done: the scheduler is rarest-first, a priority order would fight it)
 - [x] Local Service Discovery (BEP 14)
 - [x] Seeding ratio / stop seeding
-- [ ] Peer stream abstraction (`PeerStream`: Tcp | Encrypted | Utp), no behaviour change
-- [ ] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
+- [x] Peer stream abstraction (`PeerStream`: Tcp | Encrypted | Utp), no behaviour change
+- [x] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
       settings Disabled/Prefer/Require with plaintext fallback
 - [ ] uTP via `librqbit-utp` (maintained, tokio, has a `Transport` trait), sharing UDP
       6881 with the DHT through a demux: KRPC starts with `d`, uTP with `0x?1`; the DHT
@@ -477,3 +477,29 @@ resume file's new `uploaded` key plus the running swarm's count; the task carrie
 `uploaded_before` across pause/unpause and sessions, and `Progress::uploaded` is the total,
 with `Progress::ratio()` for display. The GUI shows the ratio in the details and edits the
 limit in the settings dialog. Test: `seeding_stops_at_the_ratio_limit`.
+
+# Protocol encryption (MSE), 2026-09-06
+`mse.rs` is the Vuze/Azureus "Message Stream Encryption" that every mainstream client speaks:
+768-bit Diffie-Hellman, SHA-1-derived RC4 keys with the first 1024 keystream bytes dropped,
+and the info hash mixed into the key so a responder serving several torrents can tell which
+one the initiator means. It is obfuscation against traffic shaping, not secrecy, and the
+settings dialog shouldn't pretend otherwise. Only RC4 is offered and accepted; the spec's
+"plaintext after the key exchange" option is treated as no encryption, since it would need a
+third stream flavour for no gain.
+
+`PeerStream` (`stream.rs`) is what everything above the handshake holds now: `Tcp`, or
+`Encrypted` wrapping another `PeerStream` (so MSE-over-uTP is free later). `stream::connect`
+and `stream::accept` are the only places that know the policy: `Disabled`, `Prefer`
+(default; try encrypted, reconnect in plaintext if that fails), `Require`. Inbound, the
+first 20 bytes decide: the protocol string means plaintext, anything else is a DH public
+key. The policy lives on `Identity`, so like the port it takes effect at the next start.
+The whole opening (connect, MSE, handshake) is bounded by `HANDSHAKE_TIMEOUT`, which it
+wasn't before.
+
+A `Prefer` fallback costs one extra connection per peer that doesn't speak MSE. `KnownPeer`
+could remember which peers those are and skip the encrypted try; not done, since nearly
+every client accepts it. Peers show `E` in their flags when encrypted.
+
+Tests: RC4 known answer, DH agreement, both handshake sides over an in-memory pipe (several
+served torrents, a pre-read head, a torrent we don't serve), and `stream::connect` against
+`stream::accept` over TCP for encrypted, fallback, and both `Require` refusals.

@@ -9,7 +9,6 @@ use tokio_util::{
     bytes::Buf,
     codec::{Decoder, Encoder},
 };
-use tracing::info;
 use tracing::warn;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -541,23 +540,21 @@ pub(crate) async fn send_handshake<S: AsyncWrite + Unpin>(
 /// the accept path needs to read this first to find out which torrent (if any) the connection
 /// is for, before it knows what to check against.
 pub(crate) async fn read_handshake<S: AsyncRead + Unpin>(peer: &mut S) -> io::Result<Handshake> {
-    let mut read_buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
-    let Ok(_) = peer.read_exact(&mut read_buf).await else {
-        info!("Peer didn't send enough bytes for a handshake");
-        return Err(io::Error::other("early EOF during handshake"));
-    };
-
-    if read_buf[..HANDSHAKE_STR.len()] != *HANDSHAKE_STR {
-        warn!(
-            "protocol initiation string didn't match, expected {:?}, got {:?}",
-            HANDSHAKE_STR,
-            &read_buf[..HANDSHAKE_STR.len()],
-        );
+    let mut head = [0u8; HANDSHAKE_STR.len()];
+    peer.read_exact(&mut head).await?;
+    if head != *HANDSHAKE_STR {
+        warn!("protocol initiation string didn't match, expected {HANDSHAKE_STR:?}, got {head:?}");
         return Err(io::Error::other("protocol string didn't match"));
     }
+    read_handshake_body(peer).await
+}
 
-    let handshake = Handshake::ref_from_bytes(&read_buf[HANDSHAKE_STR.len()..]).expect("shit should work");
-    Ok(*handshake)
+/// The rest of a handshake once the protocol string has been read and checked; the accept
+/// path reads that string first to tell a plaintext peer from an encrypted one.
+pub(crate) async fn read_handshake_body<S: AsyncRead + Unpin>(peer: &mut S) -> io::Result<Handshake> {
+    let mut body = [0u8; size_of::<Handshake>()];
+    peer.read_exact(&mut body).await?;
+    Ok(Handshake::read_from_bytes(&body).unwrap())
 }
 
 /// Performs the outbound side of a handshake: send ours, then read and validate theirs.
@@ -611,6 +608,7 @@ mod test {
             peer_id,
             serving: "127.0.0.1:0".parse().unwrap(),
             dht,
+            encryption: crate::config::Encryption::Disabled,
         };
 
         let server = tokio::spawn(async move {

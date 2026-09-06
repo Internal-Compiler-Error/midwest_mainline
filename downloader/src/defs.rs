@@ -1,6 +1,7 @@
+use crate::config::Encryption;
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord, Copy)]
+#[derive(Debug, Clone, Eq, PartialEq, Copy)]
 pub struct Identity {
     pub peer_id: [u8; 20],
     /// Only `.port()` is actually used as a bind address: `bt_client::accept_incoming` listens
@@ -9,4 +10,5 @@ pub struct Identity {
     pub serving: SocketAddr,
     /// we run a DHT node: announced in the handshake, and followed by a Port message
     pub dht: bool,
+    pub encryption: Encryption,
 }

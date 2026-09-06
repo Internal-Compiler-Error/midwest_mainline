@@ -7,7 +7,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use downloader::{
-    FileInfo, LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState, data_dir,
+    Encryption, FileInfo, LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState,
+    data_dir,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -225,7 +226,13 @@ fn clear_logs(app: State<App>) {
 
 #[tauri::command]
 fn default_download_dir(app: State<App>) -> String {
-    app.session.lock().unwrap().settings().download_dir.display().to_string()
+    app.session
+        .lock()
+        .unwrap()
+        .settings()
+        .download_dir
+        .display()
+        .to_string()
 }
 
 /// `Settings` field for field, in the units the dialog edits.
@@ -238,6 +245,7 @@ struct SettingsDto {
     download_limit: u64,
     upload_limit: u64,
     seed_ratio_limit: f64,
+    encryption: Encryption,
 }
 
 impl From<Settings> for SettingsDto {
@@ -250,6 +258,7 @@ impl From<Settings> for SettingsDto {
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
             seed_ratio_limit: s.seed_ratio_limit,
+            encryption: s.encryption,
         }
     }
 }
@@ -264,6 +273,7 @@ impl From<SettingsDto> for Settings {
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
             seed_ratio_limit: s.seed_ratio_limit,
+            encryption: s.encryption,
         }
     }
 }
@@ -279,7 +289,9 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
     let mut session = app.session.lock().unwrap();
     let before = session.settings();
     let settings: Settings = settings.into();
-    let restart = settings.listen_port != before.listen_port || settings.dht != before.dht;
+    let restart = settings.listen_port != before.listen_port
+        || settings.dht != before.dht
+        || settings.encryption != before.encryption;
     session.update_settings(settings).map_err(|e| format!("{e:#}"))?;
     Ok(restart)
 }

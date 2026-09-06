@@ -6,6 +6,7 @@ pub mod dht;
 mod limiter;
 pub mod logs;
 mod lsd;
+mod mse;
 pub mod magnet;
 pub mod metadata;
 pub mod paths;
@@ -20,7 +21,7 @@ pub mod torrent_swarm;
 mod wire;
 
 pub use bt_client::BtClient;
-pub use config::{Settings, SettingsWatch};
+pub use config::{Encryption, Settings, SettingsWatch};
 pub use defs::Identity;
 pub use dht::{Dht, DhtWatch};
 pub use logs::LogBuffer;

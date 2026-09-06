@@ -524,6 +524,7 @@ impl Session {
             peer_id: config.peer_id,
             serving: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port).into(),
             dht: config.settings.dht,
+            encryption: config.settings.encryption,
         };
         let shutdown = CancellationToken::new();
         let (settings_tx, settings_rx) = watch::channel(config.settings.clone());
@@ -801,6 +802,9 @@ impl Entry {
                 }
                 if p.interested_us {
                     flags.push(if p.choked_them { 'u' } else { 'U' });
+                }
+                if p.encrypted {
+                    flags.push('E');
                 }
                 PeerInfo {
                     addr: p.addr.to_string(),

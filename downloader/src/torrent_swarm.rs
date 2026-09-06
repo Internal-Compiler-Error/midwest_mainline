@@ -16,7 +16,7 @@ use crate::settings::{
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
-use crate::wire::{BitField, BtMessage, Piece, Request, shake_hands};
+use crate::wire::{BitField, BtMessage, Piece, Request};
 use anyhow::Context;
 use bitvec::prelude::*;
 use futures::StreamExt;
@@ -1342,15 +1342,19 @@ async fn next_peer_message(peers: &mut [Peer], offset: usize) -> (usize, Option<
 }
 
 async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow::Result<ConnectedPeer> {
-    let mut tcp = crate::wire::connect(addr)
-        .await
-        .with_context(|| format!("Failed to establish tcp stream with {addr}"))?;
-    let handshake = shake_hands(&mut tcp, &torrent.info_hash, our_id)
-        .await
-        .with_context(|| format!("Failed to complete handshake with {addr}"))?;
-    info!("Peer connection to {addr} established");
+    let (stream, handshake) = tokio::time::timeout(
+        crate::settings::HANDSHAKE_TIMEOUT,
+        crate::stream::connect(addr, &torrent.info_hash, our_id),
+    )
+    .await
+    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+    .with_context(|| format!("Failed to connect to {addr}"))?;
+    info!(
+        "Peer connection to {addr} established{}",
+        if stream.is_encrypted() { " (encrypted)" } else { "" }
+    );
     Ok(ConnectedPeer {
-        stream: PeerStream::Tcp(tcp),
+        stream,
         remote_addr: addr,
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
@@ -1431,6 +1435,7 @@ mod test {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
             dht: false,
+            encryption: crate::config::Encryption::Prefer,
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
         let (settings_tx, settings_rx) = watch::channel(settings);
@@ -1595,6 +1600,7 @@ mod test {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
             dht: false,
+            encryption: crate::config::Encryption::Prefer,
         });
         let (swarm, handle) = TorrentSwarm::new(
             torrent,

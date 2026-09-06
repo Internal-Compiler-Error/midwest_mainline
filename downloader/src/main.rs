@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         peer_id: random_idv4(&public_ip, 3),
         serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
         dht: true,
+        encryption: downloader::Encryption::default(),
     };
 
     // resume files and the DHT database live in the data dir (see `paths::data_dir`)

@@ -17,10 +17,9 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
-use crate::stream::PeerStream;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
-use crate::wire::{BtCodec, BtMessage, Extended, shake_hands};
+use crate::wire::{BtCodec, BtMessage, Extended};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
@@ -197,14 +196,9 @@ pub struct Fetched {
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
 async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, identity: Arc<Identity>) -> anyhow::Result<Vec<u8>> {
-    let mut stream = PeerStream::Tcp(
-        crate::wire::connect(addr)
-            .await
-            .with_context(|| format!("connect to {addr}"))?,
-    );
-    let handshake = shake_hands(&mut stream, &info_hash, &identity)
+    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity)
         .await
-        .with_context(|| format!("handshake with {addr}"))?;
+        .with_context(|| format!("connect to {addr}"))?;
     ensure!(
         handshake.supports_extensions(),
         "{addr} doesn't support the extension protocol, so it can't serve metadata"
@@ -396,6 +390,7 @@ mod test {
             peer_id: [9u8; 20],
             serving: "127.0.0.1:0".parse().unwrap(),
             dht: false,
+            encryption: crate::config::Encryption::Disabled,
         }
     }
 
@@ -770,6 +765,7 @@ mod test {
             peer_id: *b"-TEST01-000000000000",
             serving: "127.0.0.1:6881".parse().unwrap(),
             dht: false,
+            encryption: crate::config::Encryption::Disabled,
         });
 
         let torrent = tokio::time::timeout(
@@ -821,6 +817,7 @@ mod test {
             peer_id: *b"-TEST01-000000000000",
             serving: "127.0.0.1:6881".parse().unwrap(),
             dht: false,
+            encryption: crate::config::Encryption::Disabled,
         });
 
         let torrent = tokio::time::timeout(

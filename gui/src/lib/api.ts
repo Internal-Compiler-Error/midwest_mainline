@@ -83,6 +83,8 @@ export interface Settings {
   upload_limit: number
   /** stop seeding at uploaded / size, 0 to seed forever */
   seed_ratio_limit: number
+  /** MSE protocol encryption; obfuscation against traffic shaping, not secrecy */
+  encryption: 'disabled' | 'prefer' | 'require'
 }
 
 export const settings = () => invoke<Settings>('settings')

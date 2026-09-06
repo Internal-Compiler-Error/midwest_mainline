@@ -1238,6 +1238,7 @@ dependencies = [
  "futures",
  "juicy_bencode 0.2.0",
  "midwest_mainline",
+ "num-bigint",
  "public-ip",
  "rand 0.9.4",
  "reqwest 0.12.28",

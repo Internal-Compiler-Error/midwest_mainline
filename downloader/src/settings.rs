@@ -32,6 +32,11 @@ pub const MAX_REQUEST_WINDOW: usize = 128;
 /// long for each of them.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on everything between a connection opening and the BitTorrent handshake completing
+/// (an MSE exchange, possibly a plaintext retry). A peer that stalls here holds nothing
+/// worth waiting for.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Endgame: once every missing piece is in flight and a peer still has room, the pieces
 /// furthest from done are also requested from other peers, in the opposite block order,
 /// and whoever finishes second gets Cancel for the rest. This many peers may hold the

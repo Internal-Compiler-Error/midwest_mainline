@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Edits a copy of the settings and saves on OK; the port and DHT switch only take effect
-  // after a restart, which the dialog says when they changed.
+  // Edits a copy of the settings and saves on OK; the port, DHT switch, and encryption policy
+  // only take effect after a restart, which the dialog says when they changed.
   import { open } from '@tauri-apps/plugin-dialog'
   import { Button } from '$lib/components/ui/button'
   import * as Dialog from '$lib/components/ui/dialog'
@@ -87,6 +87,17 @@
 
         <Label for="ratio">Stop seeding at ratio</Label>
         <Input id="ratio" type="number" min="0" step="0.1" bind:value={draft.seed_ratio_limit} class="h-8 w-28" />
+
+        <Label for="encryption">Encryption</Label>
+        <select
+          id="encryption"
+          bind:value={draft.encryption}
+          class="border-input bg-background h-8 w-40 rounded-md border px-2 text-sm"
+        >
+          <option value="disabled">Disabled</option>
+          <option value="prefer">Prefer</option>
+          <option value="require">Require</option>
+        </select>
       </div>
       {#if error}<p class="text-destructive">{error}</p>{/if}
       {#if notice}<p class="text-muted-foreground">{notice}</p>{/if}

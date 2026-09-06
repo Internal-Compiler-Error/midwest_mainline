@@ -278,11 +278,24 @@ impl BtClient {
             let id = id.clone();
             let swarms = swarms.clone();
             tokio::spawn(async move {
-                let mut stream = PeerStream::Tcp(tcp);
-                let handshake = match crate::wire::read_handshake(&mut stream).await {
-                    Ok(handshake) => handshake,
-                    Err(e) => {
+                let served = || {
+                    swarms
+                        .upgrade()
+                        .map(|swarms| swarms.lock().unwrap().keys().copied().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                let opening = tokio::time::timeout(
+                    crate::settings::HANDSHAKE_TIMEOUT,
+                    crate::stream::accept(PeerStream::Tcp(tcp), id.encryption, served),
+                );
+                let (mut stream, handshake) = match opening.await {
+                    Ok(Ok(opened)) => opened,
+                    Ok(Err(e)) => {
                         tracing::debug!("bad handshake from {remote_addr}: {e:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!("{remote_addr} took too long to handshake");
                         return;
                     }
                 };

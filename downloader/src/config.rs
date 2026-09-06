@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
+/// Whether connections use MSE (see `mse`). Inbound: `Disabled` refuses encrypted peers,
+/// `Require` refuses plaintext ones. Outbound: `Prefer` tries encryption first and falls back
+/// to plaintext on a fresh connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Encryption {
+    Disabled,
+    #[default]
+    Prefer,
+    Require,
+}
+
 pub const FILE_NAME: &str = "settings.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,6 +39,8 @@ pub struct Settings {
     /// live. The upload total survives restarts, so a torrent that seeded 1.5 last week and
     /// comes back with a limit of 2 keeps going until it has uploaded 2 sizes in all.
     pub seed_ratio_limit: f64,
+    /// MSE protocol encryption policy. Next start.
+    pub encryption: Encryption,
 }
 
 impl Default for Settings {
@@ -39,6 +53,7 @@ impl Default for Settings {
             download_limit: 0,
             upload_limit: 0,
             seed_ratio_limit: 0.0,
+            encryption: Encryption::Prefer,
         }
     }
 }
