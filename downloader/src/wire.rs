@@ -3,8 +3,7 @@ use midwest_mainline::types::InfoHash;
 use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::{
     bytes::Buf,
@@ -366,7 +365,7 @@ impl Encoder<BtMessage> for BtEncoder {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BtDecoder;
 
-/// Both halves in one type, for a `Framed<TcpStream, _>` that reads and writes through the
+/// Both halves in one type, for a `Framed<PeerStream, _>` that reads and writes through the
 /// same object (`FramedRead`/`FramedWrite` over split halves want the two separate types).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BtCodec;
@@ -516,7 +515,11 @@ impl Handshake {
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
 /// we have a matching torrent).
-pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &Identity) -> io::Result<()> {
+pub(crate) async fn send_handshake<S: AsyncWrite + Unpin>(
+    peer: &mut S,
+    info_hash: &InfoHash,
+    local_id: &Identity,
+) -> io::Result<()> {
     let mut extensions = [0u8; 8];
     extensions[5] |= 0x10; // BEP 10: we support the extension protocol
     extensions[7] |= 0x04; // BEP 6: we support the fast extension
@@ -537,7 +540,7 @@ pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, l
 /// Reads the remote's half of the handshake, without checking which info hash it names --
 /// the accept path needs to read this first to find out which torrent (if any) the connection
 /// is for, before it knows what to check against.
-pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake> {
+pub(crate) async fn read_handshake<S: AsyncRead + Unpin>(peer: &mut S) -> io::Result<Handshake> {
     let mut read_buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
     let Ok(_) = peer.read_exact(&mut read_buf).await else {
         info!("Peer didn't send enough bytes for a handshake");
@@ -546,12 +549,10 @@ pub(crate) async fn read_handshake(peer: &mut TcpStream) -> io::Result<Handshake
 
     if read_buf[..HANDSHAKE_STR.len()] != *HANDSHAKE_STR {
         warn!(
-            "protocol initiation string didn't match, expected {:?}, got {:?} from {}",
+            "protocol initiation string didn't match, expected {:?}, got {:?}",
             HANDSHAKE_STR,
             &read_buf[..HANDSHAKE_STR.len()],
-            peer.peer_addr().unwrap(),
         );
-        peer.shutdown().await?;
         return Err(io::Error::other("protocol string didn't match"));
     }
 
@@ -569,8 +570,8 @@ pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
 }
 
 #[tracing::instrument(skip(peer))]
-pub(crate) async fn shake_hands(
-    peer: &mut TcpStream,
+pub(crate) async fn shake_hands<S: AsyncRead + AsyncWrite + Unpin>(
+    peer: &mut S,
     info_hash: &InfoHash,
     local_id: &Identity,
 ) -> io::Result<Handshake> {

@@ -5,6 +5,7 @@ use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
 use crate::storage::TorrentStorage;
+use crate::stream::PeerStream;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
 use anyhow::{Context, bail};
@@ -263,7 +264,7 @@ impl BtClient {
             if swarms.strong_count() == 0 {
                 break;
             }
-            let (mut tcp, remote_addr) = tokio::select! {
+            let (tcp, remote_addr) = tokio::select! {
                 (accepted, _idx, _rest) = select_all(listeners.iter().map(|l| Box::pin(l.accept()))) => match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
@@ -277,7 +278,8 @@ impl BtClient {
             let id = id.clone();
             let swarms = swarms.clone();
             tokio::spawn(async move {
-                let handshake = match crate::wire::read_handshake(&mut tcp).await {
+                let mut stream = PeerStream::Tcp(tcp);
+                let handshake = match crate::wire::read_handshake(&mut stream).await {
                     Ok(handshake) => handshake,
                     Err(e) => {
                         tracing::debug!("bad handshake from {remote_addr}: {e:#}");
@@ -294,14 +296,14 @@ impl BtClient {
                     return;
                 };
 
-                if let Err(e) = crate::wire::send_handshake(&mut tcp, &handshake.info_hash, &id).await {
+                if let Err(e) = crate::wire::send_handshake(&mut stream, &handshake.info_hash, &id).await {
                     tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
                     return;
                 }
 
                 handle
                     .peer_connected(ConnectedPeer {
-                        tcp,
+                        stream,
                         remote_addr,
                         remote_supports_extensions: handshake.supports_extensions(),
                         remote_supports_fast: handshake.supports_fast_extension(),

@@ -1,4 +1,5 @@
 use crate::settings::{BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, RATE_WINDOW, REQUEST_PIPELINE_TARGET};
+use crate::stream::PeerStream;
 use crate::wire::{
     BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece, Port,
     RejectRequest, Request, Unchoke,
@@ -9,7 +10,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 /// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
@@ -37,7 +37,7 @@ pub(crate) struct Peer {
     /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
     pub their_ut_pex_id: Option<u8>,
 
-    pub socket: Framed<TcpStream, BtCodec>,
+    pub socket: Framed<PeerStream, BtCodec>,
 
     /// BEP 3 bitfield layout: `ceil(num_pieces / 8)` bytes, piece 0 is the high bit of byte 0
     they_have: Box<[u8]>,
@@ -167,7 +167,7 @@ pub(crate) struct ProtocolViolation(pub String);
 
 impl Peer {
     pub fn new(
-        tcp: TcpStream,
+        stream: PeerStream,
         remote_addr: SocketAddr,
         num_pieces: usize,
         remote_supports_fast: bool,
@@ -179,7 +179,7 @@ impl Peer {
             remote_supports_fast,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
-            socket: Framed::new(tcp, BtCodec),
+            socket: Framed::new(stream, BtCodec),
             they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
             num_pieces,
             // BEP 3: "At the start of the connection, both sides ... are choked."
@@ -901,9 +901,11 @@ mod test {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let _other_end = listener.accept().await.unwrap();
-        let mut peer = Peer::new(tcp, "10.0.0.1:1".parse().unwrap(), 4, false, [0u8; 20]);
+        let mut peer = Peer::new(PeerStream::Tcp(tcp), "10.0.0.1:1".parse().unwrap(), 4, false, [0u8; 20]);
         let limit = Duration::from_millis(50);
 
         assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");

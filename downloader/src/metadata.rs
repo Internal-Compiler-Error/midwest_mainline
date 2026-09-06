@@ -17,9 +17,10 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
+use crate::stream::PeerStream;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
-use crate::wire::{BtDecoder, BtEncoder, BtMessage, Extended, shake_hands};
+use crate::wire::{BtCodec, BtMessage, Extended, shake_hands};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
@@ -32,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -196,10 +197,12 @@ pub struct Fetched {
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
 async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, identity: Arc<Identity>) -> anyhow::Result<Vec<u8>> {
-    let mut tcp = crate::wire::connect(addr)
-        .await
-        .with_context(|| format!("connect to {addr}"))?;
-    let handshake = shake_hands(&mut tcp, &info_hash, &identity)
+    let mut stream = PeerStream::Tcp(
+        crate::wire::connect(addr)
+            .await
+            .with_context(|| format!("connect to {addr}"))?,
+    );
+    let handshake = shake_hands(&mut stream, &info_hash, &identity)
         .await
         .with_context(|| format!("handshake with {addr}"))?;
     ensure!(
@@ -207,9 +210,7 @@ async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, identity: Arc<Id
         "{addr} doesn't support the extension protocol, so it can't serve metadata"
     );
 
-    let (reader, writer) = tcp.into_split();
-    let mut reader = FramedRead::new(reader, BtDecoder);
-    let mut writer = FramedWrite::new(writer, BtEncoder);
+    let (mut writer, mut reader) = Framed::new(stream, BtCodec).split();
 
     // BEP 10: declare which id we want their ut_metadata messages on. We advertise no
     // `metadata_size` because we don't have the metadata -- that's the whole point.
@@ -399,6 +400,8 @@ mod test {
     }
 
     use super::*;
+    use crate::wire::{BtDecoder, BtEncoder};
+    use tokio_util::codec::{FramedRead, FramedWrite};
 
     fn bencode_str(bytes: &[u8]) -> Vec<u8> {
         let mut out = format!("{}:", bytes.len()).into_bytes();

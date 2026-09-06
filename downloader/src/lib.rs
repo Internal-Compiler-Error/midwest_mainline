@@ -14,6 +14,7 @@ pub mod resume;
 pub mod session;
 mod settings;
 mod storage;
+mod stream;
 mod torrent;
 pub mod torrent_swarm;
 mod wire;

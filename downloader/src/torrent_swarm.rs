@@ -14,6 +14,7 @@ use crate::settings::{
     PEX_MAX_ADDED_PEERS,
 };
 use crate::storage::TorrentStorage;
+use crate::stream::PeerStream;
 use crate::torrent::Torrent;
 use crate::wire::{BitField, BtMessage, Piece, Request, shake_hands};
 use anyhow::Context;
@@ -27,7 +28,6 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -144,9 +144,9 @@ impl TorrentSwarmHandle {
     }
 }
 
-/// A socket that has completed the BitTorrent handshake and is ready to become a `Peer`.
+/// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
 pub(crate) struct ConnectedPeer {
-    pub tcp: TcpStream,
+    pub stream: PeerStream,
     pub remote_addr: SocketAddr,
     pub remote_supports_extensions: bool,
     pub remote_supports_fast: bool,
@@ -1175,7 +1175,7 @@ impl TorrentSwarm {
 
         let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port);
         let mut peer = Peer::new(
-            connected.tcp,
+            connected.stream,
             remote_addr,
             self.torrent.pieces.len(),
             connected.remote_supports_fast,
@@ -1350,7 +1350,7 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
         .with_context(|| format!("Failed to complete handshake with {addr}"))?;
     info!("Peer connection to {addr} established");
     Ok(ConnectedPeer {
-        tcp,
+        stream: PeerStream::Tcp(tcp),
         remote_addr: addr,
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
@@ -1449,17 +1449,23 @@ mod test {
 
     /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
     /// (as if it had just completed a handshake), the test keeps the other.
-    async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -> Framed<TcpStream, BtCodec> {
+    async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -> Framed<tokio::net::TcpStream, BtCodec> {
         fake_peer_with(handle, pretend_addr, false).await
     }
 
-    async fn fake_peer_with(handle: &TorrentSwarmHandle, pretend_addr: &str, fast: bool) -> Framed<TcpStream, BtCodec> {
+    async fn fake_peer_with(
+        handle: &TorrentSwarmHandle,
+        pretend_addr: &str,
+        fast: bool,
+    ) -> Framed<tokio::net::TcpStream, BtCodec> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let ours = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (theirs, _) = listener.accept().await.unwrap();
         handle
             .peer_connected(ConnectedPeer {
-                tcp: ours,
+                stream: PeerStream::Tcp(ours),
                 remote_addr: pretend_addr.parse().unwrap(),
                 remote_supports_extensions: false,
                 remote_supports_fast: fast,
@@ -1472,12 +1478,12 @@ mod test {
 
     /// The fake peer's side of the opening exchange: it expects our BitField and Interested,
     /// then declares it has everything and unchokes us.
-    async fn open_as_seeder(peer: &mut Framed<TcpStream, BtCodec>) {
+    async fn open_as_seeder(peer: &mut Framed<tokio::net::TcpStream, BtCodec>) {
         open_with(peer, 0xFF).await;
     }
 
     /// Like `open_as_seeder`, but the peer declares only the pieces set in `bitfield`.
-    async fn open_with(peer: &mut Framed<TcpStream, BtCodec>, bitfield: u8) {
+    async fn open_with(peer: &mut Framed<tokio::net::TcpStream, BtCodec>, bitfield: u8) {
         let Some(Ok(BtMessage::BitField(_))) = peer.next().await else {
             panic!("expected our bitfield first");
         };
