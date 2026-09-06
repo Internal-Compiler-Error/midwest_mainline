@@ -21,6 +21,7 @@ survives context resets; re-read before acting.
 - [x] Peer stream abstraction (`PeerStream`: Tcp | Encrypted | Utp), no behaviour change
 - [x] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
       settings Disabled/Prefer/Require with plaintext fallback
+- [x] Port mapping: NAT-PMP/PCP via `crab_nat`, UPnP via `igd-next`
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -536,3 +537,20 @@ the UDP and TCP ports match" branch went with it, since they never match now.
 
 Tests: `utp_is_tried_when_tcp_is_refused` dials a port that has a uTP socket and no TCP
 listener, under `Disabled` and `Prefer`, and checks both ends see uTP (and encryption).
+
+# Port mapping, 2026-09-06
+`portmap.rs` asks the router to forward the listen port (TCP and UDP, for peers and uTP)
+and the DHT port (UDP): NAT-PMP/PCP through `crab_nat` first, since that's one UDP round
+trip and what every router of the last decade speaks, then UPnP IGD through `igd-next` if
+nothing answers. Leases are two hours, renewed at half, removed at shutdown. Nothing else
+in the client knows whether a mapping exists; the outcome is one log line.
+
+The router is found with `netdev`: the default route's interface if it has a gateway, else
+any interface that does. The second case is the user's own machine: on a VPN the default
+route is the tunnel, with no router behind it, and the LAN interface still has one. A
+mapping made there is useless while the VPN is up (peers learn the VPN address, not the
+ISP's), but harmless, and it would be what makes the feature testable here, except that the
+router at 192.168.2.1 answers neither NAT-PMP/PCP nor UPnP (a raw SSDP M-SEARCH from the
+LAN address gets no responder at all), so only the "found the gateway, tried both, gave up
+cleanly, retries in ten minutes" path has run for real. Port 0 (tests) maps nothing.
+Setting: `port_mapping`, default on, next start.

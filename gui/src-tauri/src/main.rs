@@ -247,6 +247,7 @@ struct SettingsDto {
     seed_ratio_limit: f64,
     encryption: Encryption,
     utp: bool,
+    port_mapping: bool,
 }
 
 impl From<Settings> for SettingsDto {
@@ -261,6 +262,7 @@ impl From<Settings> for SettingsDto {
             seed_ratio_limit: s.seed_ratio_limit,
             encryption: s.encryption,
             utp: s.utp,
+            port_mapping: s.port_mapping,
         }
     }
 }
@@ -277,6 +279,7 @@ impl From<SettingsDto> for Settings {
             seed_ratio_limit: s.seed_ratio_limit,
             encryption: s.encryption,
             utp: s.utp,
+            port_mapping: s.port_mapping,
         }
     }
 }
@@ -295,7 +298,8 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
     let restart = settings.listen_port != before.listen_port
         || settings.dht != before.dht
         || settings.encryption != before.encryption
-        || settings.utp != before.utp;
+        || settings.utp != before.utp
+        || settings.port_mapping != before.port_mapping;
     session.update_settings(settings).map_err(|e| format!("{e:#}"))?;
     Ok(restart)
 }

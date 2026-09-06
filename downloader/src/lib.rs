@@ -11,6 +11,7 @@ pub mod metadata;
 mod mse;
 pub mod paths;
 mod peer;
+mod portmap;
 pub mod resume;
 pub mod session;
 mod settings;

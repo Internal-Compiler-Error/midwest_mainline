@@ -43,6 +43,8 @@ pub struct Settings {
     pub encryption: Encryption,
     /// accept and dial peers over uTP as well as TCP. Next start.
     pub utp: bool,
+    /// ask the router to forward our ports (NAT-PMP, PCP, or UPnP). Next start.
+    pub port_mapping: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +59,7 @@ impl Default for Settings {
             seed_ratio_limit: 0.0,
             encryption: Encryption::Prefer,
             utp: true,
+            port_mapping: true,
         }
     }
 }

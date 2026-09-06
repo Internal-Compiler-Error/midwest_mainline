@@ -4,6 +4,7 @@ use crate::dht::DhtWatch;
 use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
+use crate::portmap;
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
@@ -79,6 +80,13 @@ impl BtClient {
         } else {
             utp::none()
         };
+        if settings.borrow().port_mapping {
+            let ports = portmap::Ports {
+                peer: id.serving.port(),
+                dht: id.dht.then(|| settings.borrow().dht_port()),
+            };
+            portmap::start(ports, shutdown.clone());
+        }
         let client = Self {
             lsd: Arc::new(Lsd::spawn(Arc::downgrade(&swarms), id.serving.port(), shutdown.clone())),
             id: Arc::new(id),

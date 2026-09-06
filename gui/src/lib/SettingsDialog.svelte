@@ -1,6 +1,7 @@
 <script lang="ts">
-  // Edits a copy of the settings and saves on OK; the port, DHT and uTP switches, and the
-  // encryption policy only take effect after a restart, which the dialog says when they changed.
+  // Edits a copy of the settings and saves on OK; the port, the DHT, uTP and port mapping
+  // switches, and the encryption policy only take effect after a restart, which the dialog
+  // says when they changed.
   import { open } from '@tauri-apps/plugin-dialog'
   import { Button } from '$lib/components/ui/button'
   import * as Dialog from '$lib/components/ui/dialog'
@@ -78,6 +79,9 @@
 
         <Label for="utp">uTP</Label>
         <Switch id="utp" bind:checked={draft.utp} />
+
+        <Label for="port-mapping">Port mapping (NAT-PMP / UPnP)</Label>
+        <Switch id="port-mapping" bind:checked={draft.port_mapping} />
 
         <Label for="max-peers">Peers per torrent</Label>
         <Input id="max-peers" type="number" min="1" bind:value={draft.max_peers_per_torrent} class="h-8 w-28" />

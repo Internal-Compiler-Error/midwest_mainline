@@ -87,6 +87,8 @@ export interface Settings {
   encryption: 'disabled' | 'prefer' | 'require'
   /** dial and accept peers over uTP as well as TCP */
   utp: boolean
+  /** ask the router to forward our ports (NAT-PMP, PCP, or UPnP) */
+  port_mapping: boolean
 }
 
 export const settings = () => invoke<Settings>('settings')
