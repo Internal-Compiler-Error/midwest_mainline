@@ -33,7 +33,9 @@
     return t.kind === 'resolving' || t.kind === 'failed' ? t.source : t.name
   }
 
-  function status(t: TorrentRow): string {
+  // the state and the rates are separate fixed-width columns, so a longer word or a wider
+  // number in one row doesn't shift the bar in every other
+  function state(t: TorrentRow): string {
     switch (t.kind) {
       case 'resolving':
         return 'resolving…'
@@ -44,12 +46,16 @@
       case 'queued':
         return 'queued'
       case 'paused':
-        return t.completed ? 'paused, complete' : 'paused'
+        return t.completed ? 'paused, done' : 'paused'
       case 'downloading':
-        return t.completed
-          ? `seeding  ↑ ${humanBytes(t.upload_bps)}/s`
-          : `↓ ${humanBytes(t.download_bps)}/s  ↑ ${humanBytes(t.upload_bps)}/s`
+        return t.completed ? 'seeding' : 'downloading'
     }
+  }
+
+  function rates(t: TorrentRow): string {
+    if (t.kind !== 'downloading') return ''
+    const up = `↑ ${humanBytes(t.upload_bps)}/s`
+    return t.completed ? up : `↓ ${humanBytes(t.download_bps)}/s  ${up}`
   }
 </script>
 
@@ -65,7 +71,8 @@
             <ProgressBar fraction={fraction(t.checked_pieces, t.total_pieces)} done={false} />
           {/if}
         </Table.Cell>
-        <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">{status(t)}</Table.Cell>
+        <Table.Cell class="w-28 min-w-28 whitespace-nowrap text-muted-foreground">{state(t)}</Table.Cell>
+        <Table.Cell class="w-44 min-w-44 whitespace-nowrap text-right text-muted-foreground tabular-nums">{rates(t)}</Table.Cell>
         <Table.Cell class="w-16 pr-1 whitespace-nowrap">
           {#if t.kind === 'downloading' || t.kind === 'queued'}
             <Button
