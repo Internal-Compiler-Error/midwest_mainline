@@ -1,4 +1,7 @@
 <script lang="ts">
+  import X from '@lucide/svelte/icons/x'
+  import { Button } from '$lib/components/ui/button'
+  import * as Table from '$lib/components/ui/table'
   import type { TorrentId, TorrentRow } from './api'
   import { fraction, humanBytes } from './api'
   import ProgressBar from './ProgressBar.svelte'
@@ -33,62 +36,29 @@
   }
 </script>
 
-<table>
-  <tbody>
+<Table.Root>
+  <Table.Body>
     {#each torrents as t (t.id)}
-      <tr class:selected={t.id === selected} onclick={() => onselect(t.id)}>
-        <td class="name" title={name(t)}>{name(t)}</td>
-        <td class="progress">
+      <Table.Row data-state={t.id === selected ? 'selected' : undefined} onclick={() => onselect(t.id)}>
+        <Table.Cell class="w-full max-w-0 truncate" title={name(t)}>{name(t)}</Table.Cell>
+        <Table.Cell class="w-44 min-w-44">
           {#if t.kind === 'downloading'}
             <ProgressBar fraction={fraction(t.verified_pieces, t.total_pieces)} done={t.completed} />
           {/if}
-        </td>
-        <td class="status">{status(t)}</td>
-        <td class="remove">
-          <button
-            class="small"
+        </Table.Cell>
+        <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">{status(t)}</Table.Cell>
+        <Table.Cell class="w-8 pr-1">
+          <Button
+            variant="ghost"
+            size="icon-xs"
             title="remove, deleting its files"
             onclick={(e) => {
               e.stopPropagation()
               onremove(t.id)
-            }}>✕</button
+            }}><X /></Button
           >
-        </td>
-      </tr>
+        </Table.Cell>
+      </Table.Row>
     {/each}
-  </tbody>
-</table>
-
-<style>
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-  tr {
-    cursor: default;
-  }
-  tr:nth-child(even) {
-    background: var(--stripe);
-  }
-  tr.selected {
-    background: var(--selected);
-  }
-  td {
-    padding: 4px 8px;
-    vertical-align: middle;
-    white-space: nowrap;
-  }
-  .name {
-    max-width: 0;
-    width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .progress {
-    width: 140px;
-    min-width: 140px;
-  }
-  .remove {
-    width: 1px;
-  }
-</style>
+  </Table.Body>
+</Table.Root>

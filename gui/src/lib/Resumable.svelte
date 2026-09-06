@@ -1,4 +1,7 @@
 <script lang="ts">
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw'
+  import { Button } from '$lib/components/ui/button'
+  import * as Table from '$lib/components/ui/table'
   import type { Resumable } from './api'
   import { fraction } from './api'
   import ProgressBar from './ProgressBar.svelte'
@@ -10,49 +13,24 @@
   }: { entries: Resumable[]; onresume: (path: string) => void; onrescan: () => void } = $props()
 </script>
 
-<div class="head">
-  <strong>Resume an earlier download</strong>
-  <button class="small" title="rescan ./resume" onclick={onrescan}>⟳</button>
+<div class="mb-2 flex items-center gap-2">
+  <span class="font-medium">Resume an earlier download</span>
+  <Button variant="ghost" size="icon-xs" title="rescan ./resume" onclick={onrescan}><RefreshCw /></Button>
 </div>
 {#if entries.length === 0}
-  <div class="muted">(nothing in ./resume)</div>
+  <div class="text-muted-foreground">(nothing in ./resume)</div>
 {:else}
-  <table>
-    <tbody>
+  <Table.Root>
+    <Table.Body>
       {#each entries as entry (entry.path)}
-        <tr>
-          <td class="name" title={entry.root}>{entry.name}</td>
-          <td class="progress"><ProgressBar fraction={fraction(entry.verified_pieces, entry.total_pieces)} /></td>
-          <td><button onclick={() => onresume(entry.path)}>Resume</button></td>
-        </tr>
+        <Table.Row>
+          <Table.Cell class="w-full max-w-0 truncate" title={entry.root}>{entry.name}</Table.Cell>
+          <Table.Cell class="w-44 min-w-44">
+            <ProgressBar fraction={fraction(entry.verified_pieces, entry.total_pieces)} />
+          </Table.Cell>
+          <Table.Cell class="w-px"><Button size="xs" variant="outline" onclick={() => onresume(entry.path)}>Resume</Button></Table.Cell>
+        </Table.Row>
       {/each}
-    </tbody>
-  </table>
+    </Table.Body>
+  </Table.Root>
 {/if}
-
-<style>
-  .head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 6px;
-  }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-  }
-  td {
-    padding: 3px 8px 3px 0;
-    white-space: nowrap;
-  }
-  .name {
-    max-width: 0;
-    width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .progress {
-    width: 140px;
-    min-width: 140px;
-  }
-</style>

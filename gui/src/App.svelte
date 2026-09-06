@@ -2,6 +2,10 @@
   // Layout and state only: what's shown comes from `torrents()` every 250 ms, and every
   // user action is one command to the Tauri side (see lib/api.ts).
   import { open } from '@tauri-apps/plugin-dialog'
+  import { ModeWatcher } from 'mode-watcher'
+  import { Button } from '$lib/components/ui/button'
+  import * as Resizable from '$lib/components/ui/resizable'
+  import { Separator } from '$lib/components/ui/separator'
   import * as api from './lib/api'
   import type { Resumable, TorrentId, TorrentRow } from './lib/api'
   import Console from './lib/Console.svelte'
@@ -71,42 +75,46 @@
   }
 </script>
 
-<div class="app">
+<ModeWatcher />
+
+<div class="flex h-screen flex-col text-sm select-none">
   <Toolbar onadd={add} />
-  <main>
-    {#if torrents.length === 0}
-      <p>Open a .torrent file, or paste a magnet link above.</p>
-    {:else}
-      <TorrentList {torrents} {selected} onselect={(id) => (selected = id)} onremove={remove} />
-    {/if}
 
-    {#if selectedTorrent}
-      <hr />
-      <Details torrent={selectedTorrent} />
-    {/if}
+  <Resizable.PaneGroup direction="vertical" class="flex-1">
+    <Resizable.Pane defaultSize={70} minSize={25}>
+      <main class="h-full overflow-auto p-3">
+        {#if torrents.length === 0}
+          <p class="text-muted-foreground">Open a .torrent file, or paste a magnet link above.</p>
+        {:else}
+          <TorrentList {torrents} {selected} onselect={(id) => (selected = id)} onremove={remove} />
+        {/if}
 
-    {#if resumable.length > 0 || torrents.length === 0}
-      <hr />
-      <ResumableList entries={resumable} onresume={resume} onrescan={rescan} />
+        {#if selectedTorrent}
+          <Separator class="my-3" />
+          <Details torrent={selectedTorrent} />
+        {/if}
+
+        {#if resumable.length > 0 || torrents.length === 0}
+          <Separator class="my-3" />
+          <ResumableList entries={resumable} onresume={resume} onrescan={rescan} />
+        {/if}
+      </main>
+    </Resizable.Pane>
+    {#if showConsole}
+      <Resizable.Handle withHandle />
+      <Resizable.Pane defaultSize={30} minSize={10}>
+        <Console lines={logLines} />
+      </Resizable.Pane>
     {/if}
-  </main>
-  <Console lines={logLines} bind:open={showConsole} onclear={clearLogs} />
+  </Resizable.PaneGroup>
+
+  <footer class="flex items-center gap-3 border-t bg-card px-3 py-1">
+    <Button variant={showConsole ? 'secondary' : 'ghost'} size="xs" onclick={() => (showConsole = !showConsole)}>
+      Console
+    </Button>
+    <span class="text-xs text-muted-foreground">{logLines.length} lines</span>
+    {#if showConsole}
+      <Button variant="ghost" size="xs" onclick={clearLogs}>clear</Button>
+    {/if}
+  </footer>
 </div>
-
-<style>
-  .app {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-  }
-  main {
-    flex: 1;
-    overflow: auto;
-    padding: 10px;
-  }
-  hr {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: 12px 0;
-  }
-</style>

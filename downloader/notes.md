@@ -309,8 +309,16 @@ in `capabilities/default.json`. The session is shut down from the run-event call
 from inside Tauri's own runtime.
 
 Run it with `pnpm tauri dev` in `gui/` (needs `pnpm install` once); `pnpm check` type-checks
-the Svelte side. The chosen framework is for growing into a full client UI with component
-libraries later; for now the styling is hand-written CSS in `app.css` and per-component.
+the Svelte side.
+
+Styling is Tailwind 4 with shadcn-svelte (preset chosen by the user on shadcn-svelte.com,
+recorded in `gui/components.json`; Vega style, neutral base, green primary, Inter, Lucide).
+Components are copied into `gui/src/lib/components/ui` by `pnpm dlx shadcn-svelte@latest add
+<name>`, so they're ours to edit. `mode-watcher` follows the system dark mode by setting the
+`.dark` class the stylesheet keys on. The console sits in a vertical paneforge pane group
+under the main view, so its height is dragged, and the toggle lives in a footer bar so the
+pane can be removed entirely. The `$lib` alias is set in both `vite.config.ts` and the
+tsconfigs, and shadcn's CLI checks the root `tsconfig.json` for it.
 
 Known gap: like the CLI, it resolves `resume/` and the default download dir against the
 current directory, which is `/` when launched from Finder. A proper data directory is the
