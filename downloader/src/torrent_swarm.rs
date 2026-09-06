@@ -814,13 +814,11 @@ impl TorrentSwarm {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
                 // anyway (we don't advertise ut_pex when private, so a compliant peer won't)
                 if !self.torrent.private {
-                    let gossiped = parse_pex_message(&ext.payload);
-                    for (addr, flags) in &gossiped {
-                        if flags & PEX_UTP != 0 {
-                            self.known.entry(canonical(*addr)).or_default().prefers_utp = true;
-                        }
-                    }
-                    self.connect_to_discovered_peers(gossiped.into_iter().map(|(addr, _)| addr).collect());
+                    let gossiped = parse_pex_message(&ext.payload)
+                        .into_iter()
+                        .map(|(addr, flags)| (addr, flags & PEX_UTP != 0))
+                        .collect();
+                    self.connect_to_peers(gossiped);
                 }
             }
             BtMessage::Extended(ext) => {
@@ -1286,9 +1284,17 @@ impl TorrentSwarm {
     /// Dials every address in `peers` we're not already connected to or dialing. Shared by
     /// tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
     fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
+        self.connect_to_peers(peers.into_iter().map(|addr| (addr, false)).collect());
+    }
+
+    /// Dials what a tracker, the DHT, LSD or PEX handed out, as far as the peer cap allows.
+    /// The flag marks an address PEX said speaks uTP; it's remembered only for addresses
+    /// that get dialled, so gossip about peers we never call doesn't pile up in `known`.
+    fn connect_to_peers(&mut self, peers: Vec<(SocketAddr, bool)>) {
         let now = Instant::now();
         let cap = self.settings.borrow().max_peers_per_torrent;
-        for addr in peers.into_iter().map(canonical) {
+        for (addr, utp_capable) in peers {
+            let addr = canonical(addr);
             if self.peers.len() + self.dialing.len() >= cap {
                 break;
             }
@@ -1299,6 +1305,9 @@ impl TorrentSwarm {
             let worth_it = self.known.get(&addr).is_none_or(|k| k.may_dial(now));
             if !worth_it || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
                 continue;
+            }
+            if utp_capable {
+                self.known.entry(addr).or_default().prefers_utp = true;
             }
             let events = self.events_tx.clone();
             let torrent = self.torrent.clone();
