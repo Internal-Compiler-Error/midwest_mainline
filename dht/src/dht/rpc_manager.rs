@@ -154,7 +154,7 @@ impl RpcManager {
                         }
                     }
                     Err(e) => {
-                        warn!("Error in parsing packets {e} from {socket_addr}")
+                        tracing::debug!("ignoring an unparseable packet from {socket_addr}: {e}")
                     }
                 }
             }

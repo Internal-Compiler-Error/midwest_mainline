@@ -1,5 +1,5 @@
 //! The KRPC wire protocol (BEP 5): bencoded dicts with a transaction id (`t`), a message
-//! type (`y` = q/r/e), and a body. Parsing is two-pass: bendy validates the bencode,
+//! type (`y` = q/r/e), and a body. Parsing is one pass with juicy_bencode,
 //! juicy_bencode borrows the fields. KRPC responses are not self-describing, so both
 //! find_node and get_peers responses map to one [`FindNodeGetPeersResponse`] struct.
 
@@ -8,7 +8,6 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::our_error::OurError;
 use crate::types::{NodeInfo, Token, TransactionId};
-use bendy::decoding::{Decoder, Object};
 
 use bendy::encoding::{Encoder, SingleItemEncoder};
 use bendy::value;
@@ -259,20 +258,8 @@ impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
     #[instrument(skip(self))]
     fn parse(&self) -> Result<Krpc, OurError> {
-        // Use bendy to validate the input is valid bencode message, extracting the fields is done
-        // with juicy_bencode instead
-        let mut decoder = Decoder::new(self);
-        let message = decoder
-            .next_object()
-            .map_err(|e| OurError::BendyDecodeError(e))?
-            .ok_or(OurError::DecodeError(eyre!("Empty input")))?;
-
-        let Object::Dict(mut dict) = message else {
-            return Err(OurError::DecodeError(eyre!("Message is not a dict")));
-        };
-        dict.consume_all()
-            .map_err(|e| OurError::DecodeError(eyre!("Message structure is invalid: {e}")))?;
-
+        // juicy_bencode does the structural validation too; a bendy pass used to run first, and
+        // it rejected dicts whose keys aren't sorted, which plenty of live nodes send
         let (unused, mut parsed) =
             parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained: {e}")))?;
         if !unused.is_empty() {

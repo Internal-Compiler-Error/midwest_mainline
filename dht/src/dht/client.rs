@@ -17,7 +17,9 @@ use crate::our_error::{OurError, naur};
 use crate::types::{InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 
 const ROUNDS_LIMIT: i32 = 8;
-const CONCURRENT_REQS: usize = 3;
+/// Nodes queried per lookup round. BEP 5 suggests 3; more costs little on UDP and finishes
+/// a lookup in seconds rather than a minute when many nodes are dead.
+const CONCURRENT_REQS: usize = 8;
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
 #[derive(Debug)]
