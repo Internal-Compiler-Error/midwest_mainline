@@ -6,7 +6,7 @@
 
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
-use crate::settings::DHT_ANNOUNCE_INTERVAL;
+use crate::settings::{ANNOUNCE_RETRY, ANNOUNCE_RETRY_MAX, DHT_ANNOUNCE_INTERVAL};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use anyhow::{self, Context, bail};
 use juicy_bencode::BencodeItemView;
@@ -47,6 +47,49 @@ struct HttpAnnouncer {
     sent_completed: bool,
     #[eq(skip)]
     shutdown: CancellationToken,
+    #[eq(skip)]
+    board: (TrackerBoard, usize),
+    /// consecutive failed announces, for the retry backoff
+    #[eq(skip)]
+    failures: u32,
+}
+
+/// What a tracker (or the DHT) has done for a torrent lately, for the details panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerStatus {
+    /// the announce URL, or "DHT"
+    pub url: String,
+    pub state: TrackerState,
+    /// peers the last successful announce returned
+    pub peers: usize,
+    pub next_announce: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackerState {
+    /// not announced yet
+    Pending,
+    Working,
+    /// the last announce failed; retried with backoff
+    Failed(String),
+}
+
+/// One row per announcer, written by them and read through what `spawn_announcers` returns.
+type TrackerBoard = Arc<watch::Sender<Vec<TrackerStatus>>>;
+
+fn report(board: &TrackerBoard, slot: usize, update: impl FnOnce(&mut TrackerStatus)) {
+    board.send_modify(|rows| {
+        if let Some(row) = rows.get_mut(slot) {
+            update(row);
+        }
+    });
+}
+
+/// How long to wait before announcing again after `failures` consecutive failures.
+fn retry_delay(failures: u32) -> Duration {
+    ANNOUNCE_RETRY
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1)))
+        .min(ANNOUNCE_RETRY_MAX)
 }
 
 /// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
@@ -61,15 +104,36 @@ pub(crate) fn spawn_announcers(
     events: mpsc::WeakSender<SwarmEvent>,
     shutdown: CancellationToken,
     dht: DhtWatch,
-) {
-    tokio::spawn(dht_announcer(
-        info_hash,
-        identity.serving.port(),
-        dht,
-        events.clone(),
-        shutdown.clone(),
-    ));
-    for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
+) -> watch::Receiver<Vec<TrackerStatus>> {
+    let (board, statuses) = watch::channel(vec![]);
+    let board = Arc::new(board);
+    let mut rows = Vec::new();
+    let mut slot = |url: &str| {
+        rows.push(TrackerStatus {
+            url: url.to_owned(),
+            state: TrackerState::Pending,
+            peers: 0,
+            next_announce: None,
+        });
+        rows.len() - 1
+    };
+    // a watch whose sender is gone is a client with no DHT, now or ever; no row for it
+    let dht_slot = dht.has_changed().is_ok().then(|| slot("DHT"));
+    let usable: Vec<Url> = trackers.iter().filter_map(|t| Url::parse(t).ok()).collect();
+    let slots: Vec<usize> = usable.iter().map(|url| slot(url.as_str())).collect();
+    let _ = board.send(rows);
+
+    if let Some(dht_slot) = dht_slot {
+        tokio::spawn(dht_announcer(
+            info_hash,
+            identity.serving.port(),
+            dht,
+            events.clone(),
+            shutdown.clone(),
+            (board.clone(), dht_slot),
+        ));
+    }
+    for (url, slot) in usable.into_iter().zip(slots) {
         match url.scheme() {
             "http" | "https" => {
                 let announcer = HttpAnnouncer::new(
@@ -79,6 +143,7 @@ pub(crate) fn spawn_announcers(
                     stat_rx.clone(),
                     events.clone(),
                     shutdown.clone(),
+                    (board.clone(), slot),
                 );
                 tokio::spawn(announcer.ev_loop());
             }
@@ -90,12 +155,19 @@ pub(crate) fn spawn_announcers(
                     stat_rx.clone(),
                     events.clone(),
                     shutdown.clone(),
+                    (board.clone(), slot),
                 );
                 tokio::spawn(announcer.ev_loop());
             }
-            scheme => warn!("ignoring tracker with unsupported scheme {scheme:?}"),
+            scheme => {
+                warn!("ignoring tracker with unsupported scheme {scheme:?}");
+                report(&board, slot, |row| {
+                    row.state = TrackerState::Failed(format!("unsupported scheme {scheme:?}"))
+                });
+            }
         }
     }
+    statuses
 }
 
 /// BEP 5 as a peer source: every DHT_ANNOUNCE_INTERVAL, look the info hash up, hand whatever
@@ -107,6 +179,7 @@ async fn dht_announcer(
     mut dht: DhtWatch,
     events: mpsc::WeakSender<SwarmEvent>,
     shutdown: CancellationToken,
+    (board, slot): (TrackerBoard, usize),
 ) {
     let handle = loop {
         if let Some(handle) = dht.borrow().clone() {
@@ -131,6 +204,11 @@ async fn dht_announcer(
                     result.peers.len(),
                     result.announce_candidates.len()
                 );
+                report(&board, slot, |row| {
+                    row.state = TrackerState::Working;
+                    row.peers = result.peers.len();
+                    row.next_announce = Some(Instant::now() + DHT_ANNOUNCE_INTERVAL);
+                });
                 let Some(events) = events.upgrade() else { return };
                 let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
                 if events.send(SwarmEvent::PeersDiscovered(peers)).await.is_err() {
@@ -146,7 +224,13 @@ async fn dht_announcer(
                     }
                 }
             }
-            Err(e) => warn!("DHT lookup for {info_hash:?} failed: {e:#}"),
+            Err(e) => {
+                warn!("DHT lookup for {info_hash:?} failed: {e:#}");
+                report(&board, slot, |row| {
+                    row.state = TrackerState::Failed(format!("{e:#}"));
+                    row.next_announce = Some(Instant::now() + DHT_ANNOUNCE_INTERVAL);
+                });
+            }
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -197,6 +281,7 @@ impl HttpAnnouncer {
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         events: mpsc::WeakSender<SwarmEvent>,
         shutdown: CancellationToken,
+        board: (TrackerBoard, usize),
     ) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
         let already_complete = swarm_stat.borrow().completed;
@@ -213,6 +298,8 @@ impl HttpAnnouncer {
             sent_completed: already_complete,
             swarm_stat,
             shutdown,
+            board,
+            failures: 0,
         }
     }
 
@@ -323,14 +410,28 @@ impl HttpAnnouncer {
                     match self.announce(event).await {
                         Ok(result) => {
                             self.sent_started = true;
+                            self.failures = 0;
+                            let (board, slot) = &self.board;
+                            let (peers, next) = (result.len(), self.next_ready);
+                            report(board, *slot, |row| {
+                                row.state = TrackerState::Working;
+                                row.peers = peers;
+                                row.next_announce = Some(next);
+                            });
                             if let Some(events) = self.events.upgrade() {
                                 let _ = events.send(SwarmEvent::PeersDiscovered(result)).await;
                             }
                         }
                         Err(e) => {
                             warn!("{e:#}");
-                            // TODO: use exponential backoff
-                            self.next_ready = Instant::now() + Duration::from_mins(1);
+                            self.failures += 1;
+                            self.next_ready = Instant::now() + retry_delay(self.failures);
+                            let (board, slot) = &self.board;
+                            let next = self.next_ready;
+                            report(board, *slot, |row| {
+                                row.state = TrackerState::Failed(format!("{e:#}"));
+                                row.next_announce = Some(next);
+                            });
                         }
                     }
                 }
@@ -378,6 +479,10 @@ struct UdpAnnouncer {
     sent_completed: bool,
     #[eq(skip)]
     shutdown: CancellationToken,
+    #[eq(skip)]
+    board: (TrackerBoard, usize),
+    #[eq(skip)]
+    failures: u32,
 }
 
 #[repr(i32)]
@@ -405,6 +510,7 @@ impl UdpAnnouncer {
         swarm_stat: watch::Receiver<TorrentSwarmStats>,
         event: mpsc::WeakSender<SwarmEvent>,
         shutdown: CancellationToken,
+        board: (TrackerBoard, usize),
     ) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
         let already_complete = swarm_stat.borrow().completed;
@@ -422,6 +528,8 @@ impl UdpAnnouncer {
             sent_completed: already_complete,
             swarm_stat,
             shutdown,
+            board,
+            failures: 0,
         }
     }
 
@@ -700,13 +808,15 @@ impl UdpAnnouncer {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn ev_loop(mut self) -> anyhow::Result<()> {
-        let tracker_addr = self.resolve().await.inspect_err(|e| warn!("{e:#}"))?;
-
-        let Some(tracker_addr) = tracker_addr else {
-            bail!("Tracker [{}] did not resolve to any address", self.tracker);
-        };
-
+    /// Resolves, binds, and connects to the tracker if `socket` doesn't hold a connection yet.
+    async fn tracker_socket(&mut self, socket: &mut Option<UdpSocket>) -> anyhow::Result<()> {
+        if socket.is_some() {
+            return Ok(());
+        }
+        let tracker_addr = self
+            .resolve()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Tracker [{}] did not resolve to any address", self.tracker))?;
         info!("Tracker [{}] resolved as {}", self.tracker, tracker_addr);
 
         // bind our own socket in the same family as the tracker resolved to
@@ -714,42 +824,67 @@ impl UdpAnnouncer {
             SocketAddr::V4(_) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into(),
             SocketAddr::V6(_) => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into(),
         };
-        info!("Binding to socket");
-        let mut socket = UdpSocket::bind(our_socket)
+        let mut fresh = UdpSocket::bind(our_socket)
             .await
-            .with_context(|| format!("Failed to bind a udp socket on {our_socket}"))
-            .inspect_err(|e| warn!("{e:#}"))?;
-
-        info!("\"Connecting\" to {}", tracker_addr);
-        socket
+            .with_context(|| format!("Failed to bind a udp socket on {our_socket}"))?;
+        fresh
             .connect(tracker_addr)
             .await
-            .with_context(|| format!("Failed to connect to addr: {}", tracker_addr))
-            .inspect_err(|e| warn!("{e:#}"))?;
+            .with_context(|| format!("Failed to connect to addr: {}", tracker_addr))?;
+        self.connect(&mut fresh).await?;
+        *socket = Some(fresh);
+        Ok(())
+    }
 
-        self.connect(&mut socket).await.inspect_err(|e| warn!("{e:#}"))?;
-
+    /// Announces on schedule for as long as the swarm lives. A failure anywhere (resolving,
+    /// connecting, announcing) is retried with backoff on a fresh socket, since the tracker
+    /// may have been down or renumbered.
+    async fn ev_loop(mut self) {
+        let mut socket: Option<UdpSocket> = None;
         loop {
             tokio::select! {
                 _ = self.ready() => {
-                    // TODO: should retry instead of stopping at first failure
                     // BEP 15: the first announce to a tracker must carry event=started
                     let event = if self.sent_started { AnnounceEvent::Regular } else { AnnounceEvent::Started };
-                    let peers = self
-                        .announce(&mut socket, event)
-                        .await
-                        .with_context(|| format!("Tracker [{}] announce failed", self.tracker))?;
-                    self.sent_started = true;
-
-                    if let Some(events) = self.event.upgrade() {
-                        let _ = events.send(SwarmEvent::PeersDiscovered(peers)).await;
+                    let announced = match self.tracker_socket(&mut socket).await {
+                        Ok(()) => self.announce(socket.as_mut().unwrap(), event).await,
+                        Err(e) => Err(e),
+                    };
+                    match announced {
+                        Ok(peers) => {
+                            self.sent_started = true;
+                            self.failures = 0;
+                            let (board, slot) = &self.board;
+                            let (count, next) = (peers.len(), self.next_ready);
+                            report(board, *slot, |row| {
+                                row.state = TrackerState::Working;
+                                row.peers = count;
+                                row.next_announce = Some(next);
+                            });
+                            if let Some(events) = self.event.upgrade() {
+                                let _ = events.send(SwarmEvent::PeersDiscovered(peers)).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Tracker [{}]: {e:#}", self.tracker);
+                            socket = None;
+                            self.failures += 1;
+                            self.next_ready = Instant::now() + retry_delay(self.failures);
+                            let (board, slot) = &self.board;
+                            let next = self.next_ready;
+                            report(board, *slot, |row| {
+                                row.state = TrackerState::Failed(format!("{e:#}"));
+                                row.next_announce = Some(next);
+                            });
+                        }
                     }
                 }
                 // BEP 15: a single announce reporting event=completed should follow the
                 // download finishing, rather than waiting for the next periodic announce
                 Ok(()) = self.swarm_stat.changed(), if !self.sent_completed => {
                     if self.swarm_stat.borrow().completed
-                        && self.announce(&mut socket, AnnounceEvent::Completed).await.is_ok()
+                        && let Some(connected) = socket.as_mut()
+                        && self.announce(connected, AnnounceEvent::Completed).await.is_ok()
                     {
                         self.sent_started = true;
                         self.sent_completed = true;
@@ -758,16 +893,97 @@ impl UdpAnnouncer {
                 // BEP 15: send a courtesy event=stopped on graceful shutdown so the tracker
                 // drops us immediately instead of waiting out the interval; best-effort
                 _ = self.shutdown.cancelled() => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.announce(&mut socket, AnnounceEvent::Stopped),
-                    )
-                    .await;
+                    if let Some(connected) = socket.as_mut() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            self.announce(connected, AnnounceEvent::Stopped),
+                        )
+                        .await;
+                    }
                     break;
                 }
             }
         }
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn retry_delay_doubles_and_caps() {
+        assert_eq!(retry_delay(1), ANNOUNCE_RETRY);
+        assert_eq!(retry_delay(2), ANNOUNCE_RETRY * 2);
+        assert_eq!(retry_delay(3), ANNOUNCE_RETRY * 4);
+        assert_eq!(retry_delay(40), ANNOUNCE_RETRY_MAX);
+    }
+
+    /// One row per usable tracker, in order, plus a DHT row only when there is (or may be) a
+    /// node; the rows exist before any announcer has done anything.
+    #[tokio::test]
+    async fn the_board_lists_every_announcer_up_front() {
+        let identity = Arc::new(Identity {
+            peer_id: [1; 20],
+            serving: "127.0.0.1:0".parse().unwrap(),
+            dht: false,
+            encryption: crate::config::Encryption::Disabled,
+        });
+        let trackers = [
+            "http://127.0.0.1:1/announce".to_string(),
+            "wss://nope.test/announce".to_string(),
+            "udp://127.0.0.1:1".to_string(),
+        ];
+        let stats = watch::channel(TorrentSwarmStats {
+            uploaded: 0,
+            downloaded: 0,
+            wasted: 0,
+            left: 0,
+            written: 0,
+            verified: bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::new().into_boxed_bitslice(),
+            wanted: bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::new().into_boxed_bitslice(),
+            completed: false,
+        })
+        .1;
+        let (events, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+
+        let rows = spawn_announcers(
+            &trackers,
+            InfoHash::from_bytes(&[2; 20]),
+            identity.clone(),
+            stats.clone(),
+            events.downgrade(),
+            shutdown.clone(),
+            crate::dht::Dht::none(),
+        );
+        let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(
+            urls,
+            [
+                "http://127.0.0.1:1/announce",
+                "wss://nope.test/announce",
+                "udp://127.0.0.1:1"
+            ]
+        );
+        assert!(
+            matches!(rows.borrow()[1].state, TrackerState::Failed(_)),
+            "unsupported scheme"
+        );
+
+        let (dht_tx, dht_rx) = watch::channel(None);
+        let rows = spawn_announcers(
+            &trackers[..1],
+            InfoHash::from_bytes(&[2; 20]),
+            identity,
+            stats,
+            events.downgrade(),
+            shutdown.clone(),
+            dht_rx,
+        );
+        let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);
+        drop(dht_tx);
+        shutdown.cancel();
     }
 }

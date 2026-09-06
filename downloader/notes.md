@@ -26,6 +26,7 @@ survives context resets; re-read before acting.
 - [x] Sequential download
 - [x] Status bar: total rates, DHT node count, listen port, port mapping state
 - [x] Download queue: `max_active_downloads`, seeding doesn't count
+- [x] Tracker status in the details panel; announce retries with backoff
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -594,3 +595,16 @@ lowering it acquires the difference in the background and forgets those permits,
 running download keeps its place until it finishes. "No limit" is 2^20 permits rather than
 the semaphore's maximum, so shrinking from it fits `acquire_many`'s `u32`. Test:
 `downloads_beyond_the_limit_queue_up`.
+
+# Tracker status, and announces that retry, 2026-09-06
+Every announcer (HTTP, UDP, and the DHT lookup) writes one row of a `TrackerBoard` (a watch
+of `TrackerStatus`: waiting / working / what failed, peers from the last announce, when the
+next one is) that the swarm handle exposes and the details panel shows as a table. The
+board is filled in up front so the panel lists every tracker before any has answered.
+
+While here, both tracker kinds retry failures with backoff (`ANNOUNCE_RETRY` doubling to
+`ANNOUNCE_RETRY_MAX`) instead of what they did: HTTP a flat minute, UDP giving up for good
+at the first failure anywhere in resolve/bind/connect/announce (the `?`s in its loop), so a
+UDP tracker that was down when the torrent started never came back. The UDP loop now
+reconnects on a fresh socket after a failure. Tests: `retry_delay_doubles_and_caps`,
+`the_board_lists_every_announcer_up_front`.

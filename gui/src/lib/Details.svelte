@@ -89,6 +89,27 @@
     </ScrollArea>
 
     {#if torrent.kind === 'downloading'}
+      <div class="font-medium">Trackers ({torrent.trackers.length})</div>
+      <ScrollArea class="max-h-32 rounded-md border">
+        <Table.Root>
+          <Table.Body>
+            {#each torrent.trackers as tracker (tracker.url)}
+              <Table.Row>
+                <Table.Cell class="max-w-0 truncate select-text" title={tracker.url}>{tracker.url}</Table.Cell>
+                <Table.Cell
+                  class="max-w-64 truncate {tracker.status === 'working' ? '' : tracker.status === 'waiting' ? 'text-muted-foreground' : 'text-destructive'}"
+                  title={tracker.status}>{tracker.status}</Table.Cell
+                >
+                <Table.Cell class="whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
+                <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">
+                  {tracker.next_announce_secs === null ? '' : `next in ${Math.floor(tracker.next_announce_secs / 60)}m ${tracker.next_announce_secs % 60}s`}
+                </Table.Cell>
+              </Table.Row>
+            {/each}
+          </Table.Body>
+        </Table.Root>
+      </ScrollArea>
+
       <div class="font-medium">Peers ({torrent.peers.length})</div>
       <ScrollArea class="max-h-64 rounded-md border">
         <Table.Root class="text-xs">

@@ -1,4 +1,4 @@
-use crate::announcer::spawn_announcers;
+use crate::announcer::{TrackerStatus, spawn_announcers};
 use crate::config::SettingsWatch;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
@@ -113,6 +113,7 @@ pub struct TorrentSwarmHandle {
     tx: mpsc::Sender<SwarmEvent>,
     stats: watch::Receiver<TorrentSwarmStats>,
     peers: watch::Receiver<Vec<PeerSnapshot>>,
+    trackers: watch::Receiver<Vec<TrackerStatus>>,
 }
 
 impl TorrentSwarmHandle {
@@ -132,6 +133,11 @@ impl TorrentSwarmHandle {
     /// the inbound listener (`BtClient::accept_incoming`) and the swarm's own dial tasks.
     pub(crate) async fn peer_connected(&self, connected: ConnectedPeer) {
         let _ = self.tx.send(SwarmEvent::PeerConnected(connected)).await;
+    }
+
+    /// What each tracker (and the DHT) has done for this torrent lately.
+    pub fn trackers(&self) -> watch::Receiver<Vec<TrackerStatus>> {
+        self.trackers.clone()
     }
 
     /// Addresses worth dialing, from wherever the caller got them.
@@ -443,22 +449,24 @@ impl TorrentSwarm {
 
         let (events_tx, events_rx) = mpsc::channel(512);
         let (peers_tx, peers_rx) = watch::channel(vec![]);
-        let handle = TorrentSwarmHandle {
-            tx: events_tx,
-            stats: stat_rx.clone(),
-            peers: peers_rx,
-        };
-        let events_tx = handle.tx.downgrade();
+        let events_tx_weak = events_tx.downgrade();
         let announcers = CancellationToken::new();
-        spawn_announcers(
+        let trackers = spawn_announcers(
             &torrent.all_trackers(),
             torrent.info_hash,
             id.clone(),
-            stat_rx,
-            events_tx.clone(),
+            stat_rx.clone(),
+            events_tx_weak.clone(),
             announcers.clone(),
             dht.clone(),
         );
+        let handle = TorrentSwarmHandle {
+            tx: events_tx,
+            stats: stat_rx,
+            peers: peers_rx,
+            trackers,
+        };
+        let events_tx = events_tx_weak;
 
         let swarm = TorrentSwarm {
             peers: vec![],

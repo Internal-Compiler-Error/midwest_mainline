@@ -7,6 +7,7 @@
 //! [`Session::torrents`] whenever it wants to draw, and renders the [`TorrentState`]s it gets
 //! back.
 
+use crate::announcer::{TrackerState, TrackerStatus};
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
@@ -79,6 +80,19 @@ pub struct Progress {
     pub peers: Vec<PeerInfo>,
     /// pieces are fetched in order, see `Session::set_sequential`
     pub sequential: bool,
+    /// the trackers and the DHT; empty while paused
+    pub trackers: Vec<TrackerInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerInfo {
+    /// the announce URL, or "DHT"
+    pub url: String,
+    /// "waiting", "working", or what went wrong
+    pub status: String,
+    /// peers the last announce returned
+    pub peers: usize,
+    pub next_announce_secs: Option<u64>,
 }
 
 impl Progress {
@@ -401,6 +415,10 @@ impl TorrentTask {
             .stats(torrent)
             .ok_or_else(|| anyhow::anyhow!("torrent was added but reported no stats"))?;
         let peers = self.client.peers(torrent).unwrap_or_else(|| watch::channel(vec![]).1);
+        let trackers = self
+            .client
+            .trackers(torrent)
+            .unwrap_or_else(|| watch::channel(vec![]).1);
         let stop_saving = self.cancel.child_token();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
@@ -419,6 +437,7 @@ impl TorrentTask {
             root: root.to_path_buf(),
             stats: stats.clone(),
             peers,
+            trackers,
             selected: self.selected.subscribe(),
             sequential: self.sequential.subscribe(),
             uploaded_before: self.uploaded_before,
@@ -605,6 +624,7 @@ enum Phase {
         root: PathBuf,
         stats: watch::Receiver<TorrentSwarmStats>,
         peers: watch::Receiver<Vec<PeerSnapshot>>,
+        trackers: watch::Receiver<Vec<TrackerStatus>>,
         selected: watch::Receiver<Vec<bool>>,
         sequential: watch::Receiver<bool>,
         uploaded_before: u64,
@@ -1011,6 +1031,7 @@ impl Entry {
                 root,
                 stats,
                 peers,
+                trackers,
                 selected,
                 sequential,
                 uploaded_before,
@@ -1027,6 +1048,7 @@ impl Entry {
                 );
                 progress.uploaded += uploaded_before;
                 progress.peers = self.peers(&peers.borrow());
+                progress.trackers = trackers.borrow().iter().map(tracker_info).collect();
                 TorrentState::Downloading(progress)
             }
             Phase::Paused {
@@ -1134,6 +1156,22 @@ fn progress(
         upload_bps: rates.upload_bps,
         peers: vec![],
         sequential,
+        trackers: vec![],
+    }
+}
+
+fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
+    TrackerInfo {
+        url: status.url.clone(),
+        status: match &status.state {
+            TrackerState::Pending => "waiting".to_owned(),
+            TrackerState::Working => "working".to_owned(),
+            TrackerState::Failed(why) => why.clone(),
+        },
+        peers: status.peers,
+        next_announce_secs: status
+            .next_announce
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()).as_secs()),
     }
 }
 
@@ -1228,6 +1266,7 @@ mod test {
             upload_bps: 0.0,
             peers: vec![],
             sequential: false,
+            trackers: vec![],
         };
         // a zero-piece torrent must not divide by zero
         assert_eq!(p.fraction(), 0.0);

@@ -104,6 +104,11 @@ pub const LSD_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// How often to look a torrent up in the DHT and re-announce ourselves for it. Announced
 /// peers expire from nodes after roughly 45 minutes, so this is comfortably inside that.
+/// After a failed announce, how long before the next try; doubles per consecutive failure up
+/// to `ANNOUNCE_RETRY_MAX`.
+pub const ANNOUNCE_RETRY: Duration = Duration::from_secs(60);
+pub const ANNOUNCE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
 pub const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// BEP 11 (PEX): the spec recommends capping a single message at roughly 50 added peers.

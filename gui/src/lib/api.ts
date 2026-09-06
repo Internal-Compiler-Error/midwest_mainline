@@ -21,6 +21,17 @@ export interface Progress {
   peers: Peer[]
   /** pieces are fetched in order, for playing a file while it downloads */
   sequential: boolean
+  /** the trackers and the DHT; empty while paused */
+  trackers: Tracker[]
+}
+
+export interface Tracker {
+  /** the announce URL, or "DHT" */
+  url: string
+  /** "waiting", "working", or what went wrong */
+  status: string
+  peers: number
+  next_announce_secs: number | null
 }
 
 export interface TorrentFile {

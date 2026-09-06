@@ -32,7 +32,10 @@ pub use magnet::{MagnetLink, is_magnet_uri, parse_magnet};
 pub use paths::{data_dir, default_download_dir};
 pub use portmap::MappingState;
 pub use resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
-pub use session::{FileInfo, PeerInfo, Progress, Session, SessionConfig, TorrentId, TorrentState, human_bytes};
+pub use session::{
+    FileInfo, PeerInfo, Progress, Session, SessionConfig, SessionStatus, TorrentId, TorrentState, TrackerInfo,
+    human_bytes,
+};
 pub use torrent::{Torrent, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
 pub use utp::UtpWatch;

@@ -1,3 +1,4 @@
+use crate::announcer::TrackerStatus;
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
@@ -131,6 +132,15 @@ impl BtClient {
             .unwrap()
             .get(&torrent.info_hash)
             .map(TorrentSwarmHandle::peers)
+    }
+
+    /// What each tracker of a torrent has done lately, refreshed as they announce.
+    pub fn trackers(&self, torrent: &Torrent) -> Option<watch::Receiver<Vec<TrackerStatus>>> {
+        self.swarms
+            .lock()
+            .unwrap()
+            .get(&torrent.info_hash)
+            .map(TorrentSwarmHandle::trackers)
     }
 
     /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as

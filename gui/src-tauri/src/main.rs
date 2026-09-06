@@ -8,7 +8,7 @@
 
 use downloader::{
     Encryption, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId,
-    TorrentState, data_dir,
+    TorrentState, TrackerInfo, data_dir,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -66,6 +66,26 @@ struct ProgressDto {
     upload_bps: f64,
     peers: Vec<PeerDto>,
     sequential: bool,
+    trackers: Vec<TrackerDto>,
+}
+
+#[derive(Serialize)]
+struct TrackerDto {
+    url: String,
+    status: String,
+    peers: usize,
+    next_announce_secs: Option<u64>,
+}
+
+impl From<TrackerInfo> for TrackerDto {
+    fn from(t: TrackerInfo) -> Self {
+        Self {
+            url: t.url,
+            status: t.status,
+            peers: t.peers,
+            next_announce_secs: t.next_announce_secs,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -130,6 +150,7 @@ impl From<Progress> for ProgressDto {
             upload_bps: p.upload_bps,
             peers: p.peers.into_iter().map(PeerDto::from).collect(),
             sequential: p.sequential,
+            trackers: p.trackers.into_iter().map(TrackerDto::from).collect(),
         }
     }
 }
