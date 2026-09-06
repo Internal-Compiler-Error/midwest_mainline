@@ -571,7 +571,9 @@ mod test {
             }
         });
 
-        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity())).await.unwrap();
+        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity()))
+            .await
+            .unwrap();
         assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
         server.await.unwrap();
     }
@@ -627,7 +629,9 @@ mod test {
             }
         });
 
-        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity())).await.unwrap_err();
+        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity()))
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("doesn't match the requested info hash"),
             "expected an info-hash mismatch, got: {err:#}"

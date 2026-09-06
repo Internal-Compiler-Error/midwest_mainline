@@ -17,7 +17,7 @@ survives context resets; re-read before acting.
 - [x] Global speed limits
 - [x] File selection (priorities not done: the scheduler is rarest-first, a priority order would fight it)
 - [x] Local Service Discovery (BEP 14)
-- [ ] Seeding ratio / stop seeding
+- [x] Seeding ratio / stop seeding
 - [ ] MSE encryption
 - [ ] uTP: evaluate crates; skip if nothing maintained
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -462,3 +462,13 @@ our own Port after the handshake); the metadata deadline had no ceiling (`OVERAL
 of 10 min on top of the 120 s idle timeout); the log forwarder queued without bound while
 a connect blocked (bounded channel, connect timeout, 5 s between attempts); and doc comments
 displaced by inserted functions.
+
+# Seeding ratio, 2026-09-06
+`Settings::seed_ratio_limit` (0 = seed forever): a complete torrent whose lifetime upload
+total reaches that many times its size pauses itself (`TorrentTask::seeded_enough`, checked
+on every stats change, on every settings change, and once at the start of a stretch, so a
+torrent that comes back already over the limit stops at once). The lifetime total is the
+resume file's new `uploaded` key plus the running swarm's count; the task carries it as
+`uploaded_before` across pause/unpause and sessions, and `Progress::uploaded` is the total,
+with `Progress::ratio()` for display. The GUI shows the ratio in the details and edits the
+limit in the settings dialog. Test: `seeding_stops_at_the_ratio_limit`.

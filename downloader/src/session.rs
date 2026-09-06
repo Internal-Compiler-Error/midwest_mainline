@@ -7,7 +7,7 @@
 //! [`Session::torrents`] whenever it wants to draw, and renders the [`TorrentState`]s it gets
 //! back.
 
-use crate::config::Settings;
+use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
 use crate::peer::PeerSnapshot;
@@ -70,6 +70,18 @@ pub struct Progress {
     pub peers: Vec<PeerInfo>,
 }
 
+impl Progress {
+    /// Uploaded over the torrent's whole life as a share of its size, what the seeding
+    /// ratio limit compares against.
+    pub fn ratio(&self) -> f64 {
+        if self.total_size == 0 {
+            0.0
+        } else {
+            self.uploaded as f64 / self.total_size as f64
+        }
+    }
+}
+
 /// One of a torrent's files.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileInfo {
@@ -119,6 +131,8 @@ struct Resolved {
     peers: Vec<std::net::SocketAddr>,
     /// one flag per file
     selected: Vec<bool>,
+    /// bytes uploaded in earlier sessions
+    uploaded: u64,
 }
 
 /// The task that owns one torrent for its whole life in the session: resolves the source,
@@ -135,6 +149,10 @@ struct TorrentTask {
     /// known before resolving for a magnet or a resume file; names the resume file to
     /// delete if removal comes before the torrent is known
     info_hash: Option<InfoHash>,
+    settings: SettingsWatch,
+    /// bytes uploaded in earlier stretches of this torrent's life, including earlier
+    /// sessions (from the resume file); the running swarm's own count is added on top
+    uploaded_before: u64,
 }
 
 /// What ended a running or paused stretch of a torrent's life.
@@ -175,6 +193,7 @@ impl TorrentTask {
             mut paused,
             mut peers,
             selected,
+            uploaded,
         } = match resolved {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -184,6 +203,7 @@ impl TorrentTask {
         };
         let torrent = Arc::new(torrent);
         let _ = self.selected.send(selected);
+        self.uploaded_before = uploaded;
         paused |= pause_asked;
 
         let mut last_stats = None;
@@ -287,6 +307,7 @@ impl TorrentTask {
             root.to_path_buf(),
             stats.clone(),
             self.selected.subscribe(),
+            self.uploaded_before,
             self.resume_dir.clone(),
             stop_saving.clone(),
         ));
@@ -296,9 +317,16 @@ impl TorrentTask {
             stats: stats.clone(),
             peers,
             selected: self.selected.subscribe(),
+            uploaded_before: self.uploaded_before,
         });
 
+        let mut ratio_stats = stats.clone();
         let stop = loop {
+            // a torrent that comes back already over its ratio stops before waiting for
+            // anything to change
+            if self.seeded_enough(torrent, &ratio_stats.borrow_and_update()) {
+                break Stop::Pause;
+            }
             tokio::select! {
                 _ = self.cancel.cancelled() => break Stop::Shutdown,
                 command = self.commands.recv() => match command {
@@ -311,6 +339,21 @@ impl TorrentTask {
                     Some(Command::Unpause) => {}
                     None => break Stop::Shutdown,
                 },
+                // the stats change on every verified piece and uploaded block, the settings
+                // when the user edits the limit; either can be what tips the ratio over
+                changed = ratio_stats.changed() => {
+                    if changed.is_err() {
+                        break Stop::Shutdown;
+                    }
+                    if self.seeded_enough(torrent, &ratio_stats.borrow()) {
+                        break Stop::Pause;
+                    }
+                }
+                _ = self.settings.changed() => {
+                    if self.seeded_enough(torrent, &stats.borrow()) {
+                        break Stop::Pause;
+                    }
+                }
             }
         };
         // the torrent leaves the client; the saver gets its final write in before anything
@@ -320,7 +363,22 @@ impl TorrentTask {
         let _ = saver.await;
         let last = stats.borrow().clone();
         *verified = last.verified.clone();
+        self.uploaded_before += last.uploaded;
         Ok((stop, Some(last)))
+    }
+
+    /// Complete, with a ratio limit set, and uploaded that many times its size over its life.
+    fn seeded_enough(&self, torrent: &Torrent, stats: &TorrentSwarmStats) -> bool {
+        let limit = self.settings.borrow().seed_ratio_limit;
+        if !stats.completed || limit <= 0.0 || torrent.total_size == 0 {
+            return false;
+        }
+        let uploaded = self.uploaded_before + stats.uploaded;
+        let reached = uploaded as f64 / torrent.total_size as f64 >= limit;
+        if reached {
+            tracing::info!("{} seeded to ratio {limit}, stopping", torrent.name);
+        }
+        reached
     }
 
     /// Marks the resume file paused, so a restart brings the torrent back paused, and waits
@@ -334,19 +392,24 @@ impl TorrentTask {
     ) -> anyhow::Result<(Stop, Option<TorrentSwarmStats>)> {
         // the counters of the stretch that just ended, if there was one; a torrent that
         // started paused has none
-        let stats = last_stats.unwrap_or_else(|| {
+        // the uploaded count of a stretch that just ended is already folded into
+        // `uploaded_before`, so the snapshot shown while paused must not add it again
+        let mut stats = last_stats.unwrap_or_else(|| {
             let wanted = torrent.wanted_pieces(&self.selected.borrow());
             TorrentSwarmStats::for_verified(torrent, verified.clone(), wanted)
         });
+        stats.uploaded = 0;
         let _ = self.phase.send(Phase::Paused {
             torrent: torrent.clone(),
             root: root.to_path_buf(),
             stats: stats.clone(),
             selected: self.selected.subscribe(),
+            uploaded_before: self.uploaded_before,
         });
         let mut data = ResumeData::from_torrent(torrent, root, verified);
         data.paused = true;
         data.skip = crate::resume::skipped(&self.selected.borrow());
+        data.uploaded = self.uploaded_before;
         if let Err(e) = data.write(&self.resume_dir.join(ResumeData::file_name(&torrent.info_hash))) {
             tracing::warn!("couldn't mark {} paused in its resume file: {e:#}", torrent.name);
         }
@@ -382,6 +445,7 @@ enum Phase {
         stats: watch::Receiver<TorrentSwarmStats>,
         peers: watch::Receiver<Vec<PeerSnapshot>>,
         selected: watch::Receiver<Vec<bool>>,
+        uploaded_before: u64,
     },
     Paused {
         torrent: Arc<Torrent>,
@@ -389,6 +453,7 @@ enum Phase {
         /// the last stats before the swarm was stopped
         stats: TorrentSwarmStats,
         selected: watch::Receiver<Vec<bool>>,
+        uploaded_before: u64,
     },
     Failed {
         error: String,
@@ -529,6 +594,7 @@ impl Session {
                 resumed: false,
                 paused: false,
                 peers: loaded.peers,
+                uploaded: 0,
             })
         })
     }
@@ -549,6 +615,7 @@ impl Session {
                 resumed: true,
                 paused: data.paused,
                 peers: vec![],
+                uploaded: data.uploaded,
             })
         })
     }
@@ -637,6 +704,8 @@ impl Session {
             commands: commands_rx,
             selected: watch::channel(vec![]).0,
             info_hash,
+            settings: self.settings.subscribe(),
+            uploaded_before: 0,
         };
         self.handle.spawn(task.run(resolve));
         id
@@ -693,10 +762,12 @@ impl Entry {
                 stats,
                 peers,
                 selected,
+                uploaded_before,
             } => {
                 let stats = stats.borrow().clone();
                 self.rates.update(stats.downloaded, stats.uploaded);
                 let mut progress = progress(&torrent, &root, &stats, &selected.borrow(), &self.rates);
+                progress.uploaded += uploaded_before;
                 progress.peers = self.peers(&peers.borrow());
                 TorrentState::Downloading(progress)
             }
@@ -705,10 +776,13 @@ impl Entry {
                 root,
                 stats,
                 selected,
+                uploaded_before,
             } => {
                 self.rates = Rates::new();
                 self.peer_rates.clear();
-                TorrentState::Paused(progress(&torrent, &root, &stats, &selected.borrow(), &self.rates))
+                let mut progress = progress(&torrent, &root, &stats, &selected.borrow(), &self.rates);
+                progress.uploaded += uploaded_before;
+                TorrentState::Paused(progress)
             }
         }
     }
@@ -1062,6 +1136,46 @@ mod test {
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
         session.unpause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A complete torrent whose lifetime upload total is over the ratio limit stops seeding
+    /// as soon as it starts; raising the limit lets it seed again.
+    #[test]
+    fn seeding_stops_at_the_ratio_limit() {
+        let dir = scratch("ratio");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("session.bin"), [7u8; 40]).unwrap();
+        let torrent = crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap();
+        let mut data = ResumeData::from_torrent(&torrent, &root, &bitvec![u8, Msb0; 1; 3]);
+        data.uploaded = 80;
+        let resume_dir = dir.join("resume");
+        std::fs::create_dir_all(&resume_dir).unwrap();
+        let path = resume_dir.join(ResumeData::file_name(&torrent.info_hash));
+        data.write(&path).unwrap();
+
+        let mut config = test_config(&dir);
+        config.settings.seed_ratio_limit = 1.5;
+        let mut session = Session::new(config).unwrap();
+        let id = session.resume(&path);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        let Some((_, TorrentState::Paused(progress))) = session.torrents().into_iter().find(|(i, _)| *i == id) else {
+            panic!()
+        };
+        assert_eq!((progress.uploaded, progress.ratio()), (80, 2.0));
+
+        let mut settings = session.settings();
+        settings.seed_ratio_limit = 3.0;
+        session.update_settings(settings).unwrap();
+        session.unpause(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.completed),
+        );
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

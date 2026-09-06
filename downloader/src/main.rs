@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         root,
         stats,
         all_files,
+        0,
         resume_dir,
         client.shutdown_token(),
     ));

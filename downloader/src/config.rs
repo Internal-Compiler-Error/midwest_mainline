@@ -23,6 +23,10 @@ pub struct Settings {
     /// bytes per second across all torrents, 0 for no limit; applies live
     pub download_limit: u64,
     pub upload_limit: u64,
+    /// stop seeding once uploaded / torrent size reaches this, 0 to seed forever; applies
+    /// live. The upload total survives restarts, so a torrent that seeded 1.5 last week and
+    /// comes back with a limit of 2 keeps going until it has uploaded 2 sizes in all.
+    pub seed_ratio_limit: f64,
 }
 
 impl Default for Settings {
@@ -34,6 +38,7 @@ impl Default for Settings {
             max_peers_per_torrent: 200,
             download_limit: 0,
             upload_limit: 0,
+            seed_ratio_limit: 0.0,
         }
     }
 }

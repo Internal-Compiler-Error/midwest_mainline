@@ -81,6 +81,8 @@ export interface Settings {
   /** bytes per second, 0 for no limit */
   download_limit: number
   upload_limit: number
+  /** stop seeding at uploaded / size, 0 to seed forever */
+  seed_ratio_limit: number
 }
 
 export const settings = () => invoke<Settings>('settings')

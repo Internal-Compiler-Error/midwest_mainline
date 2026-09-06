@@ -41,6 +41,8 @@ pub struct ResumeData {
     pub paused: bool,
     /// indices into the torrent's files of the ones the user doesn't want
     pub skip: Vec<u32>,
+    /// bytes uploaded over the torrent's whole life, for the seeding ratio
+    pub uploaded: u64,
 }
 
 impl ResumeData {
@@ -54,6 +56,7 @@ impl ResumeData {
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
             skip: vec![],
+            uploaded: 0,
         }
     }
 
@@ -107,6 +110,10 @@ impl ResumeData {
             out.extend_from_slice(&bstr(t.as_bytes()));
         }
         out.push(b'e');
+        if self.uploaded > 0 {
+            out.extend_from_slice(&bstr(b"uploaded"));
+            out.extend_from_slice(format!("i{}e", self.uploaded).as_bytes());
+        }
         out.extend_from_slice(&bstr(b"verified"));
         out.extend_from_slice(&bstr(self.verified.as_raw_slice()));
         out.extend_from_slice(&bstr(b"version"));
@@ -142,6 +149,10 @@ impl ResumeData {
         };
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
         let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
+        let uploaded = match dict.remove(b"uploaded".as_slice()) {
+            Some(BencodeItemView::Integer(n)) => u64::try_from(n).unwrap_or(0),
+            _ => 0,
+        };
         let skip: Vec<u32> = match dict.remove(b"skip".as_slice()) {
             Some(BencodeItemView::List(items)) => items
                 .into_iter()
@@ -178,6 +189,7 @@ impl ResumeData {
             verified: verified.into_boxed_bitslice(),
             paused,
             skip,
+            uploaded,
         })
     }
 
@@ -218,6 +230,7 @@ pub async fn keep_saving(
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
     selected: watch::Receiver<Vec<bool>>,
+    uploaded_before: u64,
     dir: PathBuf,
     shutdown: CancellationToken,
 ) {
@@ -225,8 +238,10 @@ pub async fn keep_saving(
 
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
     let save = |stats: &watch::Receiver<TorrentSwarmStats>| {
-        let mut data = ResumeData::from_torrent(&torrent, &root, &stats.borrow().verified);
+        let stats = stats.borrow();
+        let mut data = ResumeData::from_torrent(&torrent, &root, &stats.verified);
         data.skip = skipped(&selected.borrow());
+        data.uploaded = uploaded_before + stats.uploaded;
         let written = std::fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
             .and_then(|()| data.write(&path));
@@ -425,11 +440,13 @@ mod test {
 
         let skipping = ResumeData {
             skip: vec![0, 2],
+            uploaded: 123_456,
             ..paused
         };
         let decoded = ResumeData::decode(&skipping.encode()).unwrap();
         assert_eq!(decoded.skip, vec![0, 2]);
         assert_eq!(decoded.selected(4), vec![false, true, false, true]);
+        assert_eq!(decoded.uploaded, 123_456);
     }
 
     #[test]
@@ -610,6 +627,7 @@ mod test {
             dir.clone(),
             rx,
             selected_rx,
+            0,
             dir.join("nested"),
             shutdown.clone(),
         ));

@@ -237,6 +237,7 @@ struct SettingsDto {
     max_peers_per_torrent: usize,
     download_limit: u64,
     upload_limit: u64,
+    seed_ratio_limit: f64,
 }
 
 impl From<Settings> for SettingsDto {
@@ -248,6 +249,7 @@ impl From<Settings> for SettingsDto {
             max_peers_per_torrent: s.max_peers_per_torrent,
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
+            seed_ratio_limit: s.seed_ratio_limit,
         }
     }
 }
@@ -261,6 +263,7 @@ impl From<SettingsDto> for Settings {
             max_peers_per_torrent: s.max_peers_per_torrent,
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
+            seed_ratio_limit: s.seed_ratio_limit,
         }
     }
 }

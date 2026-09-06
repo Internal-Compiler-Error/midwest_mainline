@@ -45,6 +45,7 @@
         ['Location', torrent.root],
         ['Downloaded', `${humanBytes(torrent.downloaded)}  (${humanBytes(torrent.download_bps)}/s)`],
         ['Uploaded', `${humanBytes(torrent.uploaded)}  (${humanBytes(torrent.upload_bps)}/s)`],
+        ['Ratio', (torrent.total_size ? torrent.uploaded / torrent.total_size : 0).toFixed(2)],
         ['Wasted', humanBytes(torrent.wasted)],
         ['Remaining', humanBytes(torrent.left)],
         ['Total size', humanBytes(torrent.total_size)],

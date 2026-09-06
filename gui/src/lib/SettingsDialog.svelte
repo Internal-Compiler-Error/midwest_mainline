@@ -60,7 +60,7 @@
   <Dialog.Content class="sm:max-w-md">
     <Dialog.Header>
       <Dialog.Title>Settings</Dialog.Title>
-      <Dialog.Description>Limits of 0 mean no limit.</Dialog.Description>
+      <Dialog.Description>Limits and the ratio at 0 mean no limit.</Dialog.Description>
     </Dialog.Header>
     {#if draft}
       <div class="grid grid-cols-[max-content_1fr] items-center gap-x-4 gap-y-3">
@@ -84,6 +84,9 @@
 
         <Label for="up-limit">Upload limit (KiB/s)</Label>
         <Input id="up-limit" type="number" min="0" bind:value={uploadKib} class="h-8 w-28" />
+
+        <Label for="ratio">Stop seeding at ratio</Label>
+        <Input id="ratio" type="number" min="0" step="0.1" bind:value={draft.seed_ratio_limit} class="h-8 w-28" />
       </div>
       {#if error}<p class="text-destructive">{error}</p>{/if}
       {#if notice}<p class="text-muted-foreground">{notice}</p>{/if}
