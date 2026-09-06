@@ -19,12 +19,14 @@ use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
+use crate::utp::UtpWatch;
 use crate::wire::{BtCodec, BtMessage, Extended};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
 use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
+use librqbit_utp::UtpSocketUdp;
 use midwest_mainline::types::InfoHash;
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeSet, VecDeque};
@@ -70,6 +72,7 @@ pub async fn fetch(
     identity: Arc<Identity>,
     shutdown: CancellationToken,
     dht: DhtWatch,
+    utp: UtpWatch,
 ) -> anyhow::Result<Fetched> {
     // a watch whose sender is gone is a client with no DHT, now or ever (`Dht::none`, or a
     // node that failed to start); with no trackers either there's nowhere to find a peer
@@ -136,8 +139,9 @@ pub async fn fetch(
             let info_hash = magnet.info_hash;
             let identity = identity.clone();
             let result_tx = result_tx.clone();
+            let utp = utp.borrow().clone();
             tokio::spawn(async move {
-                let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity))
+                let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity, utp))
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
                 let _ = result_tx.send(result).await;
@@ -195,8 +199,13 @@ pub struct Fetched {
 }
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
-async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, identity: Arc<Identity>) -> anyhow::Result<Vec<u8>> {
-    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity)
+async fn fetch_from_peer(
+    addr: SocketAddr,
+    info_hash: InfoHash,
+    identity: Arc<Identity>,
+    utp: Option<Arc<UtpSocketUdp>>,
+) -> anyhow::Result<Vec<u8>> {
+    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity, utp.as_ref())
         .await
         .with_context(|| format!("connect to {addr}"))?;
     ensure!(
@@ -569,7 +578,7 @@ mod test {
             }
         });
 
-        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity()))
+        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity()), None)
             .await
             .unwrap();
         assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
@@ -627,7 +636,7 @@ mod test {
             }
         });
 
-        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity()))
+        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity()), None)
             .await
             .unwrap_err();
         assert!(
@@ -770,7 +779,13 @@ mod test {
 
         let torrent = tokio::time::timeout(
             Duration::from_secs(20),
-            fetch(&magnet, identity, CancellationToken::new(), crate::dht::Dht::none()),
+            fetch(
+                &magnet,
+                identity,
+                CancellationToken::new(),
+                crate::dht::Dht::none(),
+                crate::utp::none(),
+            ),
         )
         .await
         .expect("magnet resolution timed out")
@@ -822,7 +837,13 @@ mod test {
 
         let torrent = tokio::time::timeout(
             Duration::from_secs(25),
-            fetch(&magnet, identity, CancellationToken::new(), crate::dht::Dht::none()),
+            fetch(
+                &magnet,
+                identity,
+                CancellationToken::new(),
+                crate::dht::Dht::none(),
+                crate::utp::none(),
+            ),
         )
         .await
         .expect("should reach the live peer well before the timeout")

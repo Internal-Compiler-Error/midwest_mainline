@@ -23,8 +23,8 @@ pub const FILE_NAME: &str = "settings.json";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// TCP port for inbound peers, and the DHT node's UDP port. Takes effect at the next
-    /// start.
+    /// port for inbound peers, TCP and uTP alike; the DHT node takes the next one up (see
+    /// `dht_port`). Takes effect at the next start.
     pub listen_port: u16,
     /// where a new torrent goes unless the user picks somewhere else
     pub download_dir: PathBuf,
@@ -41,6 +41,8 @@ pub struct Settings {
     pub seed_ratio_limit: f64,
     /// MSE protocol encryption policy. Next start.
     pub encryption: Encryption,
+    /// accept and dial peers over uTP as well as TCP. Next start.
+    pub utp: bool,
 }
 
 impl Default for Settings {
@@ -54,11 +56,23 @@ impl Default for Settings {
             upload_limit: 0,
             seed_ratio_limit: 0.0,
             encryption: Encryption::Prefer,
+            utp: true,
         }
     }
 }
 
 impl Settings {
+    /// The DHT node's UDP port: uTP has the listen port's number, and a node's port is its own
+    /// business (BEP 5 carries it in the Port message), so the next one up keeps it stable
+    /// across restarts and one thing to forward.
+    pub fn dht_port(&self) -> u16 {
+        if self.listen_port == u16::MAX {
+            self.listen_port - 1
+        } else {
+            self.listen_port + 1
+        }
+    }
+
     /// The settings in `data_dir`, or the defaults if there's no file yet. A file that
     /// doesn't parse is reported and treated as absent rather than blocking startup.
     pub fn load(data_dir: &Path) -> Self {

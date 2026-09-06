@@ -33,6 +33,8 @@ pub(crate) struct Peer {
     pub remote_supports_fast: bool,
     /// the connection is MSE-obfuscated; shown to the user, decides nothing
     pub encrypted: bool,
+    /// same for running over uTP
+    pub utp: bool,
     /// the message id the remote wants us to use for ut_metadata messages, learned from
     /// their extended handshake; `None` until then (or if they don't support it)
     pub their_ut_metadata_id: Option<u8>,
@@ -86,6 +88,7 @@ pub struct PeerSnapshot {
     /// blocks requested from the peer and not yet delivered
     pub outstanding: usize,
     pub encrypted: bool,
+    pub utp: bool,
 }
 
 /// A human-readable client name from a peer id. Azureus-style ids (`-XX1234-...`) name the
@@ -181,6 +184,7 @@ impl Peer {
             remote_addr,
             remote_supports_fast,
             encrypted: stream.is_encrypted(),
+            utp: stream.is_utp(),
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
             socket: Framed::new(stream, BtCodec),
@@ -233,6 +237,7 @@ impl Peer {
             interested_them: self.interested_them,
             outstanding: self.requested.len(),
             encrypted: self.encrypted,
+            utp: self.utp,
         }
     }
 

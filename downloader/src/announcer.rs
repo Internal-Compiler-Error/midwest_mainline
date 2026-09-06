@@ -117,9 +117,7 @@ async fn dht_announcer(
             changed = dht.changed() => if changed.is_err() { return },
         }
     };
-    // BEP 5: implied_port tells the node to use the UDP source port, which is only right
-    // when it's also our TCP port
-    let port = (handle.udp_port != tcp_port).then_some(tcp_port);
+    let port = Some(tcp_port);
 
     loop {
         let lookup = tokio::select! {

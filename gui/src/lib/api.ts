@@ -85,6 +85,8 @@ export interface Settings {
   seed_ratio_limit: number
   /** MSE protocol encryption; obfuscation against traffic shaping, not secrecy */
   encryption: 'disabled' | 'prefer' | 'require'
+  /** dial and accept peers over uTP as well as TCP */
+  utp: boolean
 }
 
 export const settings = () => invoke<Settings>('settings')

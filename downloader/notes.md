@@ -21,15 +21,16 @@ survives context resets; re-read before acting.
 - [x] Peer stream abstraction (`PeerStream`: Tcp | Encrypted | Utp), no behaviour change
 - [x] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
       settings Disabled/Prefer/Require with plaintext fallback
-- [ ] uTP via `librqbit-utp` (maintained, tokio, has a `Transport` trait), sharing UDP
-      6881 with the DHT through a demux: KRPC starts with `d`, uTP with `0x?1`; the DHT
-      crate's `RpcManager` gets a datagram trait instead of owning the `UdpSocket`
+- [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
+      next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
 
 Decisions made without the user (to report): data dir location; remove now asks (keep files
 or delete files) instead of always deleting; the endgame raced-piece cap is now 32 MiB of
 pieces rather than 5% of the piece count (2% waste on the 3068-piece Arch ISO vs 0.2% on
-Silo came from the count-based cap).
+Silo came from the count-based cap). The DHT node's UDP port is `listen_port + 1` (6882 by
+default), not 6881: uTP needs the listen port's number and the uTP crate can't share a
+socket; anyone with only 6881/UDP forwarded loses inbound DHT queries until 6882 is too.
 
 # Thoughts on actors in rust
 An actor should probably do the following
@@ -503,3 +504,35 @@ every client accepts it. Peers show `E` in their flags when encrypted.
 Tests: RC4 known answer, DH agreement, both handshake sides over an in-memory pipe (several
 served torrents, a pre-read head, a torrent we don't serve), and `stream::connect` against
 `stream::accept` over TCP for encrypted, fallback, and both `Require` refusals.
+
+# uTP, 2026-09-06
+`utp.rs` binds a `librqbit_utp::UtpSocketUdp` on UDP `listen_port` (dual-stack if the
+platform allows, else v4, else any port with a loud warning) and hands it out through a
+watch like the DHT's. `PeerStream::Utp` is the third stream flavour; `Encrypted` wraps it
+like it wraps TCP, so MSE over uTP came for free. The inbound side is `BtClient::accept_utp`,
+which feeds the same `welcome` (opening, handshake reply, hand to the swarm) as the TCP
+listener. Peers show `T` in their flags.
+
+Dial order: TCP first; uTP only when TCP can't *connect* (refused, unreachable, timed out).
+A peer TCP reaches but that rejects the handshake is reachable and just didn't want us, so
+it isn't retried over uTP. That means outbound uTP fires rarely; inbound uTP is where most
+of it happens, and on a VPN without a port forward there is none. libtorrent prefers uTP
+for peers PEX flagged uTP-capable (`added.f` bit 0x04), which this PEX neither sends nor
+reads; that's the refinement if uTP is ever wanted more often. The whole dial (both
+transports, an MSE attempt, a plaintext retry) is bounded by `HANDSHAKE_TIMEOUT`, now 30 s.
+While here, `Prefer` no longer opens two TCP connections to a dead peer: the first connect
+happens once, and only the plaintext retry dials again.
+
+The plan was to share UDP 6881 between uTP and the DHT with a first-byte demux (KRPC is
+bencode and starts with `d`; a uTP header's low nibble is the version, 1). `librqbit-utp`'s
+`Transport` trait allows a custom transport, but the constructor that takes one also wants
+a `UtpEnvironment`, and neither that trait nor its default type is exported, so the
+constructor is unreachable from outside the crate. Forking it for one `pub use` isn't
+"using an existing solution". Instead the DHT node takes `listen_port + 1`
+(`Settings::dht_port`): BEP 5 carries the node's port in the Port message precisely so it
+can differ from the peer port, and the routing table in SQLite is about other nodes, so
+ours changing port costs a warm-up and nothing else. The announcer's "implied_port when
+the UDP and TCP ports match" branch went with it, since they never match now.
+
+Tests: `utp_is_tried_when_tcp_is_refused` dials a port that has a uTP socket and no TCP
+listener, under `Disabled` and `Prefer`, and checks both ends see uTP (and encryption).

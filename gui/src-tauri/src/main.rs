@@ -246,6 +246,7 @@ struct SettingsDto {
     upload_limit: u64,
     seed_ratio_limit: f64,
     encryption: Encryption,
+    utp: bool,
 }
 
 impl From<Settings> for SettingsDto {
@@ -259,6 +260,7 @@ impl From<Settings> for SettingsDto {
             upload_limit: s.upload_limit,
             seed_ratio_limit: s.seed_ratio_limit,
             encryption: s.encryption,
+            utp: s.utp,
         }
     }
 }
@@ -274,6 +276,7 @@ impl From<SettingsDto> for Settings {
             upload_limit: s.upload_limit,
             seed_ratio_limit: s.seed_ratio_limit,
             encryption: s.encryption,
+            utp: s.utp,
         }
     }
 }
@@ -291,7 +294,8 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
     let settings: Settings = settings.into();
     let restart = settings.listen_port != before.listen_port
         || settings.dht != before.dht
-        || settings.encryption != before.encryption;
+        || settings.encryption != before.encryption
+        || settings.utp != before.utp;
     session.update_settings(settings).map_err(|e| format!("{e:#}"))?;
     Ok(restart)
 }

@@ -16,6 +16,7 @@ use crate::settings::{
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
+use crate::utp::UtpWatch;
 use crate::wire::{BitField, BtMessage, Piece, Request};
 use anyhow::Context;
 use bitvec::prelude::*;
@@ -142,6 +143,17 @@ impl TorrentSwarmHandle {
     pub(crate) async fn select_files(&self, selected: Vec<bool>) {
         let _ = self.tx.send(SwarmEvent::FilesSelected(selected)).await;
     }
+}
+
+/// What every swarm of one client has in common: who we are and the client-wide services.
+#[derive(Clone)]
+pub(crate) struct Shared {
+    pub id: Arc<Identity>,
+    pub dht: DhtWatch,
+    pub utp: UtpWatch,
+    /// live settings; the connection cap and the rate limits are read from it
+    pub settings: SettingsWatch,
+    pub limiter: Arc<RateLimiter>,
 }
 
 /// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
@@ -342,6 +354,7 @@ pub struct TorrentSwarm {
     id: Arc<Identity>,
     /// the client's DHT node, if it has one, for pinging the nodes peers tell us about
     dht: DhtWatch,
+    utp: UtpWatch,
     /// live user settings: the connection cap
     settings: SettingsWatch,
     /// the client-wide download and upload limits
@@ -387,13 +400,10 @@ impl TorrentSwarm {
     pub(crate) fn spawn(
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
-        id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
-        dht: DhtWatch,
-        settings: SettingsWatch,
-        limiter: Arc<RateLimiter>,
+        shared: Shared,
     ) -> TorrentSwarmHandle {
-        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht, settings, limiter);
+        let (swarm, handle) = Self::new(torrent, storage, verified, shared);
         tokio::spawn(swarm.work_loop());
         handle
     }
@@ -401,12 +411,16 @@ impl TorrentSwarm {
     fn new(
         torrent: Arc<Torrent>,
         storage: Arc<TorrentStorage>,
-        id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
-        dht: DhtWatch,
-        settings: SettingsWatch,
-        limiter: Arc<RateLimiter>,
+        shared: Shared,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
+        let Shared {
+            id,
+            dht,
+            utp,
+            settings,
+            limiter,
+        } = shared;
         assert_eq!(
             verified.len(),
             torrent.pieces.len(),
@@ -448,6 +462,7 @@ impl TorrentSwarm {
             storage,
             id,
             dht,
+            utp,
             settings,
             limiter,
             held_uploads: VecDeque::new(),
@@ -1240,8 +1255,9 @@ impl TorrentSwarm {
             let events = self.events_tx.clone();
             let torrent = self.torrent.clone();
             let our_id = self.id.clone();
+            let utp = self.utp.borrow().clone();
             tokio::spawn(async move {
-                let result = match dial(addr, &torrent, &our_id).await {
+                let result = match dial(addr, &torrent, &our_id, utp).await {
                     Ok(connected) => SwarmEvent::PeerConnected(connected),
                     Err(e) => {
                         tracing::debug!("couldn't connect to {addr}: {e:#}");
@@ -1341,16 +1357,22 @@ async fn next_peer_message(peers: &mut [Peer], offset: usize) -> (usize, Option<
     (order[position], msg)
 }
 
-async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow::Result<ConnectedPeer> {
+async fn dial(
+    addr: SocketAddr,
+    torrent: &Torrent,
+    our_id: &Identity,
+    utp: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+) -> anyhow::Result<ConnectedPeer> {
     let (stream, handshake) = tokio::time::timeout(
         crate::settings::HANDSHAKE_TIMEOUT,
-        crate::stream::connect(addr, &torrent.info_hash, our_id),
+        crate::stream::connect(addr, &torrent.info_hash, our_id, utp.as_ref()),
     )
     .await
     .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
     .with_context(|| format!("Failed to connect to {addr}"))?;
     info!(
-        "Peer connection to {addr} established{}",
+        "Peer connection to {addr} established{}{}",
+        if stream.is_utp() { " over uTP" } else { "" },
         if stream.is_encrypted() { " (encrypted)" } else { "" }
     );
     Ok(ConnectedPeer {
@@ -1440,15 +1462,14 @@ mod test {
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
         let (settings_tx, settings_rx) = watch::channel(settings);
         std::mem::forget(settings_tx);
-        let (swarm, handle) = TorrentSwarm::new(
-            torrent,
-            storage,
+        let shared = Shared {
             id,
-            verified,
-            crate::dht::Dht::none(),
-            settings_rx.clone(),
-            Arc::new(RateLimiter::new(settings_rx)),
-        );
+            dht: crate::dht::Dht::none(),
+            utp: crate::utp::none(),
+            settings: settings_rx.clone(),
+            limiter: Arc::new(RateLimiter::new(settings_rx)),
+        };
+        let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         (swarm, handle, path)
     }
 
@@ -1602,15 +1623,15 @@ mod test {
             dht: false,
             encryption: crate::config::Encryption::Prefer,
         });
-        let (swarm, handle) = TorrentSwarm::new(
-            torrent,
-            storage,
+        let shared = Shared {
             id,
-            bitvec![u8, Msb0; 0; 3].into_boxed_bitslice(),
-            crate::dht::Dht::none(),
-            crate::bt_client::default_settings(),
-            Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
-        );
+            dht: crate::dht::Dht::none(),
+            utp: crate::utp::none(),
+            settings: crate::bt_client::default_settings(),
+            limiter: Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
+        };
+        let verified = bitvec![u8, Msb0; 0; 3].into_boxed_bitslice();
+        let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         let stats = handle.stats();
         tokio::spawn(swarm.work_loop());
         handle.select_files(vec![true, false]).await;

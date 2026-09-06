@@ -1,4 +1,4 @@
-use downloader::{BtClient, Dht, Identity, ResumeData, data_dir, keep_saving, load_source};
+use downloader::{BtClient, Dht, Identity, ResumeData, Settings, data_dir, keep_saving, load_source};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
@@ -50,17 +50,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let public_ip = Ipv4Addr::from_str("99.226.33.190")?;
+    let settings = Settings::default();
     let identity = Identity {
         peer_id: random_idv4(&public_ip, 3),
-        serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
+        serving: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, settings.listen_port).into(),
         dht: true,
-        encryption: downloader::Encryption::default(),
+        encryption: settings.encryption,
     };
 
     // resume files and the DHT database live in the data dir (see `paths::data_dir`)
     let data_dir = data_dir();
     std::fs::create_dir_all(data_dir.join("resume"))?;
-    let dht = Dht::start(data_dir.join("dht.db"), 6881);
+    let dht = Dht::start(data_dir.join("dht.db"), settings.dht_port());
     let client = BtClient::new(identity, dht.watch());
     let (torrent, root) = if Path::new(&source)
         .extension()
@@ -88,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let resolving = CancellationToken::new();
         let loaded = tokio::select! {
-            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht()) => resolved?,
+            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht(), client.utp()) => resolved?,
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("interrupted while resolving, stopping tracker announces...");
                 resolving.cancel();

@@ -7,7 +7,8 @@ use crate::peer::PeerSnapshot;
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
-use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
+use crate::torrent_swarm::{ConnectedPeer, Shared, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
+use crate::utp::{self, UtpWatch};
 use anyhow::{Context, bail};
 use bitvec::prelude::*;
 use futures::future::select_all;
@@ -41,6 +42,7 @@ pub struct BtClient {
     dht: DhtWatch,
     /// live settings, read by every swarm
     settings: SettingsWatch,
+    utp: UtpWatch,
     /// the download and upload limits, shared by every swarm
     limiter: Arc<RateLimiter>,
     /// local service discovery, poked when a torrent is added
@@ -51,6 +53,10 @@ impl BtClient {
     /// The DHT node this client discovers peers with; stays `None` if there is none.
     pub fn dht(&self) -> DhtWatch {
         self.dht.clone()
+    }
+
+    pub fn utp(&self) -> UtpWatch {
+        self.utp.clone()
     }
 
     /// Must be called on a tokio runtime: the inbound listener starts right away.
@@ -68,6 +74,11 @@ impl BtClient {
         settings: SettingsWatch,
     ) -> Self {
         let swarms = Arc::new(Mutex::new(HashMap::new()));
+        let utp = if settings.borrow().utp {
+            utp::start(id.serving.port(), shutdown.clone())
+        } else {
+            utp::none()
+        };
         let client = Self {
             lsd: Arc::new(Lsd::spawn(Arc::downgrade(&swarms), id.serving.port(), shutdown.clone())),
             id: Arc::new(id),
@@ -76,11 +87,18 @@ impl BtClient {
             dht,
             limiter: Arc::new(RateLimiter::new(settings.clone())),
             settings,
+            utp,
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),
             Arc::downgrade(&client.swarms),
             client.shutdown.clone(),
+        ));
+        tokio::spawn(Self::accept_utp(
+            client.id.clone(),
+            Arc::downgrade(&client.swarms),
+            client.shutdown.clone(),
+            client.utp.clone(),
         ));
         client
     }
@@ -200,15 +218,14 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let handle = TorrentSwarm::spawn(
-            torrent.clone(),
-            storage,
-            self.id.clone(),
-            verified,
-            self.dht.clone(),
-            self.settings.clone(),
-            self.limiter.clone(),
-        );
+        let shared = Shared {
+            id: self.id.clone(),
+            dht: self.dht.clone(),
+            utp: self.utp.clone(),
+            settings: self.settings.clone(),
+            limiter: self.limiter.clone(),
+        };
+        let handle = TorrentSwarm::spawn(torrent.clone(), storage, verified, shared);
         swarms.insert(torrent.info_hash, handle);
         self.lsd.announce();
         Ok(())
@@ -275,58 +292,105 @@ impl BtClient {
                 _ = shutdown.cancelled() => break,
             };
 
-            let id = id.clone();
-            let swarms = swarms.clone();
-            tokio::spawn(async move {
-                let served = || {
-                    swarms
-                        .upgrade()
-                        .map(|swarms| swarms.lock().unwrap().keys().copied().collect::<Vec<_>>())
-                        .unwrap_or_default()
-                };
-                let opening = tokio::time::timeout(
-                    crate::settings::HANDSHAKE_TIMEOUT,
-                    crate::stream::accept(PeerStream::Tcp(tcp), id.encryption, served),
-                );
-                let (mut stream, handshake) = match opening.await {
-                    Ok(Ok(opened)) => opened,
-                    Ok(Err(e)) => {
-                        tracing::debug!("bad handshake from {remote_addr}: {e:#}");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::debug!("{remote_addr} took too long to handshake");
-                        return;
-                    }
-                };
-
-                // cloned out so the lock isn't held across the awaits below
-                let handle = swarms
-                    .upgrade()
-                    .and_then(|swarms| swarms.lock().unwrap().get(&handshake.info_hash).cloned());
-                let Some(handle) = handle else {
-                    tracing::debug!("inbound connection from {remote_addr} named a torrent we're not serving");
-                    return;
-                };
-
-                if let Err(e) = crate::wire::send_handshake(&mut stream, &handshake.info_hash, &id).await {
-                    tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
-                    return;
-                }
-
-                handle
-                    .peer_connected(ConnectedPeer {
-                        stream,
-                        remote_addr,
-                        remote_supports_extensions: handshake.supports_extensions(),
-                        remote_supports_fast: handshake.supports_fast_extension(),
-                        remote_supports_dht: handshake.supports_dht(),
-                        peer_id: handshake.peer_id,
-                    })
-                    .await;
-            });
+            tokio::spawn(welcome(PeerStream::Tcp(tcp), remote_addr, id.clone(), swarms.clone()));
         }
     }
+
+    /// Like `accept_incoming`, for uTP: waits for the socket, then accepts on it until shutdown.
+    async fn accept_utp(
+        id: Arc<Identity>,
+        swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
+        shutdown: CancellationToken,
+        mut utp: UtpWatch,
+    ) {
+        let socket = loop {
+            if let Some(socket) = utp.borrow().clone() {
+                break socket;
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                changed = utp.changed() => if changed.is_err() { return },
+            }
+        };
+        loop {
+            if swarms.strong_count() == 0 {
+                break;
+            }
+            let stream = tokio::select! {
+                accepted = socket.accept() => match accepted {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::warn!("failed to accept an inbound uTP connection: {e}");
+                        continue;
+                    }
+                },
+                _ = shutdown.cancelled() => break,
+            };
+            let remote_addr = stream.remote_addr();
+            tokio::spawn(welcome(
+                PeerStream::Utp(stream),
+                remote_addr,
+                id.clone(),
+                swarms.clone(),
+            ));
+        }
+    }
+}
+
+/// Takes an inbound connection through its opening (see `stream::accept`), replies to the
+/// handshake if it names a torrent we serve, and hands the peer to that torrent's swarm.
+async fn welcome(
+    stream: PeerStream,
+    remote_addr: SocketAddr,
+    id: Arc<Identity>,
+    swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
+) {
+    let served = || {
+        swarms
+            .upgrade()
+            .map(|swarms| swarms.lock().unwrap().keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let opening = tokio::time::timeout(
+        crate::settings::HANDSHAKE_TIMEOUT,
+        crate::stream::accept(stream, id.encryption, served),
+    );
+    let (mut stream, handshake) = match opening.await {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => {
+            tracing::debug!("bad handshake from {remote_addr}: {e:#}");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("{remote_addr} took too long to handshake");
+            return;
+        }
+    };
+
+    // cloned out so the lock isn't held across the awaits below
+    let handle = swarms
+        .upgrade()
+        .and_then(|swarms| swarms.lock().unwrap().get(&handshake.info_hash).cloned());
+    let Some(handle) = handle else {
+        tracing::debug!("inbound connection from {remote_addr} named a torrent we're not serving");
+        return;
+    };
+
+    if let Err(e) = crate::wire::send_handshake(&mut stream, &handshake.info_hash, &id).await {
+        tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
+        return;
+    }
+
+    handle
+        .peer_connected(ConnectedPeer {
+            stream,
+            remote_addr,
+            remote_supports_extensions: handshake.supports_extensions(),
+            remote_supports_fast: handshake.supports_fast_extension(),
+            remote_supports_dht: handshake.supports_dht(),
+            peer_id: handshake.peer_id,
+        })
+        .await;
 }
 
 /// A settings watch that stays at the defaults, for a client with nobody to change them.

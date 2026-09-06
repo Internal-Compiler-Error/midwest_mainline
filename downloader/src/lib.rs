@@ -6,9 +6,9 @@ pub mod dht;
 mod limiter;
 pub mod logs;
 mod lsd;
-mod mse;
 pub mod magnet;
 pub mod metadata;
+mod mse;
 pub mod paths;
 mod peer;
 pub mod resume;
@@ -18,6 +18,7 @@ mod storage;
 mod stream;
 mod torrent;
 pub mod torrent_swarm;
+pub mod utp;
 mod wire;
 
 pub use bt_client::BtClient;
@@ -31,6 +32,7 @@ pub use resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
 pub use session::{FileInfo, PeerInfo, Progress, Session, SessionConfig, TorrentId, TorrentState, human_bytes};
 pub use torrent::{Torrent, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
+pub use utp::UtpWatch;
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -46,10 +48,11 @@ pub async fn load_source(
     identity: Arc<Identity>,
     shutdown: CancellationToken,
     dht: DhtWatch,
+    utp: UtpWatch,
 ) -> anyhow::Result<Loaded> {
     if is_magnet_uri(source) {
         let magnet = parse_magnet(source)?;
-        let fetched = metadata::fetch(&magnet, identity, shutdown, dht).await?;
+        let fetched = metadata::fetch(&magnet, identity, shutdown, dht, utp).await?;
         Ok(Loaded {
             torrent: fetched.torrent,
             peers: fetched.peers,

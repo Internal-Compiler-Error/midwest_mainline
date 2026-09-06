@@ -534,7 +534,7 @@ impl Session {
             let dht = config
                 .settings
                 .dht
-                .then(|| Dht::start(config.data_dir.join("dht.db"), port));
+                .then(|| Dht::start(config.data_dir.join("dht.db"), config.settings.dht_port()));
             let watch = dht.as_ref().map_or_else(Dht::none, Dht::watch);
             (
                 BtClient::new_with_shutdown(identity, shutdown.clone(), watch, settings_rx),
@@ -583,9 +583,10 @@ impl Session {
         let root = root.into();
         let identity = self.identity.clone();
         let dht = self.client.dht();
+        let utp = self.client.utp();
         let info_hash = crate::magnet::parse_magnet(&source).ok().map(|m| m.info_hash);
         self.launch(source.clone(), info_hash, |cancel| async move {
-            let loaded = load_source(&source, identity, cancel, dht).await?;
+            let loaded = load_source(&source, identity, cancel, dht, utp).await?;
             let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
             Ok(Resolved {
                 selected: vec![true; loaded.torrent.files.len()],
@@ -805,6 +806,9 @@ impl Entry {
                 }
                 if p.encrypted {
                     flags.push('E');
+                }
+                if p.utp {
+                    flags.push('T');
                 }
                 PeerInfo {
                     addr: p.addr.to_string(),

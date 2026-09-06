@@ -201,6 +201,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Encrypted<S> {
         }
     }
 
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.written < self.pending.len() {
             let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.written..]))?;
