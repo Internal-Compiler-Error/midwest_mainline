@@ -19,7 +19,7 @@ use diesel::{insert_into, prelude::*};
 use futures::future::join_all;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::dht::xor;
 use crate::message::Krpc;
@@ -216,7 +216,7 @@ impl RoutingTable {
         // TODO: contains will request another connection from the pool..., should be fine
         // for now
         if self.contains(&new_node_id) {
-            info!("Already contains this node in routing table, skipping");
+            debug!("Already contains this node in routing table, skipping");
             return;
         }
 
