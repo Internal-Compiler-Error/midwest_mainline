@@ -11,10 +11,6 @@ path = "src/lib.rs"
 name = "downloader"
 path = "src/main.rs"
 
-[[bin]]
-name = "downloader-gui"
-path = "src/bin/gui.rs"
-
 [dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
 midwest_mainline = { path = "../dht"}
@@ -36,5 +32,3 @@ zerocopy = { version = "0.8.31", features = ["derive"] }
 # log = "0.4.29"
 # pretty_env_logger = "0.5.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-eframe = "0.29"
-rfd = "0.15"
