@@ -9,7 +9,7 @@ use crate::peer::{
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
-    ENDGAME_MAX_RACED_FRACTION, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
+    ENDGAME_MAX_RACED_BYTES, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
     MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL,
     PEX_MAX_ADDED_PEERS,
 };
@@ -1000,8 +1000,12 @@ impl TorrentSwarm {
     }
 
     fn race_the_last_pieces(&mut self) {
-        let max_raced = ((self.torrent.pieces.len() as f64 * ENDGAME_MAX_RACED_FRACTION).ceil() as usize).max(1);
-        let mut raced = self.in_flight.values().filter(|f| f.claims.len() > 1).count();
+        let mut raced_bytes: usize = self
+            .in_flight
+            .values()
+            .filter(|f| f.claims.len() > 1)
+            .map(|f| f.buf.len())
+            .sum();
         // furthest from done first: bytes still missing over the rate of everyone on it
         let mut by_eta: Vec<(f64, u32)> = self
             .in_flight
@@ -1019,7 +1023,7 @@ impl TorrentSwarm {
         by_eta.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (_, piece) in by_eta {
             let already_raced = self.in_flight[&piece].claims.len() > 1;
-            if !already_raced && raced >= max_raced {
+            if !already_raced && raced_bytes > 0 && raced_bytes >= ENDGAME_MAX_RACED_BYTES {
                 continue;
             }
             while self.in_flight[&piece].claims.len() < ENDGAME_RACERS {
@@ -1031,7 +1035,7 @@ impl TorrentSwarm {
                 info!("endgame: also requesting piece {piece} from {addr}");
             }
             if !already_raced && self.in_flight[&piece].claims.len() > 1 {
-                raced += 1;
+                raced_bytes += self.in_flight[&piece].buf.len();
             }
         }
     }
@@ -1923,10 +1927,11 @@ mod test {
             }
         };
         let _ = tokio::time::timeout(Duration::from_millis(300), drain).await;
-        assert_eq!(
-            cancelled.len(),
-            2,
-            "the slow peer was told to stop on both raced pieces"
+        // both of the slow peer's pieces were taken from it; the fast peer's own piece may
+        // have been raced with the slow peer too, so there can be a third
+        assert!(
+            cancelled.len() >= 2,
+            "the slow peer was told to stop on both raced pieces: {cancelled:?}"
         );
         assert_eq!(stats.borrow().wasted, 0, "the slow peer never sent anything to waste");
         assert_eq!(std::fs::read(&path).unwrap(), content());

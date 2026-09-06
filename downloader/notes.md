@@ -23,8 +23,9 @@ survives context resets; re-read before acting.
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
 
 Decisions made without the user (to report): data dir location; remove now asks (keep files
-or delete files) instead of always deleting; the endgame raced-piece cap should be bytes, not
-a piece fraction (2% waste on the 3068-piece Arch ISO vs 0.2% on Silo).
+or delete files) instead of always deleting; the endgame raced-piece cap is now 32 MiB of
+pieces rather than 5% of the piece count (2% waste on the 3068-piece Arch ISO vs 0.2% on
+Silo came from the count-based cap).
 
 # Thoughts on actors in rust
 An actor should probably do the following

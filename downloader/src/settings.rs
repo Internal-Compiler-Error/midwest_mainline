@@ -38,9 +38,12 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// same piece at once.
 pub const ENDGAME_RACERS: usize = 2;
 
-/// Endgame: at most this fraction of the torrent's pieces (rounded up, so at least one)
-/// may be raced at any time, bounding the bytes downloaded twice.
-pub const ENDGAME_MAX_RACED_FRACTION: f64 = 0.05;
+/// Endgame: at most this many bytes of pieces may be raced at any time, which bounds the
+/// bytes downloaded twice. A cap in pieces let a torrent with small pieces race far more of
+/// itself than one with large pieces (2% waste on a 512 KiB-piece ISO against 0.2% on a
+/// 4 MiB-piece video); the piece the user is waiting on always gets a racer even if it's
+/// bigger than this.
+pub const ENDGAME_MAX_RACED_BYTES: usize = 32 * 1024 * 1024;
 
 /// How long to leave an address alone after a failed dial. Doubles with each consecutive
 /// failure up to DIAL_BACKOFF_MAX; trackers and PEX keep handing out the same dead
