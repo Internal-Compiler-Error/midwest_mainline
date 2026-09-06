@@ -4,6 +4,7 @@
   import { Switch } from '$lib/components/ui/switch'
   import { Label } from '$lib/components/ui/label'
   import * as Table from '$lib/components/ui/table'
+  import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
   import { fraction, humanBytes, isMagnetUri } from './api'
   import ProgressBar from './ProgressBar.svelte'
@@ -88,8 +89,12 @@
     </div>
 
     {#if torrent.kind === 'downloading'}
-      <div class="font-medium">Trackers ({torrent.trackers.length})</div>
-      <div class="max-h-32 overflow-auto rounded-md border">
+      <Tabs.Root value="peers">
+        <Tabs.List>
+          <Tabs.Trigger value="peers">Peers ({torrent.peers.length})</Tabs.Trigger>
+          <Tabs.Trigger value="trackers">Trackers ({torrent.trackers.length})</Tabs.Trigger>
+        </Tabs.List>
+        <Tabs.Content value="trackers" class="max-h-64 overflow-auto rounded-md border">
         <Table.Root>
           <Table.Body>
             {#each torrent.trackers as tracker (tracker.url)}
@@ -107,10 +112,8 @@
             {/each}
           </Table.Body>
         </Table.Root>
-      </div>
-
-      <div class="font-medium">Peers ({torrent.peers.length})</div>
-      <div class="max-h-64 overflow-auto rounded-md border">
+        </Tabs.Content>
+        <Tabs.Content value="peers" class="max-h-64 overflow-auto rounded-md border">
         <Table.Root class="text-xs">
           <Table.Header>
             <Table.Row>
@@ -141,7 +144,8 @@
             {/each}
           </Table.Body>
         </Table.Root>
-      </div>
+        </Tabs.Content>
+      </Tabs.Root>
     {/if}
   {/if}
 </div>
