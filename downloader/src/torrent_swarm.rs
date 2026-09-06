@@ -143,6 +143,11 @@ impl TorrentSwarmHandle {
     pub(crate) async fn select_files(&self, selected: Vec<bool>) {
         let _ = self.tx.send(SwarmEvent::FilesSelected(selected)).await;
     }
+
+    /// Fetch pieces in order (for playing a file while it downloads) rather than rarest first.
+    pub(crate) async fn set_sequential(&self, on: bool) {
+        let _ = self.tx.send(SwarmEvent::Sequential(on)).await;
+    }
 }
 
 /// What every swarm of one client has in common: who we are and the client-wide services.
@@ -174,6 +179,8 @@ pub(crate) enum SwarmEvent {
     PeersDiscovered(Vec<SocketAddr>),
     /// one flag per file, see `TorrentSwarmHandle::select_files`
     FilesSelected(Vec<bool>),
+    /// see `TorrentSwarmHandle::set_sequential`
+    Sequential(bool),
     /// a socket finished its handshake and is ours to own
     PeerConnected(ConnectedPeer),
     /// a block a peer asked for has been read off disk (or couldn't be), see `serve_request`
@@ -381,6 +388,8 @@ pub struct TorrentSwarm {
 
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
+    /// pick the lowest missing piece instead of the rarest
+    sequential: bool,
     in_flight: BTreeMap<u32, InFlight>,
     /// block requests sent to any peer this session, UCB's `t`
     total_picks: usize,
@@ -469,6 +478,7 @@ impl TorrentSwarm {
             events_rx,
             events_tx,
             missing,
+            sequential: false,
             in_flight: BTreeMap::new(),
             total_picks: 0,
             stat,
@@ -546,6 +556,7 @@ impl TorrentSwarm {
         match event {
             SwarmEvent::PeersDiscovered(peers) => self.connect_to_discovered_peers(peers),
             SwarmEvent::FilesSelected(selected) => self.select_files(&selected).await,
+            SwarmEvent::Sequential(on) => self.sequential = on,
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::DialFailed(addr) => {
@@ -990,7 +1001,7 @@ impl TorrentSwarm {
             if in_flight >= MAX_INFLIGHT_BYTES {
                 break;
             }
-            let Some(piece) = self.rarest_piece() else {
+            let Some(piece) = self.next_piece() else {
                 break;
             };
             let Some(idx) = self.best_peer(piece) else {
@@ -1088,11 +1099,15 @@ impl TorrentSwarm {
         }
     }
 
-    /// Rarest-first piece selection: among the missing pieces, the one held by the fewest
-    /// connected peers (ties broken randomly, so many peers starting at once don't all pile
-    /// onto the same single rarest piece). `None` if no connected peer has any of them.
-    fn rarest_piece(&self) -> Option<u32> {
+    /// The next piece to fetch. Rarest first: among the missing pieces, the one held by the
+    /// fewest connected peers (ties broken randomly, so many peers starting at once don't all
+    /// pile onto the same single rarest piece). Sequential: the lowest one anyone has. `None`
+    /// if no connected peer has any of them.
+    fn next_piece(&self) -> Option<u32> {
         let availability = |piece: u32| self.peers.iter().filter(|p| p.they_have(piece)).count();
+        if self.sequential {
+            return self.missing.iter().copied().filter(|&p| availability(p) > 0).min();
+        }
 
         let mut by_availability: Vec<(u32, usize)> = self
             .missing
@@ -1840,6 +1855,27 @@ mod test {
                 .is_err(),
             "a peer that delivered nothing is left alone"
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Sequential mode asks for piece 0's blocks first, then piece 1's; rarest first would
+    /// start anywhere.
+    #[tokio::test]
+    async fn sequential_asks_for_pieces_in_order() {
+        let (swarm, handle, path) = swarm("sequential");
+        tokio::spawn(swarm.work_loop());
+        handle.set_sequential(true).await;
+
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+        let mut pieces = vec![];
+        while pieces.len() < 4 {
+            let Some(Ok(BtMessage::Request(req))) = seeder.next().await else {
+                panic!("expected a request");
+            };
+            pieces.push(req.index);
+        }
+        assert_eq!(pieces, [0, 0, 0, 1]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

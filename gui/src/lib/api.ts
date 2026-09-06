@@ -19,6 +19,8 @@ export interface Progress {
   download_bps: number
   upload_bps: number
   peers: Peer[]
+  /** pieces are fetched in order, for playing a file while it downloads */
+  sequential: boolean
 }
 
 export interface TorrentFile {
@@ -70,6 +72,7 @@ export const pauseTorrent = (id: TorrentId) => invoke<void>('pause_torrent', { i
 export const selectFiles = (id: TorrentId, selected: boolean[]) => invoke<void>('select_files', { id, selected })
 export const unpauseTorrent = (id: TorrentId) => invoke<void>('unpause_torrent', { id })
 export const recheckTorrent = (id: TorrentId) => invoke<void>('recheck_torrent', { id })
+export const setSequential = (id: TorrentId, on: boolean) => invoke<void>('set_sequential', { id, on })
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })
 export const clearLogs = () => invoke<void>('clear_logs')

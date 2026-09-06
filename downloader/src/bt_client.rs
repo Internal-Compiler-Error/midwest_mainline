@@ -144,6 +144,15 @@ impl BtClient {
         }
     }
 
+    /// Fetches a torrent's pieces in order rather than rarest first. Unknown torrents are
+    /// ignored.
+    pub fn set_sequential(&self, info_hash: &InfoHash, on: bool) {
+        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
+        if let Some(handle) = handle {
+            tokio::spawn(async move { handle.set_sequential(on).await });
+        }
+    }
+
     /// Tells a torrent's swarm about peers found some other way than its own announces, such
     /// as the ones a magnet's metadata fetch met. Unknown torrents are ignored.
     pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {

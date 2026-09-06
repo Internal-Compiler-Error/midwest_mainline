@@ -2,12 +2,18 @@
   import LoaderCircle from '@lucide/svelte/icons/loader-circle'
   import { Checkbox } from '$lib/components/ui/checkbox'
   import { ScrollArea } from '$lib/components/ui/scroll-area'
+  import { Switch } from '$lib/components/ui/switch'
+  import { Label } from '$lib/components/ui/label'
   import * as Table from '$lib/components/ui/table'
   import type { TorrentRow } from './api'
   import { fraction, humanBytes, isMagnetUri } from './api'
   import ProgressBar from './ProgressBar.svelte'
 
-  let { torrent, onselectfiles }: { torrent: TorrentRow; onselectfiles: (selected: boolean[]) => void } = $props()
+  let {
+    torrent,
+    onselectfiles,
+    onsequential,
+  }: { torrent: TorrentRow; onselectfiles: (selected: boolean[]) => void; onsequential: (on: boolean) => void } = $props()
 
   function toggleFile(index: number, checked: boolean) {
     if (torrent.kind !== 'downloading' && torrent.kind !== 'paused') return
@@ -58,6 +64,12 @@
         <dd class="tabular-nums">{value}</dd>
       {/each}
     </dl>
+
+    <div class="flex items-center gap-2">
+      <Switch id="sequential" checked={torrent.sequential} onCheckedChange={(on) => onsequential(on)} />
+      <Label for="sequential">Sequential download</Label>
+      <span class="text-muted-foreground">(pieces in order, for playing while it downloads)</span>
+    </div>
 
     <div class="font-medium">Files ({torrent.files.length})</div>
     <ScrollArea class="max-h-40 rounded-md border">

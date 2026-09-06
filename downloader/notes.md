@@ -23,6 +23,7 @@ survives context resets; re-read before acting.
       settings Disabled/Prefer/Require with plaintext fallback
 - [x] Port mapping: NAT-PMP/PCP via `crab_nat`, UPnP via `igd-next`
 - [x] Force recheck
+- [x] Sequential download
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -565,3 +566,11 @@ that's missing or short fails every piece touching it. The GUI has it in the row
 
 Tests: `check::good_bad_and_missing_pieces_are_told_apart` (a piece straddling two files, a
 corrupted piece, a missing file) and `session::recheck_finds_what_is_on_disk`.
+
+# Sequential download, 2026-09-06
+A per-torrent switch (`Session::set_sequential`, `sequential` in the resume file, a Switch in
+the details panel) that makes `TorrentSwarm::next_piece` return the lowest missing piece
+anyone has instead of the rarest. Peer selection is untouched: UCB still decides who gets
+the piece. For playing a file while it downloads; costs the swarm some piece diversity,
+which is why it's off by default and per torrent. Test:
+`sequential_asks_for_pieces_in_order`.

@@ -64,6 +64,7 @@ struct ProgressDto {
     download_bps: f64,
     upload_bps: f64,
     peers: Vec<PeerDto>,
+    sequential: bool,
 }
 
 #[derive(Serialize)]
@@ -127,6 +128,7 @@ impl From<Progress> for ProgressDto {
             download_bps: p.download_bps,
             upload_bps: p.upload_bps,
             peers: p.peers.into_iter().map(PeerDto::from).collect(),
+            sequential: p.sequential,
         }
     }
 }
@@ -217,6 +219,11 @@ fn unpause_torrent(app: State<App>, id: TorrentId) {
 #[tauri::command]
 fn recheck_torrent(app: State<App>, id: TorrentId) {
     app.session.lock().unwrap().recheck(id);
+}
+
+#[tauri::command]
+fn set_sequential(app: State<App>, id: TorrentId, on: bool) {
+    app.session.lock().unwrap().set_sequential(id, on);
 }
 
 #[tauri::command]
@@ -367,6 +374,7 @@ fn main() {
             pause_torrent,
             unpause_torrent,
             recheck_torrent,
+            set_sequential,
             select_files,
             resumable,
             logs_since,

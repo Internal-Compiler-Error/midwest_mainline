@@ -43,6 +43,8 @@ pub struct ResumeData {
     pub skip: Vec<u32>,
     /// bytes uploaded over the torrent's whole life, for the seeding ratio
     pub uploaded: u64,
+    /// pieces are fetched in order rather than rarest first
+    pub sequential: bool,
 }
 
 impl ResumeData {
@@ -55,6 +57,7 @@ impl ResumeData {
             root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
+            sequential: false,
             skip: vec![],
             uploaded: 0,
         }
@@ -96,6 +99,10 @@ impl ResumeData {
         }
         out.extend_from_slice(&bstr(b"root"));
         out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
+        if self.sequential {
+            out.extend_from_slice(&bstr(b"sequential"));
+            out.extend_from_slice(b"i1e");
+        }
         if !self.skip.is_empty() {
             out.extend_from_slice(&bstr(b"skip"));
             out.push(b'l');
@@ -149,6 +156,7 @@ impl ResumeData {
         };
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
         let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
+        let sequential = matches!(dict.remove(b"sequential".as_slice()), Some(BencodeItemView::Integer(1)));
         let uploaded = match dict.remove(b"uploaded".as_slice()) {
             Some(BencodeItemView::Integer(n)) => u64::try_from(n).unwrap_or(0),
             _ => 0,
@@ -190,6 +198,7 @@ impl ResumeData {
             paused,
             skip,
             uploaded,
+            sequential,
         })
     }
 
@@ -230,6 +239,7 @@ pub async fn keep_saving(
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
     selected: watch::Receiver<Vec<bool>>,
+    sequential: watch::Receiver<bool>,
     uploaded_before: u64,
     dir: PathBuf,
     shutdown: CancellationToken,
@@ -241,6 +251,7 @@ pub async fn keep_saving(
         let stats = stats.borrow();
         let mut data = ResumeData::from_torrent(&torrent, &root, &stats.verified);
         data.skip = skipped(&selected.borrow());
+        data.sequential = *sequential.borrow();
         data.uploaded = uploaded_before + stats.uploaded;
         let written = std::fs::create_dir_all(&dir)
             .map_err(anyhow::Error::from)
@@ -622,12 +633,14 @@ mod test {
         };
         let (tx, rx) = watch::channel(stats.clone());
         let (_selected_tx, selected_rx) = watch::channel(vec![true]);
+        let (_sequential_tx, sequential_rx) = watch::channel(false);
         let shutdown = CancellationToken::new();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
             dir.clone(),
             rx,
             selected_rx,
+            sequential_rx,
             0,
             dir.join("nested"),
             shutdown.clone(),
