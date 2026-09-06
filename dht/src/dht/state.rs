@@ -4,7 +4,7 @@
 
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{SqliteConnection, prelude::*};
-use rand::Rng;
+use rand::RngExt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 

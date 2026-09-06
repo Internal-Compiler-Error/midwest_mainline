@@ -11,7 +11,7 @@ use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use anyhow::{self, Context, bail};
 use juicy_bencode::BencodeItemView;
 use midwest_mainline::types::InfoHash;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::Client;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;

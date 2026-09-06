@@ -625,3 +625,14 @@ Found while screenshotting: the run skill's GUI runs were downloading into the r
 `~/Downloads`, since only the data dir was redirected. The driver now writes a scratch
 `settings.json` with `download_dir` under the run dir, and the stray partial ISO in
 `~/Downloads` (mtime matching the run) was deleted.
+
+# Dependencies upgraded to the latest, 2026-09-06
+Every crate in the four manifests is at the newest crates.io release (skipping the alphas of
+zerocopy 0.9 and smallvec 2). The only source changes were rand 0.10's renames (`RngCore` is
+`Rng`, the convenience methods live on `RngExt`). The DHT crate's dev-dependencies on the
+OpenTelemetry/Jaeger stack and `external-ip` were dead (commented-out code) and are gone.
+`libsqlite3-sys` is pinned to the 0.38 line with `bundled`, which diesel 2.3 accepts.
+
+The GUI's packages are at the latest too, except TypeScript, pinned to 6: svelte-check 4.7
+supports TypeScript 7 only through its `--tsgo` mode with both versions installed side by
+side, which isn't worth the ceremony until it's the default.

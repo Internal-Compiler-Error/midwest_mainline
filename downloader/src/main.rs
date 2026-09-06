@@ -24,9 +24,9 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
 
     id[0] = (crc >> 24) as u8;
     id[1] = (crc >> 16) as u8;
-    id[2] = (((crc >> 8) & 0xf8) as u8) | (rand::Rng::random::<u8>(&mut rng) & 0x7);
+    id[2] = (((crc >> 8) & 0xf8) as u8) | (rand::RngExt::random::<u8>(&mut rng) & 0x7);
 
-    rand::RngCore::fill_bytes(&mut rng, &mut id[3..19]);
+    rand::Rng::fill_bytes(&mut rng, &mut id[3..19]);
 
     id[19] = rand;
 

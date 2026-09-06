@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use axum::{Json, Router, extract::State, routing::post};
 use futures::future::join_all;
 use midwest_mainline::{dht::DhtSession, types::NodeId};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::{
     env,

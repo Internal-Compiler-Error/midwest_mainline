@@ -7,7 +7,7 @@
 use crate::settings::LSD_INTERVAL;
 use crate::torrent_swarm::TorrentSwarmHandle;
 use midwest_mainline::types::InfoHash;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, Weak};

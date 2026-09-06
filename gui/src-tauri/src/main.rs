@@ -395,7 +395,7 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
 /// A fully random peer id, Azureus-style ("-DL0100-" + 12 random bytes).
 fn random_peer_id() -> [u8; 20] {
     let mut id = *b"-DL0100-............";
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut id[8..]);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut id[8..]);
     id
 }
 

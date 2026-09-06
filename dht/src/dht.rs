@@ -35,7 +35,7 @@ use diesel::{
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tracing::info;
 
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use routing_table::RoutingTable;
 use rpc_manager::RpcManager;
 use std::{

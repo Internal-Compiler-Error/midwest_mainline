@@ -12,30 +12,30 @@ name = "downloader"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.45.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 midwest_mainline = { path = "../dht"}
-tokio-util = { version = "0.7.15", features = ["codec"] }
-futures = "0.3.31"
-tracing = "0.1.41"
+tokio-util = { version = "0.7.19", features = ["codec"] }
+futures = "0.3.34"
+tracing = "0.1.44"
 juicy_bencode =  { path = "../../juicy_bencode" }
-sha1 = "0.10.6"
-rand = "0.9.1"
-reqwest = "0.12.20"
-url = "2.5.4"
-bendy = "0.4.0-beta.4"
-anyhow = "1.0.98"
-bitvec = "1.0.1"
-derive_more = { version = "2.1.0", features = ["full"] }
-crc32c = "0.6.0"
-zerocopy = { version = "0.8.31", features = ["derive"] }
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+sha1 = "0.11.0"
+rand = "0.10.2"
+reqwest = "0.13.4"
+url = "2.5.8"
+bendy = "0.6.1"
+anyhow = "1.0.104"
+bitvec = "1.1.1"
+derive_more = { version = "2.1.1", features = ["full"] }
+crc32c = "0.6.8"
+zerocopy = { version = "0.8.48", features = ["derive"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 dirs = "7.0.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-socket2 = "0.5"
-public-ip = "0.2"
-num-bigint = "0.4"
-librqbit-utp = "0.7"
-igd-next = { version = "0.17", features = ["aio_tokio"] }
-crab_nat = "0.8"
-netdev = "0.31"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = "0.6.5"
+public-ip = "0.2.2"
+num-bigint = "0.5.1"
+librqbit-utp = "0.7.0"
+igd-next = { version = "0.17.1", features = ["aio_tokio"] }
+crab_nat = "0.8.1"
+netdev = "0.46.2"
