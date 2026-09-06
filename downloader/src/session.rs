@@ -91,8 +91,7 @@ pub struct Progress {
 pub struct TrackerInfo {
     /// the announce URL, or "DHT"
     pub url: String,
-    /// "waiting", "working", or what went wrong
-    pub status: String,
+    pub state: TrackerState,
     /// peers the last announce returned
     pub peers: usize,
     pub next_announce_secs: Option<u64>,
@@ -130,9 +129,12 @@ pub struct PeerInfo {
     pub uploaded: u64,
     pub download_bps: f64,
     pub upload_bps: f64,
-    /// the usual client shorthand: `D`/`d` we download from it (`d`: want to, but choked),
-    /// `U`/`u` it downloads from us (`u`: wants to, but we choke it)
-    pub flags: String,
+    pub choked_us: bool,
+    pub choked_them: bool,
+    pub interested_us: bool,
+    pub interested_them: bool,
+    pub encrypted: bool,
+    pub utp: bool,
 }
 
 impl Progress {
@@ -1160,19 +1162,6 @@ impl Entry {
             .map(|p| {
                 let rates = self.peer_rates.entry(p.addr).or_insert_with(Rates::new);
                 rates.update(p.downloaded, p.uploaded);
-                let mut flags = String::new();
-                if p.interested_them {
-                    flags.push(if p.choked_us { 'd' } else { 'D' });
-                }
-                if p.interested_us {
-                    flags.push(if p.choked_them { 'u' } else { 'U' });
-                }
-                if p.encrypted {
-                    flags.push('E');
-                }
-                if p.utp {
-                    flags.push('T');
-                }
                 PeerInfo {
                     addr: p.addr.to_string(),
                     client: p.client.clone(),
@@ -1181,7 +1170,12 @@ impl Entry {
                     uploaded: p.uploaded,
                     download_bps: rates.download_bps,
                     upload_bps: rates.upload_bps,
-                    flags,
+                    choked_us: p.choked_us,
+                    choked_them: p.choked_them,
+                    interested_us: p.interested_us,
+                    interested_them: p.interested_them,
+                    encrypted: p.encrypted,
+                    utp: p.utp,
                 }
             })
             .collect()
@@ -1229,11 +1223,7 @@ fn progress(
 fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
     TrackerInfo {
         url: status.url.clone(),
-        status: match &status.state {
-            TrackerState::Pending => "waiting".to_owned(),
-            TrackerState::Working => "working".to_owned(),
-            TrackerState::Failed(why) => why.clone(),
-        },
+        state: status.state.clone(),
         peers: status.peers,
         next_announce_secs: status
             .next_announce
@@ -1285,34 +1275,9 @@ impl Rates {
     }
 }
 
-/// Formats a byte count for display, e.g. `1.50 MiB`.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.2} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn formats_byte_counts() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1024), "1.00 KiB");
-        assert_eq!(human_bytes(1536), "1.50 KiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024), "5.00 MiB");
-    }
 
     #[test]
     fn fraction_is_clamped_and_total() {

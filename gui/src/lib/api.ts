@@ -30,8 +30,9 @@ export interface Progress {
 export interface Tracker {
   /** the announce URL, or "DHT" */
   url: string
-  /** "waiting", "working", or what went wrong */
-  status: string
+  state: 'pending' | 'working' | 'failed'
+  /** what went wrong, for "failed" */
+  error: string | null
   peers: number
   next_announce_secs: number | null
 }
@@ -50,7 +51,27 @@ export interface Peer {
   uploaded: number
   download_bps: number
   upload_bps: number
-  flags: string
+  choked_us: boolean
+  choked_them: boolean
+  interested_us: boolean
+  interested_them: boolean
+  encrypted: boolean
+  utp: boolean
+}
+
+/** The usual client shorthand: `D`/`d` we download from it (`d`: want to, but choked),
+ * `U`/`u` it downloads from us (`u`: wants to, but we choke it), `E` encrypted, `T` uTP. */
+export function peerFlags(p: Peer): string {
+  let flags = ''
+  if (p.interested_them) flags += p.choked_us ? 'd' : 'D'
+  if (p.interested_us) flags += p.choked_them ? 'u' : 'U'
+  if (p.encrypted) flags += 'E'
+  if (p.utp) flags += 'T'
+  return flags
+}
+
+export function trackerStatus(t: Tracker): string {
+  return t.state === 'failed' ? (t.error ?? 'failed') : t.state === 'working' ? 'working' : 'waiting'
 }
 
 export type TorrentRow = { id: TorrentId } & (
@@ -151,4 +172,5 @@ export function humanBytesLike(bytes: number, like: number): string {
   return unit === 0 ? `${Math.round(bytes)} B` : `${(bytes / scale).toFixed(1)} ${UNITS[unit]}`
 }
 
-export const perSecondLike = (bytes: number, like: number) => `${humanBytesLike(bytes, like)}/s`
+/** Rates are always in KiB/s, so a moving figure never changes unit. */
+export const kibPerSecond = (bytes: number) => `${(bytes / 1024).toFixed(1)} KiB/s`

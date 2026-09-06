@@ -6,7 +6,7 @@
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
-  import { fraction, humanBytes, humanBytesLike, isMagnetUri, perSecondLike } from './api'
+  import { fraction, humanBytes, humanBytesLike, isMagnetUri, kibPerSecond, peerFlags, trackerStatus } from './api'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import ProgressBar from './ProgressBar.svelte'
@@ -57,9 +57,9 @@
       <dt class="font-medium">Location</dt>
       <dd>{torrent.root}</dd>
       <dt class="font-medium">Downloaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={perSecondLike} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={kibPerSecond} />)</dd>
       <dt class="font-medium">Uploaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={perSecondLike} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={kibPerSecond} />)</dd>
       <dt class="font-medium">Ratio</dt>
       <dd class="tabular-nums"><Num value={torrent.total_size ? torrent.uploaded / torrent.total_size : 0} format={(n) => n.toFixed(2)} /></dd>
       <dt class="font-medium">Wasted</dt>
@@ -106,8 +106,8 @@
               <Table.Row>
                 <Table.Cell class="truncate select-text" title={tracker.url}>{tracker.url}</Table.Cell>
                 <Table.Cell
-                  class="w-64 truncate {tracker.status === 'working' ? '' : tracker.status === 'waiting' ? 'text-muted-foreground' : 'text-destructive'}"
-                  title={tracker.status}>{tracker.status}</Table.Cell
+                  class="w-64 truncate {tracker.state === 'working' ? '' : tracker.state === 'pending' ? 'text-muted-foreground' : 'text-destructive'}"
+                  title={trackerStatus(tracker)}>{trackerStatus(tracker)}</Table.Cell
                 >
                 <Table.Cell class="w-24 whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
                 <Table.Cell class="w-36 whitespace-nowrap text-muted-foreground tabular-nums">
@@ -141,12 +141,12 @@
                 <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
                 <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>
                 <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
-                  <Num value={peer.download_bps} format={perSecondLike} />
+                  <Num value={peer.download_bps} format={kibPerSecond} />
                 </Table.Cell>
                 <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.uploaded)} in total">
-                  <Num value={peer.upload_bps} format={perSecondLike} />
+                  <Num value={peer.upload_bps} format={kibPerSecond} />
                 </Table.Cell>
-                <Table.Cell class="font-mono">{peer.flags}</Table.Cell>
+                <Table.Cell class="font-mono">{peerFlags(peer)}</Table.Cell>
               </Table.Row>
             {/each}
           </Table.Body>

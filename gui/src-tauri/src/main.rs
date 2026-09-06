@@ -8,7 +8,7 @@
 
 use downloader::{
     Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
-    TorrentId, TorrentState, TrackerInfo, data_dir,
+    TorrentId, TorrentState, TrackerInfo, TrackerState, data_dir,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -81,16 +81,25 @@ struct ProgressDto {
 #[derive(Serialize)]
 struct TrackerDto {
     url: String,
-    status: String,
+    /// "pending", "working" or "failed"
+    state: &'static str,
+    /// what went wrong, for "failed"
+    error: Option<String>,
     peers: usize,
     next_announce_secs: Option<u64>,
 }
 
 impl From<TrackerInfo> for TrackerDto {
     fn from(t: TrackerInfo) -> Self {
+        let (state, error) = match t.state {
+            TrackerState::Pending => ("pending", None),
+            TrackerState::Working => ("working", None),
+            TrackerState::Failed(why) => ("failed", Some(why)),
+        };
         Self {
             url: t.url,
-            status: t.status,
+            state,
+            error,
             peers: t.peers,
             next_announce_secs: t.next_announce_secs,
         }
@@ -123,7 +132,12 @@ struct PeerDto {
     uploaded: u64,
     download_bps: f64,
     upload_bps: f64,
-    flags: String,
+    choked_us: bool,
+    choked_them: bool,
+    interested_us: bool,
+    interested_them: bool,
+    encrypted: bool,
+    utp: bool,
 }
 
 impl From<PeerInfo> for PeerDto {
@@ -136,7 +150,12 @@ impl From<PeerInfo> for PeerDto {
             uploaded: p.uploaded,
             download_bps: p.download_bps,
             upload_bps: p.upload_bps,
-            flags: p.flags,
+            choked_us: p.choked_us,
+            choked_them: p.choked_them,
+            interested_us: p.interested_us,
+            interested_them: p.interested_them,
+            encrypted: p.encrypted,
+            utp: p.utp,
         }
     }
 }

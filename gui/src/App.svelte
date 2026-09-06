@@ -10,7 +10,7 @@
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
-  import { perSecondLike } from './lib/api'
+  import { kibPerSecond } from './lib/api'
   import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
   import Insights from './lib/Insights.svelte'
@@ -254,7 +254,7 @@
     {/if}
     {#if status}
       <span class="ml-auto flex gap-4 text-xs text-muted-foreground tabular-nums">
-        <span>↓ <Num value={status.download_bps} format={perSecondLike} /> ↑ <Num value={status.upload_bps} format={perSecondLike} /></span>
+        <span>↓ <Num value={status.download_bps} format={kibPerSecond} /> ↑ <Num value={status.upload_bps} format={kibPerSecond} /></span>
         <span title="nodes in the DHT routing table">DHT {#if status.dht_nodes === null}off{:else}<Num value={status.dht_nodes} /> nodes{/if}</span>
         <span title={mappingTitle(status)}>port {status.listen_port} · <Flip text={mappingLabel(status)} /></span>
       </span>

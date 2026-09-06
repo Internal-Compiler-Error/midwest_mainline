@@ -24,6 +24,7 @@ pub mod torrent_swarm;
 pub mod utp;
 mod wire;
 
+pub use announcer::TrackerState;
 pub use bt_client::BtClient;
 pub use config::{Encryption, Settings, SettingsWatch};
 pub use defs::Identity;
@@ -36,7 +37,6 @@ pub use portmap::MappingState;
 pub use resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
 pub use session::{
     FileInfo, PeerInfo, Progress, Session, SessionConfig, SessionStatus, TorrentId, TorrentState, TrackerInfo,
-    human_bytes,
 };
 pub use torrent::{Torrent, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
