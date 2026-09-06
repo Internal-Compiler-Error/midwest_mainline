@@ -6,9 +6,10 @@
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
-  import { fraction, humanBytes, humanBytesLike, isMagnetUri, kibPerSecond, peerFlags, trackerStatus } from './api'
+  import { fraction, humanBytes, humanBytesLike, isMagnetUri, kibPerSecond, trackerStatus } from './api'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
+  import PeerTable from './PeerTable.svelte'
   import ProgressBar from './ProgressBar.svelte'
 
 
@@ -119,38 +120,7 @@
         </Table.Root>
         </Tabs.Content>
         <Tabs.Content value="peers" class="max-h-64 overflow-auto rounded-md border">
-        <!-- fixed layout: the numeric columns keep their width as values come and go, so
-             the rest of the row doesn't shift every second -->
-        <Table.Root class="table-fixed text-xs">
-          <Table.Header>
-            <Table.Row>
-              <Table.Head class="w-52">Address</Table.Head>
-              <Table.Head>Client</Table.Head>
-              <Table.Head class="w-14 text-right">Has</Table.Head>
-              <Table.Head class="w-28 text-right">Down</Table.Head>
-              <Table.Head class="w-28 text-right">Up</Table.Head>
-              <Table.Head class="w-16" title="D/d: we download from it (d: choked). U/u: it downloads from us (u: we choke it)">
-                Flags
-              </Table.Head>
-            </Table.Row>
-          </Table.Header>
-          <Table.Body>
-            {#each torrent.peers as peer (peer.addr)}
-              <Table.Row>
-                <Table.Cell class="truncate font-mono select-text" title={peer.addr}>{peer.addr}</Table.Cell>
-                <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
-                <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>
-                <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
-                  <Num value={peer.download_bps} format={kibPerSecond} />
-                </Table.Cell>
-                <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.uploaded)} in total">
-                  <Num value={peer.upload_bps} format={kibPerSecond} />
-                </Table.Cell>
-                <Table.Cell class="font-mono">{peerFlags(peer)}</Table.Cell>
-              </Table.Row>
-            {/each}
-          </Table.Body>
-        </Table.Root>
+          <PeerTable peers={torrent.peers} />
         </Tabs.Content>
       </Tabs.Root>
     {/if}
