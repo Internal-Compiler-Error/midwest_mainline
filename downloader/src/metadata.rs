@@ -17,6 +17,7 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
+use crate::stream::DialHints;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use crate::utp::UtpWatch;
@@ -205,7 +206,7 @@ async fn fetch_from_peer(
     identity: Arc<Identity>,
     utp: Option<Arc<UtpSocketUdp>>,
 ) -> anyhow::Result<Vec<u8>> {
-    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity, utp.as_ref())
+    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity, utp.as_ref(), DialHints::default())
         .await
         .with_context(|| format!("connect to {addr}"))?;
     ensure!(

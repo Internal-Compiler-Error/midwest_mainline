@@ -4,7 +4,7 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::limiter::RateLimiter;
 use crate::peer::{
-    Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
+    PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
     parse_ut_metadata_request,
 };
 use crate::settings::{
@@ -14,7 +14,7 @@ use crate::settings::{
     PEX_MAX_ADDED_PEERS,
 };
 use crate::storage::TorrentStorage;
-use crate::stream::PeerStream;
+use crate::stream::{DialHints, PeerStream};
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
 use crate::wire::{BitField, BtMessage, Piece, Request};
@@ -170,6 +170,8 @@ pub(crate) struct Shared {
 /// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
 pub(crate) struct ConnectedPeer {
     pub stream: PeerStream,
+    /// we opened it (as opposed to accepting it), so its encryption says what the peer takes
+    pub dialed: bool,
     pub remote_addr: SocketAddr,
     pub remote_supports_extensions: bool,
     pub remote_supports_fast: bool,
@@ -308,6 +310,19 @@ struct KnownPeer {
     consecutive_dial_failures: u32,
     dial_after: Option<Instant>,
     banned_until: Option<Instant>,
+    /// PEX flagged it uTP-capable
+    prefers_utp: bool,
+    /// it refused the encrypted opening when we dialled it
+    plaintext_only: bool,
+}
+
+impl KnownPeer {
+    fn dial_hints(&self) -> DialHints {
+        DialHints {
+            prefer_utp: self.prefers_utp,
+            plaintext: self.plaintext_only,
+        }
+    }
 }
 
 impl KnownPeer {
@@ -799,7 +814,13 @@ impl TorrentSwarm {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
                 // anyway (we don't advertise ut_pex when private, so a compliant peer won't)
                 if !self.torrent.private {
-                    self.connect_to_discovered_peers(parse_pex_message(&ext.payload));
+                    let gossiped = parse_pex_message(&ext.payload);
+                    for (addr, flags) in &gossiped {
+                        if flags & PEX_UTP != 0 {
+                            self.known.entry(canonical(*addr)).or_default().prefers_utp = true;
+                        }
+                    }
+                    self.connect_to_discovered_peers(gossiped.into_iter().map(|(addr, _)| addr).collect());
                 }
             }
             BtMessage::Extended(ext) => {
@@ -1206,6 +1227,10 @@ impl TorrentSwarm {
             return;
         }
         known.connected();
+        // a dialled peer that came up plaintext under `Prefer` refused the encrypted opening
+        if connected.dialed && self.id.encryption == crate::config::Encryption::Prefer {
+            known.plaintext_only = !connected.stream.is_encrypted();
+        }
         if self.peers.len() >= self.settings.borrow().max_peers_per_torrent {
             tracing::debug!("{remote_addr} refused, at the connection cap");
             return;
@@ -1279,8 +1304,9 @@ impl TorrentSwarm {
             let torrent = self.torrent.clone();
             let our_id = self.id.clone();
             let utp = self.utp.borrow().clone();
+            let hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
             tokio::spawn(async move {
-                let result = match dial(addr, &torrent, &our_id, utp).await {
+                let result = match dial(addr, &torrent, &our_id, utp, hints).await {
                     Ok(connected) => SwarmEvent::PeerConnected(connected),
                     Err(e) => {
                         tracing::debug!("couldn't connect to {addr}: {e:#}");
@@ -1343,13 +1369,13 @@ impl TorrentSwarm {
             return;
         }
 
-        let all_addrs: Vec<SocketAddr> = self.peers.iter().map(|p| p.remote_addr).collect();
+        let all: Vec<(SocketAddr, u8)> = self.peers.iter().map(|p| (p.remote_addr, p.pex_flags())).collect();
         self.broadcast(move |peer| {
             // BEP 11 recommends capping a single PEX message at roughly 50 added peers
-            let added: Vec<SocketAddr> = all_addrs
+            let added: Vec<(SocketAddr, u8)> = all
                 .iter()
                 .copied()
-                .filter(|a| *a != peer.remote_addr)
+                .filter(|(a, _)| *a != peer.remote_addr)
                 .take(PEX_MAX_ADDED_PEERS)
                 .collect();
             Box::pin(async move {
@@ -1385,10 +1411,11 @@ async fn dial(
     torrent: &Torrent,
     our_id: &Identity,
     utp: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+    hints: DialHints,
 ) -> anyhow::Result<ConnectedPeer> {
     let (stream, handshake) = tokio::time::timeout(
         crate::settings::HANDSHAKE_TIMEOUT,
-        crate::stream::connect(addr, &torrent.info_hash, our_id, utp.as_ref()),
+        crate::stream::connect(addr, &torrent.info_hash, our_id, utp.as_ref(), hints),
     )
     .await
     .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
@@ -1400,6 +1427,7 @@ async fn dial(
     );
     Ok(ConnectedPeer {
         stream,
+        dialed: true,
         remote_addr: addr,
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
@@ -1515,6 +1543,7 @@ mod test {
         handle
             .peer_connected(ConnectedPeer {
                 stream: PeerStream::Tcp(ours),
+                dialed: false,
                 remote_addr: pretend_addr.parse().unwrap(),
                 remote_supports_extensions: false,
                 remote_supports_fast: fast,

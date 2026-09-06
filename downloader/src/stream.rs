@@ -38,13 +38,31 @@ impl PeerStream {
     }
 }
 
+/// What's remembered about a peer from earlier (see `torrent_swarm::KnownPeer`), to skip
+/// attempts that are known to fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DialHints {
+    /// PEX flagged it uTP-capable: try uTP before TCP
+    pub prefer_utp: bool,
+    /// it refused the encrypted opening last time: with `Prefer`, go straight to plaintext
+    pub plaintext: bool,
+}
+
 /// How a second connection to the same peer is made, for the plaintext retry of `Prefer`.
+#[derive(Clone)]
 enum Transport {
     Tcp,
     Utp(Arc<UtpSocketUdp>),
 }
 
 impl Transport {
+    fn name(&self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Utp(_) => "utp",
+        }
+    }
+
     async fn dial(&self, addr: SocketAddr) -> io::Result<PeerStream> {
         match self {
             Transport::Tcp => Ok(PeerStream::Tcp(crate::wire::connect(addr).await?)),
@@ -60,33 +78,29 @@ impl Transport {
 }
 
 /// Opens a connection to `addr` and completes the BitTorrent handshake for `info_hash`.
-/// TCP first; if that can't even connect and there's a uTP socket, uTP. A peer that TCP
-/// reaches but that rejects the handshake isn't retried over uTP: it's reachable and just
-/// didn't want us. Encryption follows `our_id.encryption`; with `Prefer`, a peer that doesn't
-/// take the encrypted opening is dialled again in plaintext over the same transport, since
-/// the first connection is spent once what we sent on it wasn't a handshake.
+/// TCP first (uTP first for a peer PEX flagged uTP-capable); if that can't even connect and
+/// there's the other transport, that one. A peer one transport reaches but that rejects the
+/// handshake isn't retried over the other: it's reachable and just didn't want us.
+/// Encryption follows `our_id.encryption`; with `Prefer`, a peer that doesn't take the
+/// encrypted opening is dialled again in plaintext over the same transport, since the first
+/// connection is spent once what we sent on it wasn't a handshake, and a peer remembered as
+/// having refused it before is dialled in plaintext from the start.
 pub(crate) async fn connect(
     addr: SocketAddr,
     info_hash: &InfoHash,
     our_id: &Identity,
     utp: Option<&Arc<UtpSocketUdp>>,
+    hints: DialHints,
 ) -> io::Result<(PeerStream, Handshake)> {
-    let (first, transport) = match crate::wire::connect(addr).await {
-        Ok(tcp) => (PeerStream::Tcp(tcp), Transport::Tcp),
-        Err(tcp_err) => {
-            let Some(utp) = utp else { return Err(tcp_err) };
-            let transport = Transport::Utp(utp.clone());
-            let stream = transport
-                .dial(addr)
-                .await
-                .map_err(|utp_err| io::Error::other(format!("tcp: {tcp_err}; utp: {utp_err}")))?;
-            (stream, transport)
-        }
+    let (first, transport) = open_transport(addr, utp, hints.prefer_utp).await?;
+    let policy = match our_id.encryption {
+        Encryption::Prefer if hints.plaintext => Encryption::Disabled,
+        policy => policy,
     };
 
     let encrypt =
         |stream| async { io::Result::Ok(PeerStream::Encrypted(Box::new(mse::initiate(stream, info_hash).await?))) };
-    let mut stream = match our_id.encryption {
+    let mut stream = match policy {
         Encryption::Disabled => first,
         Encryption::Require => encrypt(first).await?,
         // only the MSE exchange itself failing means "try plaintext": a peer that completed
@@ -101,6 +115,31 @@ pub(crate) async fn connect(
     };
     let handshake = shake_hands(&mut stream, info_hash, our_id).await?;
     Ok((stream, handshake))
+}
+
+/// A connection over whichever of TCP and uTP answers, in the order asked for.
+async fn open_transport(
+    addr: SocketAddr,
+    utp: Option<&Arc<UtpSocketUdp>>,
+    utp_first: bool,
+) -> io::Result<(PeerStream, Transport)> {
+    let mut order = vec![Transport::Tcp];
+    if let Some(utp) = utp {
+        let utp = Transport::Utp(utp.clone());
+        if utp_first {
+            order.insert(0, utp);
+        } else {
+            order.push(utp);
+        }
+    }
+    let mut errors = vec![];
+    for transport in order {
+        match transport.dial(addr).await {
+            Ok(stream) => return Ok((stream, transport)),
+            Err(e) => errors.push(format!("{}: {e}", transport.name())),
+        }
+    }
+    Err(io::Error::other(errors.join("; ")))
 }
 
 /// Reads an inbound connection's opening, which is either a plaintext BitTorrent handshake
@@ -212,9 +251,15 @@ mod test {
     async fn an_encrypted_dial_meets_an_encrypted_accept() {
         let hash = InfoHash::from_bytes(&[5; 20]);
         let (addr, task) = listener(Encryption::Prefer, hash, 1).await;
-        let (stream, handshake) = connect(addr, &hash, &identity(1, Encryption::Prefer), None)
-            .await
-            .unwrap();
+        let (stream, handshake) = connect(
+            addr,
+            &hash,
+            &identity(1, Encryption::Prefer),
+            None,
+            DialHints::default(),
+        )
+        .await
+        .unwrap();
         assert!(stream.is_encrypted());
         assert_eq!(handshake.peer_id, [2; 20]);
         assert_eq!(task.await.unwrap(), [true]);
@@ -226,9 +271,15 @@ mod test {
     async fn prefer_falls_back_to_plaintext() {
         let hash = InfoHash::from_bytes(&[6; 20]);
         let (addr, task) = listener(Encryption::Disabled, hash, 2).await;
-        let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Prefer), None)
-            .await
-            .unwrap();
+        let (stream, _) = connect(
+            addr,
+            &hash,
+            &identity(1, Encryption::Prefer),
+            None,
+            DialHints::default(),
+        )
+        .await
+        .unwrap();
         assert!(!stream.is_encrypted());
         assert_eq!(
             task.await.unwrap(),
@@ -242,17 +293,29 @@ mod test {
         let hash = InfoHash::from_bytes(&[7; 20]);
         let (addr, task) = listener(Encryption::Require, hash, 1).await;
         assert!(
-            connect(addr, &hash, &identity(1, Encryption::Disabled), None)
-                .await
-                .is_err()
+            connect(
+                addr,
+                &hash,
+                &identity(1, Encryption::Disabled),
+                None,
+                DialHints::default()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(task.await.unwrap(), [false]);
 
         let (addr, task) = listener(Encryption::Disabled, hash, 1).await;
         assert!(
-            connect(addr, &hash, &identity(1, Encryption::Require), None)
-                .await
-                .is_err()
+            connect(
+                addr,
+                &hash,
+                &identity(1, Encryption::Require),
+                None,
+                DialHints::default()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(task.await.unwrap(), [false]);
     }
@@ -278,9 +341,15 @@ mod test {
                 .is_err()
         });
         assert!(
-            connect(addr, &hash, &identity(1, Encryption::Prefer), None)
-                .await
-                .is_err()
+            connect(
+                addr,
+                &hash,
+                &identity(1, Encryption::Prefer),
+                None,
+                DialHints::default()
+            )
+            .await
+            .is_err()
         );
         assert!(task.await.unwrap(), "no second connection");
     }
@@ -301,10 +370,43 @@ mod test {
                 send_handshake(&mut stream, &hash, &identity(2, policy)).await.unwrap();
                 (stream.is_utp(), stream.is_encrypted())
             });
-            let (stream, _) = connect(addr, &hash, &identity(1, policy), Some(&client)).await.unwrap();
+            let (stream, _) = connect(addr, &hash, &identity(1, policy), Some(&client), DialHints::default())
+                .await
+                .unwrap();
             let expected = (true, policy == Encryption::Prefer);
             assert_eq!((stream.is_utp(), stream.is_encrypted()), expected);
             assert_eq!(acceptor.await.unwrap(), expected);
         }
+    }
+
+    /// With TCP and uTP both listening on the port, the hints decide: uTP first, and no
+    /// encrypted opening for a peer remembered as refusing one, even under `Prefer`.
+    #[tokio::test]
+    async fn hints_pick_utp_first_and_skip_the_encrypted_opening() {
+        let hash = InfoHash::from_bytes(&[11; 20]);
+        let server = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let addr = server.bind_addr();
+        let tcp = TcpListener::bind(addr).await.unwrap();
+        let client = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let acceptor = tokio::spawn(async move {
+            let stream = server.accept().await.unwrap();
+            let (mut stream, _) = accept(PeerStream::Utp(stream), Encryption::Prefer, || vec![hash])
+                .await
+                .unwrap();
+            send_handshake(&mut stream, &hash, &identity(2, Encryption::Prefer))
+                .await
+                .unwrap();
+            stream.is_encrypted()
+        });
+        let hints = DialHints {
+            prefer_utp: true,
+            plaintext: true,
+        };
+        let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Prefer), Some(&client), hints)
+            .await
+            .unwrap();
+        assert!(stream.is_utp() && !stream.is_encrypted());
+        assert!(!acceptor.await.unwrap());
+        drop(tcp);
     }
 }

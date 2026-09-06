@@ -419,6 +419,7 @@ async fn welcome(
     handle
         .peer_connected(ConnectedPeer {
             stream,
+            dialed: false,
             remote_addr,
             remote_supports_extensions: handshake.supports_extensions(),
             remote_supports_fast: handshake.supports_fast_extension(),
