@@ -42,6 +42,12 @@ pub enum TorrentState {
     Downloading(Progress),
     /// Stopped by the user: no connections, files and progress kept, ready to `unpause`
     Paused(Progress),
+    /// Re-hashing the files on disk (`recheck`); goes back to downloading or paused after
+    Checking {
+        name: String,
+        checked_pieces: usize,
+        total_pieces: usize,
+    },
     Failed {
         source: String,
         error: String,
@@ -159,6 +165,7 @@ struct TorrentTask {
 enum Stop {
     Pause,
     Unpause,
+    Recheck,
     Remove { delete_files: bool },
     Shutdown,
 }
@@ -181,7 +188,7 @@ impl TorrentTask {
                     Some(Command::Remove { .. }) | None => return,
                     Some(Command::Pause) => pause_asked = true,
                     Some(Command::Unpause) => pause_asked = false,
-                    Some(Command::SelectFiles(_)) => {}
+                    Some(Command::SelectFiles(_) | Command::Recheck) => {}
                 },
             }
         };
@@ -221,6 +228,11 @@ impl TorrentTask {
                     last_stats = stats;
                 }
                 Ok((Stop::Unpause, _)) => paused = false,
+                // back to whichever of the two it was in, with what the disk really holds
+                Ok((Stop::Recheck, _)) => match self.check(&torrent, &root, &mut verified).await {
+                    Ok(()) => resumed = true,
+                    Err(stop) => break stop,
+                },
                 Ok((stop, _)) => break stop,
                 Err(e) => {
                     self.fail(format!("{e:#}"), Some((&torrent, &root))).await;
@@ -231,6 +243,51 @@ impl TorrentTask {
 
         if let Stop::Remove { delete_files } = stop {
             self.remove_files(&torrent, &root, delete_files);
+        }
+    }
+
+    /// Re-hashes the files off the runtime, publishing progress meanwhile. Only removal and
+    /// shutdown interrupt it; the hashing itself runs to its end regardless.
+    async fn check(
+        &mut self,
+        torrent: &Arc<Torrent>,
+        root: &Path,
+        verified: &mut BitBox<u8, Msb0>,
+    ) -> Result<(), Stop> {
+        let (progress, checked) = watch::channel(0);
+        let _ = self.phase.send(Phase::Checking {
+            torrent: torrent.clone(),
+            checked,
+        });
+        let hashing = {
+            let torrent = torrent.clone();
+            let root = root.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::check::check_files(&torrent, &root, |n| {
+                    let _ = progress.send(n);
+                })
+            })
+        };
+        tokio::pin!(hashing);
+        loop {
+            tokio::select! {
+                result = &mut hashing => {
+                    match result {
+                        Ok(bits) => {
+                            tracing::info!("{}: {} of {} pieces are on disk", torrent.name, bits.count_ones(), bits.len());
+                            *verified = bits;
+                        }
+                        Err(e) => tracing::warn!("rechecking {} failed: {e}", torrent.name),
+                    }
+                    return Ok(());
+                }
+                _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
+                command = self.commands.recv() => match command {
+                    Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
+                    None => return Err(Stop::Shutdown),
+                    Some(_) => {}
+                },
+            }
         }
     }
 
@@ -331,6 +388,7 @@ impl TorrentTask {
                 _ = self.cancel.cancelled() => break Stop::Shutdown,
                 command = self.commands.recv() => match command {
                     Some(Command::Pause) => break Stop::Pause,
+                    Some(Command::Recheck) => break Stop::Recheck,
                     Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
                     Some(Command::SelectFiles(selected)) => {
                         self.client.select_files(&torrent.info_hash, selected.clone());
@@ -418,6 +476,7 @@ impl TorrentTask {
                 _ = self.cancel.cancelled() => break Stop::Shutdown,
                 command = self.commands.recv() => match command {
                     Some(Command::Unpause) => break Stop::Unpause,
+                    Some(Command::Recheck) => break Stop::Recheck,
                     Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
                     Some(Command::SelectFiles(selected)) => {
                         let _ = self.selected.send(selected);
@@ -455,6 +514,11 @@ enum Phase {
         selected: watch::Receiver<Vec<bool>>,
         uploaded_before: u64,
     },
+    Checking {
+        torrent: Arc<Torrent>,
+        /// pieces hashed so far
+        checked: watch::Receiver<usize>,
+    },
     Failed {
         error: String,
     },
@@ -466,6 +530,7 @@ enum Command {
     Unpause,
     Remove { delete_files: bool },
     SelectFiles(Vec<bool>),
+    Recheck,
 }
 
 /// The session's side of one torrent; the task that actually runs it holds the other side.
@@ -648,6 +713,12 @@ impl Session {
         self.command(id, Command::Unpause);
     }
 
+    /// Re-hashes the torrent's files and continues from what's actually on disk, in the
+    /// state (downloading or paused) it was in. For when the resume data can't be trusted.
+    pub fn recheck(&mut self, id: TorrentId) {
+        self.command(id, Command::Recheck);
+    }
+
     /// Downloads only the selected files from now on: one flag per file in the order
     /// `Progress::files` lists them. Pieces shared with a selected file are still fetched.
     pub fn select_files(&mut self, id: TorrentId, selected: Vec<bool>) {
@@ -742,7 +813,9 @@ impl Entry {
     /// Known up front for a magnet or a resume file, and for anything else once it's running.
     fn info_hash(&self) -> Option<InfoHash> {
         self.info_hash.or_else(|| match &*self.phase.borrow() {
-            Phase::Downloading { torrent, .. } | Phase::Paused { torrent, .. } => Some(torrent.info_hash),
+            Phase::Downloading { torrent, .. } | Phase::Paused { torrent, .. } | Phase::Checking { torrent, .. } => {
+                Some(torrent.info_hash)
+            }
             _ => None,
         })
     }
@@ -757,6 +830,11 @@ impl Entry {
             Phase::Resolving { started } => TorrentState::Resolving {
                 source: self.source.clone(),
                 elapsed: started.elapsed(),
+            },
+            Phase::Checking { torrent, checked } => TorrentState::Checking {
+                name: torrent.name.clone(),
+                checked_pieces: *checked.borrow(),
+                total_pieces: torrent.pieces.len(),
             },
             Phase::Downloading {
                 torrent,
@@ -1092,6 +1170,38 @@ mod test {
 
         let session = Session::new(test_config(&dir)).unwrap();
         assert!(!session.resumable()[0].paused, "unpausing clears the flag");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The torrent starts with nothing verified; writing the real content to its file and
+    /// rechecking finds every piece, and the torrent goes back to being paused, complete.
+    #[test]
+    fn recheck_finds_what_is_on_disk() {
+        let dir = scratch("recheck");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+
+        std::fs::write(root.join("session.bin"), [7u8; 40]).unwrap();
+        session.recheck(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.completed),
+        );
+        session.shutdown();
+
+        let session = Session::new(test_config(&dir)).unwrap();
+        assert_eq!(
+            session.resumable()[0].verified_pieces,
+            3,
+            "the resume file has the new bitfield"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

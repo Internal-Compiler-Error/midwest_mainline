@@ -30,6 +30,10 @@
     {/if}
   {:else if torrent.kind === 'failed'}
     <div class="text-destructive">⚠ {torrent.error}</div>
+  {:else if torrent.kind === 'checking'}
+    <h2 class="text-base font-semibold">Checking files</h2>
+    <ProgressBar fraction={fraction(torrent.checked_pieces, torrent.total_pieces)} done={false} tall />
+    <div class="text-muted-foreground">{torrent.checked_pieces} / {torrent.total_pieces} pieces hashed</div>
   {:else}
     <div class="flex items-center gap-3">
       <h2 class="text-base font-semibold">

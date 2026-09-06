@@ -15,6 +15,7 @@
     onselect,
     onpause,
     onunpause,
+    onrecheck,
     onremove,
   }: {
     torrents: TorrentRow[]
@@ -22,11 +23,12 @@
     onselect: (id: TorrentId) => void
     onpause: (id: TorrentId) => void
     onunpause: (id: TorrentId) => void
+    onrecheck: (id: TorrentId) => void
     onremove: (id: TorrentId, deleteFiles: boolean) => void
   } = $props()
 
   function name(t: TorrentRow): string {
-    return t.kind === 'downloading' || t.kind === 'paused' ? t.name : t.source
+    return t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'checking' ? t.name : t.source
   }
 
   function status(t: TorrentRow): string {
@@ -35,6 +37,8 @@
         return 'resolving…'
       case 'failed':
         return '⚠ failed'
+      case 'checking':
+        return `checking ${Math.floor(fraction(t.checked_pieces, t.total_pieces) * 100)}%`
       case 'paused':
         return t.completed ? 'paused, complete' : 'paused'
       case 'downloading':
@@ -53,6 +57,8 @@
         <Table.Cell class="w-44 min-w-44">
           {#if t.kind === 'downloading' || t.kind === 'paused'}
             <ProgressBar fraction={fraction(t.verified_pieces, t.total_pieces)} done={t.completed} />
+          {:else if t.kind === 'checking'}
+            <ProgressBar fraction={fraction(t.checked_pieces, t.total_pieces)} done={false} />
           {/if}
         </Table.Cell>
         <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">{status(t)}</Table.Cell>
@@ -85,6 +91,10 @@
               {/snippet}
             </DropdownMenu.Trigger>
             <DropdownMenu.Content align="end">
+              {#if t.kind === 'downloading' || t.kind === 'paused'}
+                <DropdownMenu.Item onclick={() => onrecheck(t.id)}>Force recheck</DropdownMenu.Item>
+                <DropdownMenu.Separator />
+              {/if}
               <DropdownMenu.Item onclick={() => onremove(t.id, false)}>Remove, keep files</DropdownMenu.Item>
               <DropdownMenu.Item variant="destructive" onclick={() => onremove(t.id, true)}>
                 Remove and delete files

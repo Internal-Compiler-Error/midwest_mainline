@@ -1,5 +1,6 @@
 mod announcer;
 mod bt_client;
+pub mod check;
 pub mod config;
 mod defs;
 pub mod dht;

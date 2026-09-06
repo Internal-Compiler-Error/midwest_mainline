@@ -95,6 +95,7 @@
             onselect={(id) => (selected = id)}
             onpause={api.pauseTorrent}
             onunpause={api.unpauseTorrent}
+            onrecheck={api.recheckTorrent}
             onremove={remove}
           />
         {/if}

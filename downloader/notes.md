@@ -22,6 +22,7 @@ survives context resets; re-read before acting.
 - [x] MSE (BEP "protocol encryption"): DH + RC4 stream wrapper, initiator and responder,
       settings Disabled/Prefer/Require with plaintext fallback
 - [x] Port mapping: NAT-PMP/PCP via `crab_nat`, UPnP via `igd-next`
+- [x] Force recheck
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -554,3 +555,13 @@ router at 192.168.2.1 answers neither NAT-PMP/PCP nor UPnP (a raw SSDP M-SEARCH 
 LAN address gets no responder at all), so only the "found the gateway, tried both, gave up
 cleanly, retries in ten minutes" path has run for real. Port 0 (tests) maps nothing.
 Setting: `port_mapping`, default on, next start.
+
+# Force recheck, 2026-09-06
+`Session::recheck(id)` re-hashes a torrent's files (`check::check_files`, off the runtime in
+`spawn_blocking`) and continues from what's really on disk, in whichever of downloading or
+paused it was in. While it runs the torrent is `TorrentState::Checking` with a piece count;
+only removal and shutdown interrupt it, and the hashing itself finishes regardless. A file
+that's missing or short fails every piece touching it. The GUI has it in the row's menu.
+
+Tests: `check::good_bad_and_missing_pieces_are_told_apart` (a piece straddling two files, a
+corrupted piece, a missing file) and `session::recheck_finds_what_is_on_disk`.

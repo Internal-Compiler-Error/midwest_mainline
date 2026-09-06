@@ -42,6 +42,7 @@ export type TorrentRow = { id: TorrentId } & (
   | { kind: 'resolving'; source: string; elapsed_ms: number }
   | ({ kind: 'downloading' } & Progress)
   | ({ kind: 'paused' } & Progress)
+  | { kind: 'checking'; name: string; checked_pieces: number; total_pieces: number }
   | { kind: 'failed'; source: string; error: string }
 )
 
@@ -68,6 +69,7 @@ export const removeTorrent = (id: TorrentId, deleteFiles: boolean) =>
 export const pauseTorrent = (id: TorrentId) => invoke<void>('pause_torrent', { id })
 export const selectFiles = (id: TorrentId, selected: boolean[]) => invoke<void>('select_files', { id, selected })
 export const unpauseTorrent = (id: TorrentId) => invoke<void>('unpause_torrent', { id })
+export const recheckTorrent = (id: TorrentId) => invoke<void>('recheck_torrent', { id })
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })
 export const clearLogs = () => invoke<void>('clear_logs')

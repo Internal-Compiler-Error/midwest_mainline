@@ -30,10 +30,21 @@ struct TorrentRow {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StateDto {
-    Resolving { source: String, elapsed_ms: u64 },
+    Resolving {
+        source: String,
+        elapsed_ms: u64,
+    },
     Downloading(ProgressDto),
     Paused(ProgressDto),
-    Failed { source: String, error: String },
+    Checking {
+        name: String,
+        checked_pieces: usize,
+        total_pieces: usize,
+    },
+    Failed {
+        source: String,
+        error: String,
+    },
 }
 
 /// `Progress` field for field; the library stays free of serde.
@@ -129,6 +140,15 @@ impl From<TorrentState> for StateDto {
             },
             TorrentState::Downloading(progress) => StateDto::Downloading(progress.into()),
             TorrentState::Paused(progress) => StateDto::Paused(progress.into()),
+            TorrentState::Checking {
+                name,
+                checked_pieces,
+                total_pieces,
+            } => StateDto::Checking {
+                name,
+                checked_pieces,
+                total_pieces,
+            },
             TorrentState::Failed { source, error } => StateDto::Failed { source, error },
         }
     }
@@ -192,6 +212,11 @@ fn pause_torrent(app: State<App>, id: TorrentId) {
 #[tauri::command]
 fn unpause_torrent(app: State<App>, id: TorrentId) {
     app.session.lock().unwrap().unpause(id);
+}
+
+#[tauri::command]
+fn recheck_torrent(app: State<App>, id: TorrentId) {
+    app.session.lock().unwrap().recheck(id);
 }
 
 #[tauri::command]
@@ -341,6 +366,7 @@ fn main() {
             remove_torrent,
             pause_torrent,
             unpause_torrent,
+            recheck_torrent,
             select_files,
             resumable,
             logs_since,
