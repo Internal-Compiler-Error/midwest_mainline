@@ -2,6 +2,7 @@ use crate::announcer::TrackerStatus;
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::events::{Event, EventBus, PeerSource};
 use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
@@ -50,6 +51,8 @@ pub struct BtClient {
     limiter: Arc<RateLimiter>,
     /// local service discovery, poked when a torrent is added
     lsd: Arc<Lsd>,
+    /// everything that happens, for whoever listens (see `events`)
+    events: EventBus,
 }
 
 impl BtClient {
@@ -68,7 +71,17 @@ impl BtClient {
 
     /// Must be called on a tokio runtime: the inbound listener starts right away.
     pub fn new(id: Identity, dht: DhtWatch) -> Self {
-        Self::new_with_shutdown(id, CancellationToken::new(), dht, default_settings())
+        Self::with_events(id, dht, EventBus::new())
+    }
+
+    /// `new` with a bus the caller already hands out to other components (the DHT node).
+    pub fn with_events(id: Identity, dht: DhtWatch, events: EventBus) -> Self {
+        Self::new_with_shutdown(id, CancellationToken::new(), dht, default_settings(), events)
+    }
+
+    /// The stream of everything this client does; subscribe to it for a live view.
+    pub fn events(&self) -> EventBus {
+        self.events.clone()
     }
 
     /// Like `new`, but driven by a caller-supplied token, so an owner that already has its own
@@ -79,6 +92,7 @@ impl BtClient {
         shutdown: CancellationToken,
         dht: DhtWatch,
         settings: SettingsWatch,
+        events: EventBus,
     ) -> Self {
         let swarms = Arc::new(Mutex::new(HashMap::new()));
         let utp = if settings.borrow().utp {
@@ -91,7 +105,7 @@ impl BtClient {
                 peer: id.serving.port(),
                 dht: id.dht.then(|| settings.borrow().dht_port()),
             };
-            portmap::start(ports, shutdown.clone())
+            portmap::start(ports, shutdown.clone(), events.clone())
         } else {
             portmap::none()
         };
@@ -105,17 +119,20 @@ impl BtClient {
             settings,
             utp,
             port_mapping,
+            events,
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),
             Arc::downgrade(&client.swarms),
             client.shutdown.clone(),
+            client.events.clone(),
         ));
         tokio::spawn(Self::accept_utp(
             client.id.clone(),
             Arc::downgrade(&client.swarms),
             client.shutdown.clone(),
             client.utp.clone(),
+            client.events.clone(),
         ));
         client
     }
@@ -176,7 +193,7 @@ impl BtClient {
     pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {
         let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
         if let Some(handle) = handle {
-            tokio::spawn(async move { handle.peers_discovered(peers).await });
+            tokio::spawn(async move { handle.peers_discovered(peers, PeerSource::Metadata).await });
         }
     }
 
@@ -254,6 +271,7 @@ impl BtClient {
         let storage = Arc::new(storage);
 
         let shared = Shared {
+            events: self.events.clone(),
             id: self.id.clone(),
             dht: self.dht.clone(),
             utp: self.utp.clone(),
@@ -274,6 +292,7 @@ impl BtClient {
         id: Arc<Identity>,
         swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
         shutdown: CancellationToken,
+        events: EventBus,
     ) {
         // Listen on both families independently rather than relying on a single dual-stack
         // socket (whether an unspecified IPv6 bind also accepts v4-mapped connections is a
@@ -289,6 +308,10 @@ impl BtClient {
                     "listening for inbound peer connections on {}",
                     listener.local_addr().unwrap()
                 );
+                events.emit(Event::Listening {
+                    transport: "tcp",
+                    port: listener.local_addr().map(|a| a.port()).unwrap_or(port),
+                });
                 listeners.push(listener);
             }
             Err(e) => tracing::warn!("no ipv6 inbound listener on port {port} ({e}); ipv6 peers can't dial us"),
@@ -299,6 +322,10 @@ impl BtClient {
                     "listening for inbound peer connections on {}",
                     listener.local_addr().unwrap()
                 );
+                events.emit(Event::Listening {
+                    transport: "tcp",
+                    port: listener.local_addr().map(|a| a.port()).unwrap_or(port),
+                });
                 listeners.push(listener);
             }
             Err(e) => tracing::warn!(
@@ -337,6 +364,7 @@ impl BtClient {
         swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
         shutdown: CancellationToken,
         mut utp: UtpWatch,
+        events: EventBus,
     ) {
         let socket = loop {
             if let Some(socket) = utp.borrow().clone() {
@@ -347,6 +375,10 @@ impl BtClient {
                 changed = utp.changed() => if changed.is_err() { return },
             }
         };
+        events.emit(Event::Listening {
+            transport: "utp",
+            port: socket.bind_addr().port(),
+        });
         loop {
             if swarms.strong_count() == 0 {
                 break;

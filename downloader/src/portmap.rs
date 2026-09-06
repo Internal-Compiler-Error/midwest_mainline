@@ -7,6 +7,7 @@
 //! Best effort: no gateway, or one that refuses, is logged once and that's that. Nothing
 //! else in the client knows whether a mapping exists.
 
+use crate::events::{Event, EventBus};
 use crab_nat::{GatewayAddress, InternetProtocol, PortMapping, PortMappingOptions};
 use igd_next::PortMappingProtocol;
 use igd_next::aio::tokio::{Tokio, search_gateway};
@@ -26,7 +27,8 @@ const UPNP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const DESCRIPTION: &str = "downloader";
 
 /// Where the mapping stands, for a status line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum MappingState {
     /// turned off in the settings
     Off,
@@ -78,18 +80,22 @@ impl std::fmt::Display for Protocol {
 }
 
 /// Keeps the mappings up on the current runtime until `shutdown`, then removes them.
-pub(crate) fn start(ports: Ports, shutdown: CancellationToken) -> MappingWatch {
+pub(crate) fn start(ports: Ports, shutdown: CancellationToken, bus: EventBus) -> MappingWatch {
     // port 0 means the OS picked one, which nobody outside can be told about; tests use it
     if ports.peer == 0 {
         return none();
     }
-    let (state, watch) = watch::channel(MappingState::Searching);
+    let (state_tx, watch) = watch::channel(MappingState::Searching);
+    let state = move |next: MappingState| {
+        bus.emit(Event::PortMapping { state: next.clone() });
+        let _ = state_tx.send(next);
+    };
     tokio::spawn(async move {
         loop {
-            let _ = state.send(MappingState::Searching);
+            state(MappingState::Searching);
             let Some((gateway, local_ip)) = gateway() else {
                 debug!("no gateway to map ports on");
-                let _ = state.send(MappingState::Unavailable);
+                state(MappingState::Unavailable);
                 wait_or_stop(RETRY, &shutdown).await;
                 if shutdown.is_cancelled() {
                     return;
@@ -98,7 +104,7 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken) -> MappingWatch {
             };
             match Mapper::open(gateway, local_ip, ports).await {
                 Some(mut mapper) => {
-                    let _ = state.send(MappingState::Mapped {
+                    state(MappingState::Mapped {
                         external_ip: mapper.external_ip().await,
                     });
                     mapper.keep_alive(&shutdown).await;
@@ -107,7 +113,7 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken) -> MappingWatch {
                 }
                 None => {
                     info!("no port mapping: the gateway at {gateway} answers neither NAT-PMP nor UPnP");
-                    let _ = state.send(MappingState::Unavailable);
+                    state(MappingState::Unavailable);
                     wait_or_stop(RETRY, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;

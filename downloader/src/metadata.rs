@@ -12,9 +12,11 @@
 //! Peers come from the magnet's trackers and from the DHT, which is how a magnet with no
 //! trackers at all still resolves.
 
+use crate::announcer::Announcing;
 use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::events::{Event, EventBus};
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::stream::DialHints;
@@ -74,6 +76,7 @@ pub async fn fetch(
     shutdown: CancellationToken,
     dht: DhtWatch,
     utp: UtpWatch,
+    bus: EventBus,
 ) -> anyhow::Result<Fetched> {
     // a watch whose sender is gone is a client with no DHT, now or ever (`Dht::none`, or a
     // node that failed to start); with no trackers either there's nowhere to find a peer
@@ -108,19 +111,21 @@ pub async fn fetch(
     // cancel anything the caller still needs
     let announcer_shutdown = StopAnnouncersOnDrop(shutdown.child_token());
 
-    spawn_announcers(
-        &magnet.trackers,
-        magnet.info_hash,
-        identity.clone(),
-        stat_rx,
+    spawn_announcers(Announcing {
+        trackers: magnet.trackers.clone(),
+        info_hash: magnet.info_hash,
+        identity: identity.clone(),
+        stats: stat_rx,
         // announcers hold weak senders (see `TorrentSwarmHandle`); `event_tx` itself lives in
         // this frame, so the channel stays open exactly as long as this fetch does
-        event_tx.downgrade(),
-        announcer_shutdown.0.clone(),
+        events: event_tx.downgrade(),
+        shutdown: announcer_shutdown.0.clone(),
         dht,
-    );
+        bus: bus.clone(),
+    });
 
-    let (result_tx, mut result_rx) = mpsc::channel::<anyhow::Result<Vec<u8>>>(MAX_CONCURRENT_FETCHES);
+    let started = tokio::time::Instant::now();
+    let (result_tx, mut result_rx) = mpsc::channel::<(SocketAddr, anyhow::Result<Vec<u8>>)>(MAX_CONCURRENT_FETCHES);
     let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
     // Peers discovered but not yet dialled, because the concurrency limit was already reached.
     // These have to be queued rather than dropped: a tracker typically returns dozens of peers
@@ -132,7 +137,7 @@ pub async fn fetch(
     let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
     let give_up = tokio::time::Instant::now() + OVERALL_TIMEOUT;
 
-    let raw_info = loop {
+    let (from, raw_info) = loop {
         // top up to the concurrency limit from whatever's queued
         while in_flight < MAX_CONCURRENT_FETCHES {
             let Some(peer) = pending.pop_front() else { break };
@@ -145,7 +150,7 @@ pub async fn fetch(
                 let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity, utp))
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
-                let _ = result_tx.send(result).await;
+                let _ = result_tx.send((peer, result)).await;
             });
         }
 
@@ -161,7 +166,7 @@ pub async fn fetch(
             _ = shutdown.cancelled() => bail!("cancelled while fetching metadata"),
 
             Some(event) = event_rx.recv() => {
-                let SwarmEvent::PeersDiscovered(peers) = event else {
+                let SwarmEvent::PeersDiscovered(peers, _) = event else {
                     continue;
                 };
                 // queue every peer we haven't already tried; the loop head dials as many as
@@ -173,17 +178,26 @@ pub async fn fetch(
                 }
             }
 
-            Some(result) = result_rx.recv() => {
+            Some((peer, result)) = result_rx.recv() => {
                 in_flight = in_flight.saturating_sub(1);
                 match result {
-                    Ok(raw_info) => break raw_info,
+                    Ok(raw_info) => break (peer, raw_info),
                     Err(e) => debug!("metadata fetch from a peer failed: {e:#}"),
                 }
             }
         }
     };
 
-    info!("fetched {} bytes of metadata, building torrent", raw_info.len());
+    info!(
+        "fetched {} bytes of metadata from {from}, building torrent",
+        raw_info.len()
+    );
+    bus.emit(Event::MetadataFetched {
+        info_hash: magnet.info_hash,
+        from,
+        bytes: raw_info.len(),
+        took_ms: started.elapsed().as_millis() as u64,
+    });
     let torrent_file = build_torrent_file(&raw_info, &magnet.trackers);
     let torrent = parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")?;
     Ok(Fetched {
@@ -786,6 +800,7 @@ mod test {
                 CancellationToken::new(),
                 crate::dht::Dht::none(),
                 crate::utp::none(),
+                EventBus::new(),
             ),
         )
         .await
@@ -844,6 +859,7 @@ mod test {
                 CancellationToken::new(),
                 crate::dht::Dht::none(),
                 crate::utp::none(),
+                EventBus::new(),
             ),
         )
         .await

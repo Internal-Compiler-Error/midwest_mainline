@@ -1,7 +1,8 @@
-use crate::announcer::{TrackerStatus, spawn_announcers};
+use crate::announcer::{Announcing, TrackerStatus, spawn_announcers};
 use crate::config::SettingsWatch;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::events::{Event, EventBus, PeerSource};
 use crate::limiter::RateLimiter;
 use crate::peer::{
     PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
@@ -141,8 +142,8 @@ impl TorrentSwarmHandle {
     }
 
     /// Addresses worth dialing, from wherever the caller got them.
-    pub(crate) async fn peers_discovered(&self, peers: Vec<SocketAddr>) {
-        let _ = self.tx.send(SwarmEvent::PeersDiscovered(peers)).await;
+    pub(crate) async fn peers_discovered(&self, peers: Vec<SocketAddr>, source: PeerSource) {
+        let _ = self.tx.send(SwarmEvent::PeersDiscovered(peers, source)).await;
     }
 
     /// One flag per file; only pieces of selected files are downloaded.
@@ -159,6 +160,7 @@ impl TorrentSwarmHandle {
 /// What every swarm of one client has in common: who we are and the client-wide services.
 #[derive(Clone)]
 pub(crate) struct Shared {
+    pub events: EventBus,
     pub id: Arc<Identity>,
     pub dht: DhtWatch,
     pub utp: UtpWatch,
@@ -183,8 +185,8 @@ pub(crate) struct ConnectedPeer {
 /// tasks it doesn't poll itself (tracker announcers, dial tasks, the inbound listener). The
 /// swarm decides what to do about each; the sender never asks it for anything.
 pub(crate) enum SwarmEvent {
-    /// a tracker answered with peers
-    PeersDiscovered(Vec<SocketAddr>),
+    /// a tracker, the DHT, LSD or the metadata fetch handed out peers
+    PeersDiscovered(Vec<SocketAddr>, PeerSource),
     /// one flag per file, see `TorrentSwarmHandle::select_files`
     FilesSelected(Vec<bool>),
     /// see `TorrentSwarmHandle::set_sequential`
@@ -387,6 +389,7 @@ pub struct TorrentSwarm {
     settings: SettingsWatch,
     /// the client-wide download and upload limits
     limiter: Arc<RateLimiter>,
+    bus: EventBus,
     /// blocks read off disk that the upload limit didn't allow out yet, oldest first;
     /// housekeeping sends what the limit allows
     held_uploads: VecDeque<(SocketAddr, Piece)>,
@@ -445,6 +448,7 @@ impl TorrentSwarm {
         shared: Shared,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
         let Shared {
+            events: bus,
             id,
             dht,
             utp,
@@ -466,15 +470,25 @@ impl TorrentSwarm {
         let (peers_tx, peers_rx) = watch::channel(vec![]);
         let events_tx_weak = events_tx.downgrade();
         let announcers = CancellationToken::new();
-        let trackers = spawn_announcers(
-            &torrent.all_trackers(),
-            torrent.info_hash,
-            id.clone(),
-            stat_rx.clone(),
-            events_tx_weak.clone(),
-            announcers.clone(),
-            dht.clone(),
-        );
+        let trackers = spawn_announcers(Announcing {
+            trackers: torrent.all_trackers(),
+            info_hash: torrent.info_hash,
+            identity: id.clone(),
+            stats: stat_rx.clone(),
+            events: events_tx_weak.clone(),
+            shutdown: announcers.clone(),
+            dht: dht.clone(),
+            bus: bus.clone(),
+        });
+        bus.emit(Event::PiecesKnown {
+            info_hash: torrent.info_hash,
+            bitfield: stat
+                .verified
+                .as_raw_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        });
         let handle = TorrentSwarmHandle {
             tx: events_tx,
             stats: stat_rx,
@@ -497,6 +511,7 @@ impl TorrentSwarm {
             utp,
             settings,
             limiter,
+            bus,
             held_uploads: VecDeque::new(),
             events_rx,
             events_tx,
@@ -510,6 +525,30 @@ impl TorrentSwarm {
             _stop_announcers: announcers.drop_guard(),
         };
         (swarm, handle)
+    }
+
+    /// Once a second: where every peer stands, and the torrent's running totals.
+    fn sample_peers(&self) {
+        let info_hash = self.torrent.info_hash;
+        for peer in &self.peers {
+            self.bus.emit(Event::PeerSample {
+                info_hash,
+                addr: peer.remote_addr,
+                rx_bps: peer.stats.rx_rate,
+                downloaded: peer.stats.received as u64,
+                uploaded: peer.stats.sent as u64,
+                outstanding: peer.requested.len(),
+                choked_us: peer.choked_us,
+                choked_them: peer.choked_them,
+            });
+        }
+        self.bus.emit(Event::Traffic {
+            info_hash,
+            downloaded: self.stat.downloaded,
+            uploaded: self.stat.uploaded,
+            wasted: self.stat.wasted,
+            peers: self.peers.len(),
+        });
     }
 
     fn publish_stats(&self) {
@@ -544,11 +583,11 @@ impl TorrentSwarm {
                         Some(Ok(msg)) => self.on_peer_message(idx, msg).await,
                         Some(Err(e)) => {
                             info!("{} read failed ({e}), disconnecting", self.peers[idx].remote_addr);
-                            self.drop_peer(idx);
+                            self.drop_peer(idx, "read failed");
                         }
                         None => {
                             info!("{} hung up", self.peers[idx].remote_addr);
-                            self.drop_peer(idx);
+                            self.drop_peer(idx, "hung up");
                         }
                     }
                 }
@@ -577,12 +616,23 @@ impl TorrentSwarm {
 
     async fn process_event(&mut self, event: SwarmEvent) {
         match event {
-            SwarmEvent::PeersDiscovered(peers) => self.connect_to_discovered_peers(peers),
+            SwarmEvent::PeersDiscovered(peers, source) => {
+                self.bus.emit(Event::PeersDiscovered {
+                    info_hash: self.torrent.info_hash,
+                    source,
+                    count: peers.len(),
+                });
+                self.connect_to_discovered_peers(peers)
+            }
             SwarmEvent::FilesSelected(selected) => self.select_files(&selected).await,
             SwarmEvent::Sequential(on) => self.sequential = on,
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::DialFailed(addr) => {
+                self.bus.emit(Event::DialFailed {
+                    info_hash: self.torrent.info_hash,
+                    addr,
+                });
                 self.dialing.remove(&addr);
                 self.known
                     .entry(canonical(addr))
@@ -630,7 +680,7 @@ impl TorrentSwarm {
                 "{} timed out (no messages for {:?}), disconnecting",
                 self.peers[idx].remote_addr, PEER_TIMEOUT
             );
-            self.drop_peer(idx);
+            self.drop_peer(idx, "timed out");
         }
         stalled.sort_unstable();
         stalled.dedup();
@@ -642,6 +692,7 @@ impl TorrentSwarm {
         self.schedule().await;
         self.send_held_uploads().await;
         self.publish_stats();
+        self.sample_peers();
         let _ = self
             .peers_snapshot_tx
             .send(self.peers.iter().map(Peer::snapshot).collect());
@@ -660,7 +711,7 @@ impl TorrentSwarm {
             }
             self.stat.uploaded += block.length as u64;
             if self.peers[idx].send_block(block).await.is_err() {
-                self.drop_peer(idx);
+                self.drop_peer(idx, "send failed");
             }
         }
     }
@@ -682,8 +733,15 @@ impl TorrentSwarm {
     }
 
     /// Removes a peer and puts whatever it was downloading for us back up for grabs.
-    fn drop_peer(&mut self, idx: usize) {
+    fn drop_peer(&mut self, idx: usize, reason: &'static str) {
         let peer = self.peers.remove(idx);
+        self.bus.emit(Event::PeerDisconnected {
+            info_hash: self.torrent.info_hash,
+            addr: peer.remote_addr,
+            downloaded: peer.stats.received as u64,
+            uploaded: peer.stats.sent as u64,
+            reason,
+        });
         self.subsample.remove(&peer.remote_addr);
         self.known
             .entry(peer.remote_addr)
@@ -725,15 +783,24 @@ impl TorrentSwarm {
             }
         }
         for idx in dead.into_iter().rev() {
-            self.drop_peer(idx);
+            self.drop_peer(idx, "send failed");
         }
     }
 
     async fn on_peer_message(&mut self, idx: usize, msg: BtMessage) {
         let peer = &mut self.peers[idx];
         let choked = matches!(msg, BtMessage::Choke(_));
+        let choked_us_before = peer.choked_us;
         let msg = match peer.apply(msg) {
             Ok(None) => {
+                if peer.choked_us != choked_us_before {
+                    self.bus.emit(Event::ChokeChanged {
+                        info_hash: self.torrent.info_hash,
+                        addr: peer.remote_addr,
+                        choked: peer.choked_us,
+                        by_us: false,
+                    });
+                }
                 if choked {
                     // BEP 3: a choke discards our outstanding requests, and nothing more
                     // will be asked of the peer until it unchokes, so its pieces go back
@@ -751,7 +818,7 @@ impl TorrentSwarm {
             Err(ProtocolViolation(what)) => {
                 warn!("{} sent {what}, disconnecting", peer.remote_addr);
                 let addr = peer.remote_addr;
-                self.drop_peer(idx);
+                self.drop_peer(idx, "protocol violation");
                 self.ban(addr);
                 return;
             }
@@ -807,17 +874,22 @@ impl TorrentSwarm {
                 let total_size = self.torrent.metadata_size();
                 let data = &self.torrent.raw_info[start..end];
                 if peer.send_metadata_piece(piece, total_size, data).await.is_err() {
-                    self.drop_peer(idx);
+                    self.drop_peer(idx, "send failed");
                 }
             }
             BtMessage::Extended(ext) if ext.ext_id == UT_PEX_ID => {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
                 // anyway (we don't advertise ut_pex when private, so a compliant peer won't)
                 if !self.torrent.private {
-                    let gossiped = parse_pex_message(&ext.payload)
+                    let gossiped: Vec<(SocketAddr, bool)> = parse_pex_message(&ext.payload)
                         .into_iter()
                         .map(|(addr, flags)| (addr, flags & PEX_UTP != 0))
                         .collect();
+                    self.bus.emit(Event::PeersDiscovered {
+                        info_hash: self.torrent.info_hash,
+                        source: PeerSource::Pex { from: peer.remote_addr },
+                        count: gossiped.len(),
+                    });
                     self.connect_to_peers(gossiped);
                 }
             }
@@ -839,7 +911,7 @@ impl TorrentSwarm {
         let peer = &mut self.peers[idx];
         if peer.choked_them {
             if peer.send_reject(request).await.is_err() {
-                self.drop_peer(idx);
+                self.drop_peer(idx, "send failed");
             }
             return;
         }
@@ -848,7 +920,7 @@ impl TorrentSwarm {
         let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
         if !verified {
             if peer.send_reject(request).await.is_err() {
-                self.drop_peer(idx);
+                self.drop_peer(idx, "send failed");
             }
             return;
         }
@@ -905,7 +977,7 @@ impl TorrentSwarm {
             Err(request) => peer.send_reject(request).await,
         };
         if sent.is_err() {
-            self.drop_peer(idx);
+            self.drop_peer(idx, "send failed");
         }
     }
 
@@ -915,6 +987,12 @@ impl TorrentSwarm {
         if peer.block_received(&block).is_none() {
             tracing::debug!("{from} sent a block we weren't waiting for, ignoring");
             self.stat.wasted += block.length as u64;
+            self.bus.emit(Event::BlockWasted {
+                info_hash: self.torrent.info_hash,
+                addr: from,
+                len: block.length,
+                why: "unexpected",
+            });
             return;
         }
         self.stat.downloaded += block.length as u64;
@@ -937,6 +1015,12 @@ impl TorrentSwarm {
         if slot.is_some() {
             // a racer lost this block
             self.stat.wasted += block.length as u64;
+            self.bus.emit(Event::BlockWasted {
+                info_hash: self.torrent.info_hash,
+                addr: from,
+                len: block.length,
+                why: "lost race",
+            });
             self.refill(idx).await;
             return;
         }
@@ -957,12 +1041,22 @@ impl TorrentSwarm {
             return;
         }
         match self.verify_hash(piece) {
-            Some(true) => {}
+            Some(true) => self.bus.emit(Event::PieceVerified {
+                info_hash: self.torrent.info_hash,
+                piece,
+                len: in_flight.buf.len(),
+                peers: senders.iter().copied().collect(),
+            }),
             Some(false) => {
+                self.bus.emit(Event::PieceFailed {
+                    info_hash: self.torrent.info_hash,
+                    piece,
+                    peers: senders.iter().copied().collect(),
+                });
                 if senders.len() == 1 {
                     warn!("piece {piece} from {from} failed hash verification, banning the peer");
                     if let Some(idx) = self.peer_index(from) {
-                        self.drop_peer(idx);
+                        self.drop_peer(idx, "sent a bad piece");
                     }
                     self.ban(from);
                 } else {
@@ -1004,7 +1098,7 @@ impl TorrentSwarm {
             let peer = &mut self.peers[idx];
             for req in peer.forget_piece(piece) {
                 if peer.send_cancel(req).await.is_err() {
-                    self.drop_peer(idx);
+                    self.drop_peer(idx, "send failed");
                     break;
                 }
             }
@@ -1038,6 +1132,7 @@ impl TorrentSwarm {
             let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
             self.missing.retain(|p| *p != piece);
             let addr = self.peers[idx].remote_addr;
+            self.emit_pick(idx, piece);
             self.in_flight.insert(piece, InFlight::new(size, addr));
             info!(
                 "requesting piece {piece} from {addr} (window {})",
@@ -1084,6 +1179,7 @@ impl TorrentSwarm {
                     break;
                 };
                 let addr = self.peers[idx].remote_addr;
+                self.emit_pick(idx, piece);
                 self.in_flight.get_mut(&piece).expect("just looked up").add_racer(addr);
                 info!("endgame: also requesting piece {piece} from {addr}");
             }
@@ -1122,7 +1218,7 @@ impl TorrentSwarm {
             break;
         }
         if failed {
-            self.drop_peer(idx);
+            self.drop_peer(idx, "send failed");
         }
     }
 
@@ -1159,6 +1255,26 @@ impl TorrentSwarm {
                 self.subsample.insert(peer.remote_addr);
             }
         }
+    }
+
+    /// The pick just made, with the two halves of the score that decided it.
+    fn emit_pick(&self, idx: usize, piece: u32) {
+        let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
+        let peer = &self.peers[idx];
+        let (exploit, explore) = if self.total_picks == 0 || peer.stats.picked_count == 0 {
+            (0.0, f64::INFINITY)
+        } else {
+            peer.stats.ucb_terms(self.total_picks, rate_scale)
+        };
+        self.bus.emit(Event::PeerPicked {
+            info_hash: self.torrent.info_hash,
+            addr: peer.remote_addr,
+            piece,
+            exploit,
+            explore,
+            picked_count: peer.stats.picked_count,
+            total_picks: self.total_picks,
+        });
     }
 
     /// UCB peer selection: of the subsample members that have `piece`, aren't choking us,
@@ -1278,6 +1394,14 @@ impl TorrentSwarm {
         }
 
         info!("{remote_addr} connected, {} peers now", self.peers.len() + 1);
+        self.bus.emit(Event::PeerConnected {
+            info_hash: self.torrent.info_hash,
+            addr: remote_addr,
+            client: crate::peer::client_name(&peer.peer_id),
+            dialed: connected.dialed,
+            encrypted: peer.encrypted,
+            utp: peer.utp,
+        });
         self.peers.insert(insert_at, peer);
     }
 
@@ -1353,6 +1477,17 @@ impl TorrentSwarm {
             }
         }
 
+        for peer in &self.peers {
+            let should_unchoke = to_unchoke.contains(&peer.remote_addr);
+            if should_unchoke == peer.choked_them {
+                self.bus.emit(Event::ChokeChanged {
+                    info_hash: self.torrent.info_hash,
+                    addr: peer.remote_addr,
+                    choked: !should_unchoke,
+                    by_us: true,
+                });
+            }
+        }
         self.broadcast(move |peer| {
             let should_unchoke = to_unchoke.contains(&peer.remote_addr);
             Box::pin(async move {
@@ -1523,6 +1658,7 @@ mod test {
         let (settings_tx, settings_rx) = watch::channel(settings);
         std::mem::forget(settings_tx);
         let shared = Shared {
+            events: EventBus::new(),
             id,
             dht: crate::dht::Dht::none(),
             utp: crate::utp::none(),
@@ -1531,6 +1667,39 @@ mod test {
         };
         let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         (swarm, handle, path)
+    }
+
+    /// The bus hears a peer arrive and leave, with the reason.
+    #[tokio::test]
+    async fn the_bus_hears_peers_come_and_go() {
+        let (swarm, handle, path) = swarm("bus");
+        let mut events = swarm.bus.subscribe();
+        tokio::spawn(swarm.work_loop());
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+        drop(seeder);
+
+        let mut saw = Vec::new();
+        let wanted = async {
+            loop {
+                let stamped = events.next().await.expect("the bus is alive");
+                match stamped.event {
+                    Event::PeerConnected { addr, dialed, .. } => {
+                        assert_eq!(addr, "10.0.0.1:6881".parse().unwrap());
+                        assert!(!dialed);
+                        saw.push("connected");
+                    }
+                    Event::PeerDisconnected { reason, .. } => {
+                        saw.push(reason);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wanted).await.unwrap();
+        assert_eq!(saw, ["connected", "hung up"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
@@ -1685,6 +1854,7 @@ mod test {
             encryption: crate::config::Encryption::Prefer,
         });
         let shared = Shared {
+            events: EventBus::new(),
             id,
             dht: crate::dht::Dht::none(),
             utp: crate::utp::none(),
@@ -1888,7 +2058,10 @@ mod test {
 
         handle
             .tx
-            .send(SwarmEvent::PeersDiscovered(vec![fruitless_addr, useful_addr]))
+            .send(SwarmEvent::PeersDiscovered(
+                vec![fruitless_addr, useful_addr],
+                PeerSource::Lsd,
+            ))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), useful_listener.accept())

@@ -1,4 +1,6 @@
-use downloader::{BtClient, Dht, Identity, ResumeData, ResumeInputs, Settings, data_dir, keep_saving, load_source};
+use downloader::{
+    BtClient, Dht, EventBus, Identity, ResumeData, ResumeInputs, Settings, data_dir, keep_saving, load_source,
+};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
@@ -61,8 +63,9 @@ async fn main() -> anyhow::Result<()> {
     // resume files and the DHT database live in the data dir (see `paths::data_dir`)
     let data_dir = data_dir();
     std::fs::create_dir_all(data_dir.join("resume"))?;
-    let dht = Dht::start(data_dir.join("dht.db"), settings.dht_port());
-    let client = BtClient::new(identity, dht.watch());
+    let events = EventBus::new();
+    let dht = Dht::start(data_dir.join("dht.db"), settings.dht_port(), events.clone());
+    let client = BtClient::with_events(identity, dht.watch(), events);
     let (torrent, root) = if Path::new(&source)
         .extension()
         .is_some_and(|ext| ext == downloader::resume::EXTENSION)
@@ -89,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let resolving = CancellationToken::new();
         let loaded = tokio::select! {
-            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht(), client.utp()) => resolved?,
+            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht(), client.utp(), client.events()) => resolved?,
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("interrupted while resolving, stopping tracker announces...");
                 resolving.cancel();

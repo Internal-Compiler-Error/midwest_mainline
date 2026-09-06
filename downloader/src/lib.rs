@@ -4,6 +4,7 @@ pub mod check;
 pub mod config;
 mod defs;
 pub mod dht;
+pub mod events;
 mod limiter;
 pub mod logs;
 mod lsd;
@@ -27,6 +28,7 @@ pub use bt_client::BtClient;
 pub use config::{Encryption, Settings, SettingsWatch};
 pub use defs::Identity;
 pub use dht::{Dht, DhtWatch};
+pub use events::{Event, EventBus, Events, PeerSource, Stamped};
 pub use logs::LogBuffer;
 pub use magnet::{MagnetLink, is_magnet_uri, parse_magnet};
 pub use paths::{data_dir, default_download_dir};
@@ -55,10 +57,11 @@ pub async fn load_source(
     shutdown: CancellationToken,
     dht: DhtWatch,
     utp: UtpWatch,
+    bus: EventBus,
 ) -> anyhow::Result<Loaded> {
     if is_magnet_uri(source) {
         let magnet = parse_magnet(source)?;
-        let fetched = metadata::fetch(&magnet, identity, shutdown, dht, utp).await?;
+        let fetched = metadata::fetch(&magnet, identity, shutdown, dht, utp, bus).await?;
         Ok(Loaded {
             torrent: fetched.torrent,
             peers: fetched.peers,

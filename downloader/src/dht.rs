@@ -6,6 +6,7 @@
 //! `watch` that turns from `None` to a handle once the node is up. A client with no DHT at all just gets a
 //! watch that stays `None` (`Dht::none`).
 
+use crate::events::{Event, EventBus};
 use midwest_mainline::dht::DhtSession;
 use midwest_mainline::dht::client::DhtClient;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -51,10 +52,10 @@ pub struct Dht {
 impl Dht {
     /// Starts a node on the current tokio runtime, listening on UDP `port` (or any free port
     /// if that one is taken) and keeping its routing table in the database at `db`.
-    pub fn start(db: PathBuf, port: u16) -> Dht {
+    pub fn start(db: PathBuf, port: u16, bus: EventBus) -> Dht {
         let (tx, rx) = watch::channel(None);
         let stop = CancellationToken::new();
-        tokio::spawn(run(db, port, tx, stop.clone()));
+        tokio::spawn(run(db, port, tx, stop.clone(), bus));
         Dht {
             handle: rx,
             _stop: stop.drop_guard(),
@@ -72,7 +73,7 @@ impl Dht {
     }
 }
 
-async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, stop: CancellationToken) {
+async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, stop: CancellationToken, bus: EventBus) {
     let socket = match bind(port).await {
         Ok(socket) => socket,
         Err(e) => {
@@ -106,6 +107,10 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
         _ = stop.cancelled() => {}
         _ = bootstrap(&session) => {
             info!("DHT node up on UDP port {udp_port}, {} nodes known", session.node_count());
+            bus.emit(Event::DhtUp {
+                port: udp_port,
+                nodes: session.node_count(),
+            });
             let _ = ready.send(Some(DhtHandle {
                 client: session.handle(),
                 udp_port,

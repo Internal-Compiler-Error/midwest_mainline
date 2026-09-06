@@ -8,6 +8,9 @@ survives context resets; re-read before acting.
 - [x] DHT (BEP 5) via the sibling `dht` crate: embedded migrations in the crate, session
       started in the background, announcer for swarms and the metadata fetcher, Port message
 - [x] DHT crate: external IP learned from BEP 42 responses instead of `public-ip`
+- [x] Event bus: everything the library does as one stream (`events.rs`), and the GUI's
+      Insights panel of live charts built from it
+- [ ] Torrent creation (user, 2026-09-06: "No don't do torrent creation yet")
 - [ ] DHT crate rework (user: "very badly designed, change it however you wish"): lookups
       that don't wait for a whole round; drop SQLite for an in-memory table saved to a file?
 - [x] Auto-resume every torrent in the data dir on startup
@@ -656,3 +659,44 @@ OpenTelemetry/Jaeger stack and `external-ip` were dead (commented-out code) and 
 The GUI's packages are at the latest too, except TypeScript, pinned to 6: svelte-check 4.7
 supports TypeScript 7 only through its `--tsgo` mode with both versions installed side by
 side, which isn't worth the ceremony until it's the default.
+
+# Event bus and the Insights panel, 2026-09-06
+The user asked for "some sort of global event bus for the library to emit all sort of
+things" and "rich data visualizations on the GUI side by listening to the bus and
+accumulating data", with animations and without reinventing the wheel.
+
+`events.rs`: `Event` is one enum of raw facts (a peer connected, UCB picked this peer for
+that piece with these two score halves, a piece verified from these peers, a tracker
+answered, the port mapping changed, a torrent started/paused/completed...), `Stamped` adds a
+sequence number and Unix milliseconds, `EventBus` wraps a tokio `broadcast` channel (16k
+deep) and `Events` is a subscriber whose `next()` turns falling behind into
+`Event::Lagged { missed }` rather than an error. Everything derives `Serialize` with
+`kind` as the tag and info hashes as hex, so the GUI forwards the JSON as is. The library
+never aggregates: throughput is a `Traffic` totals event per torrent per second and a
+`PeerSample` per peer per second, not a rate. Per-block events were left out on purpose (a
+fast swarm would be a thousand a second); wasted blocks and picks are the finest grain.
+`RUST_LOG=downloader::events=trace` prints the stream in the CLI.
+
+The bus is created by `Session` (or `BtClient::new`, or handed in with `with_events`) and
+threaded to the swarms through `Shared`, to the announcers through the new `Announcing`
+args struct (`spawn_announcers` was at seven parameters), and to the DHT node, port mapper,
+metadata fetcher and the listeners. `SwarmEvent::PeersDiscovered` now carries a
+`PeerSource` so discovery can be charted by origin. `Progress` gained `info_hash` (hex) so
+the GUI can join the polled rows with the events.
+
+GUI: the Tauri side subscribes in `setup` and emits batches on the `events` channel every
+100 ms (one IPC message per event would swamp the webview). `lib/bus.svelte.ts` is the
+accumulator: bounded ring buffers and maps (5 min of one-second rates, 60 samples per
+peer, 400 picks, 2000 feed lines, 200 departed peers) rebuilt from events only.
+`lib/Insights.svelte` draws them with ECharts 6 through a `use:echart` action
+(`lib/echart.ts`: option updates animate, resize observed, re-inited when the `dark` class
+flips): throughput area, a bar race of peers by rate, the UCB card (each peer's last pick as
+a stacked exploit/explore bar, plus a scatter of recent picks), the fastest peers' last
+minute, a piece map (heatmap coloured by arrival order, grey for what was on disk, red for
+a failed hash; pieces are binned above 6000), peers found by source, clients (rose pie),
+transport rings (TCP/uTP x plain/encrypted, dialed/inbound), why peers left, announces,
+lifecycle, and a filterable raw feed with per-kind counts. The bottom pane is now
+Console | Insights (footer buttons), the choice remembered in localStorage, Insights by
+default. ECharts was chosen over LayerChart (shadcn's pick) because it animates by itself
+and has every chart type needed, and over hand-rolled SVG on the user's "don't reinvent the
+wheel".

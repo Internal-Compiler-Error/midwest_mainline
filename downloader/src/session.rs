@@ -11,6 +11,7 @@ use crate::announcer::{TrackerState, TrackerStatus};
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
+use crate::events::{Event, EventBus, Events, info_hash_hex};
 use crate::peer::PeerSnapshot;
 use crate::portmap::MappingState;
 use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
@@ -61,6 +62,8 @@ pub enum TorrentState {
 /// A flat snapshot of download progress, in the units a UI wants to display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
+    /// 40 hex digits, what the event bus names the torrent by
+    pub info_hash: String,
     pub name: String,
     /// the directory the files are under
     pub root: String,
@@ -166,6 +169,9 @@ struct Resolved {
 /// shutdown, and keeps the resume file current in between.
 struct TorrentTask {
     client: BtClient,
+    bus: EventBus,
+    /// what the user gave, for naming a torrent that failed before it was known
+    source: String,
     resume_dir: PathBuf,
     cancel: CancellationToken,
     phase: watch::Sender<Phase>,
@@ -238,6 +244,14 @@ impl TorrentTask {
             }
         };
         let torrent = Arc::new(torrent);
+        self.bus.emit(Event::TorrentResolved {
+            info_hash: torrent.info_hash,
+            name: torrent.name.clone(),
+            size: torrent.total_size,
+            pieces: torrent.pieces.len(),
+            piece_size: torrent.piece_size,
+            files: torrent.files.len(),
+        });
         let _ = self.selected.send(selected);
         let _ = self.sequential.send(sequential_asked.unwrap_or(sequential));
         self.uploaded_before = uploaded;
@@ -278,6 +292,10 @@ impl TorrentTask {
 
         if let Stop::Remove { delete_files } = stop {
             self.remove_files(&torrent, &root, delete_files);
+            self.bus.emit(Event::TorrentRemoved {
+                info_hash: torrent.info_hash,
+                deleted_files: delete_files,
+            });
         }
     }
 
@@ -313,6 +331,11 @@ impl TorrentTask {
                     match result {
                         Ok(bits) => {
                             tracing::info!("{}: {} of {} pieces are on disk", torrent.name, bits.count_ones(), bits.len());
+                            self.bus.emit(Event::TorrentChecked {
+                                info_hash: torrent.info_hash,
+                                good: bits.count_ones(),
+                                pieces: bits.len(),
+                            });
                             *verified = bits;
                         }
                         Err(e) => tracing::warn!("rechecking {} failed: {e}", torrent.name),
@@ -341,6 +364,10 @@ impl TorrentTask {
     /// resume file (and data, if asked) with it; a task that simply returned here would leave
     /// the entry unremovable and the resume file to resurrect it at the next start.
     async fn fail(&mut self, error: String, torrent: Option<(&Arc<Torrent>, &Path)>) {
+        self.bus.emit(Event::TorrentFailed {
+            source: self.source.clone(),
+            error: error.clone(),
+        });
         let _ = self.phase.send(Phase::Failed { error });
         loop {
             tokio::select! {
@@ -442,11 +469,24 @@ impl TorrentTask {
             sequential: self.sequential.subscribe(),
             uploaded_before: self.uploaded_before,
         });
+        self.bus.emit(Event::TorrentStarted {
+            info_hash: torrent.info_hash,
+            verified: verified.count_ones(),
+            pieces: verified.len(),
+        });
 
         let mut ratio_stats = stats.clone();
+        // one that starts complete finished some other time
+        let mut completion_told = ratio_stats.borrow().completed;
         let stop = loop {
             if ratio_stats.borrow().completed {
                 drop(slot.take());
+                if !completion_told {
+                    completion_told = true;
+                    self.bus.emit(Event::TorrentCompleted {
+                        info_hash: torrent.info_hash,
+                    });
+                }
             }
             // a torrent that comes back already over its ratio stops before waiting for
             // anything to change
@@ -509,6 +549,9 @@ impl TorrentTask {
         let slots = self.slots.clone();
         let acquire = slots.acquire_owned();
         tokio::pin!(acquire);
+        self.bus.emit(Event::TorrentQueued {
+            info_hash: torrent.info_hash,
+        });
         loop {
             // published on entry and again after a selection change, like the paused phase
             let wanted = torrent.wanted_pieces(&self.selected.borrow());
@@ -579,6 +622,9 @@ impl TorrentTask {
             selected: self.selected.subscribe(),
             sequential: self.sequential.subscribe(),
             uploaded_before: self.uploaded_before,
+        });
+        self.bus.emit(Event::TorrentPaused {
+            info_hash: torrent.info_hash,
         });
         let mut data = ResumeData::from_torrent(torrent, root, verified);
         data.paused = true;
@@ -708,6 +754,7 @@ pub struct Session {
     _dht: Option<Dht>,
     /// active-download slots, `Settings::max_active_downloads` of them
     slots: Arc<Semaphore>,
+    events: EventBus,
     data_dir: PathBuf,
     settings: watch::Sender<Settings>,
 }
@@ -740,20 +787,25 @@ impl Session {
         };
         let shutdown = CancellationToken::new();
         let (settings_tx, settings_rx) = watch::channel(config.settings.clone());
+        let events = EventBus::new();
         // the client and the DHT node start on whatever runtime is current
         let (client, dht) = {
             let _on_runtime = rt.enter();
-            let dht = config
-                .settings
-                .dht
-                .then(|| Dht::start(config.data_dir.join("dht.db"), config.settings.dht_port()));
+            let dht = config.settings.dht.then(|| {
+                Dht::start(
+                    config.data_dir.join("dht.db"),
+                    config.settings.dht_port(),
+                    events.clone(),
+                )
+            });
             let watch = dht.as_ref().map_or_else(Dht::none, Dht::watch);
             (
-                BtClient::new_with_shutdown(identity, shutdown.clone(), watch, settings_rx),
+                BtClient::new_with_shutdown(identity, shutdown.clone(), watch, settings_rx, events.clone()),
                 dht,
             )
         };
         Ok(Self {
+            events,
             slots: Arc::new(Semaphore::new(slot_count(&config.settings))),
             handle: rt.handle().clone(),
             rt: Some(rt),
@@ -767,6 +819,16 @@ impl Session {
             data_dir: config.data_dir,
             settings: settings_tx,
         })
+    }
+
+    /// Everything the session does, as it happens; see `events::Event`. Subscribers get
+    /// what's emitted from the moment they subscribe.
+    pub fn subscribe(&self) -> Events {
+        self.events.subscribe()
+    }
+
+    pub fn events(&self) -> EventBus {
+        self.events.clone()
     }
 
     pub fn settings(&self) -> Settings {
@@ -810,9 +872,10 @@ impl Session {
         let identity = self.identity.clone();
         let dht = self.client.dht();
         let utp = self.client.utp();
+        let bus = self.events.clone();
         let info_hash = crate::magnet::parse_magnet(&source).ok().map(|m| m.info_hash);
         self.launch(source.clone(), info_hash, |cancel| async move {
-            let loaded = load_source(&source, identity, cancel, dht, utp).await?;
+            let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
             let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
             Ok(Resolved {
                 selected: vec![true; loaded.torrent.files.len()],
@@ -929,7 +992,7 @@ impl Session {
         self.torrents.insert(
             id,
             Entry {
-                source,
+                source: source.clone(),
                 info_hash,
                 phase: phase_rx,
                 commands: commands_tx,
@@ -940,6 +1003,8 @@ impl Session {
 
         let task = TorrentTask {
             client: self.client.clone(),
+            bus: self.events.clone(),
+            source,
             resume_dir: self.resume_dir.clone(),
             cancel,
             phase: phase_tx,
@@ -1132,6 +1197,7 @@ fn progress(
     rates: &Rates,
 ) -> Progress {
     Progress {
+        info_hash: info_hash_hex(&torrent.info_hash),
         name: torrent.name.clone(),
         root: root.display().to_string(),
         files: torrent
@@ -1251,6 +1317,7 @@ mod test {
     #[test]
     fn fraction_is_clamped_and_total() {
         let mut p = Progress {
+            info_hash: String::new(),
             name: String::new(),
             root: String::new(),
             files: vec![],

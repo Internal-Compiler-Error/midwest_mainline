@@ -6,6 +6,7 @@
 
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::events::{Event as BusEvent, EventBus, PeerSource};
 use crate::settings::{ANNOUNCE_RETRY, ANNOUNCE_RETRY_MAX, DHT_ANNOUNCE_INTERVAL};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use anyhow::{self, Context, bail};
@@ -52,6 +53,8 @@ struct HttpAnnouncer {
     /// consecutive failed announces, for the retry backoff
     #[eq(skip)]
     failures: u32,
+    #[eq(skip)]
+    bus: EventBus,
 }
 
 /// What a tracker (or the DHT) has done for a torrent lately, for the details panel.
@@ -92,19 +95,35 @@ fn retry_delay(failures: u32) -> Duration {
         .min(ANNOUNCE_RETRY_MAX)
 }
 
+/// What every announcer of one torrent shares.
+pub(crate) struct Announcing {
+    pub trackers: Vec<String>,
+    pub info_hash: InfoHash,
+    pub identity: Arc<Identity>,
+    /// what to tell the trackers about our progress
+    pub stats: watch::Receiver<TorrentSwarmStats>,
+    /// where discovered peers go
+    pub events: mpsc::WeakSender<SwarmEvent>,
+    pub shutdown: CancellationToken,
+    pub dht: DhtWatch,
+    pub bus: EventBus,
+}
+
 /// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
 /// `events`. Split out so a magnet link's pre-metadata phase can announce with nothing but an
 /// info hash (see `metadata::fetch`) -- at that point there is no `Torrent` and no
 /// `TorrentSwarm` to hang the announcers off.
-pub(crate) fn spawn_announcers(
-    trackers: &[String],
-    info_hash: InfoHash,
-    identity: Arc<Identity>,
-    stat_rx: watch::Receiver<TorrentSwarmStats>,
-    events: mpsc::WeakSender<SwarmEvent>,
-    shutdown: CancellationToken,
-    dht: DhtWatch,
-) -> watch::Receiver<Vec<TrackerStatus>> {
+pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerStatus>> {
+    let Announcing {
+        trackers,
+        info_hash,
+        identity,
+        events,
+        shutdown,
+        dht,
+        bus,
+        ..
+    } = &args;
     let (board, statuses) = watch::channel(vec![]);
     let board = Arc::new(board);
     let mut rows = Vec::new();
@@ -125,38 +144,23 @@ pub(crate) fn spawn_announcers(
 
     if let Some(dht_slot) = dht_slot {
         tokio::spawn(dht_announcer(
-            info_hash,
+            *info_hash,
             identity.serving.port(),
-            dht,
+            dht.clone(),
             events.clone(),
             shutdown.clone(),
             (board.clone(), dht_slot),
+            bus.clone(),
         ));
     }
     for (url, slot) in usable.into_iter().zip(slots) {
         match url.scheme() {
             "http" | "https" => {
-                let announcer = HttpAnnouncer::new(
-                    url,
-                    info_hash,
-                    identity.clone(),
-                    stat_rx.clone(),
-                    events.clone(),
-                    shutdown.clone(),
-                    (board.clone(), slot),
-                );
+                let announcer = HttpAnnouncer::new(url, &args, (board.clone(), slot));
                 tokio::spawn(announcer.ev_loop());
             }
             "udp" => {
-                let announcer = UdpAnnouncer::new(
-                    url,
-                    info_hash,
-                    identity.clone(),
-                    stat_rx.clone(),
-                    events.clone(),
-                    shutdown.clone(),
-                    (board.clone(), slot),
-                );
+                let announcer = UdpAnnouncer::new(url, &args, (board.clone(), slot));
                 tokio::spawn(announcer.ev_loop());
             }
             scheme => {
@@ -180,6 +184,7 @@ async fn dht_announcer(
     events: mpsc::WeakSender<SwarmEvent>,
     shutdown: CancellationToken,
     (board, slot): (TrackerBoard, usize),
+    bus: EventBus,
 ) {
     let handle = loop {
         if let Some(handle) = dht.borrow().clone() {
@@ -193,6 +198,7 @@ async fn dht_announcer(
     let port = Some(tcp_port);
 
     loop {
+        let started = Instant::now();
         let lookup = tokio::select! {
             _ = shutdown.cancelled() => return,
             lookup = handle.client.get_peers(info_hash) => lookup,
@@ -204,6 +210,11 @@ async fn dht_announcer(
                     result.peers.len(),
                     result.announce_candidates.len()
                 );
+                bus.emit(BusEvent::DhtLookup {
+                    info_hash,
+                    peers: result.peers.len(),
+                    took_ms: started.elapsed().as_millis() as u64,
+                });
                 report(&board, slot, |row| {
                     row.state = TrackerState::Working;
                     row.peers = result.peers.len();
@@ -211,7 +222,11 @@ async fn dht_announcer(
                 });
                 let Some(events) = events.upgrade() else { return };
                 let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
-                if events.send(SwarmEvent::PeersDiscovered(peers)).await.is_err() {
+                if events
+                    .send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 for (node, token) in result.announce_candidates {
@@ -274,32 +289,25 @@ impl AnnounceEvent {
 }
 
 impl HttpAnnouncer {
-    fn new(
-        tracker: Url,
-        info_hash: InfoHash,
-        identity: Arc<Identity>,
-        swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        events: mpsc::WeakSender<SwarmEvent>,
-        shutdown: CancellationToken,
-        board: (TrackerBoard, usize),
-    ) -> Self {
+    fn new(tracker: Url, shared: &Announcing, board: (TrackerBoard, usize)) -> Self {
         debug_assert!({ tracker.scheme() == "http" || tracker.scheme() == "https" });
-        let already_complete = swarm_stat.borrow().completed;
+        let already_complete = shared.stats.borrow().completed;
 
         HttpAnnouncer {
             tracker,
-            info_hash,
-            identity,
+            info_hash: shared.info_hash,
+            identity: shared.identity.clone(),
             next_ready: Instant::now() + Duration::from_millis(10),
-            events,
+            events: shared.events.clone(),
             sent_started: false,
             // a torrent that was already complete when resumed must not announce
             // event=completed again (BEP 3)
             sent_completed: already_complete,
-            swarm_stat,
-            shutdown,
+            swarm_stat: shared.stats.clone(),
+            shutdown: shared.shutdown.clone(),
             board,
             failures: 0,
+            bus: shared.bus.clone(),
         }
     }
 
@@ -418,8 +426,17 @@ impl HttpAnnouncer {
                                 row.peers = peers;
                                 row.next_announce = Some(next);
                             });
+                            self.bus.emit(BusEvent::Announced {
+                                info_hash: self.info_hash,
+                                url: self.tracker.to_string(),
+                                peers,
+                                interval_secs: next.saturating_duration_since(Instant::now()).as_secs(),
+                            });
                             if let Some(events) = self.events.upgrade() {
-                                let _ = events.send(SwarmEvent::PeersDiscovered(result)).await;
+                                let source = PeerSource::Tracker {
+                                    url: self.tracker.to_string(),
+                                };
+                                let _ = events.send(SwarmEvent::PeersDiscovered(result, source)).await;
                             }
                         }
                         Err(e) => {
@@ -431,6 +448,11 @@ impl HttpAnnouncer {
                             report(board, *slot, |row| {
                                 row.state = TrackerState::Failed(format!("{e:#}"));
                                 row.next_announce = Some(next);
+                            });
+                            self.bus.emit(BusEvent::AnnounceFailed {
+                                info_hash: self.info_hash,
+                                url: self.tracker.to_string(),
+                                error: format!("{e:#}"),
                             });
                         }
                     }
@@ -483,6 +505,8 @@ struct UdpAnnouncer {
     board: (TrackerBoard, usize),
     #[eq(skip)]
     failures: u32,
+    #[eq(skip)]
+    bus: EventBus,
 }
 
 #[repr(i32)]
@@ -503,33 +527,26 @@ enum Event {
 }
 
 impl UdpAnnouncer {
-    fn new(
-        tracker_url: Url,
-        info_hash: InfoHash,
-        identity: Arc<Identity>,
-        swarm_stat: watch::Receiver<TorrentSwarmStats>,
-        event: mpsc::WeakSender<SwarmEvent>,
-        shutdown: CancellationToken,
-        board: (TrackerBoard, usize),
-    ) -> Self {
+    fn new(tracker_url: Url, shared: &Announcing, board: (TrackerBoard, usize)) -> Self {
         debug_assert!(tracker_url.scheme() == "udp");
-        let already_complete = swarm_stat.borrow().completed;
+        let already_complete = shared.stats.borrow().completed;
         UdpAnnouncer {
             tracker: tracker_url,
-            info_hash,
-            identity,
+            info_hash: shared.info_hash,
+            identity: shared.identity.clone(),
             next_ready: Instant::now() + Duration::from_millis(10),
             connection_id: 0, // sentinel, meaning we haven't got an id connetion yet because we
             // haven't done anything
-            event,
+            event: shared.events.clone(),
             sent_started: false,
             // a torrent that was already complete when resumed must not announce
             // event=completed again (BEP 3)
             sent_completed: already_complete,
-            swarm_stat,
-            shutdown,
+            swarm_stat: shared.stats.clone(),
+            shutdown: shared.shutdown.clone(),
             board,
             failures: 0,
+            bus: shared.bus.clone(),
         }
     }
 
@@ -861,8 +878,17 @@ impl UdpAnnouncer {
                                 row.peers = count;
                                 row.next_announce = Some(next);
                             });
+                            self.bus.emit(BusEvent::Announced {
+                                info_hash: self.info_hash,
+                                url: self.tracker.to_string(),
+                                peers: count,
+                                interval_secs: next.saturating_duration_since(Instant::now()).as_secs(),
+                            });
                             if let Some(events) = self.event.upgrade() {
-                                let _ = events.send(SwarmEvent::PeersDiscovered(peers)).await;
+                                let source = PeerSource::Tracker {
+                                    url: self.tracker.to_string(),
+                                };
+                                let _ = events.send(SwarmEvent::PeersDiscovered(peers, source)).await;
                             }
                         }
                         Err(e) => {
@@ -875,6 +901,11 @@ impl UdpAnnouncer {
                             report(board, *slot, |row| {
                                 row.state = TrackerState::Failed(format!("{e:#}"));
                                 row.next_announce = Some(next);
+                            });
+                            self.bus.emit(BusEvent::AnnounceFailed {
+                                info_hash: self.info_hash,
+                                url: self.tracker.to_string(),
+                                error: format!("{e:#}"),
                             });
                         }
                     }
@@ -948,15 +979,16 @@ mod test {
         let (events, _rx) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
-        let rows = spawn_announcers(
-            &trackers,
-            InfoHash::from_bytes(&[2; 20]),
-            identity.clone(),
-            stats.clone(),
-            events.downgrade(),
-            shutdown.clone(),
-            crate::dht::Dht::none(),
-        );
+        let rows = spawn_announcers(Announcing {
+            trackers: trackers.to_vec(),
+            info_hash: InfoHash::from_bytes(&[2; 20]),
+            identity: identity.clone(),
+            stats: stats.clone(),
+            events: events.downgrade(),
+            shutdown: shutdown.clone(),
+            dht: crate::dht::Dht::none(),
+            bus: EventBus::new(),
+        });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(
             urls,
@@ -972,15 +1004,16 @@ mod test {
         );
 
         let (dht_tx, dht_rx) = watch::channel(None);
-        let rows = spawn_announcers(
-            &trackers[..1],
-            InfoHash::from_bytes(&[2; 20]),
+        let rows = spawn_announcers(Announcing {
+            trackers: trackers[..1].to_vec(),
+            info_hash: InfoHash::from_bytes(&[2; 20]),
             identity,
             stats,
-            events.downgrade(),
-            shutdown.clone(),
-            dht_rx,
-        );
+            events: events.downgrade(),
+            shutdown: shutdown.clone(),
+            dht: dht_rx,
+            bus: EventBus::new(),
+        });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);
         drop(dht_tx);

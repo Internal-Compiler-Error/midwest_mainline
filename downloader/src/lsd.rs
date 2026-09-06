@@ -4,6 +4,7 @@
 //! and listens for everyone else's; a message naming a torrent we have turns its sender
 //! into a `PeersDiscovered` for that swarm.
 
+use crate::events::PeerSource;
 use crate::settings::LSD_INTERVAL;
 use crate::torrent_swarm::TorrentSwarmHandle;
 use midwest_mainline::types::InfoHash;
@@ -95,7 +96,7 @@ async fn run(swarms: Swarms, tcp_port: u16, announce_now: Arc<Notify>, shutdown:
             };
             for handle in handles {
                 debug!("LSD: {peer} has one of our torrents");
-                handle.peers_discovered(vec![peer]).await;
+                handle.peers_discovered(vec![peer], PeerSource::Lsd).await;
             }
         }
     };

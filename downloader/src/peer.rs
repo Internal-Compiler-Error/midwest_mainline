@@ -690,10 +690,17 @@ impl PeerStatistics {
     /// raw bytes per second the bonus would be invisible and exploration would end with each
     /// peer's first pick.
     pub fn rx_speed_ucb(&self, total_picks: usize, rate_scale: f64) -> f64 {
+        let (exploit, explore) = self.ucb_terms(total_picks, rate_scale);
+        exploit + explore
+    }
+
+    /// The two halves of the score: the measured rate relative to the swarm's fastest, and
+    /// the exploration bonus.
+    pub fn ucb_terms(&self, total_picks: usize, rate_scale: f64) -> (f64, f64) {
         let c = 1f64;
         let t = total_picks as f64;
         let n_t = self.picked_count as f64;
-        self.rx_rate / rate_scale + c * (t.ln() / n_t).sqrt()
+        (self.rx_rate / rate_scale, c * (t.ln() / n_t).sqrt())
     }
 
     pub fn score(&self, total_picks: usize, rate_scale: f64) -> f64 {
