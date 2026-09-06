@@ -44,6 +44,7 @@ export type TorrentRow = { id: TorrentId } & (
   | { kind: 'resolving'; source: string; elapsed_ms: number }
   | ({ kind: 'downloading' } & Progress)
   | ({ kind: 'paused' } & Progress)
+  | ({ kind: 'queued' } & Progress)
   | { kind: 'checking'; name: string; checked_pieces: number; total_pieces: number }
   | { kind: 'failed'; source: string; error: string }
 )
@@ -104,6 +105,8 @@ export interface Settings {
   utp: boolean
   /** ask the router to forward our ports (NAT-PMP, PCP, or UPnP) */
   port_mapping: boolean
+  /** torrents downloading at once, 0 for no limit; seeding doesn't count */
+  max_active_downloads: number
 }
 
 export const settings = () => invoke<Settings>('settings')

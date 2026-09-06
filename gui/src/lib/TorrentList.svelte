@@ -28,7 +28,7 @@
   } = $props()
 
   function name(t: TorrentRow): string {
-    return t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'checking' ? t.name : t.source
+    return t.kind === 'resolving' || t.kind === 'failed' ? t.source : t.name
   }
 
   function status(t: TorrentRow): string {
@@ -39,6 +39,8 @@
         return '⚠ failed'
       case 'checking':
         return `checking ${Math.floor(fraction(t.checked_pieces, t.total_pieces) * 100)}%`
+      case 'queued':
+        return 'queued'
       case 'paused':
         return t.completed ? 'paused, complete' : 'paused'
       case 'downloading':
@@ -55,7 +57,7 @@
       <Table.Row data-state={t.id === selected ? 'selected' : undefined} onclick={() => onselect(t.id)}>
         <Table.Cell class="w-full max-w-0 truncate" title={name(t)}>{name(t)}</Table.Cell>
         <Table.Cell class="w-44 min-w-44">
-          {#if t.kind === 'downloading' || t.kind === 'paused'}
+          {#if t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued'}
             <ProgressBar fraction={fraction(t.verified_pieces, t.total_pieces)} done={t.completed} />
           {:else if t.kind === 'checking'}
             <ProgressBar fraction={fraction(t.checked_pieces, t.total_pieces)} done={false} />
@@ -63,7 +65,7 @@
         </Table.Cell>
         <Table.Cell class="whitespace-nowrap text-muted-foreground tabular-nums">{status(t)}</Table.Cell>
         <Table.Cell class="w-16 pr-1 whitespace-nowrap">
-          {#if t.kind === 'downloading'}
+          {#if t.kind === 'downloading' || t.kind === 'queued'}
             <Button
               variant="ghost"
               size="icon-xs"
@@ -91,7 +93,7 @@
               {/snippet}
             </DropdownMenu.Trigger>
             <DropdownMenu.Content align="end">
-              {#if t.kind === 'downloading' || t.kind === 'paused'}
+              {#if t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued'}
                 <DropdownMenu.Item onclick={() => onrecheck(t.id)}>Force recheck</DropdownMenu.Item>
                 <DropdownMenu.Separator />
               {/if}

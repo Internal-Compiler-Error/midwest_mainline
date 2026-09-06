@@ -16,7 +16,7 @@
   }: { torrent: TorrentRow; onselectfiles: (selected: boolean[]) => void; onsequential: (on: boolean) => void } = $props()
 
   function toggleFile(index: number, checked: boolean) {
-    if (torrent.kind !== 'downloading' && torrent.kind !== 'paused') return
+    if (torrent.kind !== 'downloading' && torrent.kind !== 'paused' && torrent.kind !== 'queued') return
     const selected = torrent.files.map((f) => f.selected)
     selected[index] = checked
     onselectfiles(selected)
@@ -43,7 +43,7 @@
   {:else}
     <div class="flex items-center gap-3">
       <h2 class="text-base font-semibold">
-        {torrent.kind === 'paused' ? 'Paused' : torrent.completed ? 'Seeding' : 'Downloading'}
+        {torrent.kind === 'paused' ? 'Paused' : torrent.kind === 'queued' ? 'Queued' : torrent.completed ? 'Seeding' : 'Downloading'}
       </h2>
       {#if torrent.completed}<span class="text-emerald-600 dark:text-emerald-400">✔ complete</span>{/if}
     </div>

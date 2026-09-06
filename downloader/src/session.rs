@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Identifies a torrent within one session, from `add`/`resume` until `remove`.
@@ -43,6 +43,8 @@ pub enum TorrentState {
     Downloading(Progress),
     /// Stopped by the user: no connections, files and progress kept, ready to `unpause`
     Paused(Progress),
+    /// Waiting for one of `Settings::max_active_downloads` slots; starts by itself
+    Queued(Progress),
     /// Re-hashing the files on disk (`recheck`); goes back to downloading or paused after
     Checking {
         name: String,
@@ -158,6 +160,8 @@ struct TorrentTask {
     selected: watch::Sender<Vec<bool>>,
     /// same for the sequential switch
     sequential: watch::Sender<bool>,
+    /// the session's active-download slots, see `Settings::max_active_downloads`
+    slots: Arc<Semaphore>,
     /// known before resolving for a magnet or a resume file; names the resume file to
     /// delete if removal comes before the torrent is known
     info_hash: Option<InfoHash>,
@@ -348,6 +352,14 @@ impl TorrentTask {
         resumed: &mut bool,
         peers: &mut Vec<std::net::SocketAddr>,
     ) -> anyhow::Result<(Stop, Option<TorrentSwarmStats>)> {
+        // held while downloading; released on completion so seeding never counts
+        let mut slot = match verified.all() {
+            true => None,
+            false => match self.wait_for_slot(torrent, root, verified).await {
+                Ok(permit) => Some(permit),
+                Err(stop) => return Ok((stop, None)),
+            },
+        };
         if *resumed {
             self.client
                 .add_torrent_resumed((**torrent).clone(), root, verified.clone())?;
@@ -394,6 +406,9 @@ impl TorrentTask {
 
         let mut ratio_stats = stats.clone();
         let stop = loop {
+            if ratio_stats.borrow().completed {
+                drop(slot.take());
+            }
             // a torrent that comes back already over its ratio stops before waiting for
             // anything to change
             if self.seeded_enough(torrent, &ratio_stats.borrow_and_update()) {
@@ -442,6 +457,48 @@ impl TorrentTask {
         *verified = last.verified.clone();
         self.uploaded_before += last.uploaded;
         Ok((stop, Some(last)))
+    }
+
+    /// Waits for an active-download slot, showing the torrent as queued meanwhile and still
+    /// taking the commands that make sense for one that isn't running.
+    async fn wait_for_slot(
+        &mut self,
+        torrent: &Arc<Torrent>,
+        root: &Path,
+        verified: &BitBox<u8, Msb0>,
+    ) -> Result<OwnedSemaphorePermit, Stop> {
+        let slots = self.slots.clone();
+        let acquire = slots.acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            // published on entry and again after a selection change, like the paused phase
+            let wanted = torrent.wanted_pieces(&self.selected.borrow());
+            let _ = self.phase.send(Phase::Queued {
+                torrent: torrent.clone(),
+                root: root.to_path_buf(),
+                stats: TorrentSwarmStats::for_verified(torrent, verified.clone(), wanted),
+                selected: self.selected.subscribe(),
+                sequential: self.sequential.subscribe(),
+                uploaded_before: self.uploaded_before,
+            });
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit.expect("the slots are never closed")),
+                _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
+                command = self.commands.recv() => match command {
+                    Some(Command::Pause) => return Err(Stop::Pause),
+                    Some(Command::Recheck) => return Err(Stop::Recheck),
+                    Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
+                    Some(Command::SelectFiles(selected)) => {
+                        let _ = self.selected.send(selected);
+                    }
+                    Some(Command::Sequential(on)) => {
+                        let _ = self.sequential.send(on);
+                    }
+                    Some(Command::Unpause) => {}
+                    None => return Err(Stop::Shutdown),
+                },
+            }
+        }
     }
 
     /// Complete, with a ratio limit set, and uploaded that many times its size over its life.
@@ -541,6 +598,14 @@ enum Phase {
         sequential: watch::Receiver<bool>,
         uploaded_before: u64,
     },
+    Queued {
+        torrent: Arc<Torrent>,
+        root: PathBuf,
+        stats: TorrentSwarmStats,
+        selected: watch::Receiver<Vec<bool>>,
+        sequential: watch::Receiver<bool>,
+        uploaded_before: u64,
+    },
     Checking {
         torrent: Arc<Torrent>,
         /// pieces hashed so far
@@ -601,6 +666,8 @@ pub struct Session {
     resume_dir: PathBuf,
     /// the DHT node, kept so it lives as long as the session; none if it was turned off
     _dht: Option<Dht>,
+    /// active-download slots, `Settings::max_active_downloads` of them
+    slots: Arc<Semaphore>,
     data_dir: PathBuf,
     settings: watch::Sender<Settings>,
 }
@@ -647,6 +714,7 @@ impl Session {
             )
         };
         Ok(Self {
+            slots: Arc::new(Semaphore::new(slot_count(&config.settings))),
             handle: rt.handle().clone(),
             rt: Some(rt),
             identity: Arc::new(identity),
@@ -670,6 +738,19 @@ impl Session {
     /// arrange.
     pub fn update_settings(&mut self, settings: Settings) -> anyhow::Result<()> {
         settings.save(&self.data_dir)?;
+        let before = slot_count(&self.settings.borrow());
+        let after = slot_count(&settings);
+        if after > before {
+            self.slots.add_permits(after - before);
+        } else if after < before {
+            // taken out of circulation as they free up: a running download keeps its place
+            let slots = self.slots.clone();
+            self.handle.spawn(async move {
+                if let Ok(permits) = slots.acquire_many_owned((before - after) as u32).await {
+                    permits.forget();
+                }
+            });
+        }
         let _ = self.settings.send(settings);
         Ok(())
     }
@@ -825,6 +906,7 @@ impl Session {
             commands: commands_rx,
             selected: watch::channel(vec![]).0,
             sequential: watch::channel(false).0,
+            slots: self.slots.clone(),
             info_hash,
             settings: self.settings.subscribe(),
             uploaded_before: 0,
@@ -879,15 +961,17 @@ impl Entry {
     /// Known up front for a magnet or a resume file, and for anything else once it's running.
     fn info_hash(&self) -> Option<InfoHash> {
         self.info_hash.or_else(|| match &*self.phase.borrow() {
-            Phase::Downloading { torrent, .. } | Phase::Paused { torrent, .. } | Phase::Checking { torrent, .. } => {
-                Some(torrent.info_hash)
-            }
+            Phase::Downloading { torrent, .. }
+            | Phase::Paused { torrent, .. }
+            | Phase::Queued { torrent, .. }
+            | Phase::Checking { torrent, .. } => Some(torrent.info_hash),
             _ => None,
         })
     }
 
     fn state(&mut self) -> TorrentState {
         let phase = self.phase.borrow_and_update().clone();
+        let queued = matches!(phase, Phase::Queued { .. });
         match phase {
             Phase::Failed { error } => TorrentState::Failed {
                 source: self.source.clone(),
@@ -932,6 +1016,14 @@ impl Entry {
                 selected,
                 sequential,
                 uploaded_before,
+            }
+            | Phase::Queued {
+                torrent,
+                root,
+                stats,
+                selected,
+                sequential,
+                uploaded_before,
             } => {
                 self.rates = Rates::new();
                 self.peer_rates.clear();
@@ -944,7 +1036,11 @@ impl Entry {
                     &self.rates,
                 );
                 progress.uploaded += uploaded_before;
-                TorrentState::Paused(progress)
+                if queued {
+                    TorrentState::Queued(progress)
+                } else {
+                    TorrentState::Paused(progress)
+                }
             }
         }
     }
@@ -1018,6 +1114,15 @@ fn progress(
         upload_bps: rates.upload_bps,
         peers: vec![],
         sequential,
+    }
+}
+
+/// `max_active_downloads` as semaphore permits; 0 means no limit, which is a count no session
+/// reaches (and small enough to shrink from with `acquire_many`).
+fn slot_count(settings: &Settings) -> usize {
+    match settings.max_active_downloads {
+        0 => 1 << 20,
+        n => n,
     }
 }
 
@@ -1118,19 +1223,56 @@ mod test {
     /// Hand-builds a tiny single-file `.torrent` (no peers will ever have it, which is fine:
     /// these tests are about the session's bookkeeping, not transfer).
     fn write_torrent_file(dir: &Path) -> PathBuf {
+        write_torrent_named(dir, "session", 7)
+    }
+
+    /// A `.torrent` for `<name>.bin`, 40 bytes of `fill` in 16-byte pieces.
+    fn write_torrent_named(dir: &Path, name: &str, fill: u8) -> PathBuf {
         use sha1::Digest;
-        let content = [7u8; 40];
+        let content = [fill; 40];
         let pieces: Vec<u8> = content
             .chunks(16)
             .flat_map(|c| sha1::Sha1::digest(c).to_vec())
             .collect();
-        let mut info = b"d6:lengthi40e4:name11:session.bin12:piece lengthi16e6:pieces60:".to_vec();
+        let mut info = format!(
+            "d6:lengthi40e4:name{}:{name}.bin12:piece lengthi16e6:pieces60:",
+            name.len() + 4
+        )
+        .into_bytes();
         info.extend_from_slice(&pieces);
         info.push(b'e');
         let file = crate::metadata::build_torrent_file(&info, &["wss://unused.test/announce".to_string()]);
-        let path = dir.join("session.torrent");
+        let path = dir.join(format!("{name}.torrent"));
         std::fs::write(&path, file).unwrap();
         path
+    }
+
+    /// With one slot the second torrent waits; pausing the first lets it in, and the first
+    /// then queues behind it on unpause. Raising the limit lets both run.
+    #[test]
+    fn downloads_beyond_the_limit_queue_up() {
+        let dir = scratch("queue");
+        let root = dir.join("downloads");
+        let mut config = test_config(&dir);
+        config.settings.max_active_downloads = 1;
+        let mut session = Session::new(config).unwrap();
+
+        let a = session.add(write_torrent_named(&dir, "a", 1).display().to_string(), &root);
+        wait_for(&mut session, a, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        let b = session.add(write_torrent_named(&dir, "b", 2).display().to_string(), &root);
+        wait_for(&mut session, b, |s| matches!(s, Some(TorrentState::Queued(_))));
+
+        session.pause(a);
+        wait_for(&mut session, b, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.unpause(a);
+        wait_for(&mut session, a, |s| matches!(s, Some(TorrentState::Queued(_))));
+
+        let mut settings = session.settings();
+        settings.max_active_downloads = 2;
+        session.update_settings(settings).unwrap();
+        wait_for(&mut session, a, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Any free port, no DHT node: the tests must not touch the network.

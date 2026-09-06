@@ -45,6 +45,9 @@ pub struct Settings {
     pub utp: bool,
     /// ask the router to forward our ports (NAT-PMP, PCP, or UPnP). Next start.
     pub port_mapping: bool,
+    /// torrents downloading at once, 0 for no limit; the rest wait their turn (seeding
+    /// doesn't count). Applies live, though a running download keeps its place.
+    pub max_active_downloads: usize,
 }
 
 impl Default for Settings {
@@ -60,6 +63,7 @@ impl Default for Settings {
             encryption: Encryption::Prefer,
             utp: true,
             port_mapping: true,
+            max_active_downloads: 0,
         }
     }
 }

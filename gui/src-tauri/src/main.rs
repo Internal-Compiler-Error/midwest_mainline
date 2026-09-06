@@ -36,6 +36,7 @@ enum StateDto {
     },
     Downloading(ProgressDto),
     Paused(ProgressDto),
+    Queued(ProgressDto),
     Checking {
         name: String,
         checked_pieces: usize,
@@ -142,6 +143,7 @@ impl From<TorrentState> for StateDto {
             },
             TorrentState::Downloading(progress) => StateDto::Downloading(progress.into()),
             TorrentState::Paused(progress) => StateDto::Paused(progress.into()),
+            TorrentState::Queued(progress) => StateDto::Queued(progress.into()),
             TorrentState::Checking {
                 name,
                 checked_pieces,
@@ -310,6 +312,7 @@ struct SettingsDto {
     encryption: Encryption,
     utp: bool,
     port_mapping: bool,
+    max_active_downloads: usize,
 }
 
 impl From<Settings> for SettingsDto {
@@ -325,6 +328,7 @@ impl From<Settings> for SettingsDto {
             encryption: s.encryption,
             utp: s.utp,
             port_mapping: s.port_mapping,
+            max_active_downloads: s.max_active_downloads,
         }
     }
 }
@@ -342,6 +346,7 @@ impl From<SettingsDto> for Settings {
             encryption: s.encryption,
             utp: s.utp,
             port_mapping: s.port_mapping,
+            max_active_downloads: s.max_active_downloads,
         }
     }
 }

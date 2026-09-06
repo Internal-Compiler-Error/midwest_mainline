@@ -83,6 +83,9 @@
         <Label for="port-mapping">Port mapping (NAT-PMP / UPnP)</Label>
         <Switch id="port-mapping" bind:checked={draft.port_mapping} />
 
+        <Label for="max-active">Active downloads (0 = no limit)</Label>
+        <Input id="max-active" type="number" min="0" bind:value={draft.max_active_downloads} class="h-8 w-28" />
+
         <Label for="max-peers">Peers per torrent</Label>
         <Input id="max-peers" type="number" min="1" bind:value={draft.max_peers_per_torrent} class="h-8 w-28" />
 

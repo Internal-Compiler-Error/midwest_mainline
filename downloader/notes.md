@@ -25,6 +25,7 @@ survives context resets; re-read before acting.
 - [x] Force recheck
 - [x] Sequential download
 - [x] Status bar: total rates, DHT node count, listen port, port mapping state
+- [x] Download queue: `max_active_downloads`, seeding doesn't count
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -582,3 +583,14 @@ handle now carries the session for `node_count`), the listen port, and where por
 stands (`portmap::MappingState`, published through a watch like everything else the client
 starts in the background). The GUI shows it at the right of the footer, polled with the
 torrent list. Test: `status_reports_the_network_state`.
+
+# Download queue, 2026-09-06
+`Settings::max_active_downloads` (0 = no limit) is a `tokio::sync::Semaphore` in the
+session; a torrent's task takes a permit before it goes into the client and drops it the
+moment its stats say complete, so seeding never counts. While waiting it's
+`TorrentState::Queued` (paused-shaped, with the on-disk snapshot) and still takes pause,
+remove, recheck, and the selection switches. Raising the limit adds permits at once;
+lowering it acquires the difference in the background and forgets those permits, so a
+running download keeps its place until it finishes. "No limit" is 2^20 permits rather than
+the semaphore's maximum, so shrinking from it fits `acquire_many`'s `u32`. Test:
+`downloads_beyond_the_limit_queue_up`.
