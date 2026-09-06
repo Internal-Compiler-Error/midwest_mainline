@@ -90,5 +90,9 @@ pub const OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS: u64 = 3;
 /// "not more frequently than once per minute".
 pub const PEX_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often to look a torrent up in the DHT and re-announce ourselves for it. Announced
+/// peers expire from nodes after roughly 45 minutes, so this is comfortably inside that.
+pub const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// BEP 11 (PEX): the spec recommends capping a single message at roughly 50 added peers.
 pub const PEX_MAX_ADDED_PEERS: usize = 50;

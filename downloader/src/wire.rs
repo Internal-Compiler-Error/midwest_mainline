@@ -196,6 +196,23 @@ impl Encode for HaveAll {
     }
 }
 
+/// BEP 5: the UDP port the peer's DHT node listens on, sent after the handshake by peers
+/// that set the DHT bit in the reserved bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
+pub struct Port {
+    pub port: u16,
+}
+
+impl Encode for Port {
+    fn encode(&self, buf: &mut [u8]) {
+        let (length, header) = buf.split_at_mut(4);
+        let (header, body) = header.split_at_mut(1);
+        length.copy_from_slice(&3u32.to_be_bytes());
+        header.copy_from_slice(&[9u8]);
+        body.copy_from_slice(&self.port.to_be_bytes());
+    }
+}
+
 /// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has no pieces at all.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct HaveNone;
@@ -283,6 +300,7 @@ pub(crate) enum BtMessage {
     RejectRequest(RejectRequest),
     AllowedFast(AllowedFast),
     Extended(Extended),
+    Port(Port),
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
 
@@ -311,6 +329,7 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::RejectRequest(_) => 17,
             BtMessage::AllowedFast(_) => 9,
             BtMessage::Extended(ext) => 6 + ext.payload.len(),
+            BtMessage::Port(_) => 7,
             BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
         };
 
@@ -335,6 +354,7 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::RejectRequest(reject) => reject.encode(buf),
             BtMessage::AllowedFast(allowed_fast) => allowed_fast.encode(buf),
             BtMessage::Extended(ext) => ext.encode(buf),
+            BtMessage::Port(port) => port.encode(buf),
             BtMessage::Unknown(..) => panic!(),
         }
 
@@ -430,6 +450,9 @@ impl Decoder for BtDecoder {
                     let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
                     BtMessage::Cancel(Cancel { index, begin, length })
                 }
+                9 if buf.len() == 2 => BtMessage::Port(Port {
+                    port: u16::from_be_bytes([buf[0], buf[1]]),
+                }),
                 13 => BtMessage::SuggestPiece(SuggestPiece {
                     piece: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
                 }),
@@ -470,8 +493,7 @@ pub(crate) struct Handshake {
 // pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
 pub const HANDSHAKE_STR: &'static [u8] = b"\x13BitTorrent protocol";
 
-impl Handshake{
-
+impl Handshake {
     /// BEP 10: bit 0x10 of reserved byte 5 (0-indexed from the start of the 8-byte reserved area)
     /// signals extension protocol support.
     pub fn supports_extensions(&self) -> bool {
@@ -483,7 +505,6 @@ impl Handshake{
         self.extensions[7] & 0x04 != 0
     }
 }
-
 
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
@@ -697,6 +718,12 @@ mod test {
             payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
         };
         assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
+    }
+
+    #[test]
+    fn port_round_trips() {
+        let port = BtMessage::Port(Port { port: 6881 });
+        assert_eq!(round_trip(port.clone()), port);
     }
 
     #[test]

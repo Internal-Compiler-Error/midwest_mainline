@@ -8,6 +8,7 @@
 //! back.
 
 use crate::defs::Identity;
+use crate::dht::Dht;
 use crate::resume::{ResumeData, keep_saving};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
@@ -73,6 +74,16 @@ impl Progress {
     }
 }
 
+/// What `launch` needs to start a torrent once its source has been resolved.
+struct Resolved {
+    torrent: Torrent,
+    root: PathBuf,
+    verified: BitBox<u8, Msb0>,
+    resumed: bool,
+    /// peers already known for it, handed to the swarm right away
+    peers: Vec<std::net::SocketAddr>,
+}
+
 /// What a torrent's task publishes; `Session::torrents` turns this into a `TorrentState`.
 #[derive(Clone)]
 enum Phase {
@@ -109,23 +120,46 @@ pub struct Session {
     shutdown: CancellationToken,
     torrents: BTreeMap<TorrentId, Entry>,
     next_id: TorrentId,
-    /// where resume files are written; none means progress isn't persisted
-    resume_dir: Option<PathBuf>,
+    /// where resume files are written, `<data dir>/resume`
+    resume_dir: PathBuf,
+    /// the DHT node, kept so it lives as long as the session; none if it was turned off
+    _dht: Option<Dht>,
+}
+
+/// What a session needs to start.
+pub struct SessionConfig {
+    pub peer_id: [u8; 20],
+    /// TCP port for inbound peers, and the DHT node's UDP port
+    pub port: u16,
+    /// where the session keeps its own files: resume data and the DHT database. See
+    /// `paths::data_dir` for the usual answer.
+    pub data_dir: PathBuf,
+    /// whether to run a DHT node; off means peers come from trackers and PEX only
+    pub dht: bool,
 }
 
 impl Session {
-    /// Creates a session with its own tokio runtime, listening on `port` for inbound peers.
-    pub fn new(peer_id: [u8; 20], port: u16) -> anyhow::Result<Self> {
+    /// Creates a session with its own tokio runtime. Progress goes to `<data dir>/resume/<info
+    /// hash>.resume` for every torrent; finding those files again and handing them to
+    /// [`Session::resume`] is the caller's job, see `Session::resume_dir` and
+    /// `list_resume_files`.
+    pub fn new(config: SessionConfig) -> anyhow::Result<Self> {
+        let resume_dir = config.data_dir.join("resume");
+        std::fs::create_dir_all(&resume_dir)?;
         let rt = Runtime::new()?;
         let identity = Identity {
-            peer_id,
-            serving: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port).into(),
+            peer_id: config.peer_id,
+            serving: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, config.port).into(),
         };
         let shutdown = CancellationToken::new();
-        // the client starts its listener on whatever runtime is current
-        let client = {
+        // the client and the DHT node start on whatever runtime is current
+        let (client, dht) = {
             let _on_runtime = rt.enter();
-            BtClient::new_with_shutdown(identity, shutdown.clone())
+            let dht = config
+                .dht
+                .then(|| Dht::start(config.data_dir.join("dht.db"), config.port));
+            let watch = dht.as_ref().map_or_else(Dht::none, Dht::watch);
+            (BtClient::new_with_shutdown(identity, shutdown.clone(), watch), dht)
         };
         Ok(Self {
             handle: rt.handle().clone(),
@@ -135,15 +169,14 @@ impl Session {
             shutdown,
             torrents: BTreeMap::new(),
             next_id: 1,
-            resume_dir: None,
+            resume_dir,
+            _dht: dht,
         })
     }
 
-    /// Persist progress to `dir/<info hash>.resume` for every torrent from now on. Finding
-    /// those files again and handing them to [`Session::resume`] is the caller's job; see
-    /// `list_resume_files`.
-    pub fn set_resume_dir(&mut self, dir: impl Into<PathBuf>) {
-        self.resume_dir = Some(dir.into());
+    /// Where this session writes resume files.
+    pub fn resume_dir(&self) -> &Path {
+        &self.resume_dir
     }
 
     /// Starts downloading `source`, which may be a path to a `.torrent` or a magnet URI, into
@@ -154,10 +187,17 @@ impl Session {
         let source = source.into();
         let root = root.into();
         let identity = self.identity.clone();
+        let dht = self.client.dht();
         self.launch(source.clone(), |cancel| async move {
-            let torrent = load_source(&source, identity, cancel).await?;
-            let nothing = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-            Ok((torrent, root, nothing, false))
+            let loaded = load_source(&source, identity, cancel, dht).await?;
+            let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
+            Ok(Resolved {
+                torrent: loaded.torrent,
+                root,
+                verified: nothing,
+                resumed: false,
+                peers: loaded.peers,
+            })
         })
     }
 
@@ -167,7 +207,13 @@ impl Session {
         let path = path.as_ref().to_path_buf();
         self.launch(path.display().to_string(), |_cancel| async move {
             let data = ResumeData::read(&path)?;
-            Ok((data.to_torrent()?, data.root, data.verified, true))
+            Ok(Resolved {
+                torrent: data.to_torrent()?,
+                root: data.root,
+                verified: data.verified,
+                resumed: true,
+                peers: vec![],
+            })
         })
     }
 
@@ -188,7 +234,7 @@ impl Session {
     fn launch<F, Fut>(&mut self, source: String, resolve: F) -> TorrentId
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<(Torrent, PathBuf, BitBox<u8, Msb0>, bool)>> + Send,
+        Fut: Future<Output = anyhow::Result<Resolved>> + Send,
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -216,7 +262,13 @@ impl Session {
                 // removed while still resolving: nothing was written yet
                 _ = &mut remove_rx => return,
             };
-            let (torrent, root, verified, resumed) = match resolved {
+            let Resolved {
+                torrent,
+                root,
+                verified,
+                resumed,
+                peers,
+            } = match resolved {
                 Ok(resolved) => resolved,
                 Err(e) => {
                     let _ = phase_tx.send(Phase::Failed {
@@ -237,6 +289,7 @@ impl Session {
                 });
                 return;
             }
+            client.add_peers(&torrent.info_hash, peers);
             let Some(stats) = client.stats(&torrent) else {
                 let _ = phase_tx.send(Phase::Failed {
                     error: "torrent was added but reported no stats".to_string(),
@@ -246,15 +299,13 @@ impl Session {
 
             let torrent = Arc::new(torrent);
             let stop_saving = cancel.child_token();
-            let saver = resume_dir.as_ref().map(|dir| {
-                tokio::spawn(keep_saving(
-                    torrent.clone(),
-                    root.clone(),
-                    stats.clone(),
-                    dir.clone(),
-                    stop_saving.clone(),
-                ))
-            });
+            let saver = tokio::spawn(keep_saving(
+                torrent.clone(),
+                root.clone(),
+                stats.clone(),
+                resume_dir.clone(),
+                stop_saving.clone(),
+            ));
             let _ = phase_tx.send(Phase::Downloading {
                 torrent: torrent.clone(),
                 root: root.clone(),
@@ -270,13 +321,9 @@ impl Session {
             // before anything is deleted, or the deletion would race it
             client.remove_torrent(&torrent.info_hash);
             stop_saving.cancel();
-            if let Some(saver) = saver {
-                let _ = saver.await;
-            }
+            let _ = saver.await;
             if removed {
-                if let Some(dir) = resume_dir {
-                    let _ = std::fs::remove_file(dir.join(ResumeData::file_name(&torrent.info_hash)));
-                }
+                let _ = std::fs::remove_file(resume_dir.join(ResumeData::file_name(&torrent.info_hash)));
                 let data = root.join(torrent.top_level());
                 let deleted = if data.is_dir() {
                     std::fs::remove_dir_all(&data)
@@ -460,6 +507,16 @@ mod test {
         path
     }
 
+    /// Any free port, no DHT node: the tests must not touch the network.
+    fn test_config(dir: &Path) -> SessionConfig {
+        SessionConfig {
+            peer_id: *b"-DL0100-session-tst.",
+            port: 0,
+            data_dir: dir.to_path_buf(),
+            dht: false,
+        }
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("downloader-session-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -488,8 +545,7 @@ mod test {
         let root = dir.join("downloads");
         let resume_dir = dir.join("resume");
 
-        let mut session = Session::new(*b"-DL0100-session-tst.", 0).unwrap();
-        session.set_resume_dir(&resume_dir);
+        let mut session = Session::new(test_config(&dir)).unwrap();
         let id = session.add(torrent_file.display().to_string(), &root);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
 
@@ -538,8 +594,7 @@ mod test {
         let root = dir.join("downloads");
         let resume_dir = dir.join("resume");
 
-        let mut session = Session::new(*b"-DL0100-session-tst.", 0).unwrap();
-        session.set_resume_dir(&resume_dir);
+        let mut session = Session::new(test_config(&dir)).unwrap();
         let id = session.add(torrent_file.display().to_string(), &root);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         session.shutdown();

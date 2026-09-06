@@ -446,7 +446,7 @@ mod test {
             "paths are relative to the root"
         );
 
-        let fresh = BtClient::new(identity());
+        let fresh = BtClient::new(identity(), crate::dht::Dht::none());
         fresh.add_torrent(torrent.clone(), &dir).unwrap();
         assert_eq!(fresh.stats(&torrent).unwrap().borrow().left, bytes.len());
         drop(fresh);
@@ -468,7 +468,7 @@ mod test {
         let data = ResumeData::read(&path).unwrap();
         let rebuilt = data.to_torrent().unwrap();
         assert_eq!(data.root, dir);
-        let resumed = BtClient::new(identity());
+        let resumed = BtClient::new(identity(), crate::dht::Dht::none());
         resumed
             .add_torrent_resumed(rebuilt.clone(), &data.root, data.verified)
             .unwrap();
@@ -485,7 +485,7 @@ mod test {
         );
 
         // fully verified resumes as complete, and stays that way
-        let done = BtClient::new(identity());
+        let done = BtClient::new(identity(), crate::dht::Dht::none());
         done.add_torrent_resumed(rebuilt.clone(), &dir, bitvec![u8, Msb0; 1; 5].into_boxed_bitslice())
             .unwrap();
         let stats = done.stats(&rebuilt).unwrap().borrow().clone();
@@ -501,7 +501,7 @@ mod test {
         let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
         let some = bitvec![u8, Msb0; 0; 7].into_boxed_bitslice();
 
-        let client = BtClient::new(identity());
+        let client = BtClient::new(identity(), crate::dht::Dht::none());
         let err = client
             .add_torrent_resumed(torrent.clone(), &dir, some.clone())
             .unwrap_err();
@@ -509,14 +509,14 @@ mod test {
         assert!(!dir.join("resume-test.bin").exists(), "resume must not create the file");
 
         std::fs::write(dir.join("resume-test.bin"), b"short").unwrap();
-        let client = BtClient::new(identity());
+        let client = BtClient::new(identity(), crate::dht::Dht::none());
         let err = client
             .add_torrent_resumed(torrent.clone(), &dir, some.clone())
             .unwrap_err();
         assert!(err.to_string().contains("5 bytes on disk"), "{err:#}");
         assert_eq!(std::fs::read(dir.join("resume-test.bin")).unwrap(), b"short");
 
-        let client = BtClient::new(identity());
+        let client = BtClient::new(identity(), crate::dht::Dht::none());
         let err = client
             .add_torrent_resumed(torrent, &dir, bitvec![u8, Msb0; 0; 8].into_boxed_bitslice())
             .unwrap_err();

@@ -160,14 +160,12 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         }
     }
 
-    // Fall back to single announce if announce-list is not present or empty
-    if announce_tiers.is_empty() {
-        if let Some(BencodeItemView::ByteString(announce)) = torrent.remove(b"announce".as_slice()) {
-            let announce_str = String::from_utf8(announce.to_vec())?;
-            announce_tiers.push(vec![announce_str]);
-        } else {
-            bail!("torrent must have either 'announce' or 'announce-list'");
-        }
+    // Fall back to single announce if announce-list is not present or empty. Neither is
+    // required: a torrent built from a tracker-less magnet finds its peers over the DHT.
+    if announce_tiers.is_empty()
+        && let Some(BencodeItemView::ByteString(announce)) = torrent.remove(b"announce".as_slice())
+    {
+        announce_tiers.push(vec![String::from_utf8(announce.to_vec())?]);
     }
 
     let BencodeItemView::ByteString(name) = info.remove(b"name".as_slice()).unwrap() else {

@@ -1,9 +1,8 @@
 //! Magnet URI parsing (BEP 9's "magnet-uri" form).
 //!
 //! Only what's needed to start a download without a `.torrent` file: the info hash, the
-//! display name, and the tracker list. Everything peer discovery needs comes from `&tr=`
-//! params -- there is deliberately no DHT here, so a magnet with no trackers has nowhere to
-//! find peers and is rejected up front rather than hanging forever.
+//! display name, and the tracker list. A magnet with no trackers is fine: the DHT finds its
+//! peers.
 
 use anyhow::{bail, ensure};
 use midwest_mainline::types::InfoHash;
@@ -49,13 +48,6 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     let Some(info_hash) = info_hash else {
         bail!("magnet URI has no `xt=urn:btih:` info hash (v2-only `btmh` magnets aren't supported)");
     };
-
-    // Without DHT, trackers are the only way to find a peer, and without a peer there's no way
-    // to fetch the metadata. Failing here beats appearing to start and then sitting at 0%.
-    ensure!(
-        !trackers.is_empty(),
-        "magnet URI has no trackers (`tr=`), and this client has no DHT to find peers with"
-    );
 
     Ok(MagnetLink {
         info_hash,
@@ -123,7 +115,10 @@ fn decode_base32(s: &str) -> anyhow::Result<[u8; 20]> {
         }
     }
 
-    ensure!(written == 20, "base32 info hash decoded to {written} bytes, expected 20");
+    ensure!(
+        written == 20,
+        "base32 info hash decoded to {written} bytes, expected 20"
+    );
     Ok(out)
 }
 
@@ -173,12 +168,12 @@ mod test {
         assert_eq!(magnet.trackers, ["udp://tracker.test:6969/announce"]);
     }
 
-    /// No DHT means trackers are the only peer source, so a trackerless magnet can never make
-    /// progress -- it should fail loudly instead of stalling at 0%.
+    /// A magnet with no `tr=` is a normal DHT-only magnet, not an error.
     #[test]
-    fn rejects_magnet_without_trackers() {
+    fn accepts_magnet_without_trackers() {
         let uri = format!("magnet:?xt=urn:btih:{HEX}&dn=lonely");
-        assert!(parse_magnet(&uri).is_err());
+        let magnet = parse_magnet(&uri).unwrap();
+        assert!(magnet.trackers.is_empty());
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub struct LogBuffer {
     capacity: usize,
     /// lines ever pushed, so a reader can ask for "everything after the N-th"
     pushed: Arc<AtomicU64>,
+    /// a copy of every line goes here when `DOWNLOADER_LOG_ADDR` is set, see `spawn_forwarder`
+    forward: Option<std::sync::mpsc::Sender<String>>,
 }
 
 impl LogBuffer {
@@ -31,6 +33,7 @@ impl LogBuffer {
             lines: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity,
             pushed: Arc::new(AtomicU64::new(0)),
+            forward: std::env::var("DOWNLOADER_LOG_ADDR").ok().map(spawn_forwarder),
         };
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         tracing_subscriber::registry()
@@ -68,6 +71,9 @@ impl LogBuffer {
     }
 
     fn push(&self, line: String) {
+        if let Some(forward) = &self.forward {
+            let _ = forward.send(line.clone());
+        }
         let mut lines = self.lines.lock().unwrap();
         if lines.len() == self.capacity {
             lines.pop_front();
@@ -75,6 +81,32 @@ impl LogBuffer {
         lines.push_back(line);
         self.pushed.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Streams log lines to a TCP listener at `addr`, one per line, so a GUI's console can be
+/// watched from a terminal (`nc -l 9999`, then run the app with
+/// `DOWNLOADER_LOG_ADDR=127.0.0.1:9999`). Reconnects when the listener goes away; lines
+/// logged while nobody is listening are dropped, not queued.
+fn spawn_forwarder(addr: String) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("log-forwarder".into())
+        .spawn(move || {
+            use std::io::Write;
+            let mut conn: Option<std::net::TcpStream> = None;
+            for line in rx {
+                if conn.is_none() {
+                    conn = std::net::TcpStream::connect(&addr).ok();
+                }
+                if let Some(stream) = &mut conn {
+                    if writeln!(stream, "{line}").is_err() {
+                        conn = None;
+                    }
+                }
+            }
+        })
+        .expect("spawning the log forwarder thread");
+    tx
 }
 
 struct BufferLayer(LogBuffer);
@@ -139,6 +171,7 @@ mod test {
             lines: Arc::new(Mutex::new(VecDeque::new())),
             capacity: 2,
             pushed: Arc::new(AtomicU64::new(0)),
+            forward: None,
         };
         // a local subscriber rather than the global one, so tests don't fight over it
         let subscriber = tracing_subscriber::registry().with(BufferLayer(buffer.clone()));

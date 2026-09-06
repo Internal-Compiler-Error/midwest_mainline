@@ -145,7 +145,7 @@ impl Peer {
             BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {}
             BtMessage::Extended(ext) if ext.ext_id == 0 => self.handle_extended_handshake(&ext.payload),
             BtMessage::Unknown(msg_type, _) => {
-                tracing::warn!("{} sent unsupported message type {msg_type}", self.remote_addr)
+                tracing::debug!("{} sent unsupported message type {msg_type}", self.remote_addr)
             }
             other => return Ok(Some(other)),
         }

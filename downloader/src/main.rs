@@ -1,4 +1,4 @@
-use downloader::{BtClient, Identity, ResumeData, keep_saving, load_source};
+use downloader::{BtClient, Dht, Identity, ResumeData, data_dir, keep_saving, load_source};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
@@ -34,7 +34,6 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
 }
 
 /// Resume files go next to the downloads, so `downloader resume/<hash>.resume` picks one up.
-const RESUME_DIR: &str = "resume";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,7 +57,11 @@ async fn main() -> anyhow::Result<()> {
         serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
     };
 
-    let client = BtClient::new(identity);
+    // resume files and the DHT database live in the data dir (see `paths::data_dir`)
+    let data_dir = data_dir();
+    std::fs::create_dir_all(data_dir.join("resume"))?;
+    let dht = Dht::start(data_dir.join("dht.db"), 6881);
+    let client = BtClient::new(identity, dht.watch());
     let (torrent, root) = if Path::new(&source)
         .extension()
         .is_some_and(|ext| ext == downloader::resume::EXTENSION)
@@ -84,24 +87,26 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("resolving magnet link, fetching metadata from peers...");
         }
         let resolving = CancellationToken::new();
-        let torrent = tokio::select! {
-            resolved = load_source(&source, Arc::new(identity), resolving.clone()) => resolved?,
+        let loaded = tokio::select! {
+            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht()) => resolved?,
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("interrupted while resolving, stopping tracker announces...");
                 resolving.cancel();
                 return Ok(());
             }
         };
+        let torrent = loaded.torrent;
         tracing::info!(
             "got metadata for {} files, downloading into {}",
             torrent.files.len(),
             root.display()
         );
         client.add_torrent(torrent.clone(), &root)?;
+        client.add_peers(&torrent.info_hash, loaded.peers);
         (torrent, root)
     };
 
-    let resume_dir = PathBuf::from(RESUME_DIR);
+    let resume_dir = data_dir.join("resume");
     tracing::info!(
         "progress is saved to {}",
         resume_dir.join(ResumeData::file_name(&torrent.info_hash)).display()

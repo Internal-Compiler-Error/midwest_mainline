@@ -13,6 +13,7 @@
 
 use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
+use crate::dht::DhtWatch;
 use crate::magnet::MagnetLink;
 use crate::settings::METADATA_PIECE_SIZE;
 use crate::torrent::{Torrent, parse_torrent};
@@ -44,6 +45,9 @@ const UT_METADATA_ID: u8 = 1;
 const PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to keep trying peers overall before giving up on the magnet entirely.
+/// How long to keep going with no new peer source turning anything up. Measured from the
+/// last peer discovery rather than from the start: the DHT can take a while to come up and
+/// finish its first lookup, and a fresh batch of peers deserves the full wait.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How many peers to have metadata fetches in flight against at once. Metadata is tiny and any
@@ -61,7 +65,8 @@ pub async fn fetch(
     magnet: &MagnetLink,
     identity: Arc<Identity>,
     shutdown: CancellationToken,
-) -> anyhow::Result<Torrent> {
+    dht: DhtWatch,
+) -> anyhow::Result<Fetched> {
     // The announcers report progress they can't possibly know yet; they only need something
     // shaped like stats to read `left`/`uploaded`/`downloaded` out of.
     let placeholder_stats = TorrentSwarmStats {
@@ -98,6 +103,7 @@ pub async fn fetch(
         // this frame, so the channel stays open exactly as long as this fetch does
         event_tx.downgrade(),
         announcer_shutdown.0.clone(),
+        dht,
     );
 
     let (result_tx, mut result_rx) = mpsc::channel::<anyhow::Result<Vec<u8>>>(MAX_CONCURRENT_FETCHES);
@@ -109,7 +115,7 @@ pub async fn fetch(
     // any timeout here.
     let mut pending: VecDeque<SocketAddr> = VecDeque::new();
     let mut in_flight = 0usize;
-    let deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+    let mut deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
 
     let raw_info = loop {
         // top up to the concurrency limit from whatever's queued
@@ -130,7 +136,7 @@ pub async fn fetch(
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
                 bail!(
-                    "timed out after {}s fetching metadata for {:?} (tried {} peers)",
+                    "no metadata after {}s without a new peer for {:?} (tried {} peers)",
                     OVERALL_TIMEOUT.as_secs(),
                     magnet.display_name.as_deref().unwrap_or("magnet"),
                     tried.len(),
@@ -144,7 +150,11 @@ pub async fn fetch(
                 };
                 // queue every peer we haven't already tried; the loop head dials as many as
                 // the concurrency limit allows and keeps the rest for when a slot frees up
+                let before = pending.len();
                 pending.extend(peers.into_iter().filter(|peer| tried.insert(*peer)));
+                if pending.len() > before {
+                    deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+                }
             }
 
             Some(result) = result_rx.recv() => {
@@ -159,7 +169,18 @@ pub async fn fetch(
 
     info!("fetched {} bytes of metadata, building torrent", raw_info.len());
     let torrent_file = build_torrent_file(&raw_info, &magnet.trackers);
-    parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")
+    let torrent = parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")?;
+    Ok(Fetched {
+        torrent,
+        peers: tried.into_iter().collect(),
+    })
+}
+
+/// A torrent built from fetched metadata, and every peer the fetch heard of on the way: the
+/// swarm that starts next would otherwise wait for its own announces to find them again.
+pub struct Fetched {
+    pub torrent: Torrent,
+    pub peers: Vec<SocketAddr>,
 }
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
@@ -726,11 +747,12 @@ mod test {
 
         let torrent = tokio::time::timeout(
             Duration::from_secs(20),
-            fetch(&magnet, identity, CancellationToken::new()),
+            fetch(&magnet, identity, CancellationToken::new(), crate::dht::Dht::none()),
         )
         .await
         .expect("magnet resolution timed out")
-        .expect("magnet resolution failed");
+        .expect("magnet resolution failed")
+        .torrent;
 
         assert_eq!(torrent.info_hash, info_hash);
         assert_eq!(torrent.raw_info, raw_info);
@@ -775,11 +797,12 @@ mod test {
 
         let torrent = tokio::time::timeout(
             Duration::from_secs(25),
-            fetch(&magnet, identity, CancellationToken::new()),
+            fetch(&magnet, identity, CancellationToken::new(), crate::dht::Dht::none()),
         )
         .await
         .expect("should reach the live peer well before the timeout")
-        .expect("magnet resolution failed");
+        .expect("magnet resolution failed")
+        .torrent;
 
         assert_eq!(torrent.info_hash, info_hash);
     }

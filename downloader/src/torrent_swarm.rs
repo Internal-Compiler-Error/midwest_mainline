@@ -1,5 +1,6 @@
 use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
+use crate::dht::DhtWatch;
 use crate::peer::{
     Peer, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
 };
@@ -19,7 +20,7 @@ use futures::future::select_all;
 use rand::seq::IndexedRandom;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,6 +86,11 @@ impl TorrentSwarmHandle {
     /// the inbound listener (`BtClient::accept_incoming`) and the swarm's own dial tasks.
     pub(crate) async fn peer_connected(&self, connected: ConnectedPeer) {
         let _ = self.tx.send(SwarmEvent::PeerConnected(connected)).await;
+    }
+
+    /// Addresses worth dialing, from wherever the caller got them.
+    pub(crate) async fn peers_discovered(&self, peers: Vec<SocketAddr>) {
+        let _ = self.tx.send(SwarmEvent::PeersDiscovered(peers)).await;
     }
 }
 
@@ -280,6 +286,8 @@ pub struct TorrentSwarm {
     storage: Arc<TorrentStorage>,
 
     id: Arc<Identity>,
+    /// the client's DHT node, if it has one, for pinging the nodes peers tell us about
+    dht: DhtWatch,
 
     events_rx: mpsc::Receiver<SwarmEvent>,
     /// for the tasks the swarm spawns for itself (announcers, dials, block reads) to report
@@ -319,8 +327,9 @@ impl TorrentSwarm {
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
+        dht: DhtWatch,
     ) -> TorrentSwarmHandle {
-        let (swarm, handle) = Self::new(torrent, storage, id, verified);
+        let (swarm, handle) = Self::new(torrent, storage, id, verified, dht);
         tokio::spawn(swarm.work_loop());
         handle
     }
@@ -330,6 +339,7 @@ impl TorrentSwarm {
         storage: Arc<TorrentStorage>,
         id: Arc<Identity>,
         verified: BitBox<u8, Msb0>,
+        dht: DhtWatch,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
         assert_eq!(
             verified.len(),
@@ -367,6 +377,7 @@ impl TorrentSwarm {
             stat_rx,
             events_tx.clone(),
             announcers.clone(),
+            dht.clone(),
         );
 
         let swarm = TorrentSwarm {
@@ -379,6 +390,7 @@ impl TorrentSwarm {
             torrent,
             storage,
             id,
+            dht,
             events_rx,
             events_tx,
             missing,
@@ -596,6 +608,17 @@ impl TorrentSwarm {
         };
 
         match msg {
+            BtMessage::Port(port) => {
+                // BEP 5: the peer runs a DHT node there; pinging it puts it in our routing
+                // table, which is how the table fills from a swarm rather than the routers
+                let dht = self.dht.borrow().clone();
+                if let (Some(dht), SocketAddr::V4(addr)) = (dht, peer.remote_addr) {
+                    let node = SocketAddrV4::new(*addr.ip(), port.port);
+                    tokio::spawn(async move {
+                        let _ = dht.client.ping(node).await;
+                    });
+                }
+            }
             BtMessage::Request(request) => self.serve_request(idx, request).await,
             BtMessage::Piece(piece) => self.block_arrived(idx, piece).await,
             BtMessage::RejectRequest(reject) => {
@@ -1270,7 +1293,7 @@ mod test {
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
-        let (swarm, handle) = TorrentSwarm::new(torrent, storage, id, verified);
+        let (swarm, handle) = TorrentSwarm::new(torrent, storage, id, verified, crate::dht::Dht::none());
         (swarm, handle, path)
     }
 

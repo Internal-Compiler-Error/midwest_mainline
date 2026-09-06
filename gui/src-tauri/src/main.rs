@@ -1,18 +1,16 @@
 //! Desktop front end for the `downloader` library: a Tauri shell around `Session`. The
 //! Svelte side (`gui/src`) renders what `torrents` reports and forwards what the user does
 //! to `add_torrent`/`resume_torrent`/`remove_torrent`; no download logic lives here. The one
-//! thing the library leaves to the UI is *finding* resume files: they're kept in `RESUME_DIR`
-//! next to the downloads, shared with the CLI.
+//! thing the library leaves to the UI is *finding* resume files: `Session::resume_dir` says
+//! where they are, shared with the CLI.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::{LogBuffer, Progress, Session, TorrentId, TorrentState, list_resume_files};
+use downloader::{LogBuffer, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir, list_resume_files};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent, State};
-
-const RESUME_DIR: &str = "resume";
 
 struct App {
     session: Mutex<Session>,
@@ -131,8 +129,9 @@ fn remove_torrent(app: State<App>, id: TorrentId) {
 }
 
 #[tauri::command]
-fn resumable() -> Vec<ResumableDto> {
-    list_resume_files(std::path::Path::new(RESUME_DIR))
+fn resumable(app: State<App>) -> Vec<ResumableDto> {
+    let dir = app.session.lock().unwrap().resume_dir().to_path_buf();
+    list_resume_files(&dir)
         .into_iter()
         .map(|r| ResumableDto {
             path: r.path.display().to_string(),
@@ -158,10 +157,7 @@ fn clear_logs(app: State<App>) {
 
 #[tauri::command]
 fn default_download_dir() -> String {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .display()
-        .to_string()
+    downloader::default_download_dir().display().to_string()
 }
 
 /// A fully random peer id, Azureus-style ("-DL0100-" + 12 random bytes).
@@ -174,8 +170,13 @@ fn random_peer_id() -> [u8; 20] {
 fn main() {
     // installed before anything that logs; the console panel shows what lands here
     let logs = LogBuffer::install(5_000).expect("failed to install the log buffer");
-    let mut session = Session::new(random_peer_id(), 6881).expect("failed to start a session");
-    session.set_resume_dir(RESUME_DIR);
+    let mut session = Session::new(SessionConfig {
+        peer_id: random_peer_id(),
+        port: 6881,
+        data_dir: data_dir(),
+        dht: true,
+    })
+    .expect("failed to start a session");
     if let Some(source) = std::env::args().nth(1) {
         session.add(source, default_download_dir());
     }

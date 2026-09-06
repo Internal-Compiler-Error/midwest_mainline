@@ -1,4 +1,5 @@
 use crate::defs::Identity;
+use crate::dht::DhtWatch;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
@@ -9,6 +10,7 @@ use midwest_mainline::types::InfoHash;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
+use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
@@ -30,22 +32,30 @@ pub struct BtClient {
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
     shutdown: CancellationToken,
+    /// the client's DHT node, shared by every swarm
+    dht: DhtWatch,
 }
 
 impl BtClient {
     /// Must be called on a tokio runtime: the inbound listener starts right away.
-    pub fn new(id: Identity) -> Self {
-        Self::new_with_shutdown(id, CancellationToken::new())
+    /// The DHT node this client discovers peers with; stays `None` if there is none.
+    pub fn dht(&self) -> DhtWatch {
+        self.dht.clone()
+    }
+
+    pub fn new(id: Identity, dht: DhtWatch) -> Self {
+        Self::new_with_shutdown(id, CancellationToken::new(), dht)
     }
 
     /// Like `new`, but driven by a caller-supplied token, so an owner that already has its own
     /// cancellation scope (see `session::Session`) can stop the client along with everything
     /// else it started, rather than having to reach in for `shutdown_token` afterwards.
-    pub fn new_with_shutdown(id: Identity, shutdown: CancellationToken) -> Self {
+    pub fn new_with_shutdown(id: Identity, shutdown: CancellationToken, dht: DhtWatch) -> Self {
         let client = Self {
             id: Arc::new(id),
             swarms: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
+            dht,
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),
@@ -68,6 +78,15 @@ impl BtClient {
             .unwrap()
             .get(&torrent.info_hash)
             .map(TorrentSwarmHandle::stats)
+    }
+
+    /// Tells a torrent's swarm about peers found some other way than its own announces, such
+    /// as the ones a magnet's metadata fetch met. Unknown torrents are ignored.
+    pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {
+        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
+        if let Some(handle) = handle {
+            tokio::spawn(async move { handle.peers_discovered(peers).await });
+        }
     }
 
     /// Stops serving `info_hash`: its swarm ends, and every connection to its peers closes.
@@ -143,7 +162,7 @@ impl BtClient {
         let storage = TorrentStorage::new(torrent.clone(), files);
         let storage = Arc::new(storage);
 
-        let handle = TorrentSwarm::spawn(torrent.clone(), storage, self.id.clone(), verified);
+        let handle = TorrentSwarm::spawn(torrent.clone(), storage, self.id.clone(), verified, self.dht.clone());
         swarms.insert(torrent.info_hash, handle);
         Ok(())
     }

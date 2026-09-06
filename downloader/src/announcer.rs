@@ -5,6 +5,8 @@
 //! nothing else to give, which is why these don't live inside `TorrentSwarm`.
 
 use crate::defs::Identity;
+use crate::dht::DhtWatch;
+use crate::settings::DHT_ANNOUNCE_INTERVAL;
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use anyhow::{self, Context, bail};
 use juicy_bencode::BencodeItemView;
@@ -58,7 +60,15 @@ pub(crate) fn spawn_announcers(
     stat_rx: watch::Receiver<TorrentSwarmStats>,
     events: mpsc::WeakSender<SwarmEvent>,
     shutdown: CancellationToken,
+    dht: DhtWatch,
 ) {
+    tokio::spawn(dht_announcer(
+        info_hash,
+        identity.serving.port(),
+        dht,
+        events.clone(),
+        shutdown.clone(),
+    ));
     for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
         match url.scheme() {
             "http" | "https" => {
@@ -84,6 +94,65 @@ pub(crate) fn spawn_announcers(
                 tokio::spawn(announcer.ev_loop());
             }
             scheme => warn!("ignoring tracker with unsupported scheme {scheme:?}"),
+        }
+    }
+}
+
+/// BEP 5 as a peer source: every DHT_ANNOUNCE_INTERVAL, look the info hash up, hand whatever
+/// peers come back to the swarm, and announce our port to the nodes that issued tokens.
+/// Waits for the node to come up first, and does nothing at all if it never does.
+async fn dht_announcer(
+    info_hash: InfoHash,
+    tcp_port: u16,
+    mut dht: DhtWatch,
+    events: mpsc::WeakSender<SwarmEvent>,
+    shutdown: CancellationToken,
+) {
+    let handle = loop {
+        if let Some(handle) = dht.borrow().clone() {
+            break handle;
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            changed = dht.changed() => if changed.is_err() { return },
+        }
+    };
+    // BEP 5: implied_port tells the node to use the UDP source port, which is only right
+    // when it's also our TCP port
+    let port = (handle.udp_port != tcp_port).then_some(tcp_port);
+
+    loop {
+        let lookup = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            lookup = handle.client.get_peers(info_hash) => lookup,
+        };
+        match lookup {
+            Ok(result) => {
+                info!(
+                    "DHT lookup found {} peers, {} nodes accept our announce",
+                    result.peers.len(),
+                    result.announce_candidates.len()
+                );
+                let Some(events) = events.upgrade() else { return };
+                let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
+                if events.send(SwarmEvent::PeersDiscovered(peers)).await.is_err() {
+                    return;
+                }
+                for (node, token) in result.announce_candidates {
+                    if let Err(e) = handle
+                        .client
+                        .announce_peers(node.end_point(), info_hash, port, token)
+                        .await
+                    {
+                        tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
+                    }
+                }
+            }
+            Err(e) => warn!("DHT lookup for {info_hash:?} failed: {e:#}"),
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(DHT_ANNOUNCE_INTERVAL) => {}
         }
     }
 }
@@ -619,7 +688,7 @@ impl UdpAnnouncer {
             bail!("server responsed with an action different than connection whilst we attempted to announce");
         }
 
-        let txn_id = header.transaction_id.into();
+        let txn_id: i32 = header.transaction_id.into();
         if transaction_id != txn_id {
             bail!("tracker transaction id didn't match our transaction id");
         }

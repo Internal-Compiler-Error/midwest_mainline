@@ -1,3 +1,29 @@
+# Roadmap (autonomous session started 2026-09-06)
+The user asked for "as many features of a typical bt client as make sense", with quality
+passes on existing code in between. One feature per commit. Status is kept here so it
+survives context resets; re-read before acting.
+
+- [x] Data directory: `dirs::data_local_dir()/downloader`, override `DOWNLOADER_DATA_DIR`,
+      for dht.db and resume files, CLI and GUI alike
+- [x] DHT (BEP 5) via the sibling `dht` crate: embedded migrations in the crate, session
+      started in the background, announcer for swarms and the metadata fetcher, Port message
+- [ ] DHT crate rework (user: "very badly designed, change it however you wish"): learn the
+      external IP from BEP 42 responses instead of public-ip; lookups that don't wait for a
+      whole round; drop SQLite for an in-memory table saved to a file?
+- [ ] Auto-resume every torrent in the data dir on startup
+- [ ] Pause/resume per torrent; remove with files vs remove keeping files
+- [ ] Peer list in the GUI (address, client, rates, progress, flags)
+- [ ] Persisted settings (listen port, default download dir, max peers) + settings dialog
+- [ ] Global speed limits
+- [ ] File selection / priorities
+- [ ] Local Service Discovery (BEP 14)
+- [ ] Seeding ratio / stop seeding
+- [ ] MSE encryption
+- [ ] uTP: evaluate crates; skip if nothing maintained
+- Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
+
+Decisions made without the user (to report): data dir location; remove semantics.
+
 # Thoughts on actors in rust
 An actor should probably do the following
 1. define publicly an enum of events it can emit
@@ -323,3 +349,32 @@ tsconfigs, and shadcn's CLI checks the root `tsconfig.json` for it.
 Known gap: like the CLI, it resolves `resume/` and the default download dir against the
 current directory, which is `/` when launched from Finder. A proper data directory is the
 next thing to decide.
+
+# DHT, 2026-09-06
+The client runs one BEP 5 node (`dht.rs`, on the sibling `midwest_mainline` crate) per
+process, on UDP port 6881 or any free port if that's taken, with its routing table in
+`<data dir>/dht.db`. It starts in the background: bind, learn the external IP for the
+BEP 42 node id (`public-ip`, 5 s, else 0.0.0.0 and a warning), open the database, spawn the
+node's tasks, bootstrap from five well-known routers, then publish a `DhtHandle` through a
+`watch` that consumers hold as `DhtWatch`. `Dht::none()` is the watch for a client without
+DHT (tests). `spawn_announcers` gained a DHT announcer next to the tracker ones: every
+`DHT_ANNOUNCE_INTERVAL` it runs `get_peers`, emits `PeersDiscovered`, and announces our TCP
+port to the nodes that issued tokens (implied_port only when UDP and TCP ports match). Both
+the swarm and the metadata fetcher get it, so a magnet with no trackers works: the Arch
+Linux ISO magnet resolved in 25 s and pulled 2000 pieces in 90 s from DHT peers alone. The
+Port message (id 9) is decoded now, and a peer's DHT node gets pinged into our table.
+
+Things that had to change around it: `parse_magnet` and `parse_torrent` no longer require
+trackers; the metadata fetch's 120 s timeout counts from the last peer discovery rather
+than from the start, because the DHT can take 20 s to come up; and the peers a metadata
+fetch met are handed to the swarm (`Loaded::peers`, `BtClient::add_peers`) so it doesn't
+start cold. In the crate: embedded migrations, a lenient parser (unsorted keys are common
+in the wild), 3 s request timeout and 8 queries per round (a lookup went from 90 s to
+about 20 s).
+
+The data directory (`paths::data_dir`, `DOWNLOADER_DATA_DIR` to override) came with it,
+since the database needed a home that isn't the current directory: resume files moved there
+too, for the CLI and the GUI alike. Existing `./resume` files aren't migrated.
+
+`DOWNLOADER_LOG_ADDR=host:port` makes the GUI's `LogBuffer` also stream every line to a TCP
+listener (`nc -l 9999`), so its console can be watched from a terminal.
