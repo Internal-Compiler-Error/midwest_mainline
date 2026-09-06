@@ -217,6 +217,17 @@ pub struct TorrentSwarm {
     /// back on; weak so they can't keep the swarm alive, only a `TorrentSwarmHandle` can
     events_tx: mpsc::WeakSender<SwarmEvent>,
 
+    /// The peers UCB chooses between. Bayati et al., "The Unreasonable Effectiveness of
+    /// Greedy Algorithms in Multi-Armed Bandit with Many Arms": when there are more arms
+    /// than about sqrt(horizon), UCB over all of them is provably sub-optimal because trying
+    /// each once already costs order-k regret, and running it on a random subsample of
+    /// sqrt(horizon) arms is rate-optimal. The horizon here is piece assignments, and a
+    /// swarm offers hundreds of peers for a few hundred pieces. Peers are admitted in the
+    /// order they become ready until the set is full, which for a swarm is as good as
+    /// uniform, and a member's slot only frees when it disconnects.
+    subsample: BTreeSet<SocketAddr>,
+    subsample_size: usize,
+
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
     in_flight: BTreeMap<u32, InFlight>,
@@ -260,7 +271,8 @@ impl TorrentSwarm {
             .iter_ones()
             .map(|p| torrent.nth_piece_size(p as u32).expect("index came from the bitfield"))
             .sum();
-        let missing = verified.iter_zeros().map(|p| p as u32).collect();
+        let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
+        let subsample_size = (missing.len() as f64).sqrt().ceil() as usize;
         let stat = TorrentSwarmStats {
             uploaded: 0,
             downloaded: 0,
@@ -291,6 +303,8 @@ impl TorrentSwarm {
             peers: vec![],
             dialing: BTreeSet::new(),
             known: BTreeMap::new(),
+            subsample: BTreeSet::new(),
+            subsample_size,
             poll_offset: 0,
             torrent,
             storage,
@@ -438,6 +452,7 @@ impl TorrentSwarm {
     /// Removes a peer and puts whatever it was downloading for us back up for grabs.
     fn drop_peer(&mut self, idx: usize) {
         let peer = self.peers.remove(idx);
+        self.subsample.remove(&peer.remote_addr);
         self.known
             .entry(peer.remote_addr)
             .or_default()
@@ -710,6 +725,7 @@ impl TorrentSwarm {
     /// rather than compete. A piece is assigned whole to one peer, but its blocks are only
     /// requested as that peer's window allows (see `refill`).
     async fn schedule(&mut self) {
+        self.admit_to_subsample();
         loop {
             let in_flight: usize = self.in_flight.values().map(|f| f.buf.len()).sum();
             if in_flight >= MAX_INFLIGHT_BYTES {
@@ -791,9 +807,22 @@ impl TorrentSwarm {
         by_availability.choose(&mut rand::rng()).map(|&(piece, _)| piece)
     }
 
-    /// UCB peer selection: of the peers that have `piece`, aren't choking us, and have room
-    /// in their request window for more work, the one with the highest upper confidence
-    /// bound on its download speed.
+    /// Fills free slots in the subsample (see the field) with peers that are ready to serve
+    /// us, in peer order.
+    fn admit_to_subsample(&mut self) {
+        for peer in &self.peers {
+            if self.subsample.len() >= self.subsample_size {
+                break;
+            }
+            if peer.ready() {
+                self.subsample.insert(peer.remote_addr);
+            }
+        }
+    }
+
+    /// UCB peer selection: of the subsample members that have `piece`, aren't choking us,
+    /// and have room in their request window for more work, the one with the highest upper
+    /// confidence bound on its download speed.
     fn best_peer(&self, piece: u32) -> Option<usize> {
         let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
         let mut backlog: BTreeMap<SocketAddr, usize> = BTreeMap::new();
@@ -805,7 +834,7 @@ impl TorrentSwarm {
         self.peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.ready() && p.they_have(piece) && has_room(p))
+            .filter(|(_, p)| self.subsample.contains(&p.remote_addr) && p.ready() && p.they_have(piece) && has_room(p))
             .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
@@ -887,6 +916,10 @@ impl TorrentSwarm {
     fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
         let now = Instant::now();
         for addr in peers.into_iter().map(canonical) {
+            // trackers and PEX both hand out port 0 for peers whose port they don't know
+            if addr.port() == 0 {
+                continue;
+            }
             let worth_it = self.known.get(&addr).is_none_or(|k| k.may_dial(now));
             if !worth_it || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
                 continue;
@@ -1301,6 +1334,60 @@ mod test {
                 .is_err(),
             "a peer that delivered nothing is left alone"
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// With 3 pieces the subsample holds 2 peers. A third ready peer isn't asked for anything,
+    /// even when it's the only one UCB hasn't tried, until a member disconnects.
+    #[tokio::test]
+    async fn only_the_subsample_is_asked_for_pieces() {
+        let (swarm, handle, path) = swarm("subsample");
+        assert_eq!(swarm.subsample_size, 2);
+        tokio::spawn(swarm.work_loop());
+
+        let mut a = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut a).await;
+        let Some(Ok(BtMessage::Request(first))) = a.next().await else {
+            panic!("expected a request");
+        };
+        let mut b = fake_peer(&handle, "10.0.0.2:6881").await;
+        open_as_seeder(&mut b).await;
+        let Some(Ok(BtMessage::Request(_))) = b.next().await else {
+            panic!("expected a request");
+        };
+        let mut c = fake_peer(&handle, "10.0.0.3:6881").await;
+        open_as_seeder(&mut c).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // a hands a piece back; without subsampling the untried c would get it
+        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
+            index: first.index,
+            begin: first.begin,
+            length: first.length,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), c.next())
+                .await
+                .is_err(),
+            "a peer outside the subsample is never asked"
+        );
+
+        drop(a);
+        let asked_c = async {
+            loop {
+                match c.next().await {
+                    Some(Ok(BtMessage::Request(_))) => break,
+                    Some(Ok(_)) => {}
+                    other => panic!("c's socket ended: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), asked_c)
+            .await
+            .expect("a member leaving frees its slot for the next peer");
+        drop(b);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

@@ -41,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
     // RUST_LOG picks the verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .without_time()
         .pretty()
         .init();
 

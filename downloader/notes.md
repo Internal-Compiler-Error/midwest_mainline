@@ -245,3 +245,34 @@ failing to reach them says nothing about them reaching us. The table is keyed by
 canonical address (`canonical()`, v4-mapped v6 collapsed) and never pruned. The metadata
 fetcher dials on its own path and doesn't consult it. Tests: `known_peer_*`,
 `fruitless_peers_are_not_redialed_but_useful_ones_are`, `a_peer_that_sends_a_bad_piece_is_banned`.
+
+# UCB runs on a subsample of peers, 2026-09-05
+A 3-minute run on the Silo swarm with 251 peers collapsed to 89 pieces: 134 of 160 piece
+assignments went to peers UCB hadn't tried (infinite score), each trial cost a whole 4 MiB
+piece and one of the 32 in-flight slots, and the proven fast peers sat idle once the slots
+were full of strangers trickling data at the floor window. That's the many-armed regime of
+Bayati, Hamidi, Johari, Khosravi, "The Unreasonable Effectiveness of Greedy Algorithms in
+Multi-Armed Bandit with Many Arms" (arXiv:2002.10121): with more arms than about
+sqrt(horizon), UCB over all arms is provably sub-optimal (trying each once already costs
+order-k regret) and UCB on a random subsample of sqrt(horizon) arms is rate-optimal.
+
+`TorrentSwarm::subsample` is that subsample, sized `ceil(sqrt(pieces missing at start))`
+(27 on Silo). Ready peers are admitted in peer order until it's full; a member's slot frees
+only when it disconnects. `best_peer` considers members only. Peers outside it are still
+connected, served, and gossiped over PEX. Test: `only_the_subsample_is_asked_for_pieces`.
+
+Also from that run: trackers and PEX hand out addresses with port 0 (232 of 3175 failed
+dials); they're dropped at discovery now. And the CLI log has timestamps again, since
+"lines from request to completion" was the only duration available.
+
+## Noted, not done: greedy instead of UCB
+The same paper's stronger finding is that in this regime plain greedy (try each arm once,
+then always pull the empirically best) beats UCB and Thompson sampling, and subsampled
+greedy beats everything, because with many arms there are many near-optimal ones and
+fixating on a good one costs little. Their sequential greedy (Algorithm 5) is written for
+arms that arrive one at a time. The version that fits this swarm: score a known peer by its
+windowed rate alone, score a stranger by the mean rate of peers tried so far (so it beats
+only below-average known peers), no exploration bonus, no normalisation. The window
+mechanism keeps good peers saturated and the leftover budget flows to strangers, which is
+sequential greedy running in parallel across the in-flight slots. Try this if SS-UCB isn't
+enough.
