@@ -238,12 +238,15 @@ pub async fn keep_saving(
     torrent: Arc<Torrent>,
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
-    selected: watch::Receiver<Vec<bool>>,
-    sequential: watch::Receiver<bool>,
-    uploaded_before: u64,
+    inputs: ResumeInputs,
     dir: PathBuf,
     shutdown: CancellationToken,
 ) {
+    let ResumeInputs {
+        selected,
+        sequential,
+        uploaded_before,
+    } = inputs;
     const MIN_INTERVAL: Duration = Duration::from_secs(5);
 
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
@@ -281,6 +284,14 @@ pub async fn keep_saving(
         }
     }
     save(&stats);
+}
+
+/// What goes into the resume file besides the torrent and its progress: the user's choices,
+/// read live, and the upload count from before this run.
+pub struct ResumeInputs {
+    pub selected: watch::Receiver<Vec<bool>>,
+    pub sequential: watch::Receiver<bool>,
+    pub uploaded_before: u64,
 }
 
 /// What a front end needs to list a resume file without loading the whole thing into a client.
@@ -639,9 +650,11 @@ mod test {
             torrent.clone(),
             dir.clone(),
             rx,
-            selected_rx,
-            sequential_rx,
-            0,
+            ResumeInputs {
+                selected: selected_rx,
+                sequential: sequential_rx,
+                uploaded_before: 0,
+            },
             dir.join("nested"),
             shutdown.clone(),
         ));

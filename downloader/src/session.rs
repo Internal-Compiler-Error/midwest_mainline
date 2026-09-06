@@ -11,7 +11,7 @@ use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
 use crate::peer::PeerSnapshot;
-use crate::resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
+use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
@@ -373,9 +373,11 @@ impl TorrentTask {
             torrent.clone(),
             root.to_path_buf(),
             stats.clone(),
-            self.selected.subscribe(),
-            self.sequential.subscribe(),
-            self.uploaded_before,
+            ResumeInputs {
+                selected: self.selected.subscribe(),
+                sequential: self.sequential.subscribe(),
+                uploaded_before: self.uploaded_before,
+            },
             self.resume_dir.clone(),
             stop_saving.clone(),
         ));

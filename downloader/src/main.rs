@@ -1,4 +1,4 @@
-use downloader::{BtClient, Dht, Identity, ResumeData, Settings, data_dir, keep_saving, load_source};
+use downloader::{BtClient, Dht, Identity, ResumeData, ResumeInputs, Settings, data_dir, keep_saving, load_source};
 use std::env;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
@@ -119,9 +119,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(torrent),
         root,
         stats,
-        all_files,
-        rarest_first,
-        0,
+        ResumeInputs {
+            selected: all_files,
+            sequential: rarest_first,
+            uploaded_before: 0,
+        },
         resume_dir,
         client.shutdown_token(),
     ));
