@@ -90,6 +90,10 @@ pub const OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS: u64 = 3;
 /// "not more frequently than once per minute".
 pub const PEX_INTERVAL: Duration = Duration::from_secs(60);
 
+/// BEP 14: how often to tell the local network which torrents we serve. The BEP suggests
+/// five minutes.
+pub const LSD_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// How often to look a torrent up in the DHT and re-announce ourselves for it. Announced
 /// peers expire from nodes after roughly 45 minutes, so this is comfortably inside that.
 pub const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);

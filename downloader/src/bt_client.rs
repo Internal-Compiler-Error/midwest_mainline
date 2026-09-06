@@ -2,6 +2,7 @@ use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::limiter::RateLimiter;
+use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
@@ -41,15 +42,17 @@ pub struct BtClient {
     settings: SettingsWatch,
     /// the download and upload limits, shared by every swarm
     limiter: Arc<RateLimiter>,
+    /// local service discovery, poked when a torrent is added
+    lsd: Arc<Lsd>,
 }
 
 impl BtClient {
-    /// Must be called on a tokio runtime: the inbound listener starts right away.
     /// The DHT node this client discovers peers with; stays `None` if there is none.
     pub fn dht(&self) -> DhtWatch {
         self.dht.clone()
     }
 
+    /// Must be called on a tokio runtime: the inbound listener starts right away.
     pub fn new(id: Identity, dht: DhtWatch) -> Self {
         Self::new_with_shutdown(id, CancellationToken::new(), dht, default_settings())
     }
@@ -63,9 +66,11 @@ impl BtClient {
         dht: DhtWatch,
         settings: SettingsWatch,
     ) -> Self {
+        let swarms = Arc::new(Mutex::new(HashMap::new()));
         let client = Self {
+            lsd: Arc::new(Lsd::spawn(Arc::downgrade(&swarms), id.serving.port(), shutdown.clone())),
             id: Arc::new(id),
-            swarms: Arc::new(Mutex::new(HashMap::new())),
+            swarms,
             shutdown,
             dht,
             limiter: Arc::new(RateLimiter::new(settings.clone())),
@@ -84,8 +89,6 @@ impl BtClient {
         self.shutdown.clone()
     }
 
-    /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as
-    /// long as the torrent's swarm runs -- the receiver only depends on the underlying channel.
     /// The connected peers of a torrent, refreshed once a second.
     pub fn peers(&self, torrent: &Torrent) -> Option<watch::Receiver<Vec<PeerSnapshot>>> {
         self.swarms
@@ -95,6 +98,8 @@ impl BtClient {
             .map(TorrentSwarmHandle::peers)
     }
 
+    /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as
+    /// long as the torrent's swarm runs -- the receiver only depends on the underlying channel.
     pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
         self.swarms
             .lock()
@@ -204,6 +209,7 @@ impl BtClient {
             self.limiter.clone(),
         );
         swarms.insert(torrent.info_hash, handle);
+        self.lsd.announce();
         Ok(())
     }
 
@@ -288,7 +294,7 @@ impl BtClient {
                     return;
                 };
 
-                if let Err(e) = crate::wire::send_handshake(&mut tcp, &handshake.info_hash, &id.peer_id).await {
+                if let Err(e) = crate::wire::send_handshake(&mut tcp, &handshake.info_hash, &id).await {
                     tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
                     return;
                 }
@@ -299,6 +305,7 @@ impl BtClient {
                         remote_addr,
                         remote_supports_extensions: handshake.supports_extensions(),
                         remote_supports_fast: handshake.supports_fast_extension(),
+                        remote_supports_dht: handshake.supports_dht(),
                         peer_id: handshake.peer_id,
                     })
                     .await;

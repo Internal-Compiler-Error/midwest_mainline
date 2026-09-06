@@ -150,6 +150,7 @@ pub(crate) struct ConnectedPeer {
     pub remote_addr: SocketAddr,
     pub remote_supports_extensions: bool,
     pub remote_supports_fast: bool,
+    pub remote_supports_dht: bool,
     pub peer_id: [u8; 20],
 }
 
@@ -1168,6 +1169,7 @@ impl TorrentSwarm {
             return;
         }
 
+        let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port);
         let mut peer = Peer::new(
             connected.tcp,
             remote_addr,
@@ -1190,6 +1192,12 @@ impl TorrentSwarm {
             } else {
                 let has = Box::from(self.stat.verified.clone().as_raw_slice());
                 peer.send_bitfield(BitField { has }).await?;
+            }
+            // BEP 5: a peer that has a DHT node too gets told where ours listens
+            if connected.remote_supports_dht
+                && let Some(port) = dht_port
+            {
+                peer.send_port(port).await?;
             }
             // BEP 3: connections start choked; whether to unchoke is the choking algorithm's
             // call, not an automatic grant on connect
@@ -1333,7 +1341,7 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
     let mut tcp = crate::wire::connect(addr)
         .await
         .with_context(|| format!("Failed to establish tcp stream with {addr}"))?;
-    let handshake = shake_hands(&mut tcp, &torrent.info_hash, &our_id.peer_id)
+    let handshake = shake_hands(&mut tcp, &torrent.info_hash, our_id)
         .await
         .with_context(|| format!("Failed to complete handshake with {addr}"))?;
     info!("Peer connection to {addr} established");
@@ -1342,6 +1350,7 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
         remote_addr: addr,
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
+        remote_supports_dht: handshake.supports_dht(),
         peer_id: handshake.peer_id,
     })
 }
@@ -1417,6 +1426,7 @@ mod test {
         let id = Arc::new(Identity {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            dht: false,
         });
         let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
         let (settings_tx, settings_rx) = watch::channel(settings);
@@ -1449,6 +1459,7 @@ mod test {
                 remote_addr: pretend_addr.parse().unwrap(),
                 remote_supports_extensions: false,
                 remote_supports_fast: fast,
+                remote_supports_dht: false,
                 peer_id: *b"-TS0001-fake-peer-id",
             })
             .await;
@@ -1573,6 +1584,7 @@ mod test {
         let id = Arc::new(Identity {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            dht: false,
         });
         let (swarm, handle) = TorrentSwarm::new(
             torrent,
@@ -1583,7 +1595,7 @@ mod test {
             crate::bt_client::default_settings(),
             Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
         );
-        let mut stats = handle.stats();
+        let stats = handle.stats();
         tokio::spawn(swarm.work_loop());
         handle.select_files(vec![true, false]).await;
 

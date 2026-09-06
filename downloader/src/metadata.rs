@@ -9,7 +9,8 @@
 //! they return -> BEP 10 extended handshake -> ask for the info dict in 16KiB pieces -> verify
 //! the reassembled bytes hash to the info hash we asked for -> build a `Torrent`.
 //!
-//! There is deliberately no DHT here; trackers are the only peer source.
+//! Peers come from the magnet's trackers and from the DHT, which is how a magnet with no
+//! trackers at all still resolves.
 
 use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
@@ -44,11 +45,14 @@ const UT_METADATA_ID: u8 = 1;
 /// is bounded separately by `CONNECT_TIMEOUT`.
 const PER_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to keep trying peers overall before giving up on the magnet entirely.
-/// How long to keep going with no new peer source turning anything up. Measured from the
-/// last peer discovery rather than from the start: the DHT can take a while to come up and
-/// finish its first lookup, and a fresh batch of peers deserves the full wait.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long to keep going with no new peer turning up. Measured from the last peer discovery
+/// rather than from the start: the DHT can take a while to come up and finish its first
+/// lookup, and a fresh batch of peers deserves the full wait.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The most a fetch may take in total, however many fresh addresses keep arriving: a tracker
+/// handing out a rotating list of dead peers must not keep it alive forever.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How many peers to have metadata fetches in flight against at once. Metadata is tiny and any
 /// one peer can serve all of it; what this has to absorb is that most tracker-supplied
@@ -67,6 +71,11 @@ pub async fn fetch(
     shutdown: CancellationToken,
     dht: DhtWatch,
 ) -> anyhow::Result<Fetched> {
+    // a watch whose sender is gone is a client with no DHT, now or ever (`Dht::none`, or a
+    // node that failed to start); with no trackers either there's nowhere to find a peer
+    if magnet.trackers.is_empty() && dht.has_changed().is_err() {
+        bail!("magnet URI has no trackers (`tr=`) and the DHT is off, so there's no way to find peers");
+    }
     // The announcers report progress they can't possibly know yet; they only need something
     // shaped like stats to read `left`/`uploaded`/`downloaded` out of.
     let placeholder_stats = TorrentSwarmStats {
@@ -116,7 +125,8 @@ pub async fn fetch(
     // any timeout here.
     let mut pending: VecDeque<SocketAddr> = VecDeque::new();
     let mut in_flight = 0usize;
-    let mut deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+    let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    let give_up = tokio::time::Instant::now() + OVERALL_TIMEOUT;
 
     let raw_info = loop {
         // top up to the concurrency limit from whatever's queued
@@ -124,10 +134,10 @@ pub async fn fetch(
             let Some(peer) = pending.pop_front() else { break };
             in_flight += 1;
             let info_hash = magnet.info_hash;
-            let peer_id = identity.peer_id;
+            let identity = identity.clone();
             let result_tx = result_tx.clone();
             tokio::spawn(async move {
-                let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, peer_id))
+                let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity))
                     .await
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
                 let _ = result_tx.send(result).await;
@@ -135,11 +145,11 @@ pub async fn fetch(
         }
 
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(deadline.min(give_up)) => {
                 bail!(
-                    "no metadata after {}s without a new peer for {:?} (tried {} peers)",
-                    OVERALL_TIMEOUT.as_secs(),
+                    "no metadata for {:?} after {}s (tried {} peers)",
                     magnet.display_name.as_deref().unwrap_or("magnet"),
+                    tokio::time::Instant::now().duration_since(give_up - OVERALL_TIMEOUT).as_secs(),
                     tried.len(),
                 );
             }
@@ -154,7 +164,7 @@ pub async fn fetch(
                 let before = pending.len();
                 pending.extend(peers.into_iter().filter(|peer| tried.insert(*peer)));
                 if pending.len() > before {
-                    deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+                    deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                 }
             }
 
@@ -185,11 +195,11 @@ pub struct Fetched {
 }
 
 /// Runs the whole BEP 9 exchange against one peer, returning the verified raw info dict.
-async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, peer_id: [u8; 20]) -> anyhow::Result<Vec<u8>> {
+async fn fetch_from_peer(addr: SocketAddr, info_hash: InfoHash, identity: Arc<Identity>) -> anyhow::Result<Vec<u8>> {
     let mut tcp = crate::wire::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
-    let handshake = shake_hands(&mut tcp, &info_hash, &peer_id)
+    let handshake = shake_hands(&mut tcp, &info_hash, &identity)
         .await
         .with_context(|| format!("handshake with {addr}"))?;
     ensure!(
@@ -380,6 +390,14 @@ pub(crate) fn build_torrent_file(raw_info: &[u8], trackers: &[String]) -> Vec<u8
 
 #[cfg(test)]
 mod test {
+    fn test_identity() -> Identity {
+        Identity {
+            peer_id: [9u8; 20],
+            serving: "127.0.0.1:0".parse().unwrap(),
+            dht: false,
+        }
+    }
+
     use super::*;
 
     fn bencode_str(bytes: &[u8]) -> Vec<u8> {
@@ -494,7 +512,7 @@ mod test {
         let server = tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let their_handshake = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &their_handshake.info_hash, &[9u8; 20])
+            send_handshake(&mut tcp, &their_handshake.info_hash, &test_identity())
                 .await
                 .unwrap();
 
@@ -553,7 +571,7 @@ mod test {
             }
         });
 
-        let fetched = fetch_from_peer(addr, info_hash, [1u8; 20]).await.unwrap();
+        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity())).await.unwrap();
         assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
         server.await.unwrap();
     }
@@ -580,7 +598,7 @@ mod test {
         tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let hs = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &hs.info_hash, &[9u8; 20]).await.unwrap();
+            send_handshake(&mut tcp, &hs.info_hash, &test_identity()).await.unwrap();
 
             let (reader, writer) = tcp.into_split();
             let mut reader = FramedRead::new(reader, BtDecoder);
@@ -609,7 +627,7 @@ mod test {
             }
         });
 
-        let err = fetch_from_peer(addr, real_hash, [1u8; 20]).await.unwrap_err();
+        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity())).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("doesn't match the requested info hash"),
             "expected an info-hash mismatch, got: {err:#}"
@@ -631,7 +649,7 @@ mod test {
                 let served = raw_info.clone();
                 tokio::spawn(async move {
                     let Ok(hs) = read_handshake(&mut tcp).await else { return };
-                    if send_handshake(&mut tcp, &hs.info_hash, &[9u8; 20]).await.is_err() {
+                    if send_handshake(&mut tcp, &hs.info_hash, &test_identity()).await.is_err() {
                         return;
                     }
 
@@ -744,6 +762,7 @@ mod test {
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
             serving: "127.0.0.1:6881".parse().unwrap(),
+            dht: false,
         });
 
         let torrent = tokio::time::timeout(
@@ -794,6 +813,7 @@ mod test {
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
             serving: "127.0.0.1:6881".parse().unwrap(),
+            dht: false,
         });
 
         let torrent = tokio::time::timeout(

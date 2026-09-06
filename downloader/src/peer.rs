@@ -1,6 +1,6 @@
 use crate::settings::{BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, RATE_WINDOW, REQUEST_PIPELINE_TARGET};
 use crate::wire::{
-    BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
+    BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece, Port,
     RejectRequest, Request, Unchoke,
 };
 use futures::SinkExt;
@@ -387,6 +387,11 @@ impl Peer {
             self.requested.remove(req);
         }
         dropped
+    }
+
+    /// BEP 5: where our DHT node listens.
+    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
+        self.socket.send(BtMessage::Port(Port { port })).await
     }
 
     pub async fn send_cancel(&mut self, req: Request) -> io::Result<()> {

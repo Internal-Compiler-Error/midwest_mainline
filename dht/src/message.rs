@@ -258,8 +258,7 @@ impl ParseKrpc for &[u8] {
     /// parse out a krpc message we can do something with
     #[instrument(skip(self))]
     fn parse(&self) -> Result<Krpc, OurError> {
-        // juicy_bencode does the structural validation too; a bendy pass used to run first, and
-        // it rejected dicts whose keys aren't sorted, which plenty of live nodes send
+        // dicts with unsorted keys are accepted: plenty of live nodes send them
         let (unused, mut parsed) =
             parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained: {e}")))?;
         if !unused.is_empty() {

@@ -385,6 +385,7 @@ mod test {
         Identity {
             peer_id: *b"-DL0100-resume-test.",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            dht: false,
         }
     }
 

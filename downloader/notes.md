@@ -16,7 +16,7 @@ survives context resets; re-read before acting.
 - [x] Persisted settings (listen port, default download dir, max peers) + settings dialog
 - [x] Global speed limits
 - [x] File selection (priorities not done: the scheduler is rarest-first, a priority order would fight it)
-- [ ] Local Service Discovery (BEP 14)
+- [x] Local Service Discovery (BEP 14)
 - [ ] Seeding ratio / stop seeding
 - [ ] MSE encryption
 - [ ] uTP: evaluate crates; skip if nothing maintained
@@ -436,3 +436,29 @@ path, size and the flag; the GUI's file list has a checkbox per file. Priorities
 first) were left out on purpose: the scheduler is rarest-first with UCB peer choice, and a
 priority order would fight both; sequential download is the same story. Test:
 `deselected_files_pieces_are_not_requested`.
+
+# Local Service Discovery, 2026-09-06
+`lsd.rs`: one multicast socket per client on 239.192.152.143:6771 (SO_REUSEADDR and
+SO_REUSEPORT so several clients on one host share it), one task that every `LSD_INTERVAL`,
+and right after a torrent is added, sends a `BT-SEARCH` naming every torrent in the client
+(20 Infohash lines per message), and listens for everyone else's; a sender naming a torrent
+we have becomes `PeersDiscovered` for that swarm. A per-torrent socket was tried first and
+made the swarm test module take 11 s instead of 1: fifteen sockets on the same multicast
+port in one process, all joined to the group, contend on something in the kernel even when
+idle. One per client is also what BEP 14 intends. Own announces are told apart by a random
+cookie. Tests: the parser and the round trip of what we send; the live check was a
+multicast from Python naming a running torrent, which the client dialled within a second.
+
+# Code review findings fixed, 2026-09-06
+From a review of the day's diff: a torrent that failed after running couldn't be removed
+(its task had exited; now `TorrentTask::fail` keeps taking commands and deletes the resume
+file on Remove); a pause during resolve killed the resolve (now remembered and applied
+after); a paused torrent showed zeroed counters (two publishes of `Phase::Paused`, the
+second a blank; now one, fed the last stats); a tracker-less magnet with the DHT off hung
+120 s instead of failing at once (`Dht::none` is a watch with a dropped sender, and
+`metadata::fetch` bails when there are no trackers and no DHT can ever come); the handshake
+never set the BEP 5 bit so no peer ever sent Port (now set from `Identity::dht`, and we send
+our own Port after the handshake); the metadata deadline had no ceiling (`OVERALL_TIMEOUT`
+of 10 min on top of the 120 s idle timeout); the log forwarder queued without bound while
+a connect blocked (bounded channel, connect timeout, 5 s between attempts); and doc comments
+displaced by inserted functions.

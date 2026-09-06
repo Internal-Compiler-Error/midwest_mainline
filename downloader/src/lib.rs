@@ -5,6 +5,7 @@ mod defs;
 pub mod dht;
 mod limiter;
 pub mod logs;
+mod lsd;
 pub mod magnet;
 pub mod metadata;
 pub mod paths;

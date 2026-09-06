@@ -58,12 +58,10 @@ impl Dht {
         }
     }
 
-    /// A watch that never delivers a node, for clients that run without DHT.
+    /// A watch that never delivers a node, for clients that run without DHT. Its sender is
+    /// gone, which is what tells a consumer "no DHT, ever" apart from "not up yet".
     pub fn none() -> DhtWatch {
-        let (tx, rx) = watch::channel(None);
-        // the sender must outlive the receiver's `changed()` callers or they'd see an error
-        std::mem::forget(tx);
-        rx
+        watch::channel(None).1
     }
 
     pub fn watch(&self) -> DhtWatch {

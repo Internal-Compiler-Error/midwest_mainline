@@ -33,8 +33,6 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
     id
 }
 
-/// Resume files go next to the downloads, so `downloader resume/<hash>.resume` picks one up.
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // RUST_LOG picks the verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`
@@ -55,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let identity = Identity {
         peer_id: random_idv4(&public_ip, 3),
         serving: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 6881).into(),
+        dht: true,
     };
 
     // resume files and the DHT database live in the data dir (see `paths::data_dir`)

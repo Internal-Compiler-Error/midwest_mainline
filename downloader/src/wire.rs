@@ -1,3 +1,4 @@
+use crate::defs::Identity;
 use midwest_mainline::types::InfoHash;
 use std::io;
 use std::io::ErrorKind;
@@ -504,21 +505,30 @@ impl Handshake {
     pub fn supports_fast_extension(&self) -> bool {
         self.extensions[7] & 0x04 != 0
     }
+
+    /// BEP 5: bit 0x01 of reserved byte 7 says the peer runs a DHT node and will send its
+    /// port after the handshake.
+    pub fn supports_dht(&self) -> bool {
+        self.extensions[7] & 0x01 != 0
+    }
 }
 
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
 /// handshake) and when we accept an inbound connection (after we've read theirs and confirmed
 /// we have a matching torrent).
-pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &[u8; 20]) -> io::Result<()> {
+pub(crate) async fn send_handshake(peer: &mut TcpStream, info_hash: &InfoHash, local_id: &Identity) -> io::Result<()> {
     let mut extensions = [0u8; 8];
     extensions[5] |= 0x10; // BEP 10: we support the extension protocol
     extensions[7] |= 0x04; // BEP 6: we support the fast extension
+    if local_id.dht {
+        extensions[7] |= 0x01; // BEP 5: we'll send our DHT port
+    }
 
     let mut buf = vec![];
     buf.extend_from_slice(HANDSHAKE_STR);
     buf.extend_from_slice(&extensions);
     buf.extend_from_slice(info_hash.as_bytes());
-    buf.extend_from_slice(local_id);
+    buf.extend_from_slice(&local_id.peer_id);
 
     debug_assert!(buf.len() == 68);
     peer.write_all(&buf).await
@@ -562,7 +572,7 @@ pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
 pub(crate) async fn shake_hands(
     peer: &mut TcpStream,
     info_hash: &InfoHash,
-    local_id: &[u8; 20],
+    local_id: &Identity,
 ) -> io::Result<Handshake> {
     send_handshake(peer, info_hash, local_id).await?;
     let handshake = read_handshake(peer).await?;
@@ -596,18 +606,30 @@ mod test {
         let info_hash = InfoHash::from_bytes(&[7u8; 20]);
         let dialer_id = [1u8; 20];
         let acceptor_id = [2u8; 20];
+        let identity = |peer_id: [u8; 20], dht: bool| Identity {
+            peer_id,
+            serving: "127.0.0.1:0".parse().unwrap(),
+            dht,
+        };
 
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let handshake = read_handshake(&mut sock).await.unwrap();
             assert_eq!(handshake.info_hash, info_hash);
             assert_eq!(handshake.peer_id, dialer_id);
-            send_handshake(&mut sock, &info_hash, &acceptor_id).await.unwrap();
+            assert!(handshake.supports_dht());
+            send_handshake(&mut sock, &info_hash, &identity(acceptor_id, false))
+                .await
+                .unwrap();
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let handshake = shake_hands(&mut client, &info_hash, &dialer_id).await.unwrap();
+        let handshake = shake_hands(&mut client, &info_hash, &identity(dialer_id, true))
+            .await
+            .unwrap();
         assert_eq!(handshake.peer_id, acceptor_id);
+        assert!(!handshake.supports_dht());
+        assert!(handshake.supports_extensions() && handshake.supports_fast_extension());
 
         server.await.unwrap();
     }

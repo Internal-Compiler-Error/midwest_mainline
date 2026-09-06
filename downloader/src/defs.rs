@@ -7,4 +7,6 @@ pub struct Identity {
     /// on that port on both an IPv4 and an IPv6 socket regardless of which family `serving`
     /// itself is, so we accept inbound connections over either.
     pub serving: SocketAddr,
+    /// we run a DHT node: announced in the handshake, and followed by a Port message
+    pub dht: bool,
 }

@@ -21,7 +21,7 @@ pub struct LogBuffer {
     /// lines ever pushed, so a reader can ask for "everything after the N-th"
     pushed: Arc<AtomicU64>,
     /// a copy of every line goes here when `DOWNLOADER_LOG_ADDR` is set, see `spawn_forwarder`
-    forward: Option<std::sync::mpsc::Sender<String>>,
+    forward: Option<std::sync::mpsc::SyncSender<String>>,
 }
 
 impl LogBuffer {
@@ -72,7 +72,7 @@ impl LogBuffer {
 
     fn push(&self, line: String) {
         if let Some(forward) = &self.forward {
-            let _ = forward.send(line.clone());
+            let _ = forward.try_send(line.clone());
         }
         let mut lines = self.lines.lock().unwrap();
         if lines.len() == self.capacity {
@@ -85,18 +85,28 @@ impl LogBuffer {
 
 /// Streams log lines to a TCP listener at `addr`, one per line, so a GUI's console can be
 /// watched from a terminal (`nc -l 9999`, then run the app with
-/// `DOWNLOADER_LOG_ADDR=127.0.0.1:9999`). Reconnects when the listener goes away; lines
-/// logged while nobody is listening are dropped, not queued.
-fn spawn_forwarder(addr: String) -> std::sync::mpsc::Sender<String> {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+/// `DOWNLOADER_LOG_ADDR=127.0.0.1:9999`). Reconnects, at most every few seconds, when the
+/// listener goes away; the queue to the sending thread is bounded, so lines logged while
+/// nobody is listening (or faster than the wire takes them) are dropped, not piled up.
+fn spawn_forwarder(addr: String) -> std::sync::mpsc::SyncSender<String> {
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    const RETRY: Duration = Duration::from_secs(5);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
     std::thread::Builder::new()
         .name("log-forwarder".into())
         .spawn(move || {
             use std::io::Write;
             let mut conn: Option<std::net::TcpStream> = None;
+            let mut last_attempt: Option<std::time::Instant> = None;
             for line in rx {
-                if conn.is_none() {
-                    conn = std::net::TcpStream::connect(&addr).ok();
+                if conn.is_none() && last_attempt.is_none_or(|at| at.elapsed() >= RETRY) {
+                    last_attempt = Some(std::time::Instant::now());
+                    conn = addr
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut addrs| addrs.next())
+                        .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok());
                 }
                 if let Some(stream) = &mut conn
                     && writeln!(stream, "{line}").is_err()
