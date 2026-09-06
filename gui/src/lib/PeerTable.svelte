@@ -65,13 +65,17 @@
     return descending ? sorted.reverse() : sorted
   })
 
+  let resizing = $state<string | null>(null)
+
   function resize(e: PointerEvent, col: Column) {
     e.preventDefault()
     e.stopPropagation()
+    resizing = col.key
     const startX = e.clientX
     const startWidth = col.width
     const move = (m: PointerEvent) => (col.width = Math.max(MIN_WIDTH, startWidth + m.clientX - startX))
     const stop = () => {
+      resizing = null
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', stop)
     }
@@ -94,8 +98,12 @@
             {#if sortKey === col.key}<span class="text-muted-foreground">{descending ? '▼' : '▲'}</span>{/if}
           </button>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <!-- a visible divider, wider than it looks so it's easy to grab -->
           <span
-            class="absolute top-0 right-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40"
+            class={[
+              'absolute top-1 right-0 bottom-1 w-2 cursor-col-resize border-r-2 hover:border-primary',
+              resizing === col.key ? 'border-primary' : 'border-border',
+            ]}
             onpointerdown={(e) => resize(e, col)}
           ></span>
         </Table.Head>
