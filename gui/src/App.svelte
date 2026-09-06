@@ -43,6 +43,13 @@
       localStorage.setItem('pane', pane ?? 'none')
     } catch {}
   })
+  /// the bottom pane of the splitter, collapsed when nothing is shown in it
+  let bottom = $state<Resizable.Pane>()
+  $effect(() => {
+    if (!bottom) return
+    if (pane === null) bottom.collapse()
+    else if (bottom.isCollapsed()) bottom.expand()
+  })
   const insights = new InsightsStore()
   let showSettings = $state(false)
   let logLines = $state<string[]>([])
@@ -218,16 +225,16 @@
         {/if}
       </main>
     </Resizable.Pane>
-    {#if pane !== null}
-      <Resizable.Handle withHandle />
-      <Resizable.Pane defaultSize={pane === 'insights' ? 55 : 30} minSize={10}>
-        {#if pane === 'console'}
-          <Console lines={logLines} />
-        {:else}
-          <Insights {insights} />
-        {/if}
-      </Resizable.Pane>
-    {/if}
+    <!-- always mounted: a pane added to the group later gets no size, so a closed pane is
+         a collapsed one -->
+    <Resizable.Handle withHandle class={pane === null ? 'hidden' : ''} />
+    <Resizable.Pane bind:this={bottom} defaultSize={pane === null ? 0 : 35} minSize={10} collapsible collapsedSize={0}>
+      {#if pane === 'console'}
+        <Console lines={logLines} />
+      {:else if pane === 'insights'}
+        <Insights {insights} />
+      {/if}
+    </Resizable.Pane>
   </Resizable.PaneGroup>
 
   <footer class="flex items-center gap-3 border-t bg-card px-3 py-1">
