@@ -7,8 +7,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use downloader::{
-    Encryption, FileInfo, LogBuffer, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId, TorrentState,
-    data_dir,
+    Encryption, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings, TorrentId,
+    TorrentState, data_dir,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -165,6 +165,36 @@ struct ResumableDto {
     total_pieces: usize,
     total_size: u64,
     paused: bool,
+}
+
+#[derive(Serialize)]
+struct StatusDto {
+    download_bps: f64,
+    upload_bps: f64,
+    dht_nodes: Option<usize>,
+    listen_port: u16,
+    /// "off", "searching", "mapped", or "unavailable"
+    port_mapping: &'static str,
+    external_ip: Option<String>,
+}
+
+#[tauri::command]
+fn status(app: State<App>) -> StatusDto {
+    let status = app.session.lock().unwrap().status();
+    let (port_mapping, external_ip) = match status.port_mapping {
+        MappingState::Off => ("off", None),
+        MappingState::Searching => ("searching", None),
+        MappingState::Mapped { external_ip } => ("mapped", external_ip.map(|ip| ip.to_string())),
+        MappingState::Unavailable => ("unavailable", None),
+    };
+    StatusDto {
+        download_bps: status.download_bps,
+        upload_bps: status.upload_bps,
+        dht_nodes: status.dht_nodes,
+        listen_port: status.listen_port,
+        port_mapping,
+        external_ip,
+    }
 }
 
 #[derive(Serialize)]
@@ -368,6 +398,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             torrents,
+            status,
             add_torrent,
             resume_torrent,
             remove_torrent,

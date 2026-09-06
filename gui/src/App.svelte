@@ -7,7 +7,8 @@
   import * as Resizable from '$lib/components/ui/resizable'
   import { Separator } from '$lib/components/ui/separator'
   import * as api from './lib/api'
-  import type { Resumable, TorrentId, TorrentRow } from './lib/api'
+  import { humanBytes } from './lib/api'
+  import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
   import Details from './lib/Details.svelte'
   import ResumableList from './lib/Resumable.svelte'
@@ -25,13 +26,41 @@
   let showSettings = $state(false)
   let logLines = $state<string[]>([])
   let logSeen = 0
+  let status = $state<Status | null>(null)
 
   async function refresh() {
     torrents = await api.torrents()
+    status = await api.status()
     const chunk = await api.logsSince(logSeen)
     if (chunk.lines.length) {
       logSeen = chunk.seen
       logLines = [...logLines, ...chunk.lines].slice(-5000)
+    }
+  }
+
+  function mappingLabel(s: Status): string {
+    switch (s.port_mapping) {
+      case 'off':
+        return 'no mapping'
+      case 'searching':
+        return 'mapping…'
+      case 'mapped':
+        return 'mapped'
+      case 'unavailable':
+        return 'not mapped'
+    }
+  }
+
+  function mappingTitle(s: Status): string {
+    switch (s.port_mapping) {
+      case 'off':
+        return 'port mapping is off in the settings'
+      case 'searching':
+        return 'asking the router to forward the port'
+      case 'mapped':
+        return s.external_ip ? `the router forwards the port; external address ${s.external_ip}` : 'the router forwards the port'
+      case 'unavailable':
+        return 'the router answers neither NAT-PMP nor UPnP; forward the port by hand for inbound peers'
     }
   }
 
@@ -130,6 +159,13 @@
     <span class="text-xs text-muted-foreground">{logLines.length} lines</span>
     {#if showConsole}
       <Button variant="ghost" size="xs" onclick={clearLogs}>clear</Button>
+    {/if}
+    {#if status}
+      <span class="ml-auto flex gap-4 text-xs text-muted-foreground tabular-nums">
+        <span>↓ {humanBytes(status.download_bps)}/s ↑ {humanBytes(status.upload_bps)}/s</span>
+        <span title="nodes in the DHT routing table">DHT {status.dht_nodes === null ? 'off' : `${status.dht_nodes} nodes`}</span>
+        <span title={mappingTitle(status)}>port {status.listen_port} · {mappingLabel(status)}</span>
+      </span>
     {/if}
   </footer>
 </div>

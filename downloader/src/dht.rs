@@ -33,8 +33,16 @@ const EXTERNAL_IP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct DhtHandle {
     pub client: DhtClient,
-    /// the UDP port the node listens on, so an announce can say "same port as TCP" when it is
+    /// the UDP port the node listens on, sent to peers in the Port message
     pub udp_port: u16,
+    session: Arc<DhtSession>,
+}
+
+impl DhtHandle {
+    /// Nodes in the routing table, for a status line.
+    pub fn node_count(&self) -> usize {
+        self.session.node_count()
+    }
 }
 
 pub type DhtWatch = watch::Receiver<Option<DhtHandle>>;
@@ -115,6 +123,7 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
             let _ = ready.send(Some(DhtHandle {
                 client: session.handle(),
                 udp_port,
+                session: session.clone(),
             }));
             stop.cancelled().await;
         }

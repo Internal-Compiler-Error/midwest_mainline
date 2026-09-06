@@ -11,6 +11,7 @@ use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
 use crate::peer::PeerSnapshot;
+use crate::portmap::MappingState;
 use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
@@ -560,6 +561,18 @@ enum Command {
     Sequential(bool),
 }
 
+/// The whole session at a glance, for a status bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionStatus {
+    /// summed over every torrent
+    pub download_bps: f64,
+    pub upload_bps: f64,
+    /// nodes in the DHT routing table; `None` with no node (off, or not up yet)
+    pub dht_nodes: Option<usize>,
+    pub listen_port: u16,
+    pub port_mapping: MappingState,
+}
+
 /// The session's side of one torrent; the task that actually runs it holds the other side.
 struct Entry {
     source: String,
@@ -818,6 +831,23 @@ impl Session {
         };
         self.handle.spawn(task.run(resolve));
         id
+    }
+
+    /// Totals and the network's state; call after `torrents`, which is what refreshes the
+    /// rates.
+    pub fn status(&self) -> SessionStatus {
+        let (download_bps, upload_bps) = self
+            .torrents
+            .values()
+            .map(|e| (e.rates.download_bps, e.rates.upload_bps))
+            .fold((0.0, 0.0), |(d, u), (dd, uu)| (d + dd, u + uu));
+        SessionStatus {
+            download_bps,
+            upload_bps,
+            dht_nodes: self.client.dht().borrow().as_ref().map(|dht| dht.node_count()),
+            listen_port: self.identity.serving.port(),
+            port_mapping: self.client.port_mapping().borrow().clone(),
+        }
     }
 
     /// The current state of every torrent, ready to render. Cheap enough to call every frame.
@@ -1231,6 +1261,20 @@ mod test {
 
         let session = Session::new(test_config(&dir)).unwrap();
         assert!(!session.resumable()[0].paused, "unpausing clears the flag");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With the DHT off and an ephemeral port there's nothing to map, and the status says so.
+    #[test]
+    fn status_reports_the_network_state() {
+        let dir = scratch("status");
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        session.torrents();
+        let status = session.status();
+        assert_eq!(status.dht_nodes, None);
+        assert_eq!(status.port_mapping, MappingState::Off);
+        assert_eq!((status.download_bps, status.upload_bps), (0.0, 0.0));
+        session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

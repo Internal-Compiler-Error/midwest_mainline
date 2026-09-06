@@ -24,6 +24,7 @@ survives context resets; re-read before acting.
 - [x] Port mapping: NAT-PMP/PCP via `crab_nat`, UPnP via `igd-next`
 - [x] Force recheck
 - [x] Sequential download
+- [x] Status bar: total rates, DHT node count, listen port, port mapping state
 - [x] uTP via `librqbit-utp` on the listen port's UDP number; the DHT node moved to the
       next port up (the crate can't take a shared socket, see the uTP section)
 - Quality pass every 2-3 features: tests, clippy, pnpm check, code review, notes vs code
@@ -574,3 +575,10 @@ anyone has instead of the rarest. Peer selection is untouched: UCB still decides
 the piece. For playing a file while it downloads; costs the swarm some piece diversity,
 which is why it's off by default and per torrent. Test:
 `sequential_asks_for_pieces_in_order`.
+
+# Status bar, 2026-09-06
+`Session::status` sums the per-torrent rates and reports the DHT's routing table size (the
+handle now carries the session for `node_count`), the listen port, and where port mapping
+stands (`portmap::MappingState`, published through a watch like everything else the client
+starts in the background). The GUI shows it at the right of the footer, polled with the
+torrent list. Test: `status_reports_the_network_state`.

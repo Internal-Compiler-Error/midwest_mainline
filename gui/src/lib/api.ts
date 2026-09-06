@@ -58,12 +58,22 @@ export interface Resumable {
   paused: boolean
 }
 
+export interface Status {
+  download_bps: number
+  upload_bps: number
+  dht_nodes: number | null
+  listen_port: number
+  port_mapping: 'off' | 'searching' | 'mapped' | 'unavailable'
+  external_ip: string | null
+}
+
 export interface LogChunk {
   seen: number
   lines: string[]
 }
 
 export const torrents = () => invoke<TorrentRow[]>('torrents')
+export const status = () => invoke<Status>('status')
 export const addTorrent = (source: string, root: string) => invoke<TorrentId>('add_torrent', { source, root })
 export const resumeTorrent = (path: string) => invoke<TorrentId>('resume_torrent', { path })
 export const removeTorrent = (id: TorrentId, deleteFiles: boolean) =>

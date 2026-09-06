@@ -4,7 +4,7 @@ use crate::dht::DhtWatch;
 use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
-use crate::portmap;
+use crate::portmap::{self, MappingWatch};
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
@@ -44,6 +44,7 @@ pub struct BtClient {
     /// live settings, read by every swarm
     settings: SettingsWatch,
     utp: UtpWatch,
+    port_mapping: MappingWatch,
     /// the download and upload limits, shared by every swarm
     limiter: Arc<RateLimiter>,
     /// local service discovery, poked when a torrent is added
@@ -58,6 +59,10 @@ impl BtClient {
 
     pub fn utp(&self) -> UtpWatch {
         self.utp.clone()
+    }
+
+    pub fn port_mapping(&self) -> MappingWatch {
+        self.port_mapping.clone()
     }
 
     /// Must be called on a tokio runtime: the inbound listener starts right away.
@@ -80,13 +85,15 @@ impl BtClient {
         } else {
             utp::none()
         };
-        if settings.borrow().port_mapping {
+        let port_mapping = if settings.borrow().port_mapping {
             let ports = portmap::Ports {
                 peer: id.serving.port(),
                 dht: id.dht.then(|| settings.borrow().dht_port()),
             };
-            portmap::start(ports, shutdown.clone());
-        }
+            portmap::start(ports, shutdown.clone())
+        } else {
+            portmap::none()
+        };
         let client = Self {
             lsd: Arc::new(Lsd::spawn(Arc::downgrade(&swarms), id.serving.port(), shutdown.clone())),
             id: Arc::new(id),
@@ -96,6 +103,7 @@ impl BtClient {
             limiter: Arc::new(RateLimiter::new(settings.clone())),
             settings,
             utp,
+            port_mapping,
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),

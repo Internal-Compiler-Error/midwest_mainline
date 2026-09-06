@@ -13,6 +13,7 @@ use igd_next::aio::tokio::{Tokio, search_gateway};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -23,6 +24,28 @@ const LEASE: Duration = Duration::from_secs(2 * 3600);
 const RETRY: Duration = Duration::from_secs(10 * 60);
 const UPNP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const DESCRIPTION: &str = "downloader";
+
+/// Where the mapping stands, for a status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappingState {
+    /// turned off in the settings
+    Off,
+    /// looking for a gateway, or asking it
+    Searching,
+    Mapped {
+        /// what a UPnP gateway says it is; NAT-PMP doesn't say
+        external_ip: Option<IpAddr>,
+    },
+    /// no gateway, or one that refuses; tried again every `RETRY`
+    Unavailable,
+}
+
+pub(crate) type MappingWatch = watch::Receiver<MappingState>;
+
+/// A watch that stays `Off`, for a client with mapping turned off.
+pub(crate) fn none() -> MappingWatch {
+    watch::channel(MappingState::Off).1
+}
 
 /// Which ports to map: `peer` for TCP and UDP, `dht` (if there's a node) for UDP.
 #[derive(Clone, Copy)]
@@ -55,15 +78,18 @@ impl std::fmt::Display for Protocol {
 }
 
 /// Keeps the mappings up on the current runtime until `shutdown`, then removes them.
-pub(crate) fn start(ports: Ports, shutdown: CancellationToken) {
+pub(crate) fn start(ports: Ports, shutdown: CancellationToken) -> MappingWatch {
     // port 0 means the OS picked one, which nobody outside can be told about; tests use it
     if ports.peer == 0 {
-        return;
+        return none();
     }
+    let (state, watch) = watch::channel(MappingState::Searching);
     tokio::spawn(async move {
         loop {
+            let _ = state.send(MappingState::Searching);
             let Some((gateway, local_ip)) = gateway() else {
-                debug!("no default gateway to map ports on");
+                debug!("no gateway to map ports on");
+                let _ = state.send(MappingState::Unavailable);
                 wait_or_stop(RETRY, &shutdown).await;
                 if shutdown.is_cancelled() {
                     return;
@@ -72,12 +98,16 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken) {
             };
             match Mapper::open(gateway, local_ip, ports).await {
                 Some(mut mapper) => {
+                    let _ = state.send(MappingState::Mapped {
+                        external_ip: mapper.external_ip().await,
+                    });
                     mapper.keep_alive(&shutdown).await;
                     mapper.close().await;
                     return;
                 }
                 None => {
                     info!("no port mapping: the gateway at {gateway} answers neither NAT-PMP nor UPnP");
+                    let _ = state.send(MappingState::Unavailable);
                     wait_or_stop(RETRY, &shutdown).await;
                     if shutdown.is_cancelled() {
                         return;
@@ -86,6 +116,7 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken) {
             }
         }
     });
+    watch
 }
 
 /// A router to ask, and the address we have on its link: the default route's if it has one,
@@ -197,12 +228,23 @@ impl Mapper {
         if !mapper.add_upnp().await {
             return None;
         }
-        if let Mapper::Upnp { gateway, .. } = &mapper
-            && let Ok(ip) = gateway.get_external_ip().await
-        {
-            info!("UPnP gateway {} says our external address is {ip}", gateway.addr);
-        }
         Some(mapper)
+    }
+
+    async fn external_ip(&self) -> Option<IpAddr> {
+        let Mapper::Upnp { gateway, .. } = self else {
+            return None;
+        };
+        match gateway.get_external_ip().await {
+            Ok(ip) => {
+                info!("UPnP gateway {} says our external address is {ip}", gateway.addr);
+                Some(ip)
+            }
+            Err(e) => {
+                debug!("UPnP gateway didn't say our external address: {e}");
+                None
+            }
+        }
     }
 
     /// Adds (or refreshes) every UPnP mapping; true if at least one took.
