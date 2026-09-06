@@ -12,7 +12,7 @@ survives context resets; re-read before acting.
       whole round; drop SQLite for an in-memory table saved to a file?
 - [x] Auto-resume every torrent in the data dir on startup
 - [x] Pause/resume per torrent; remove with files vs remove keeping files
-- [ ] Peer list in the GUI (address, client, rates, progress, flags)
+- [x] Peer list in the GUI (address, client, rates, progress, flags)
 - [ ] Persisted settings (listen port, default download dir, max peers) + settings dialog
 - [ ] Global speed limits
 - [ ] File selection / priorities
@@ -394,3 +394,12 @@ menu offers both. `Session::resume_all` resumes every file in the resume dir tha
 already in the session, and `Session::resumable` is that same filtered list, so the GUI
 starts with everything from last time and only offers what isn't running. Tests:
 `pause_survives_a_restart_and_unpause_starts_again`, `remove_can_keep_the_files`.
+
+# Peer list, 2026-09-06
+`Peer::snapshot` is taken for every peer once a second in housekeeping and published on the
+swarm handle's second watch (`TorrentSwarmHandle::peers`), kept apart from the stats watch so
+the announcers and the resume saver don't wake for it. The handshake's peer id is kept on
+the `Peer` and `peer::client_name` turns it into "qBittorrent 5.1.0.0" and friends
+(Azureus and Shadow styles, printable prefix otherwise). The session adds per-peer rates
+from deltas (same `Rates` as the torrent's) and the usual `D/d U/u` flags, and the GUI
+shows a table under the details.

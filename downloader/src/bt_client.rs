@@ -1,5 +1,6 @@
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
+use crate::peer::PeerSnapshot;
 use crate::storage::TorrentStorage;
 use crate::torrent::Torrent;
 use crate::torrent_swarm::{ConnectedPeer, TorrentSwarm, TorrentSwarmHandle, TorrentSwarmStats};
@@ -72,6 +73,15 @@ impl BtClient {
 
     /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as
     /// long as the torrent's swarm runs -- the receiver only depends on the underlying channel.
+    /// The connected peers of a torrent, refreshed once a second.
+    pub fn peers(&self, torrent: &Torrent) -> Option<watch::Receiver<Vec<PeerSnapshot>>> {
+        self.swarms
+            .lock()
+            .unwrap()
+            .get(&torrent.info_hash)
+            .map(TorrentSwarmHandle::peers)
+    }
+
     pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
         self.swarms
             .lock()
@@ -259,6 +269,7 @@ impl BtClient {
                         remote_addr,
                         remote_supports_extensions: handshake.supports_extensions(),
                         remote_supports_fast: handshake.supports_fast_extension(),
+                        peer_id: handshake.peer_id,
                     })
                     .await;
             });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import LoaderCircle from '@lucide/svelte/icons/loader-circle'
   import { ScrollArea } from '$lib/components/ui/scroll-area'
+  import * as Table from '$lib/components/ui/table'
   import type { TorrentRow } from './api'
   import { fraction, humanBytes, isMagnetUri } from './api'
   import ProgressBar from './ProgressBar.svelte'
@@ -53,5 +54,41 @@
         {/each}
       </ul>
     </ScrollArea>
+
+    {#if torrent.kind === 'downloading'}
+      <div class="font-medium">Peers ({torrent.peers.length})</div>
+      <ScrollArea class="max-h-64 rounded-md border">
+        <Table.Root class="text-xs">
+          <Table.Header>
+            <Table.Row>
+              <Table.Head>Address</Table.Head>
+              <Table.Head>Client</Table.Head>
+              <Table.Head class="text-right">Has</Table.Head>
+              <Table.Head class="text-right">Down</Table.Head>
+              <Table.Head class="text-right">Up</Table.Head>
+              <Table.Head title="D/d: we download from it (d: choked). U/u: it downloads from us (u: we choke it)">
+                Flags
+              </Table.Head>
+            </Table.Row>
+          </Table.Header>
+          <Table.Body>
+            {#each torrent.peers as peer (peer.addr)}
+              <Table.Row>
+                <Table.Cell class="font-mono select-text">{peer.addr}</Table.Cell>
+                <Table.Cell class="max-w-40 truncate" title={peer.client}>{peer.client}</Table.Cell>
+                <Table.Cell class="text-right tabular-nums">{Math.round(peer.progress * 100)}%</Table.Cell>
+                <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
+                  {humanBytes(peer.download_bps)}/s
+                </Table.Cell>
+                <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.uploaded)} in total">
+                  {humanBytes(peer.upload_bps)}/s
+                </Table.Cell>
+                <Table.Cell class="font-mono">{peer.flags}</Table.Cell>
+              </Table.Row>
+            {/each}
+          </Table.Body>
+        </Table.Root>
+      </ScrollArea>
+    {/if}
   {/if}
 </div>

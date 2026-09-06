@@ -18,6 +18,18 @@ export interface Progress {
   completed: boolean
   download_bps: number
   upload_bps: number
+  peers: Peer[]
+}
+
+export interface Peer {
+  addr: string
+  client: string
+  progress: number
+  downloaded: number
+  uploaded: number
+  download_bps: number
+  upload_bps: number
+  flags: string
 }
 
 export type TorrentRow = { id: TorrentId } & (

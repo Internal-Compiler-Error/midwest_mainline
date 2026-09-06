@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::{LogBuffer, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir};
+use downloader::{LogBuffer, PeerInfo, Progress, Session, SessionConfig, TorrentId, TorrentState, data_dir};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{Manager, RunEvent, State};
@@ -49,6 +49,34 @@ struct ProgressDto {
     completed: bool,
     download_bps: f64,
     upload_bps: f64,
+    peers: Vec<PeerDto>,
+}
+
+#[derive(Serialize)]
+struct PeerDto {
+    addr: String,
+    client: String,
+    progress: f32,
+    downloaded: u64,
+    uploaded: u64,
+    download_bps: f64,
+    upload_bps: f64,
+    flags: String,
+}
+
+impl From<PeerInfo> for PeerDto {
+    fn from(p: PeerInfo) -> Self {
+        Self {
+            addr: p.addr,
+            client: p.client,
+            progress: p.progress,
+            downloaded: p.downloaded,
+            uploaded: p.uploaded,
+            download_bps: p.download_bps,
+            upload_bps: p.upload_bps,
+            flags: p.flags,
+        }
+    }
 }
 
 impl From<Progress> for ProgressDto {
@@ -67,6 +95,7 @@ impl From<Progress> for ProgressDto {
             completed: p.completed,
             download_bps: p.download_bps,
             upload_bps: p.upload_bps,
+            peers: p.peers.into_iter().map(PeerDto::from).collect(),
         }
     }
 }

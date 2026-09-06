@@ -9,13 +9,14 @@
 
 use crate::defs::Identity;
 use crate::dht::Dht;
+use crate::peer::PeerSnapshot;
 use crate::resume::{ResumeData, ResumeSummary, keep_saving, list_resume_files};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
 use bitvec::prelude::*;
 use midwest_mainline::types::InfoHash;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,6 +65,24 @@ pub struct Progress {
     pub completed: bool,
     pub download_bps: f64,
     pub upload_bps: f64,
+    /// connected peers; empty while paused
+    pub peers: Vec<PeerInfo>,
+}
+
+/// One connected peer, ready to render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerInfo {
+    pub addr: String,
+    pub client: String,
+    /// the share of the torrent the peer has, in 0.0..=1.0
+    pub progress: f32,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub download_bps: f64,
+    pub upload_bps: f64,
+    /// the usual client shorthand: `D`/`d` we download from it (`d`: want to, but choked),
+    /// `U`/`u` it downloads from us (`u`: wants to, but we choke it)
+    pub flags: String,
 }
 
 impl Progress {
@@ -198,6 +217,7 @@ impl TorrentTask {
             .client
             .stats(torrent)
             .ok_or_else(|| anyhow::anyhow!("torrent was added but reported no stats"))?;
+        let peers = self.client.peers(torrent).unwrap_or_else(|| watch::channel(vec![]).1);
         let stop_saving = self.cancel.child_token();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
@@ -210,6 +230,7 @@ impl TorrentTask {
             torrent: torrent.clone(),
             root: root.to_path_buf(),
             stats: stats.clone(),
+            peers,
         });
 
         let stop = loop {
@@ -281,6 +302,7 @@ enum Phase {
         torrent: Arc<Torrent>,
         root: PathBuf,
         stats: watch::Receiver<TorrentSwarmStats>,
+        peers: watch::Receiver<Vec<PeerSnapshot>>,
     },
     Paused {
         torrent: Arc<Torrent>,
@@ -309,6 +331,8 @@ struct Entry {
     phase: watch::Receiver<Phase>,
     commands: mpsc::UnboundedSender<Command>,
     rates: Rates,
+    /// per-peer rate samples, dropped for peers that went away
+    peer_rates: HashMap<std::net::SocketAddr, Rates>,
 }
 
 pub struct Session {
@@ -489,6 +513,7 @@ impl Session {
                 phase: phase_rx,
                 commands: commands_tx,
                 rates: Rates::new(),
+                peer_rates: HashMap::new(),
             },
         );
 
@@ -538,7 +563,8 @@ impl Entry {
     }
 
     fn state(&mut self) -> TorrentState {
-        match self.phase.borrow_and_update().clone() {
+        let phase = self.phase.borrow_and_update().clone();
+        match phase {
             Phase::Failed { error } => TorrentState::Failed {
                 source: self.source.clone(),
                 error,
@@ -547,16 +573,53 @@ impl Entry {
                 source: self.source.clone(),
                 elapsed: started.elapsed(),
             },
-            Phase::Downloading { torrent, root, stats } => {
+            Phase::Downloading {
+                torrent,
+                root,
+                stats,
+                peers,
+            } => {
                 let stats = stats.borrow().clone();
-                self.rates.update(&stats);
-                TorrentState::Downloading(progress(&torrent, &root, &stats, &self.rates))
+                self.rates.update(stats.downloaded, stats.uploaded);
+                let mut progress = progress(&torrent, &root, &stats, &self.rates);
+                progress.peers = self.peers(&peers.borrow());
+                TorrentState::Downloading(progress)
             }
             Phase::Paused { torrent, root, stats } => {
                 self.rates = Rates::new();
+                self.peer_rates.clear();
                 TorrentState::Paused(progress(&torrent, &root, &stats, &self.rates))
             }
         }
+    }
+
+    fn peers(&mut self, snapshots: &[PeerSnapshot]) -> Vec<PeerInfo> {
+        self.peer_rates
+            .retain(|addr, _| snapshots.iter().any(|p| p.addr == *addr));
+        snapshots
+            .iter()
+            .map(|p| {
+                let rates = self.peer_rates.entry(p.addr).or_insert_with(Rates::new);
+                rates.update(p.downloaded, p.uploaded);
+                let mut flags = String::new();
+                if p.interested_them {
+                    flags.push(if p.choked_us { 'd' } else { 'D' });
+                }
+                if p.interested_us {
+                    flags.push(if p.choked_them { 'u' } else { 'U' });
+                }
+                PeerInfo {
+                    addr: p.addr.to_string(),
+                    client: p.client.clone(),
+                    progress: p.progress,
+                    downloaded: p.downloaded,
+                    uploaded: p.uploaded,
+                    download_bps: rates.download_bps,
+                    upload_bps: rates.upload_bps,
+                    flags,
+                }
+            })
+            .collect()
     }
 }
 
@@ -575,6 +638,7 @@ fn progress(torrent: &Torrent, root: &Path, stats: &TorrentSwarmStats, rates: &R
         completed: stats.completed,
         download_bps: rates.download_bps,
         upload_bps: rates.upload_bps,
+        peers: vec![],
     }
 }
 
@@ -600,15 +664,15 @@ impl Rates {
 
     /// Recomputes at most every 500ms. A UI calls this once per frame (~60/s), and a window
     /// that short would divide a handful of bytes by ~16ms and produce a wildly jumpy figure.
-    fn update(&mut self, stats: &TorrentSwarmStats) {
+    fn update(&mut self, downloaded: u64, uploaded: u64) {
         let elapsed = self.last_sample.elapsed();
         if elapsed < Duration::from_millis(500) {
             return;
         }
-        self.download_bps = stats.downloaded.saturating_sub(self.last_downloaded) as f64 / elapsed.as_secs_f64();
-        self.upload_bps = stats.uploaded.saturating_sub(self.last_uploaded) as f64 / elapsed.as_secs_f64();
-        self.last_downloaded = stats.downloaded;
-        self.last_uploaded = stats.uploaded;
+        self.download_bps = downloaded.saturating_sub(self.last_downloaded) as f64 / elapsed.as_secs_f64();
+        self.upload_bps = uploaded.saturating_sub(self.last_uploaded) as f64 / elapsed.as_secs_f64();
+        self.last_downloaded = downloaded;
+        self.last_uploaded = uploaded;
         self.last_sample = Instant::now();
     }
 }
@@ -658,6 +722,7 @@ mod test {
             completed: false,
             download_bps: 0.0,
             upload_bps: 0.0,
+            peers: vec![],
         };
         // a zero-piece torrent must not divide by zero
         assert_eq!(p.fraction(), 0.0);

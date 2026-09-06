@@ -62,6 +62,102 @@ pub(crate) struct Peer {
     pub last_received: Instant,
 
     pub stats: PeerStatistics,
+    /// the id the peer sent in its handshake, for naming its client
+    pub peer_id: [u8; 20],
+}
+
+/// One peer as a front end shows it, taken by the swarm once a second.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerSnapshot {
+    pub addr: SocketAddr,
+    pub client: String,
+    /// the share of the torrent's pieces the peer has, in 0.0..=1.0
+    pub progress: f32,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    /// download throughput measured by `PeerStatistics::rx_rate`
+    pub download_bps: f64,
+    pub choked_us: bool,
+    pub choked_them: bool,
+    pub interested_us: bool,
+    pub interested_them: bool,
+    /// blocks requested from the peer and not yet delivered
+    pub outstanding: usize,
+}
+
+/// A human-readable client name from a peer id. Azureus-style ids (`-XX1234-...`) name the
+/// client by a two-letter code and its version; Shadow-style (`X1234---...`) by one letter;
+/// anything else is shown as its printable prefix.
+pub fn client_name(peer_id: &[u8; 20]) -> String {
+    let printable = |b: &u8| b.is_ascii_graphic();
+    if peer_id[0] == b'-' && peer_id[7] == b'-' && peer_id[1..7].iter().all(printable) {
+        let code = &peer_id[1..3];
+        let name = match code {
+            b"qB" => "qBittorrent",
+            b"TR" => "Transmission",
+            b"UT" | b"\xb5T" => "\u{b5}Torrent",
+            b"UM" => "\u{b5}Torrent Mac",
+            b"UW" => "\u{b5}Torrent Web",
+            b"LT" => "libtorrent",
+            b"lt" => "libtorrent",
+            b"DE" => "Deluge",
+            b"AZ" => "Vuze",
+            b"BC" => "BitComet",
+            b"BT" => "BitTorrent",
+            b"BW" => "BitTorrent Web",
+            b"XL" => "Xunlei",
+            b"SD" => "Xunlei",
+            b"TX" => "Tixati",
+            b"FC" => "FileCroc",
+            b"FD" => "Free Download Manager",
+            b"aD" => "aria2",
+            b"A2" => "aria2",
+            b"RT" => "rtorrent",
+            b"WW" => "WebTorrent",
+            b"WD" => "WebTorrent Desktop",
+            b"MT" => "MoonlightTorrent",
+            b"PI" => "PicoTorrent",
+            b"BI" => "BiglyBT",
+            b"DL" => "downloader",
+            _ => "",
+        };
+        let version: String = peer_id[3..7]
+            .iter()
+            .map(|&b| char::from(b))
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        if name.is_empty() {
+            return format!("{} {version}", String::from_utf8_lossy(code));
+        }
+        return format!("{name} {version}");
+    }
+    if peer_id[0].is_ascii_uppercase() && peer_id[1..5].iter().all(|b| b.is_ascii_alphanumeric()) && peer_id[5] == b'-'
+    {
+        let name = match peer_id[0] {
+            b'A' => "ABC",
+            b'O' => "Osprey",
+            b'Q' => "BTQueue",
+            b'R' => "Tribler",
+            b'S' => "Shad0w",
+            b'T' => "BitTornado",
+            b'U' => "UPnP NAT Bit Torrent",
+            _ => "",
+        };
+        let version = String::from_utf8_lossy(&peer_id[1..5])
+            .trim_end_matches('-')
+            .to_string();
+        if !name.is_empty() {
+            return format!("{name} {version}");
+        }
+    }
+    let prefix: String = peer_id
+        .iter()
+        .take(8)
+        .map(|&b| if printable(&b) { char::from(b) } else { '.' })
+        .collect();
+    prefix
 }
 
 /// The remote broke the protocol (an out-of-range `Have`, a wrong-sized bitfield); the swarm
@@ -70,8 +166,15 @@ pub(crate) struct Peer {
 pub(crate) struct ProtocolViolation(pub String);
 
 impl Peer {
-    pub fn new(tcp: TcpStream, remote_addr: SocketAddr, num_pieces: usize, remote_supports_fast: bool) -> Self {
+    pub fn new(
+        tcp: TcpStream,
+        remote_addr: SocketAddr,
+        num_pieces: usize,
+        remote_supports_fast: bool,
+        peer_id: [u8; 20],
+    ) -> Self {
         Self {
+            peer_id,
             remote_addr,
             remote_supports_fast,
             their_ut_metadata_id: None,
@@ -105,6 +208,27 @@ impl Peer {
 
     pub fn request_window(&self) -> usize {
         self.stats.request_window()
+    }
+
+    pub fn snapshot(&self) -> PeerSnapshot {
+        let have = self.they_have.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+        PeerSnapshot {
+            addr: self.remote_addr,
+            client: client_name(&self.peer_id),
+            progress: if self.num_pieces == 0 {
+                0.0
+            } else {
+                (have as f32 / self.num_pieces as f32).clamp(0.0, 1.0)
+            },
+            downloaded: self.stats.received as u64,
+            uploaded: self.stats.sent as u64,
+            download_bps: self.stats.rx_rate,
+            choked_us: self.choked_us,
+            choked_them: self.choked_them,
+            interested_us: self.interested_us,
+            interested_them: self.interested_them,
+            outstanding: self.requested.len(),
+        }
     }
 
     /// Applies a message that only touches this connection's own state. Anything else (data
@@ -653,6 +777,20 @@ mod test {
     }
 
     #[test]
+    fn client_names_from_peer_ids() {
+        assert_eq!(client_name(b"-qB4650-abcdefghijkl"), "qBittorrent 4.6.5.0");
+        assert_eq!(client_name(b"-TR4060-abcdefghijkl"), "Transmission 4.0.6.0");
+        assert_eq!(client_name(b"-ZZ0001-abcdefghijkl"), "ZZ 0.0.0.1");
+        assert_eq!(client_name(b"T0345---abcdefghijkl"), "BitTornado 0345");
+        assert_eq!(
+            client_name(b"M7-3-1--abcdefghijkl"),
+            "M7-3-1--",
+            "unknown ids show their prefix"
+        );
+        assert_eq!(client_name(&[0xffu8; 20]), "........");
+    }
+
+    #[test]
     fn ucb_score_is_never_nan() {
         let mut stats = PeerStatistics::default();
         assert_eq!(stats.score(0, 1.0), f64::INFINITY, "an unpicked peer is picked first");
@@ -760,7 +898,7 @@ mod test {
             .unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let _other_end = listener.accept().await.unwrap();
-        let mut peer = Peer::new(tcp, "10.0.0.1:1".parse().unwrap(), 4, false);
+        let mut peer = Peer::new(tcp, "10.0.0.1:1".parse().unwrap(), 4, false, [0u8; 20]);
         let limit = Duration::from_millis(50);
 
         assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");

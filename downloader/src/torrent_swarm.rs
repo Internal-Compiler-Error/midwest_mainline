@@ -2,7 +2,8 @@ use crate::announcer::spawn_announcers;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::peer::{
-    Peer, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
+    Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
+    parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
@@ -89,6 +90,7 @@ impl TorrentSwarmStats {
 pub struct TorrentSwarmHandle {
     tx: mpsc::Sender<SwarmEvent>,
     stats: watch::Receiver<TorrentSwarmStats>,
+    peers: watch::Receiver<Vec<PeerSnapshot>>,
 }
 
 impl TorrentSwarmHandle {
@@ -97,6 +99,11 @@ impl TorrentSwarmHandle {
     /// handle -- it only depends on the channel, not on the swarm still being reachable.
     pub fn stats(&self) -> watch::Receiver<TorrentSwarmStats> {
         self.stats.clone()
+    }
+
+    /// The connected peers as of the last housekeeping tick (once a second).
+    pub fn peers(&self) -> watch::Receiver<Vec<PeerSnapshot>> {
+        self.peers.clone()
     }
 
     /// Hands a freshly handshaken socket to the swarm, which owns it from here on. Used by both
@@ -117,6 +124,7 @@ pub(crate) struct ConnectedPeer {
     pub remote_addr: SocketAddr,
     pub remote_supports_extensions: bool,
     pub remote_supports_fast: bool,
+    pub peer_id: [u8; 20],
 }
 
 /// Everything that reaches the swarm's event loop from outside it: things that happened in
@@ -330,6 +338,7 @@ pub struct TorrentSwarm {
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
+    peers_snapshot_tx: watch::Sender<Vec<PeerSnapshot>>,
 
     /// cancels the announcers' token when the swarm goes away, so they get to say goodbye
     _stop_announcers: DropGuard,
@@ -369,9 +378,11 @@ impl TorrentSwarm {
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
         let (events_tx, events_rx) = mpsc::channel(512);
+        let (peers_tx, peers_rx) = watch::channel(vec![]);
         let handle = TorrentSwarmHandle {
             tx: events_tx,
             stats: stat_rx.clone(),
+            peers: peers_rx,
         };
         let events_tx = handle.tx.downgrade();
         let announcers = CancellationToken::new();
@@ -403,6 +414,7 @@ impl TorrentSwarm {
             total_picks: 0,
             stat,
             stat_snapshot_tx: stat_tx,
+            peers_snapshot_tx: peers_tx,
             _stop_announcers: announcers.drop_guard(),
         };
         (swarm, handle)
@@ -518,6 +530,9 @@ impl TorrentSwarm {
 
         self.schedule().await;
         self.publish_stats();
+        let _ = self
+            .peers_snapshot_tx
+            .send(self.peers.iter().map(Peer::snapshot).collect());
     }
 
     fn ban(&mut self, addr: SocketAddr) {
@@ -1066,6 +1081,7 @@ impl TorrentSwarm {
             remote_addr,
             self.torrent.pieces.len(),
             connected.remote_supports_fast,
+            connected.peer_id,
         );
         peer.stats = known.stats.clone();
         let opening = async {
@@ -1230,6 +1246,7 @@ async fn dial(addr: SocketAddr, torrent: &Torrent, our_id: &Identity) -> anyhow:
         remote_addr: addr,
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
+        peer_id: handshake.peer_id,
     })
 }
 
@@ -1318,6 +1335,7 @@ mod test {
                 remote_addr: pretend_addr.parse().unwrap(),
                 remote_supports_extensions: false,
                 remote_supports_fast: fast,
+                peer_id: *b"-TS0001-fake-peer-id",
             })
             .await;
         Framed::new(theirs, BtCodec)
