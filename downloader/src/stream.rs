@@ -190,7 +190,12 @@ impl AsyncWrite for PeerStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             PeerStream::Tcp(tcp) => Pin::new(tcp).poll_flush(cx),
-            PeerStream::Utp(utp) => Pin::new(utp).poll_flush(cx),
+            // librqbit-utp's flush waits until the remote has ACKed everything written, a
+            // round trip per message. Its dispatcher sends what's been written without one, the
+            // way the kernel does for TCP, whose flush is likewise a no-op. `Framed::send` flushes
+            // after every message, and the swarm loop awaits each send inline, so the real flush
+            // would let one uTP peer's round trip hold up every peer of the torrent.
+            PeerStream::Utp(_) => Poll::Ready(Ok(())),
             PeerStream::Encrypted(enc) => Pin::new(enc.as_mut()).poll_flush(cx),
         }
     }
@@ -377,6 +382,56 @@ mod test {
             assert_eq!((stream.is_utp(), stream.is_encrypted()), expected);
             assert_eq!(acceptor.await.unwrap(), expected);
         }
+    }
+
+    /// A burst of small messages over uTP goes out at once. `Framed::send` flushes after each
+    /// one, and were flush to wait for the remote's ACK (as librqbit-utp's own does), every
+    /// message would cost a round trip plus the receiver's delayed-ACK timer: seconds for
+    /// this burst instead of milliseconds.
+    #[tokio::test]
+    async fn small_messages_over_utp_do_not_wait_for_acks() {
+        use crate::wire::{BtCodec, BtMessage, Request};
+        use futures::{SinkExt, StreamExt};
+        use tokio_util::codec::Framed;
+
+        const BURST: u32 = 200;
+        let server = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let client = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let addr = server.bind_addr();
+        let receiver = tokio::spawn(async move {
+            let mut framed = Framed::new(PeerStream::Utp(server.accept().await.unwrap()), BtCodec);
+            let mut got = 0;
+            while got < BURST {
+                match framed.next().await.unwrap().unwrap() {
+                    BtMessage::Request(req) => {
+                        assert_eq!(req.begin, got * 16384);
+                        got += 1;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        });
+        let mut framed = Framed::new(PeerStream::Utp(client.connect(addr).await.unwrap()), BtCodec);
+        let started = std::time::Instant::now();
+        for i in 0..BURST {
+            framed
+                .send(BtMessage::Request(Request {
+                    index: 0,
+                    begin: i * 16384,
+                    length: 16384,
+                }))
+                .await
+                .unwrap();
+        }
+        let sent_in = started.elapsed();
+        tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+            .await
+            .expect("the burst arrives")
+            .unwrap();
+        assert!(
+            sent_in < std::time::Duration::from_secs(1),
+            "{BURST} requests took {sent_in:?} to send"
+        );
     }
 
     /// With TCP and uTP both listening on the port, the hints decide: uTP first, and no

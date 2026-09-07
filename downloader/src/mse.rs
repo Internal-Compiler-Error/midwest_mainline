@@ -8,6 +8,7 @@
 //!
 //! Spec: <https://wiki.vuze.com/w/Message_Stream_Encryption>.
 
+use std::collections::VecDeque;
 use midwest_mainline::types::InfoHash;
 use num_bigint::BigUint;
 use sha1::{Digest, Sha1};
@@ -181,7 +182,7 @@ pub(crate) struct Encrypted<S> {
     tx: Rc4,
     /// plaintext that arrived in the same read as the handshake's last field, handed out
     /// before anything more is read from `inner`
-    leftover: Vec<u8>,
+    leftover: VecDeque<u8>,
     /// ciphertext accepted by `poll_write` and not yet written out. Bytes are encrypted
     /// exactly once, when accepted; a short write must not run them through the cipher
     /// again or the keystreams desynchronise
@@ -190,7 +191,7 @@ pub(crate) struct Encrypted<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Encrypted<S> {
-    fn new(inner: S, rx: Rc4, tx: Rc4, leftover: Vec<u8>) -> Self {
+    fn new(inner: S, rx: Rc4, tx: Rc4, leftover: VecDeque<u8>) -> Self {
         Self {
             inner,
             rx,
@@ -224,7 +225,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Encrypted<S> {
         let this = self.get_mut();
         if !this.leftover.is_empty() {
             let n = this.leftover.len().min(buf.remaining());
-            buf.put_slice(&this.leftover[..n]);
+            let (first, _second) = this.leftover.as_slices();
+            assert!(_second.is_empty(), "leftover is not written after the handshake, so it should never wrap");
+            buf.put_slice(&first[..n]);
             this.leftover.drain(..n);
             return Poll::Ready(Ok(()));
         }
@@ -303,7 +306,7 @@ pub(crate) async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
     let pad_len = u16_of(&take(&mut stream, &mut ahead, Some(&mut rx), 2).await?);
     take(&mut stream, &mut ahead, Some(&mut rx), pad_len).await?;
     rx.apply(&mut ahead);
-    Ok(Encrypted::new(stream, rx, tx, ahead))
+    Ok(Encrypted::new(stream, rx, tx, ahead.into()))
 }
 
 /// The responder's side, for an inbound connection whose first bytes (`head`, already read
@@ -355,7 +358,7 @@ pub(crate) async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
     reply.extend(0u16.to_be_bytes()); // no PadD
     tx.apply(&mut reply);
     stream.write_all(&reply).await?;
-    Ok((Encrypted::new(stream, rx, tx, leftover), info_hash))
+    Ok((Encrypted::new(stream, rx, tx, leftover.into()), info_hash))
 }
 
 #[cfg(test)]

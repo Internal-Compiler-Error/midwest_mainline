@@ -25,8 +25,6 @@ use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use zerocopy::network_endian::{I32, I64, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-
-#[allow(unused_imports)]
 use derive_more::{Eq, PartialEq};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
