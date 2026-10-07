@@ -496,7 +496,7 @@ impl DhtSession {
                     }
                     let Some(sibling) = state.sibling() else { continue };
                     for node in nodes {
-                        sibling.routing_table.add(node.id(), node.end_point());
+                        sibling.routing_table.vet(node.id(), node.end_point());
                     }
                 }
             })
@@ -691,7 +691,7 @@ mod migration_tests {
 #[cfg(test)]
 mod ipv6_tests {
     use super::*;
-    use crate::test_support::{node, scratch_dir};
+    use crate::test_support::{eventually, node, scratch_dir};
 
     const V6_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
     const V4_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -728,7 +728,7 @@ mod ipv6_tests {
         let found = c.session.get_peers(info_hash).await;
         assert_eq!(found.peers, vec![SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 1234)]);
         // B learned of both, in its IPv6 table
-        assert_eq!(b.session.node_count(), 2);
+        assert!(eventually(|| b.session.node_count() == 2).await);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -741,7 +741,7 @@ mod ipv6_tests {
         remote4.session.pair_with(&remote6.session);
         let x = node(&dir, "x", V6_LOOPBACK).await;
         x.session.bootstrap(vec![remote6.session.local_addr()]).await.unwrap();
-        assert_eq!(remote6.session.node_count(), 1);
+        assert!(eventually(|| remote6.session.node_count() == 1).await);
 
         // and us, dual-stack too, bootstrapping over IPv4 only
         let us4 = node(&dir, "us", V4_LOOPBACK).await;
@@ -968,7 +968,7 @@ mod bep33_tests {
 #[cfg(test)]
 mod bep45_tests {
     use super::*;
-    use crate::test_support::{node, node_of, scratch_dir};
+    use crate::test_support::{eventually, node, node_of, scratch_dir};
 
     const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -993,9 +993,12 @@ mod bep45_tests {
         assert_eq!(second.session.node_count(), 0);
         second.session.bootstrap(vec![x.session.local_addr()]).await.unwrap();
         // X, and the primary X told it of: to the second, just another node
-        assert_eq!(second.session.node_count(), 2);
+        assert!(eventually(|| second.session.node_count() == 2).await);
         assert!(second.session.routing_table.contains(&primary_id));
-        assert_eq!(x.session.node_count(), 2, "the network sees two nodes");
+        assert!(
+            eventually(|| x.session.node_count() == 2).await,
+            "the network sees two nodes"
+        );
 
         // a token is the socket's that issued it
         let hash = InfoHash([0x45; 20]);

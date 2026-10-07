@@ -3,9 +3,10 @@
 //! own) so contacts survive restarts.
 //!
 //! The table learns passively: `run` consumes the broker's inbound message fan-out and
-//! records every sender we hear from. Liveness is tracked with a `failed_requests`
-//! counter — 3+ failures and 15 minutes unheard from land a node on the replacement queue,
-//! and a failed refresh ping drops it.
+//! records every node that answers a query of ours; a node that queries us is pinged before
+//! it may join, and nodes named in answers are lookup candidates, not members.
+//! Liveness is tracked with a `failed_requests` counter — 3+ failures and 15 minutes unheard
+//! from land a node on the replacement queue, and a failed refresh ping drops it.
 //!
 //! IPv4 and IPv6 nodes share the `node` table, told apart by its `family` column: each
 //! [`RoutingTable`] sees only the rows of its own family (BEP 32's separate tables).
@@ -120,6 +121,8 @@ const FAILURES_TO_REFRESH: i32 = 3;
 const PERSIST_EVERY: Duration = Duration::from_secs(1);
 /// Changes that make a batch be written early
 const PERSIST_BATCH: usize = 4096;
+/// Pings at once to nodes that would join the table if they answered (see `vet`)
+const MAX_VETTING: usize = 64;
 
 type Db = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -401,6 +404,8 @@ pub struct RoutingTable {
     bucket_capacity: usize,
     /// buckets with a refresh under way, see `add`
     refreshing: Arc<Mutex<HashSet<i32>>>,
+    /// addresses being pinged before they may join, see `vet`
+    vetting: Arc<Mutex<HashSet<SocketAddr>>>,
 }
 
 impl RoutingTable {
@@ -424,6 +429,7 @@ impl RoutingTable {
             rpc_manager,
             bucket_capacity: 1024,
             refreshing: Arc::default(),
+            vetting: Arc::default(),
         }
     }
 
@@ -446,18 +452,63 @@ impl RoutingTable {
         let Some(sender) = message.node_id() else {
             return;
         };
-        // BEP 43: a read-only node wouldn't answer us; its query is served, it isn't kept
-        if message.is_query() && message.read_only {
+        let sender = NodeInfo::new(sender, from);
+        if !message.is_query() {
+            // an answer to a query of ours, from where the query went (the broker sees to that)
+            if !self.mark_good(&sender) {
+                self.add(sender.id(), from);
+            }
+            // the other family's nodes are the session's business (see `DhtSession::pair_with`)
+            if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
+                for node in res.nodes_of(self.family) {
+                    self.vet(node.id(), node.end_point());
+                }
+            }
             return;
         }
-        self.mark_good(&NodeInfo::new(sender, from));
-        self.add(sender, from);
-        // the other family's nodes are the session's business (see `DhtSession::pair_with`)
-        if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
-            for node in res.nodes_of(self.family) {
-                self.add(node.id(), node.end_point());
+        // BEP 43: a read-only node wouldn't answer us; its query is served, it isn't kept
+        if message.read_only {
+            return;
+        }
+        // BEP 5: a node that answered us stays good while it keeps querying us; one that never
+        // did is asked first, so a query from a spoofed address or a node that won't answer
+        // gets nobody in
+        if !self.mark_good(&sender) {
+            self.vet(sender.id(), from);
+        }
+    }
+
+    /// Pings a node we heard of but never heard answer, if the table would take it: its answer
+    /// comes back through the broker and adds it (see `learn_from`). Nodes named in answers
+    /// are only candidates for lookups until then.
+    pub fn vet(&self, id: NodeId, addr: SocketAddr) {
+        if Family::of(&addr) != self.family || id == self.id || !self.would_take(&id, &addr) {
+            return;
+        }
+        {
+            let mut vetting = self.vetting.lock().unwrap();
+            if vetting.len() >= MAX_VETTING || !vetting.insert(addr) {
+                return;
             }
         }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let ping = KrpcBody::PingQuery(PingQuery::new(this.id));
+            let _ = this.rpc_manager.query(ping, addr, REQ_TIMEOUT).await;
+            this.vetting.lock().unwrap().remove(&addr);
+        });
+    }
+
+    /// Whether `id` at `addr` would get in now: it's new, its address group is free, and its
+    /// bucket has room, or would make some for it (BEP 42)
+    fn would_take(&self, id: &NodeId, addr: &SocketAddr) -> bool {
+        let nodes = self.nodes();
+        if nodes.by_id.contains_key(id) || nodes.ip_taken(&addr.ip()) {
+            return false;
+        }
+        let bucket = self.index(id);
+        nodes.buckets[bucket as usize].len() < self.bucket_capacity
+            || (compliant(id, addr.ip()) && least_recent_noncompliant(&nodes, bucket).is_some())
     }
 
     /// Learns from every message in `inbound` (the caller's subscription to the broker's
@@ -600,7 +651,7 @@ impl RoutingTable {
                 .await
                 .is_ok();
             match answered {
-                true => self.mark_good(&target),
+                true => _ = self.mark_good(&target),
                 false => self.evict(&target.id()),
             }
         }))
@@ -613,20 +664,22 @@ impl RoutingTable {
         info!("{} routing table: {all} nodes, {good} with BEP 42 ids", self.family);
     }
 
-    /// We heard from `node`; another address claiming its id doesn't count
-    fn mark_good(&self, node: &NodeInfo) {
+    /// We heard from `node`; another address claiming its id doesn't count. Whether the table
+    /// has it.
+    fn mark_good(&self, node: &NodeInfo) -> bool {
         let mut nodes = self.nodes();
         let Some(contact) = nodes.by_id.get_mut(&node.id()) else {
-            return;
+            return false;
         };
         if contact.addr != node.end_point() {
-            return;
+            return false;
         }
         contact.last_contacted = unix_timestmap_ms();
         contact.failed = 0;
         let contact = *contact;
         drop(nodes);
         self.save(node.id(), Some(contact));
+        true
     }
 
     /// Record a failed RPC to a known node; enough of these lands it on the replacement
@@ -1007,6 +1060,72 @@ mod tests {
         // the node itself does
         routing_table.learn_from(addr(1), &claim);
         assert!(routing_table.replacement_queue(routing_table.index(&dead)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_node_named_in_an_answer_is_only_a_candidate_until_it_answers_itself() {
+        use crate::message::find_node_get_peers_response::Builder;
+
+        let table = test_routing_table(NodeId([0x00; 20])).await;
+        let answerer = id_with_first_byte(0xA0);
+        let named = NodeInfo::new(id_with_first_byte(0xB0), addr(2));
+        let answer = Krpc::new(
+            types::TransactionId::from_bytes(b"aa"),
+            KrpcBody::FindNodeGetPeersResponse(Builder::new(answerer).with_node(named).build()),
+        );
+        table.learn_from(addr(1), &answer);
+        assert!(table.contains(&answerer));
+        assert!(!table.contains(&named.id()));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_queries_us_joins_once_it_answers_a_ping() {
+        let pool = memory_pool();
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
+        let us = broker.local_addr().unwrap();
+        let table = RoutingTable::new(NodeId([0x00; 20]), broker.clone(), pool);
+        let inbox = broker.subscribe_inbound();
+        tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.run().await }
+        });
+        tokio::spawn({
+            let table = table.clone();
+            async move { table.run(inbox).await }
+        });
+
+        // nobody is at a spoofed source address to answer, so it never gets in
+        let ping = |id| KrpcBody::PingQuery(PingQuery::new(id));
+        let spoofed = Krpc::new(types::TransactionId::from_bytes(b"sp"), ping(id_with_first_byte(0xD0)));
+        table.learn_from(addr(9), &spoofed);
+        assert!(!table.contains(&id_with_first_byte(0xD0)));
+
+        // a real node is asked back, and joins with its answer
+        let them = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let their_id = id_with_first_byte(0xC0);
+        let query = Krpc::new(types::TransactionId::from_bytes(b"qq"), ping(their_id));
+        them.send_to(&query.encode(), us).await.unwrap();
+        let mut buf = [0u8; 1500];
+        let asked = loop {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), them.recv_from(&mut buf))
+                .await
+                .expect("pinged back")
+                .unwrap();
+            let msg = Krpc::decode(&buf[..n]).unwrap();
+            if msg.is_query() {
+                break msg;
+            }
+        };
+        assert!(!table.contains(&their_id));
+        let answer = Krpc::new(
+            asked.txn_id,
+            KrpcBody::PingAnnouncePeerResponse(
+                crate::message::ping_announce_peer_response::PingAnnouncePeerResponse::new(their_id),
+            ),
+        );
+        them.send_to(&answer.encode(), us).await.unwrap();
+        assert!(crate::test_support::eventually(|| table.contains(&their_id)).await);
     }
 
     #[tokio::test]

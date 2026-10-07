@@ -53,6 +53,18 @@ pub(crate) fn node_of(session: Arc<DhtSession>) -> Node {
     Node { session, _run: run }
 }
 
+/// Whether `holds` comes true within two seconds, for what other nodes do in their own time
+pub(crate) async fn eventually(holds: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !holds() {
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    true
+}
+
 /// An empty directory of its own for a test
 pub(crate) fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("midwest-mainline-{}-{name}", std::process::id()));
