@@ -7,6 +7,7 @@ use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
 use crate::portmap::{self, MappingWatch};
+use crate::settings::MAX_INBOUND_HANDSHAKES;
 use crate::storage::TorrentStorage;
 use crate::stream::PeerStream;
 use crate::torrent::Torrent;
@@ -347,7 +348,10 @@ impl BtClient {
                 (accepted, _idx, _rest) = select_all(listeners.iter().map(|l| Box::pin(l.accept()))) => match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
+                        // typically out of file descriptors, which fails instantly and would
+                        // spin this loop until some close
                         tracing::warn!("failed to accept an inbound connection: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
                 },
@@ -407,6 +411,9 @@ impl BtClient {
     }
 }
 
+/// See `MAX_INBOUND_HANDSHAKES`.
+static INBOUND_HANDSHAKES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_INBOUND_HANDSHAKES);
+
 /// Takes an inbound connection through its opening (see `stream::accept`), replies to the
 /// handshake if it names a torrent we serve, and hands the peer to that torrent's swarm.
 async fn welcome(
@@ -415,6 +422,10 @@ async fn welcome(
     id: Arc<Identity>,
     swarms: Weak<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
 ) {
+    let Ok(_permit) = INBOUND_HANDSHAKES.try_acquire() else {
+        tracing::debug!("{remote_addr} turned away, too many inbound handshakes in progress");
+        return;
+    };
     let served = || {
         swarms
             .upgrade()

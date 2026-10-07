@@ -50,6 +50,15 @@ pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 /// holds nothing worth waiting for.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Outbound connection attempts in flight across the whole client. Each is a half-open socket
+/// for up to HANDSHAKE_TIMEOUT, and thousands at once overflow a home router's NAT table and
+/// look like a SYN flood; the rest wait their turn.
+pub const MAX_HALF_OPEN: usize = 256;
+
+/// Inbound connections in their opening exchange at once (an MSE handshake costs a 768-bit
+/// modular exponentiation); past this, new ones are closed straight away.
+pub const MAX_INBOUND_HANDSHAKES: usize = 256;
+
 /// uTP connections at once on our UDP socket, inbound and outbound together. librqbit-utp's
 /// default of 128 would cap uTP peers client-wide far below what the peer limits allow.
 pub const UTP_MAX_CONNECTIONS: usize = 4096;

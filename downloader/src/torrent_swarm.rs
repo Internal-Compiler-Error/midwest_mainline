@@ -11,7 +11,7 @@ use crate::peer::{
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
     ENDGAME_LAST_PIECES, ENDGAME_LAST_RACERS, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL,
-    MAX_INFLIGHT_BYTES, MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE,
+    MAX_HALF_OPEN, MAX_INFLIGHT_BYTES, MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE,
     OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS, SWARM_INBOX,
 };
 use crate::storage::TorrentStorage;
@@ -954,8 +954,11 @@ impl TorrentSwarm {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
                 // anyway (we don't advertise ut_pex when private, so a compliant peer won't)
                 if !self.torrent.private {
+                    // BEP 11 caps a message at 50 added peers; a peer sending thousands would
+                    // otherwise have us dial whoever it likes
                     let gossiped: Vec<(SocketAddr, bool)> = parse_pex_message(&ext.payload)
                         .into_iter()
+                        .take(PEX_MAX_ADDED_PEERS)
                         .map(|(addr, flags)| (addr, flags & PEX_UTP != 0))
                         .collect();
                     self.bus.emit(Event::PeersDiscovered {
@@ -1718,6 +1721,9 @@ impl TorrentSwarm {
             let utp = self.utp.borrow().clone();
             let hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
             tokio::spawn(async move {
+                let Ok(_permit) = HALF_OPEN.acquire().await else {
+                    return;
+                };
                 let result = match dial(addr, &torrent, &our_id, utp, hints).await {
                     Ok(connected) => SwarmEvent::PeerConnected(connected),
                     Err(e) => {
@@ -1840,6 +1846,9 @@ impl TorrentSwarm {
 fn upload_slots(interested: usize) -> usize {
     MAX_UNCHOKED_PEERS.max(interested.isqrt() + 1)
 }
+
+/// See `MAX_HALF_OPEN`.
+static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HALF_OPEN);
 
 async fn dial(
     addr: SocketAddr,
