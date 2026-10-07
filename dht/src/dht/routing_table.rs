@@ -401,7 +401,11 @@ impl RoutingTable {
         };
         join_all(queue.into_iter().map(|target| async move {
             let ping = KrpcBody::PingQuery(PingQuery::new(self.id));
-            let answered = self.rpc_manager.query(ping, &target, REQ_TIMEOUT).await.is_ok();
+            let answered = self
+                .rpc_manager
+                .query(ping, target.end_point(), REQ_TIMEOUT)
+                .await
+                .is_ok();
             if let Some(mut conn) = self.conn() {
                 match answered {
                     true => self.mark_good(&target.id(), &mut conn),

@@ -14,7 +14,7 @@ use std::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::{dht::rpc_manager::Routable, models::NodeNoMetaInfo, utils::base64_enc};
+use crate::{models::NodeNoMetaInfo, utils::base64_enc};
 
 pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
@@ -220,12 +220,6 @@ impl NodeInfo {
 
     pub fn family(&self) -> Family {
         Family::of(&self.end_point)
-    }
-}
-
-impl Routable for NodeInfo {
-    fn endpoint(&self) -> SocketAddr {
-        self.end_point()
     }
 }
 

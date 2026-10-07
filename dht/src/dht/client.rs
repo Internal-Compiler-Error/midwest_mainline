@@ -165,7 +165,7 @@ impl DhtClient {
     /// Asks `dest` a query answered with nodes (find_node, get_peers, sample_infohashes, get)
     async fn ask(&self, dest: SocketAddr, query: KrpcBody) -> Result<FindNodeGetPeersResponse, OurError> {
         let method = query.method();
-        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
+        match self.state.rpc_manager.query(query, dest, REQ_TIMEOUT).await?.body {
             KrpcBody::FindNodeGetPeersResponse(res) => Ok(res),
             other => Err(naur!("unexpected answer to {method:?}: {other:?}")),
         }
@@ -175,7 +175,7 @@ impl DhtClient {
     /// the id
     async fn tell(&self, dest: SocketAddr, query: KrpcBody) -> Result<NodeId, OurError> {
         let method = query.method();
-        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
+        match self.state.rpc_manager.query(query, dest, REQ_TIMEOUT).await?.body {
             KrpcBody::PingAnnouncePeerResponse(res) => Ok(res.queried()),
             other => Err(naur!("unexpected answer to {method:?}: {other:?}")),
         }

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io,
-    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -60,28 +60,6 @@ pub struct RpcManager {
     scope: Scope,
     /// BEP 43: we answer no queries, and say so in ours
     read_only: Arc<AtomicBool>,
-}
-
-pub trait Routable {
-    fn endpoint(&self) -> SocketAddr;
-}
-
-impl Routable for SocketAddr {
-    fn endpoint(&self) -> SocketAddr {
-        *self
-    }
-}
-
-impl Routable for SocketAddrV4 {
-    fn endpoint(&self) -> SocketAddr {
-        (*self).into()
-    }
-}
-
-impl Routable for SocketAddrV6 {
-    fn endpoint(&self) -> SocketAddr {
-        (*self).into()
-    }
 }
 
 impl RpcManager {
@@ -330,8 +308,13 @@ impl RpcManager {
         self.send_msg_background(message, node.end_point());
     }
 
-    pub async fn query<E: Routable>(&self, body: KrpcBody, endpoint: &E, timeout: Duration) -> Result<Krpc, OurError> {
-        let endpoint = endpoint.endpoint();
+    pub async fn query(
+        &self,
+        body: KrpcBody,
+        endpoint: impl Into<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<Krpc, OurError> {
+        let endpoint = endpoint.into();
         let message = Krpc::new(self.txn_id_generator.next().into(), body);
 
         self.send_and_wait_timeout(message, endpoint, timeout).await
@@ -346,7 +329,7 @@ mod tests {
     use crate::message::ping_query::PingQuery;
     use crate::test_support::memory_pool;
     use crate::types::NodeId;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     async fn test_broker() -> RpcManager {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -376,7 +359,7 @@ mod tests {
         let body = KrpcBody::PingQuery(PingQuery::new(NodeId([1u8; 20])));
         let dead = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
 
-        let result = broker.query(body.clone(), &dead, Duration::from_millis(50)).await;
+        let result = broker.query(body.clone(), dead, Duration::from_millis(50)).await;
         assert!(result.is_err());
         assert!(
             broker.pending_responses.lock().unwrap().is_empty(),
@@ -388,7 +371,7 @@ mod tests {
         let unroutable: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
         let result = timeout(
             Duration::from_secs(1),
-            broker.query(body, &unroutable, Duration::from_secs(30)),
+            broker.query(body, unroutable, Duration::from_secs(30)),
         )
         .await
         .expect("a failed send must not wait for the timeout");

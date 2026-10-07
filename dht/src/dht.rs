@@ -1004,7 +1004,7 @@ mod bep43_tests {
         let answer = a
             .session
             .rpc_manager
-            .query(ping, &ro.session.local_addr(), Duration::from_millis(300))
+            .query(ping, ro.session.local_addr(), Duration::from_millis(300))
             .await;
         assert!(answer.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1163,7 +1163,7 @@ mod bep44_tests {
         let code = async |body: KrpcBody| match us
             .session
             .rpc_manager
-            .query(body, &store.session.local_addr(), Duration::from_secs(1))
+            .query(body, store.session.local_addr(), Duration::from_secs(1))
             .await
         {
             Err(OurError::Remote(e)) => Some(e),
