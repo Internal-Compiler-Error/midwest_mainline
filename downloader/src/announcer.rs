@@ -115,13 +115,13 @@ pub(crate) struct Announcing {
     pub bus: EventBus,
     /// where trackers' BEP 24 `external ip` goes
     pub external: crate::external::ExternalAddress,
-    /// BEP 52: a hybrid's truncated v2 hash, looked up and announced on the DHT too so
-    /// v2-only peers find us
+    /// BEP 52: a hybrid's truncated v2 hash, announced too (to the DHT and every tracker, as
+    /// a swarm of its own) so v2-only peers find us
     pub v2: Option<InfoHash>,
 }
 
-/// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
-/// `events`. Split out so a magnet link's pre-metadata phase can announce with nothing but an
+/// Spawns a tracker announcer task per usable URL in `trackers` (two for a hybrid: one per
+/// hash, with a row each), reporting discovered peers to `events`. Split out so a magnet link's pre-metadata phase can announce with nothing but an
 /// info hash (see `metadata::fetch`) -- at that point there is no `Torrent` and no
 /// `TorrentSwarm` to hang the announcers off.
 pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerStatus>> {
@@ -149,7 +149,18 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
     let dht_slot = dht.has_changed().is_ok().then(|| slot("DHT"));
     let dht_v2_slot = v2.filter(|_| dht_slot.is_some()).map(|v2| (v2, slot("DHT (v2 hash)")));
     let usable: Vec<Url> = trackers.iter().filter_map(|t| Url::parse(t).ok()).collect();
-    let slots: Vec<usize> = usable.iter().map(|url| slot(url.as_str())).collect();
+    let announces = |url: &Url| match url.scheme() {
+        "http" | "https" => true,
+        "udp" => url.host().is_some() && url.port().is_some(),
+        _ => false,
+    };
+    let mut slots = vec![];
+    for url in &usable {
+        slots.push((url.clone(), *info_hash, slot(url.as_str())));
+        if let Some(v2) = v2.filter(|_| announces(url)) {
+            slots.push((url.clone(), v2, slot(&format!("{url} (v2 hash)"))));
+        }
+    }
     let _ = board.send(rows);
 
     for (hash, slot) in dht_slot.map(|slot| (*info_hash, slot)).into_iter().chain(dht_v2_slot) {
@@ -159,7 +170,11 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
         };
         tokio::spawn(dht_announcer(args, (board.clone(), slot)));
     }
-    for (url, slot) in usable.into_iter().zip(slots) {
+    for (url, hash, slot) in slots {
+        let args = Announcing {
+            info_hash: hash,
+            ..args.clone()
+        };
         match url.scheme() {
             "http" | "https" => {
                 let announcer = HttpAnnouncer::new(url, &args, (board.clone(), slot));
@@ -1638,6 +1653,69 @@ mod test {
             external: Default::default(),
             v2: None,
         }
+    }
+
+    /// BEP 52: a hybrid is announced to each tracker under both hashes, a row each, and the
+    /// peers of both swarms go to the one swarm.
+    #[tokio::test]
+    async fn a_hybrid_is_announced_under_both_hashes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                // a peer per swarm: 10.0.0.2 for the v1 hash, 10.0.0.3 for the v2 one
+                let last = if request.contains("info_hash=%03%03") { 3 } else { 2 };
+                let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+                body.extend_from_slice(&[10, 0, 0, last, 0x1a, 0xe1]);
+                body.push(b'e');
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                let _ = stream.write_all(&response).await;
+            }
+        });
+        let (events, mut rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let rows = spawn_announcers(Announcing {
+            trackers: vec![url.clone(), "wss://nope.test/announce".to_string()],
+            v2: Some(InfoHash::from_bytes(&[3; 20])),
+            shutdown: shutdown.clone(),
+            ..announcing(&events)
+        });
+        let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(
+            urls,
+            [
+                url.clone(),
+                format!("{url} (v2 hash)"),
+                "wss://nope.test/announce".to_string()
+            ],
+            "an unusable tracker gets one row"
+        );
+        let mut found = std::collections::BTreeSet::new();
+        while found.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let SwarmEvent::PeersDiscovered(peers, _) = event {
+                found.extend(peers);
+            }
+        }
+        let expected: std::collections::BTreeSet<SocketAddr> = ["10.0.0.2:6881", "10.0.0.3:6881"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(found, expected);
+        shutdown.cancel();
     }
 
     /// Connect, then announce with the connection ID the tracker handed out.
