@@ -105,7 +105,12 @@
   <Table.Header>
     <Table.Row>
       {#each columns as col (col.key)}
-        <Table.Head class={['relative select-none', col.right && 'text-right']} style="width: {col.width}px" title={col.title}>
+        <Table.Head
+          class={['relative select-none', col.right && 'text-right']}
+          style="width: {col.width}px"
+          title={col.title}
+          aria-sort={sortKey !== col.key ? undefined : descending ? 'descending' : 'ascending'}
+        >
           <button type="button" class="cursor-pointer" onclick={() => sortBy(col)}>
             {col.label}
             {#if sortKey === col.key}<span class="text-muted-foreground">{descending ? '▼' : '▲'}</span>{/if}

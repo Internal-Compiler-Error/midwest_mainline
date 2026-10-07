@@ -185,7 +185,9 @@
     </span>
     <span class="ml-auto flex items-center gap-1">
       {#each WINDOWS as w (w.ms)}
-        <Button variant={windowMs === w.ms ? 'secondary' : 'ghost'} size="xs" onclick={() => (windowMs = w.ms)}>{w.label}</Button>
+        <Button variant={windowMs === w.ms ? 'secondary' : 'ghost'} size="xs" aria-pressed={windowMs === w.ms} onclick={() => (windowMs = w.ms)}>
+          {w.label}
+        </Button>
       {/each}
       <Button
         variant="ghost"

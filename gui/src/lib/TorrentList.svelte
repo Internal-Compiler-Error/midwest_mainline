@@ -58,7 +58,12 @@
 <Table.Root>
   <Table.Body>
     {#each torrents as t (t.id)}
-      <Table.Row data-state={t.id === selected ? 'selected' : undefined} onclick={() => onselect(t.id)}>
+      <Table.Row
+        data-state={t.id === selected ? 'selected' : undefined}
+        tabindex={0}
+        onclick={() => onselect(t.id)}
+        onkeydown={(e) => e.key === 'Enter' && e.target === e.currentTarget && onselect(t.id)}
+      >
         <Table.Cell class="w-full max-w-0 truncate" title={name(t)}>{name(t)}</Table.Cell>
         <Table.Cell class="w-44 min-w-44">
           {#if isKnown(t)}

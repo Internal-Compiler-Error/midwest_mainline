@@ -44,6 +44,7 @@
     type="text"
     class="h-8 flex-1"
     placeholder="or paste a magnet: link"
+    aria-label="magnet link"
     bind:value={magnet}
     onkeydown={(e) => e.key === 'Enter' && addMagnet()}
   />
