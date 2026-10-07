@@ -35,6 +35,8 @@ serde_json = "1.0.151"
 socket2 = "0.6.5"
 num-bigint = "0.5.1"
 librqbit-utp = "0.7.0"
+librqbit-dualstack-sockets = "0.7.0"
+dontfrag = { version = "1.0.1", features = ["tokio"] }
 igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 crab_nat = "0.8.1"
 netdev = "0.46.2"

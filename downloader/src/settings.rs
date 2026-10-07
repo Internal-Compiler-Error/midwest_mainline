@@ -39,10 +39,31 @@ pub const MAX_SERVED_BLOCK: u32 = 128 * 1024;
 /// long for each of them.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on everything between starting to dial and the BitTorrent handshake completing: a
-/// TCP connect, uTP if that's refused, an MSE exchange, possibly a plaintext retry. A peer
-/// that stalls here holds nothing worth waiting for.
+/// Happy eyeballs (RFC 8305) between TCP and uTP: how long a dial waits on the preferred
+/// transport before trying the other one in parallel. A NATed or firewalled peer that only
+/// one of them reaches then costs this instead of a whole `CONNECT_TIMEOUT`, while a peer that
+/// answers within a typical round trip is reached over the preferred transport alone.
+pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+/// Bound on everything between starting to dial and the BitTorrent handshake completing: TCP
+/// and uTP connects, an MSE exchange, possibly a plaintext retry. A peer that stalls here
+/// holds nothing worth waiting for.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// uTP connections at once on our UDP socket, inbound and outbound together. librqbit-utp's
+/// default of 128 would cap uTP peers client-wide far below what the peer limits allow.
+pub const UTP_MAX_CONNECTIONS: usize = 4096;
+
+/// A uTP connection's receive window, which is what bounds its throughput (one window per
+/// round trip): 4 MiB is about 330 Mbit/s at 100 ms. The window is a limit, not an
+/// allocation; buffered bytes are what a slow reader leaves unread. Also the cap the send
+/// buffer grows to.
+pub const UTP_WINDOW: usize = 4 * 1024 * 1024;
+
+/// What the uTP UDP socket's kernel receive buffer is asked for, to absorb bursts from many
+/// peers while the dispatcher catches up. Linux clamps to `net.core.rmem_max`; macOS refuses
+/// anything over `kern.ipc.maxsockbuf` outright, so the largest size it takes is searched for.
+pub const UTP_UDP_RECV_BUFFER: usize = 32 * 1024 * 1024;
 
 /// How long one write to a peer may take before the connection is given up on. A peer that
 /// stops reading (zero receive window) otherwise holds its writer forever.

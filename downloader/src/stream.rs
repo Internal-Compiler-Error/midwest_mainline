@@ -12,9 +12,10 @@ use librqbit_utp::{UtpSocketUdp, UtpStream};
 use midwest_mainline::types::InfoHash;
 use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -78,9 +79,10 @@ impl Transport {
 }
 
 /// Opens a connection to `addr` and completes the BitTorrent handshake for `info_hash`.
-/// TCP first (uTP first for a peer PEX flagged uTP-capable); if that can't even connect and
-/// there's the other transport, that one. A peer one transport reaches but that rejects the
-/// handshake isn't retried over the other: it's reachable and just didn't want us.
+/// With a uTP socket, TCP and uTP race happy-eyeballs style (see `race`): TCP gets a head
+/// start, or uTP for a peer PEX flagged uTP-capable, and the first to connect is used. A peer
+/// one transport reaches but that rejects the handshake isn't retried over the other: it's
+/// reachable and just didn't want us.
 /// Encryption follows `our_id.encryption`; with `Prefer`, a peer that doesn't take the
 /// encrypted opening is dialled again in plaintext over the same transport, since the first
 /// connection is spent once what we sent on it wasn't a handshake, and a peer remembered as
@@ -117,29 +119,66 @@ pub(crate) async fn connect(
     Ok((stream, handshake))
 }
 
-/// A connection over whichever of TCP and uTP answers, in the order asked for.
+/// A connection over whichever of TCP and uTP answers first, the one asked for given a head
+/// start.
 async fn open_transport(
     addr: SocketAddr,
     utp: Option<&Arc<UtpSocketUdp>>,
     utp_first: bool,
 ) -> io::Result<(PeerStream, Transport)> {
-    let mut order = vec![Transport::Tcp];
-    if let Some(utp) = utp {
-        let utp = Transport::Utp(utp.clone());
-        if utp_first {
-            order.insert(0, utp);
-        } else {
-            order.push(utp);
-        }
+    let Some(utp) = utp else {
+        let stream = Transport::Tcp
+            .dial(addr)
+            .await
+            .map_err(|e| io::Error::other(format!("tcp: {e}")))?;
+        return Ok((stream, Transport::Tcp));
+    };
+    let utp = Transport::Utp(utp.clone());
+    let (first, second) = if utp_first {
+        (&utp, &Transport::Tcp)
+    } else {
+        (&Transport::Tcp, &utp)
+    };
+    race(addr, first, second, crate::settings::HAPPY_EYEBALLS_DELAY).await
+}
+
+/// Happy eyeballs (RFC 8305) over two transports: `first` is dialled at once and `second`
+/// after `head_start`, or as soon as `first` fails. The first connection up wins and the other
+/// dial is dropped mid-flight; the race is to connect rather than to handshake, so a peer both
+/// reach never sees two of our handshakes and drops one as a duplicate.
+async fn race(
+    addr: SocketAddr,
+    first: &Transport,
+    second: &Transport,
+    head_start: Duration,
+) -> io::Result<(PeerStream, Transport)> {
+    let failed = |transport: &Transport, e: io::Error| format!("{}: {e}", transport.name());
+    let mut first_dial = pin!(first.dial(addr));
+    let early_failure = tokio::select! {
+        result = &mut first_dial => match result {
+            Ok(stream) => return Ok((stream, first.clone())),
+            Err(e) => Some(failed(first, e)),
+        },
+        () = tokio::time::sleep(head_start) => None,
+    };
+    let mut second_dial = pin!(second.dial(addr));
+    let (failure, last, last_dial) = match early_failure {
+        Some(failure) => (failure, second, second_dial),
+        None => tokio::select! {
+            result = &mut first_dial => match result {
+                Ok(stream) => return Ok((stream, first.clone())),
+                Err(e) => (failed(first, e), second, second_dial),
+            },
+            result = &mut second_dial => match result {
+                Ok(stream) => return Ok((stream, second.clone())),
+                Err(e) => (failed(second, e), first, first_dial),
+            },
+        },
+    };
+    match last_dial.await {
+        Ok(stream) => Ok((stream, last.clone())),
+        Err(e) => Err(io::Error::other(format!("{failure}; {}", failed(last, e)))),
     }
-    let mut errors = vec![];
-    for transport in order {
-        match transport.dial(addr).await {
-            Ok(stream) => return Ok((stream, transport)),
-            Err(e) => errors.push(format!("{}: {e}", transport.name())),
-        }
-    }
-    Err(io::Error::other(errors.join("; ")))
 }
 
 /// Reads an inbound connection's opening, which is either a plaintext BitTorrent handshake
@@ -463,5 +502,68 @@ mod test {
         assert!(stream.is_utp() && !stream.is_encrypted());
         assert!(!acceptor.await.unwrap());
         drop(tcp);
+    }
+
+    /// A peer that answers TCP within the head start is reached over TCP alone: uTP is never
+    /// dialled, so the peer doesn't see a second connection from us.
+    #[tokio::test]
+    async fn tcp_that_connects_within_the_head_start_wins_alone() {
+        let hash = InfoHash::from_bytes(&[12; 20]);
+        let (addr, task) = listener(Encryption::Disabled, hash, 1).await;
+        let server = UtpSocketUdp::new_udp(addr).await.unwrap();
+        let client = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let (stream, _) = connect(
+            addr,
+            &hash,
+            &identity(1, Encryption::Disabled),
+            Some(&client),
+            DialHints::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!stream.is_utp());
+        assert_eq!(task.await.unwrap(), [false]);
+        let utp_accept = tokio::time::timeout(Duration::from_millis(500), server.accept()).await;
+        assert!(utp_accept.is_err(), "no uTP connection");
+    }
+
+    /// A peer PEX flagged uTP-capable that doesn't answer uTP gets TCP after the head start,
+    /// not after uTP's whole connect timeout.
+    #[tokio::test]
+    async fn tcp_takes_over_when_preferred_utp_does_not_answer() {
+        let hash = InfoHash::from_bytes(&[13; 20]);
+        let (addr, task) = listener(Encryption::Disabled, hash, 1).await;
+        let client = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let hints = DialHints {
+            prefer_utp: true,
+            plaintext: false,
+        };
+        let started = tokio::time::Instant::now();
+        let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Disabled), Some(&client), hints)
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert!(!stream.is_utp());
+        assert!(
+            took >= crate::settings::HAPPY_EYEBALLS_DELAY && took < crate::settings::CONNECT_TIMEOUT / 2,
+            "connected in {took:?}"
+        );
+        assert_eq!(task.await.unwrap(), [false]);
+    }
+
+    /// The losing dial is dropped mid-flight, and with both down the error names both.
+    #[tokio::test]
+    async fn a_failed_race_reports_both_transports() {
+        let free = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = free.local_addr().unwrap();
+        drop(free);
+        let client = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into()).await.unwrap();
+        let utp = Transport::Utp(client);
+        let err = race(addr, &Transport::Tcp, &utp, Duration::from_secs(60))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.starts_with("tcp: ") && err.contains("; utp: "), "{err}");
     }
 }
