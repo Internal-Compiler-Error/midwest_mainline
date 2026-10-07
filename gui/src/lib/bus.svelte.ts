@@ -14,6 +14,15 @@ const FEED_LINES = 2000
 const PICKS_KEPT = 400
 /** peers gone for good are kept this long in the table */
 const DEPARTED_KEPT = 200
+const LOG_KEPT = 100
+
+function bump<K>(counts: Map<K, number>, key: K, by = 1) {
+  counts.set(key, (counts.get(key) ?? 0) + by)
+}
+
+function keepLast<T>(list: T[], item: T, max: number): T[] {
+  return [...list, item].slice(-max)
+}
 
 export interface PeerRecord {
   addr: string
@@ -104,12 +113,12 @@ export class Insights {
 
   ingest(batch: Stamped[]) {
     for (const e of batch) this.one(e)
-    this.feed = this.feed.length + batch.length > FEED_LINES ? [...this.feed, ...batch].slice(-FEED_LINES) : [...this.feed, ...batch]
+    this.feed = [...this.feed, ...batch].slice(-FEED_LINES)
     this.received += batch.length
   }
 
   private one(e: Stamped) {
-    this.counts.set(e.kind, (this.counts.get(e.kind) ?? 0) + 1)
+    bump(this.counts, e.kind)
     switch (e.kind) {
       case 'lagged':
         this.lagged += e.missed
@@ -125,7 +134,7 @@ export class Insights {
           arrived: 0,
           failed: 0,
         })
-        this.lifecycle = [...this.lifecycle, e].slice(-100)
+        this.lifecycle = keepLast(this.lifecycle, e, LOG_KEPT)
         break
       case 'torrent_started':
       case 'torrent_queued':
@@ -138,7 +147,7 @@ export class Insights {
       case 'listening':
       case 'port_mapping':
       case 'dht_up':
-        this.lifecycle = [...this.lifecycle, e].slice(-100)
+        this.lifecycle = keepLast(this.lifecycle, e, LOG_KEPT)
         if (e.kind === 'torrent_removed') this.pieces.delete(e.info_hash)
         break
       case 'pieces_known': {
@@ -194,17 +203,18 @@ export class Insights {
       }
       case 'peers_discovered': {
         const label = sourceLabel(e.source)
-        this.discovery.set(label, (this.discovery.get(label) ?? 0) + e.count)
+        bump(this.discovery, label, e.count)
         break
       }
       case 'dial_failed':
         this.dialsFailed += 1
         break
       case 'peer_connected': {
+        const client = e.client || 'unknown'
         this.peers.set(e.addr, {
           addr: e.addr,
           info_hash: e.info_hash,
-          client: e.client || 'unknown',
+          client,
           dialed: e.dialed,
           encrypted: e.encrypted,
           utp: e.utp,
@@ -222,8 +232,7 @@ export class Insights {
           choked_them: true,
           pieces: 0,
         })
-        const client = e.client || 'unknown'
-        this.clients.set(client, (this.clients.get(client) ?? 0) + 1)
+        bump(this.clients, client)
         break
       }
       case 'peer_disconnected': {
@@ -236,7 +245,7 @@ export class Insights {
             if (this.peers.get(gone)?.left_at !== null) this.peers.delete(gone)
           }
         }
-        this.disconnects.set(e.reason, (this.disconnects.get(e.reason) ?? 0) + 1)
+        bump(this.disconnects, e.reason)
         break
       }
       case 'choke_changed': {
@@ -250,7 +259,7 @@ export class Insights {
         const explore = e.explore ?? 1.5
         const p = this.peers.get(e.addr)
         if (p) this.peers.set(e.addr, { ...p, picks: e.picked_count, exploit: e.exploit, explore })
-        this.picks = [...this.picks, { at: e.at_ms, addr: e.addr, exploit: e.exploit, explore }].slice(-PICKS_KEPT)
+        this.picks = keepLast(this.picks, { at: e.at_ms, addr: e.addr, exploit: e.exploit, explore }, PICKS_KEPT)
         break
       }
       case 'peer_sample': {
@@ -269,15 +278,19 @@ export class Insights {
         break
       }
       case 'announced':
-        this.announces = [...this.announces, { at: e.at_ms, url: e.url, ok: true, peers: e.peers, detail: `next in ${e.interval_secs}s` }].slice(-100)
+        this.announce({ at: e.at_ms, url: e.url, ok: true, peers: e.peers, detail: `next in ${e.interval_secs}s` })
         break
       case 'announce_failed':
-        this.announces = [...this.announces, { at: e.at_ms, url: e.url, ok: false, peers: 0, detail: e.error }].slice(-100)
+        this.announce({ at: e.at_ms, url: e.url, ok: false, peers: 0, detail: e.error })
         break
       case 'dht_lookup':
-        this.announces = [...this.announces, { at: e.at_ms, url: 'DHT', ok: true, peers: e.peers, detail: `${e.took_ms} ms` }].slice(-100)
+        this.announce({ at: e.at_ms, url: 'DHT', ok: true, peers: e.peers, detail: `${e.took_ms} ms` })
         break
     }
+  }
+
+  private announce(a: Announce) {
+    this.announces = keepLast(this.announces, a, LOG_KEPT)
   }
 
   private pieceMap(info_hash: string, atLeast: number): PieceMap {
