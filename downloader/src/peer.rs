@@ -1,6 +1,6 @@
 use crate::settings::{
-    BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW, REQUEST_PIPELINE_TARGET,
-    WRITE_TIMEOUT,
+    BLOCK_SIZE, MAX_QUEUED_UPLOADS, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW,
+    REQUEST_PIPELINE_TARGET, WRITE_TIMEOUT,
 };
 use crate::stream::PeerStream;
 use crate::wire::{
@@ -10,7 +10,7 @@ use crate::wire::{
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -80,6 +80,9 @@ pub(crate) struct Peer {
 
     /// blocks we've asked this peer for and haven't received yet, with when we asked
     pub requested: BTreeMap<Request, Instant>,
+    /// blocks the peer asked us for that we've accepted and not sent yet; a Cancel takes one
+    /// out, and a block read for a request no longer here isn't sent
+    pub uploads: BTreeSet<Request>,
     /// the last time this peer delivered a block, or was first asked for one after being idle;
     /// what "stalled" is measured from (see `stalled`)
     last_progress: Instant,
@@ -231,6 +234,7 @@ impl Peer {
             interested_them: false,
             interested_us: false,
             requested: BTreeMap::new(),
+            uploads: BTreeSet::new(),
             last_progress: Instant::now(),
             last_received: Instant::now(),
             stats: PeerStatistics::default(),
@@ -314,7 +318,14 @@ impl Peer {
     pub fn apply(&mut self, msg: BtMessage) -> Result<Option<BtMessage>, ProtocolViolation> {
         self.last_received = Instant::now();
         match msg {
-            BtMessage::KeepAlive(_) | BtMessage::Cancel(_) => {}
+            BtMessage::KeepAlive(_) => {}
+            BtMessage::Cancel(cancel) => {
+                self.uploads.remove(&Request {
+                    index: cancel.index,
+                    begin: cancel.begin,
+                    length: cancel.length,
+                });
+            }
             BtMessage::Choke(_) => self.choked_us = true,
             BtMessage::Unchoke(_) => self.choked_us = false,
             // whether to unchoke in return is the choking algorithm's call, not an
@@ -600,7 +611,7 @@ fn build_extended_handshake(metadata_size: u32, private: bool) -> Vec<u8> {
     } else {
         format!("d11:ut_metadatai{UT_METADATA_ID}e6:ut_pexi{UT_PEX_ID}ee")
     };
-    format!("d1:m{m}13:metadata_sizei{metadata_size}ee").into_bytes()
+    format!("d1:m{m}13:metadata_sizei{metadata_size}e4:reqqi{MAX_QUEUED_UPLOADS}ee").into_bytes()
 }
 
 /// BEP 11 "added.f" bits: what a gossiping peer knows about the one it names.

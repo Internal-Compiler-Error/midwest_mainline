@@ -11,8 +11,8 @@ use crate::peer::{
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
     ENDGAME_LAST_PIECES, ENDGAME_LAST_RACERS, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL,
-    MAX_INFLIGHT_BYTES, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT,
-    PEX_INTERVAL, PEX_MAX_ADDED_PEERS, SWARM_INBOX,
+    MAX_INFLIGHT_BYTES, MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE,
+    OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL, PEX_MAX_ADDED_PEERS, SWARM_INBOX,
 };
 use crate::storage::TorrentStorage;
 use crate::stream::{DialHints, PeerStream};
@@ -989,15 +989,22 @@ impl TorrentSwarm {
             return;
         }
 
-        // never serve a piece we haven't hash-verified
+        // never serve a piece we haven't hash-verified, nor a block size or queue depth past
+        // what a well-behaved peer asks for: each accepted request costs a disk read and its
+        // block in memory until sent
         let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
-        if !verified {
+        let sane = request.length > 0 && request.length <= MAX_SERVED_BLOCK;
+        if !verified || !sane || peer.uploads.len() >= MAX_QUEUED_UPLOADS {
             if peer.send_reject(request).await.is_err() {
                 self.drop_peer(idx, "send failed");
             }
             return;
         }
 
+        if !peer.uploads.insert(request) {
+            // asked twice; the first one is already on its way
+            return;
+        }
         // The disk read happens off this loop, so a slow disk doesn't hold up every other
         // peer; the block comes back as an event and is written to the socket then. Only
         // the requested bytes are read, not the whole piece.
@@ -1030,6 +1037,18 @@ impl TorrentSwarm {
             return;
         };
         let peer = &mut self.peers[idx];
+        let request = match &block {
+            Ok(b) => Request {
+                index: b.index,
+                begin: b.begin,
+                length: b.length,
+            },
+            Err(request) => *request,
+        };
+        if !peer.uploads.remove(&request) {
+            // cancelled meanwhile
+            return;
+        }
         let sent = match block {
             Ok(block) if !peer.choked_them => {
                 if !self.limiter.take_upload(block.length as usize) {

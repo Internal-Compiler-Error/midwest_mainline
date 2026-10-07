@@ -27,6 +27,13 @@ pub const MIN_REQUEST_WINDOW: usize = 4;
 /// (commonly 250-500) and reject, drop, or disconnect past it.
 pub const MAX_REQUEST_WINDOW: usize = 128;
 
+/// Block requests a peer may have queued with us at once; advertised as `reqq` (BEP 10) and
+/// enforced, since each one is a disk read and a block of memory until it's sent.
+pub const MAX_QUEUED_UPLOADS: usize = 500;
+
+/// The largest block we serve. BEP 3 clients ask for 16 KiB; some go up to 128 KiB.
+pub const MAX_SERVED_BLOCK: u32 = 128 * 1024;
+
 /// How long to wait for a peer's TCP connection to come up. Most addresses a tracker hands
 /// out are behind NAT or gone, and the OS default (over a minute) would hold a dial slot that
 /// long for each of them.
