@@ -1,30 +1,29 @@
 <script lang="ts">
   // Layout and state only: what's shown comes from `torrents()` every 250 ms, and every
   // user action is one command to the Tauri side (see lib/api.ts).
+  import { getCurrentWebview } from '@tauri-apps/api/webview'
   import { open } from '@tauri-apps/plugin-dialog'
+  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+  import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { ModeWatcher } from 'mode-watcher'
   import { Button } from '$lib/components/ui/button'
   import * as Resizable from '$lib/components/ui/resizable'
   import { Separator } from '$lib/components/ui/separator'
   import * as api from './lib/api'
-  import { revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
-  import { getCurrentWebview } from '@tauri-apps/api/webview'
-  import { isKnown, type Resumable, type TorrentId, type TorrentRow, type Status } from './lib/api'
-  import { rate } from './lib/format'
-  import Console from './lib/Console.svelte'
-  import Insights from './lib/Insights.svelte'
-  import TracesPane from './lib/Traces.svelte'
-  import { Traces } from './lib/spans.svelte'
-  import { Insights as InsightsStore } from './lib/bus.svelte'
+  import { isKnown, type Resumable, type Status, type TorrentId, type TorrentRow } from './lib/api'
+  import { Insights } from './lib/bus.svelte'
   import { subscribe as subscribeEvents } from './lib/events'
+  import { Logs } from './lib/logs.svelte'
+  import { Traces } from './lib/spans.svelte'
+  import ConsolePane from './lib/Console.svelte'
   import Details from './lib/Details.svelte'
-  import Flip from './lib/Flip.svelte'
-  import Num from './lib/Num.svelte'
+  import InsightsPane from './lib/Insights.svelte'
   import ResumableList from './lib/Resumable.svelte'
   import SettingsDialog from './lib/SettingsDialog.svelte'
+  import StatusBar from './lib/StatusBar.svelte'
   import Toolbar from './lib/Toolbar.svelte'
   import TorrentList from './lib/TorrentList.svelte'
+  import TracesPane from './lib/Traces.svelte'
 
   let torrents = $state<TorrentRow[]>([])
   let selected = $state<TorrentId | null>(null)
@@ -32,14 +31,20 @@
   /// where the next torrent goes; the folder picker starts here and updates it
   let downloadDir = $state('')
   let resumable = $state<Resumable[]>([])
-  type Pane = 'console' | 'insights' | 'traces' | null
+  const PANES = [
+    ['console', 'Console'],
+    ['insights', 'Insights'],
+    ['traces', 'Traces'],
+  ] as const
+  type Pane = (typeof PANES)[number][0] | null
   /// what the bottom pane shows; the choice survives a restart
   let pane = $state<Pane>(rememberedPane())
   function rememberedPane(): Pane {
     try {
       const saved = localStorage.getItem('pane')
-      if (saved === 'console' || saved === 'insights' || saved === 'traces' || saved === 'none')
-        return saved === 'none' ? null : saved
+      if (saved === 'none') return null
+      const known = PANES.find(([p]) => p === saved)
+      if (known) return known[0]
     } catch {}
     return 'insights'
   }
@@ -55,22 +60,21 @@
     if (pane === null) bottom.collapse()
     else if (bottom.isCollapsed()) bottom.expand()
   })
-  const insights = new InsightsStore()
+  const insights = new Insights()
   const traces = new Traces()
+  const logs = new Logs()
   // only polled while the pane is open, and only for the selected torrent
   $effect(() => {
     traces.follow(pane === 'traces' && selectedTorrent ? api.infoHashOf(selectedTorrent) : null)
   })
   let showSettings = $state(false)
-  let logLines = $state<string[]>([])
-  let logSeen = 0
   let status = $state<Status | null>(null)
 
   /// ids seen complete already, so finishing is announced once
   let announced = new Set<TorrentId>()
   let notifyReady = false
 
-  async function notifyCompletions() {
+  function notifyCompletions() {
     for (const t of torrents) {
       if (t.kind === 'downloading' && t.completed && !announced.has(t.id)) {
         announced.add(t.id)
@@ -102,37 +106,7 @@
     // torrents that were there at startup (resumed, or given on the command line) get the
     // details panel too, without a click
     if (selected === null && torrents.length > 0) selected = torrents[0].id
-    const chunk = await api.logsSince(logSeen)
-    if (chunk.lines.length) {
-      logSeen = chunk.seen
-      logLines = [...logLines, ...chunk.lines].slice(-5000)
-    }
-  }
-
-  function mappingLabel(s: Status): string {
-    switch (s.port_mapping) {
-      case 'off':
-        return 'no mapping'
-      case 'searching':
-        return 'mapping…'
-      case 'mapped':
-        return 'mapped'
-      case 'unavailable':
-        return 'not mapped'
-    }
-  }
-
-  function mappingTitle(s: Status): string {
-    switch (s.port_mapping) {
-      case 'off':
-        return 'port mapping is off in the settings'
-      case 'searching':
-        return 'asking the router to forward the port'
-      case 'mapped':
-        return s.external_ip ? `the router forwards the port; external address ${s.external_ip}` : 'the router forwards the port'
-      case 'unavailable':
-        return 'the router answers neither NAT-PMP nor UPnP; forward the port by hand for inbound peers'
-    }
+    await logs.poll()
   }
 
   async function rescan() {
@@ -189,11 +163,6 @@
     selected = await api.resumeTorrent(path)
     rescanSoon()
   }
-
-  function clearLogs() {
-    logLines = []
-    api.clearLogs()
-  }
 </script>
 
 <ModeWatcher />
@@ -245,9 +214,9 @@
     <Resizable.Handle withHandle class={pane === null ? 'hidden' : ''} />
     <Resizable.Pane bind:this={bottom} defaultSize={pane === null ? 0 : 35} minSize={10} collapsible collapsedSize={0}>
       {#if pane === 'console'}
-        <Console lines={logLines} />
+        <ConsolePane lines={logs.lines} />
       {:else if pane === 'insights'}
-        <Insights {insights} />
+        <InsightsPane {insights} />
       {:else if pane === 'traces'}
         {#if selectedTorrent}
           <TracesPane {traces} />
@@ -259,27 +228,19 @@
   </Resizable.PaneGroup>
 
   <footer class="flex items-center gap-3 border-t bg-card px-3 py-1">
-    <Button variant={pane === 'console' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'console' ? null : 'console')}>
-      Console
-    </Button>
-    <Button variant={pane === 'insights' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'insights' ? null : 'insights')}>
-      Insights
-    </Button>
-    <Button variant={pane === 'traces' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'traces' ? null : 'traces')}>
-      Traces
-    </Button>
+    {#each PANES as [id, label] (id)}
+      <Button variant={pane === id ? 'secondary' : 'ghost'} size="xs" aria-pressed={pane === id} onclick={() => (pane = pane === id ? null : id)}>
+        {label}
+      </Button>
+    {/each}
     {#if pane === 'console'}
-      <span class="text-xs text-muted-foreground">{logLines.length} lines</span>
-      <Button variant="ghost" size="xs" onclick={clearLogs}>clear</Button>
+      <span class="text-xs text-muted-foreground">{logs.lines.length} lines</span>
+      <Button variant="ghost" size="xs" onclick={() => logs.clear()}>clear</Button>
     {:else if pane === 'insights'}
       <span class="text-xs text-muted-foreground">{insights.received} events</span>
     {/if}
     {#if status}
-      <span class="ml-auto flex gap-4 text-xs text-muted-foreground tabular-nums">
-        <span>↓ <Num value={status.download_bps} format={rate} /> ↑ <Num value={status.upload_bps} format={rate} /></span>
-        <span title="nodes in the DHT routing table">DHT {#if status.dht_nodes === null}off{:else}<Num value={status.dht_nodes} /> nodes{/if}</span>
-        <span title={mappingTitle(status)}>port {status.listen_port} · <Flip text={mappingLabel(status)} /></span>
-      </span>
+      <StatusBar {status} />
     {/if}
   </footer>
 </div>
