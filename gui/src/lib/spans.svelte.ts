@@ -3,6 +3,7 @@
 // replaced by each poll, since they're still changing.
 import { traces, type TraceSpan } from './api'
 import { humanBytes } from './format'
+import { every } from './poll'
 
 /** How far back finished spans are kept on this side; the recorder keeps more. */
 const KEEP_MS = 30 * 60 * 1000
@@ -17,7 +18,9 @@ export class Traces {
   focus = $state<string | null>(null)
   #infoHash: string | null = null
   #seq = 0
-  #timer: ReturnType<typeof setInterval> | null = null
+  /** bumped by each `follow`, so an answer to an earlier one is dropped */
+  #generation = 0
+  #stop: (() => void) | null = null
 
   /** Starts following `infoHash`'s spans, or stops with null. */
   follow(infoHash: string | null) {
@@ -27,28 +30,22 @@ export class Traces {
     this.#seq = 0
     this.finished = []
     this.open = []
-    if (this.#timer) clearInterval(this.#timer)
-    this.#timer = null
+    this.#stop?.()
+    this.#stop = null
+    const generation = ++this.#generation
     if (infoHash === null) return
-    void this.#poll()
-    this.#timer = setInterval(() => void this.#poll(), POLL_MS)
+    this.#stop = every(POLL_MS, () => this.#poll(infoHash, generation))
   }
 
-  async #poll() {
-    const asked = this.#infoHash
-    if (asked === null) return
-    try {
-      const snapshot = await traces(asked, this.#seq)
-      if (asked !== this.#infoHash) return
-      this.#seq = snapshot.seq
-      this.now = Date.now()
-      const cutoff = this.now - KEEP_MS
-      const kept = this.finished.filter((s) => (s.end_ms ?? 0) >= cutoff)
-      this.finished = snapshot.finished.length ? kept.concat(snapshot.finished) : kept
-      this.open = snapshot.open
-    } catch {
-      // the backend is restarting or the torrent went away; the next poll tries again
-    }
+  async #poll(infoHash: string, generation: number) {
+    const snapshot = await traces(infoHash, this.#seq)
+    if (generation !== this.#generation) return
+    this.#seq = snapshot.seq
+    this.now = Date.now()
+    const cutoff = this.now - KEEP_MS
+    const kept = this.finished.filter((s) => (s.end_ms ?? 0) >= cutoff)
+    this.finished = snapshot.finished.length ? kept.concat(snapshot.finished) : kept
+    this.open = snapshot.open
   }
 
   /** Every span, finished first, with `id` to look one up by. */
