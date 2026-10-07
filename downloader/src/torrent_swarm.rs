@@ -436,6 +436,9 @@ pub struct TorrentSwarm {
     /// pick the lowest missing piece instead of the rarest
     sequential: bool,
     in_flight: BTreeMap<u32, InFlight>,
+    /// per peer, the in-flight pieces it holds a claim on: the inverse of `InFlight::claims`,
+    /// so a peer's pieces are found without scanning everything in flight (once per block)
+    holdings: BTreeMap<SocketAddr, BTreeSet<u32>>,
     /// complete pieces off being hashed and written (see `piece_assembled`)
     hashing: BTreeSet<u32>,
     /// block requests sent to any peer this session, UCB's `t`
@@ -545,6 +548,7 @@ impl TorrentSwarm {
             missing,
             sequential: false,
             in_flight: BTreeMap::new(),
+            holdings: BTreeMap::new(),
             hashing: BTreeSet::new(),
             total_picks: 0,
             stat,
@@ -761,11 +765,10 @@ impl TorrentSwarm {
     }
 
     fn pieces_held_by(&self, addr: SocketAddr) -> Vec<u32> {
-        self.in_flight
-            .iter()
-            .filter(|(_, f)| f.claims.contains_key(&addr))
-            .map(|(piece, _)| *piece)
-            .collect()
+        self.holdings
+            .get(&addr)
+            .map(|held| held.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     fn peer_index(&self, addr: SocketAddr) -> Option<usize> {
@@ -796,6 +799,7 @@ impl TorrentSwarm {
         for piece in self.pieces_held_by(peer.remote_addr) {
             self.release_claim(piece, peer.remote_addr);
         }
+        self.holdings.remove(&peer.remote_addr);
         info!("{} disconnected, {} peers left", peer.remote_addr, self.peers.len());
     }
 
@@ -811,6 +815,9 @@ impl TorrentSwarm {
             return;
         };
         in_flight.claims.remove(&peer);
+        if let Some(held) = self.holdings.get_mut(&peer) {
+            held.remove(&piece);
+        }
         tracing::debug!(parent: &in_flight.span, %peer, "claim released");
         if in_flight.claims.is_empty() {
             in_flight.span.record("outcome", "released");
@@ -1147,6 +1154,11 @@ impl TorrentSwarm {
 
         let piece = block.index;
         let in_flight = self.in_flight.remove(&piece).expect("checked above");
+        for addr in in_flight.claims.keys() {
+            if let Some(held) = self.holdings.get_mut(addr) {
+                held.remove(&piece);
+            }
+        }
         self.cancel_losers(piece, &in_flight).await;
         self.piece_assembled(piece, in_flight);
     }
@@ -1228,6 +1240,7 @@ impl TorrentSwarm {
                 self.missing.push(piece);
                 if self.stat.storage_error.is_none() {
                     self.stat.storage_error = Some(e);
+                    self.holdings.clear();
                     for (piece, f) in std::mem::take(&mut self.in_flight) {
                         for &addr in f.claims.keys() {
                             if let Some(idx) = self.peer_index(addr) {
@@ -1250,9 +1263,14 @@ impl TorrentSwarm {
             peers: senders.iter().copied().collect(),
         });
         info!("piece {piece} is completed");
-        self.stat.written += self.torrent.nth_piece_size(piece).expect("piece index in range");
+        let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
+        self.stat.written += size;
         let was_complete = self.stat.completed;
-        self.stat.refresh(&self.torrent);
+        // what `refresh` would work out, without recounting the whole bitfield per piece
+        if self.stat.wanted[piece as usize] {
+            self.stat.left -= size;
+        }
+        self.stat.completed = self.stat.left == 0;
         if self.stat.completed && !was_complete {
             info!("download complete, {} bytes were received twice", self.stat.wasted);
         }
@@ -1414,6 +1432,7 @@ impl TorrentSwarm {
                 );
                 *backlog.entry(addr).or_default() += in_flight.received.len();
                 self.in_flight.insert(piece, in_flight);
+                self.holdings.entry(addr).or_default().insert(piece);
                 in_flight_bytes += size;
                 assigned = true;
                 tracing::debug!(
@@ -1431,10 +1450,17 @@ impl TorrentSwarm {
     /// random so peers starting together spread out; the lowest one when sequential.
     fn pick_piece_for(&self, idx: usize) -> Option<usize> {
         let peer = &self.peers[idx];
-        let mut rng = rand::rng();
+        let n = self.missing.len();
+        if n == 0 {
+            return None;
+        }
+        // the scan starts somewhere random and keeps the first of the best it meets, which
+        // breaks ties at random with one draw rather than one per tied piece (early on, that's
+        // nearly every piece)
+        let offset = rand::rng().random_range(0..n);
         let mut best: Option<(usize, u32)> = None;
-        let mut ties = 0u32;
-        for (pos, &piece) in self.missing.iter().enumerate() {
+        for pos in (offset..n).chain(0..offset) {
+            let piece = self.missing[pos];
             if !peer.they_have(piece) {
                 continue;
             }
@@ -1443,18 +1469,8 @@ impl TorrentSwarm {
             } else {
                 self.availability[piece as usize]
             };
-            match best {
-                Some((_, best_rank)) if rank > best_rank => {}
-                Some((_, best_rank)) if rank == best_rank => {
-                    ties += 1;
-                    if rng.random_range(0..ties) == 0 {
-                        best = Some((pos, rank));
-                    }
-                }
-                _ => {
-                    best = Some((pos, rank));
-                    ties = 1;
-                }
+            if best.is_none_or(|(_, best_rank)| rank < best_rank) {
+                best = Some((pos, rank));
             }
         }
         best.map(|(pos, _)| pos)
@@ -1500,6 +1516,7 @@ impl TorrentSwarm {
                 let in_flight = self.in_flight.get_mut(&piece).expect("just looked up");
                 in_flight.add_racer(addr);
                 *backlog.entry(addr).or_default() += in_flight.unrequested_blocks(addr);
+                self.holdings.entry(addr).or_default().insert(piece);
                 tracing::debug!("endgame: also requesting piece {piece} from {addr}");
             }
         }
@@ -1531,6 +1548,7 @@ impl TorrentSwarm {
             let in_flight = self.in_flight.get_mut(&piece).expect("just looked up");
             in_flight.add_racer(addr);
             backlog += in_flight.unrequested_blocks(addr);
+            self.holdings.entry(addr).or_default().insert(piece);
             tracing::debug!("endgame: also requesting piece {piece} from {addr}");
         }
     }
@@ -1545,7 +1563,10 @@ impl TorrentSwarm {
         let addr = peer.remote_addr;
         let mut room = peer.request_window().saturating_sub(peer.requested.len());
         let mut failed = false;
-        'pieces: for (&piece, f) in self.in_flight.iter_mut().filter(|(_, f)| f.claims.contains_key(&addr)) {
+        'pieces: for &piece in self.holdings.get(&addr).into_iter().flatten() {
+            let Some(f) = self.in_flight.get_mut(&piece) else {
+                continue;
+            };
             while room > 0 {
                 if !self.limiter.take_download(BLOCK_SIZE) {
                     // over the download limit for now; housekeeping's schedule() retries

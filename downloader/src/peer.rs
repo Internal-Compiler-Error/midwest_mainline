@@ -573,7 +573,7 @@ async fn read_loop(mut source: Source, addr: SocketAddr, conn: u64, inbox: Inbox
 }
 
 /// Writes everything queued, then flushes once: a burst of Requests or Haves goes out in one
-/// syscall rather than one each. A write that can't finish within `WRITE_TIMEOUT` ends the
+/// syscall rather than one each. A batch that can't be written within `WRITE_TIMEOUT` ends the
 /// connection, reported to the swarm like a read error.
 async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr: SocketAddr, conn: u64, inbox: Inbox) {
     async fn timed<F: Future<Output = io::Result<()>>>(write: F) -> io::Result<()> {
@@ -583,11 +583,15 @@ async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr:
     }
     let written: io::Result<()> = async {
         while let Some(msg) = queued.recv().await {
-            timed(sink.feed(msg)).await?;
-            while let Ok(msg) = queued.try_recv() {
-                timed(sink.feed(msg)).await?;
-            }
-            timed(sink.flush()).await?;
+            // one timer per batch rather than per message: a burst is hundreds of them
+            timed(async {
+                sink.feed(msg).await?;
+                while let Ok(msg) = queued.try_recv() {
+                    sink.feed(msg).await?;
+                }
+                sink.flush().await
+            })
+            .await?;
         }
         Ok(())
     }

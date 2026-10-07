@@ -506,6 +506,10 @@ impl Tracker {
     }
 }
 
+/// Peers asked of a tracker per announce. Left out, some trackers (Ubuntu's among them) hand
+/// out a single peer; 200 is what libtorrent asks for, and peers are cheap to have on hand.
+const NUMWANT: u32 = 200;
+
 /// One shared client, so announces reuse connections; the timeout covers the whole request.
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
@@ -551,7 +555,7 @@ fn http_announce_url(
         left,
     } = progress;
     let url = format!(
-        "{base}{separator}info_hash={}&peer_id={}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1{}",
+        "{base}{separator}info_hash={}&peer_id={}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1&numwant={NUMWANT}{}",
         percent_encode(&info_hash.0),
         percent_encode(peer_id),
         event.http_str().map(|e| format!("&event={e}")).unwrap_or_default(),
@@ -978,7 +982,7 @@ impl UdpAnnouncer {
             event: event.udp_code().into(),
             ip: 0.into(), // i.e. let the tracker infer from the source packet
             key: self.key.into(),
-            num_want: (-1).into(), // -1 is the default
+            num_want: (NUMWANT as i32).into(),
             port: self.tracker.identity.serving.port().into(),
             extensions: 0.into(), // bitfield, i.e. 0 means no extensions
         };
@@ -1076,7 +1080,7 @@ mod test {
     #[test]
     fn announce_url_joins_an_existing_query() {
         let params = format!(
-            "info_hash=%20%FF{}&peer_id={}&port=6881&uploaded=1&downloaded=2&left=3&compact=1",
+            "info_hash=%20%FF{}&peer_id={}&port=6881&uploaded=1&downloaded=2&left=3&compact=1&numwant=200",
             "a".repeat(18),
             "-".repeat(20)
         );

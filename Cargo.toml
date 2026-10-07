@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["dht", "downloader", "gui/src-tauri", "json_rpc_server"]
+
+# Dependencies (SHA-1, the codecs, crypto, sqlite) optimised even in dev builds: unoptimised,
+# hashing alone held a debug download to ~9 MB/s where release does 110+. Our own crates stay
+# at opt-level 0 so they build fast and debug well.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = "line-tables-only"
