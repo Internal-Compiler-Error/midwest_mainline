@@ -281,16 +281,16 @@ where
         else {
             return;
         };
-        let mut fields = Fields::default();
-        event.record(&mut fields);
-        let mut message = fields.message.unwrap_or_default();
-        for (name, value) in &fields.values {
-            let _ = write!(message, " {name}={value}");
-        }
         let mut state = self.0.state.lock().unwrap();
         if let Some((_, span)) = state.open.get_mut(&tracked.id)
             && span.events.len() < EVENTS_PER_SPAN
         {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            let mut message = fields.message.unwrap_or_default();
+            for (name, value) in &fields.values {
+                let _ = write!(message, " {name}={value}");
+            }
             span.events.push(TraceEvent {
                 at_ms: now_ms(),
                 level: event.metadata().level().as_str(),
