@@ -14,26 +14,21 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use diesel::r2d2::PooledConnection;
-use diesel::{
-    ExpressionMethods, SqliteConnection,
-    r2d2::{ConnectionManager, Pool},
-};
-use diesel::{insert_into, prelude::*};
+use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
+use diesel::sqlite::Sqlite;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::dht::bep42::compliant;
 use crate::dht::xor;
-use crate::message::Krpc;
 use crate::message::ping_query::PingQuery;
-use crate::models::NodeNoMetaInfo;
+use crate::message::{Krpc, KrpcBody};
+use crate::models::{NodeNoMetaInfo, NodeRow};
+use crate::schema::node;
+use crate::types::{self, Family, NodeId, NodeInfo};
 use crate::utils::unix_timestmap_ms;
-use crate::{
-    message::KrpcBody,
-    types::{self, Family, NodeId, NodeInfo},
-};
 
 use super::rpc_manager::RpcManager;
 use super::state::REQ_TIMEOUT;
@@ -140,6 +135,8 @@ pub struct RoutingTable {
     refreshing: Arc<Mutex<HashSet<i32>>>,
 }
 
+type Conn = PooledConnection<ConnectionManager<SqliteConnection>>;
+
 impl RoutingTable {
     /// The table holds the nodes of the broker's address family, in the broker's scope.
     pub fn new(id: NodeId, rpc_manager: RpcManager, table: Pool<ConnectionManager<SqliteConnection>>) -> RoutingTable {
@@ -149,7 +146,7 @@ impl RoutingTable {
             scope_table: rpc_manager.scope().table,
             table,
             rpc_manager,
-            bucket_capacity: 1024, // TODO: make this configurable in the future
+            bucket_capacity: 1024,
             refreshing: Arc::default(),
         }
     }
@@ -158,57 +155,65 @@ impl RoutingTable {
         self.family
     }
 
-    fn add_new_nodes(&self, from: SocketAddr, message: &Krpc) {
+    /// A connection of the pool; `None`, logged, if it has none to give
+    fn conn(&self) -> Option<Conn> {
+        self.table
+            .get()
+            .inspect_err(|e| error!("the routing table has no database connection: {e}"))
+            .ok()
+    }
+
+    /// This table's live rows
+    fn alive(&self) -> node::BoxedQuery<'static, Sqlite> {
+        node::table
+            .filter(node::family.eq(self.scope_table))
+            .filter(node::removed.eq(false))
+            .into_boxed()
+    }
+
+    /// The sender is alive, and so maybe are the nodes it refers us to
+    fn learn_from(&self, from: SocketAddr, message: &Krpc) {
         // errors carry no id
-        let Some(node_id) = message.node_id() else {
+        let Some(sender) = message.node_id() else {
             return;
         };
         // BEP 43: a read-only node wouldn't answer us; its query is served, it isn't kept
         if message.is_query() && message.read_only {
             return;
         }
-
-        {
-            let mut conn = self.conn();
-            self.marks_as_good(&node_id, &mut conn);
-        }
-        self.add(node_id, from);
-
-        // if it's response from find_peers or get_nodes, they have additional info; the other
-        // family's nodes are the session's business (see `DhtSession::pair_with`)
+        let Some(mut conn) = self.conn() else {
+            return;
+        };
+        self.mark_good(&sender, &mut conn);
+        self.add_with(sender, from, &mut conn);
+        // the other family's nodes are the session's business (see `DhtSession::pair_with`)
         if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
             for node in res.nodes_of(self.family) {
-                self.add(node.id(), node.end_point());
+                self.add_with(node.id(), node.end_point(), &mut conn);
             }
         }
     }
 
-    /// keep listening for all incoming responses and update our table; the inbox is the
-    /// caller's subscription to the broker's inbound queue
+    /// Learns from every message in `inbound` (the caller's subscription to the broker's
+    /// inbound queue), and refreshes the table every REFRESH_EVERY
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddr)>) {
         // the refresh runs beside the inbox, which it would otherwise hold up for as long as
         // it takes
-        let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_EVERY, REFRESH_EVERY);
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut refreshing: Option<tokio::task::JoinHandle<()>> = None;
-        loop {
-            tokio::select! {
-                maybe_msg = inbound.recv() => {
-                    if let Some((msg, origin)) = maybe_msg {
-                        self.add_new_nodes(origin, &msg);
-                    } else {
-                        // Channel closed, exit loop
-                        break;
-                    }
+        let refreshing = {
+            let this = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_EVERY, REFRESH_EVERY);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    this.refresh_table().await;
                 }
-                _ = refresh.tick() => {
-                    if refreshing.as_ref().is_none_or(|task| task.is_finished()) {
-                        let this = self.clone();
-                        refreshing = Some(tokio::spawn(async move { this.refresh_table().await }));
-                    }
-                }
-            }
+            })
+        };
+        while let Some((msg, from)) = inbound.recv().await {
+            self.learn_from(from, &msg);
         }
+        refreshing.abort();
     }
 
     /// Returns the bucket index that the target node belongs in
@@ -223,13 +228,14 @@ impl RoutingTable {
 
     /// The `total` nodes we know closest to `target`, closest first.
     pub fn find_closest_n(&self, target: NodeId, total: u16) -> Vec<NodeInfo> {
-        use crate::schema::node::dsl::*;
-        node.select(NodeNoMetaInfo::as_select())
-            .filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .order(xor(id, target.as_bytes()))
+        let Some(mut conn) = self.conn() else {
+            return vec![];
+        };
+        self.alive()
+            .order(xor(node::id, target.as_bytes()))
             .limit(total.into())
-            .load(&mut self.conn())
+            .select(NodeNoMetaInfo::as_select())
+            .load(&mut conn)
             .inspect_err(|e| error!("couldn't read the routing table: {e}"))
             .unwrap_or_default()
             .into_iter()
@@ -238,125 +244,102 @@ impl RoutingTable {
     }
 
     pub fn find_exact(&self, target: &NodeId) -> Option<NodeInfo> {
-        use crate::schema::node::dsl::*;
-        let mut conn = self.table.get().unwrap();
-        let target_id = target.0.to_vec();
-        node.filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .filter(id.eq(target_id))
+        self.alive()
+            .filter(node::id.eq(target.as_bytes()))
             .select(NodeNoMetaInfo::as_select())
-            .first(&mut conn)
+            .first(&mut self.conn()?)
             .ok()
-            .map(|nodee| nodee.into())
+            .map(NodeInfo::from)
     }
 
     pub fn contains(&self, target: &NodeId) -> bool {
         self.find_exact(target).is_some()
     }
 
-    /// Whether the ith bucket is at capacity. Adds race (a refresh's insert against the inbox's),
-    /// so a bucket can end up a node or two over; that's harmless.
-    pub fn full_bucket(&self, i: i32) -> bool {
-        self.bucket_size(i) >= self.bucket_capacity
+    /// Adds a node we heard of, if its bucket has room or can make some (see `add_with`). A
+    /// node of the other address family is ignored.
+    #[tracing::instrument(skip(self))]
+    pub fn add(&self, id: NodeId, addr: SocketAddr) {
+        if let Some(mut conn) = self.conn() {
+            self.add_with(id, addr, &mut conn);
+        }
     }
 
-    /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
-    /// So is a node of the other address family.
-    #[tracing::instrument(skip(self))]
-    pub fn add(&self, new_node_id: NodeId, addr: SocketAddr) {
-        if Family::of(&addr) != self.family {
-            debug!("{addr} is not an {} address, skipping", self.family);
+    /// `add`, on `conn`. A full bucket takes a BEP 42 compliant node in place of a
+    /// non-compliant one; otherwise it's refreshed, and the node goes in if that made room.
+    fn add_with(&self, new_node_id: NodeId, addr: SocketAddr, conn: &mut SqliteConnection) {
+        if Family::of(&addr) != self.family || new_node_id == self.id {
             return;
         }
-        if new_node_id == self.id {
-            return;
-        }
-        // TODO: contains will request another connection from the pool..., should be fine
-        // for now
-        if self.contains(&new_node_id) {
-            debug!("Already contains this node in routing table, skipping");
-            return;
-        }
-        if self.ip_taken(&addr.ip()) {
-            debug!("{addr} already has a node in the routing table, skipping {new_node_id:?}");
+        let known = self
+            .alive()
+            .filter(node::id.eq(new_node_id.as_bytes()))
+            .count()
+            .get_result::<i64>(conn)
+            .is_ok_and(|n| n > 0);
+        if known || self.ip_taken(&addr.ip(), conn) {
             return;
         }
 
         let bucket_idx = self.index(&new_node_id);
-        if !self.full_bucket(bucket_idx) {
-            debug!("Bucket {bucket_idx} has capacity, inserting");
-            let node = NodeInfo::new(new_node_id, addr);
-            let mut conn = self.conn();
-            self.put_to_bucket(node, &mut conn);
+        let new_node = NodeInfo::new(new_node_id, addr);
+        if !self.full_bucket(bucket_idx, conn) {
+            self.put_to_bucket(new_node, conn);
             return;
         }
 
         // BEP 42: a compliant node takes the place of a non-compliant one, the one heard from
         // least recently
         if compliant(&new_node_id, addr.ip())
-            && let Some(victim) = self.least_recent_noncompliant(bucket_idx)
+            && let Some(victim) = self.least_recent_noncompliant(bucket_idx, conn)
         {
             debug!("Bucket {bucket_idx} full, {new_node_id:?} replaces a non-BEP 42 node");
-            let mut conn = self.conn();
-            self.mark_as_dead(&victim, &mut conn);
-            self.put_to_bucket(NodeInfo::new(new_node_id, addr), &mut conn);
+            self.tombstone(&victim, conn);
+            self.put_to_bucket(new_node, conn);
             return;
         }
 
         // one refresh of a bucket at a time; a node turning up meanwhile is let go
         if !self.refreshing.lock().unwrap().insert(bucket_idx) {
-            debug!("Bucket {bucket_idx} full and being refreshed, skipping {new_node_id:?}");
             return;
         }
         info!("Bucket {bucket_idx} full, refreshing it to evict");
         let this = self.clone();
-        let work = async move {
-            let node = NodeInfo::new(new_node_id, addr);
-
-            // instead of going from least recently seen and probe one by one, just refresh the
-            // entire bucket
+        tokio::spawn(async move {
             this.refresh_bucket(bucket_idx).await;
             this.refreshing.lock().unwrap().remove(&bucket_idx);
-
-            if this.full_bucket(bucket_idx) {
-                info!("Bucket {bucket_idx} remains full after refreshing, node not added");
+            let Some(mut conn) = this.conn() else {
                 return;
+            };
+            if this.full_bucket(bucket_idx, &mut conn) {
+                info!("Bucket {bucket_idx} remains full after refreshing, node not added");
+            } else {
+                this.put_to_bucket(new_node, &mut conn);
             }
-
-            info!("Bucket {bucket_idx} now has spare capacity, adding");
-            let mut conn = this.conn();
-            this.put_to_bucket(node, &mut conn);
-        };
-        tokio::spawn(work);
+        });
     }
 
     /// One node per public IPv4 address or IPv6 /64, as libtorrent does: someone running a
     /// thousand node ids from one machine (a Sybil parked next to popular info hashes,
     /// typically) gets one slot, not a thousand. LAN addresses are exempt, see `sybil_group`.
-    fn ip_taken(&self, ip: &IpAddr) -> bool {
-        use crate::schema::node::dsl::*;
+    fn ip_taken(&self, ip: &IpAddr, conn: &mut SqliteConnection) -> bool {
         let Some(group) = sybil_group(ip) else {
             return false;
         };
-        let mut conn = self.conn();
-        node.filter(family.eq(self.scope_table))
-            .filter(ip_group.eq(group.to_string()))
-            .filter(removed.eq(false))
+        self.alive()
+            .filter(node::ip_group.eq(group.to_string()))
             .count()
-            .get_result::<i64>(&mut conn)
+            .get_result::<i64>(conn)
             .is_ok_and(|n| n > 0)
     }
 
-    fn least_recent_noncompliant(&self, i: i32) -> Option<NodeId> {
-        use crate::schema::node::dsl::*;
-        let mut conn = self.conn();
-        node.filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .filter(bucket.eq(i))
-            .filter(bep42.eq(false))
-            .order(last_contacted.asc())
-            .select(id)
-            .first::<Vec<u8>>(&mut conn)
+    fn least_recent_noncompliant(&self, i: i32, conn: &mut SqliteConnection) -> Option<NodeId> {
+        self.alive()
+            .filter(node::bucket.eq(i))
+            .filter(node::bep42.eq(false))
+            .order(node::last_contacted.asc())
+            .select(node::id)
+            .first::<Vec<u8>>(conn)
             .ok()
             .and_then(|raw| NodeId::try_from_bytes(&raw))
     }
@@ -364,96 +347,74 @@ impl RoutingTable {
     /// How many nodes in the table have BEP 42 compliant ids (LAN ones count as compliant),
     /// and how many nodes there are
     pub fn bep42_compliance(&self) -> (usize, usize) {
-        use crate::schema::node::dsl::*;
-        let mut conn = self.conn();
-        let alive = node.filter(family.eq(self.scope_table)).filter(removed.eq(false));
-        let good: i64 = alive
-            .filter(bep42.eq(true))
-            .count()
-            .get_result(&mut conn)
-            .unwrap_or_default();
-        let all: i64 = alive.count().get_result(&mut conn).unwrap_or_default();
-        (good as usize, all as usize)
-    }
-
-    fn conn(&self) -> PooledConnection<ConnectionManager<SqliteConnection>> {
-        self.table.get().expect("Pool should just work")
+        let Some(mut conn) = self.conn() else {
+            return (0, 0);
+        };
+        let count = |query: node::BoxedQuery<'static, Sqlite>, conn: &mut Conn| {
+            query.count().get_result::<i64>(conn).unwrap_or_default() as usize
+        };
+        let good = count(self.alive().filter(node::bep42.eq(true)), &mut conn);
+        (good, count(self.alive(), &mut conn))
     }
 
     pub fn node_count(&self) -> usize {
-        use crate::schema::node::dsl::*;
-        let mut conn = self.conn();
-        let count: i64 = node
-            .filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        count as usize
+        let Some(mut conn) = self.conn() else {
+            return 0;
+        };
+        self.alive().count().get_result::<i64>(&mut conn).unwrap_or_default() as usize
     }
 
-    /// How many nodes are in the ith bucket (0-indexed)
-    pub fn bucket_size(&self, i: i32) -> usize {
-        use crate::schema::node::dsl::*;
-        let mut conn = self.conn();
-        let count: i64 = node
-            .filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .filter(bucket.eq(i))
+    /// Whether the ith bucket is at capacity. Adds race (a refresh's insert against the inbox's),
+    /// so a bucket can end up a node or two over; that's harmless.
+    fn full_bucket(&self, i: i32, conn: &mut SqliteConnection) -> bool {
+        let size = self
+            .alive()
+            .filter(node::bucket.eq(i))
             .count()
-            .get_result(&mut conn)
-            .unwrap();
-        count as usize
+            .get_result::<i64>(conn)
+            .unwrap_or_default();
+        size as usize >= self.bucket_capacity
     }
 
     /// The questionable nodes of the ith bucket (BEP 5: not heard from in 15 minutes), the ones
     /// that failed a few queries since: a refresh pings them, and drops those that don't answer
-    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<crate::models::NodeRow> {
-        use crate::schema::node::dsl::*;
+    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<NodeInfo> {
         let questionable = unix_timestmap_ms() - QUESTIONABLE_AFTER.as_millis() as i64;
-        node.filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .filter(bucket.eq(i))
-            .filter(failed_requests.ge(FAILURES_TO_REFRESH))
-            .filter(last_contacted.le(questionable))
-            .order(last_contacted.desc())
-            .select(crate::models::NodeRow::as_select())
-            .get_results(conn)
+        self.alive()
+            .filter(node::bucket.eq(i))
+            .filter(node::failed_requests.ge(FAILURES_TO_REFRESH))
+            .filter(node::last_contacted.le(questionable))
+            .order(node::last_contacted.desc())
+            .select(NodeNoMetaInfo::as_select())
+            .load(conn)
             .inspect_err(|e| error!("{e}"))
             .unwrap_or_default()
+            .into_iter()
+            .map(NodeInfo::from)
+            .collect()
     }
 
-    // Send a ping to fresh the node
-    async fn refresh_node(&self, target: &NodeInfo) {
-        let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.id));
-        let response = self.rpc_manager.query(ping_msg, target, REQ_TIMEOUT).await;
-        let mut conn = self.conn();
-        match response {
-            Ok(_) => self.marks_as_good(&target.id(), &mut conn),
-            Err(_) => self.mark_as_dead(&target.id(), &mut conn),
-        }
-    }
-
-    // TODO: introduce an inflight table to only allow one refresh operation per bucket at each
-    // time
+    /// Pings each node of the ith bucket's replacement queue, and drops those that don't answer
     async fn refresh_bucket(&self, i: i32) {
-        let mut conn = self.conn();
-        let problematics = self.replacement_queue(i, &mut conn);
-
-        let tasks = problematics.into_iter().filter_map(|n| {
-            let id = NodeId::try_from_bytes(&n.id)?;
-            let ip: IpAddr = n.ip_addr.parse().ok()?;
-            let target = NodeInfo::new(id, SocketAddr::new(ip, n.port as u16));
-            Some(async move { self.refresh_node(&target).await })
-        });
-        join_all(tasks).await;
+        let Some(queue) = self.conn().map(|mut conn| self.replacement_queue(i, &mut conn)) else {
+            return;
+        };
+        join_all(queue.into_iter().map(|target| async move {
+            let ping = KrpcBody::PingQuery(PingQuery::new(self.id));
+            let answered = self.rpc_manager.query(ping, &target, REQ_TIMEOUT).await.is_ok();
+            if let Some(mut conn) = self.conn() {
+                match answered {
+                    true => self.mark_good(&target.id(), &mut conn),
+                    false => self.tombstone(&target.id(), &mut conn),
+                }
+            }
+        }))
+        .await;
     }
 
     pub async fn refresh_table(&self) {
         // tombstoned nodes go for good, so the table doesn't grow unboundedly
-        {
-            use crate::schema::node;
-            let mut conn = self.conn();
+        if let Some(mut conn) = self.conn() {
             let _ = diesel::delete(
                 node::table
                     .filter(node::family.eq(self.scope_table))
@@ -462,75 +423,68 @@ impl RoutingTable {
             .execute(&mut conn)
             .inspect_err(|e| error!("{e}"));
         }
-
-        join_all((0..160).map(|i| async move { self.refresh_bucket(i).await })).await;
+        join_all((0..160).map(|i| self.refresh_bucket(i))).await;
         let (good, all) = self.bep42_compliance();
         info!("{} routing table: {all} nodes, {good} with BEP 42 ids", self.family);
     }
 
-    // TODO: use AsRef or Into to make it take in anything that can turn into an ID
-    fn marks_as_good(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
-        use crate::schema::node::dsl::*;
-        let now = unix_timestmap_ms();
-        let idd = nodee.0.to_vec();
-        let _ = diesel::update(node)
-            .filter(family.eq(self.scope_table))
-            .filter(id.eq(idd))
-            .set((last_contacted.eq(now), failed_requests.eq(0)))
+    fn mark_good(&self, id: &NodeId, conn: &mut SqliteConnection) {
+        let _ = diesel::update(node::table)
+            .filter(node::family.eq(self.scope_table))
+            .filter(node::id.eq(id.as_bytes()))
+            .set((
+                node::last_contacted.eq(unix_timestmap_ms()),
+                node::failed_requests.eq(0),
+            ))
             .execute(conn)
             .inspect_err(|e| error!("{e}"));
     }
 
     /// Record a failed RPC to a known node; enough of these lands it on the replacement
     /// queue (see `replacement_queue`), which is how dead nodes get evicted.
-    pub fn mark_failed(&self, nodee: &NodeId) {
-        use crate::schema::node::dsl::*;
-
-        let idd = nodee.0.to_vec();
-        let mut conn = self.conn();
-        let _ = diesel::update(node)
-            .filter(family.eq(self.scope_table))
-            .filter(id.eq(idd))
-            .set(failed_requests.eq(failed_requests + 1))
+    pub fn mark_failed(&self, id: &NodeId) {
+        let Some(mut conn) = self.conn() else {
+            return;
+        };
+        let _ = diesel::update(node::table)
+            .filter(node::family.eq(self.scope_table))
+            .filter(node::id.eq(id.as_bytes()))
+            .set(node::failed_requests.eq(node::failed_requests + 1))
             .execute(&mut conn)
             .inspect_err(|e| error!("{e}"));
     }
 
     /// Takes a node out of the table now, for misbehaving rather than for being unreachable.
-    pub fn evict(&self, nodee: &NodeId) {
-        let mut conn = self.conn();
-        self.mark_as_dead(nodee, &mut conn);
+    pub fn evict(&self, id: &NodeId) {
+        if let Some(mut conn) = self.conn() {
+            self.tombstone(id, &mut conn);
+        }
     }
 
-    fn mark_as_dead(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
-        use crate::schema::node::dsl::*;
-
-        let idd = nodee.0.to_vec();
-        let _ = diesel::update(node)
-            .filter(family.eq(self.scope_table))
-            .filter(id.eq(idd))
-            .set(removed.eq(true))
+    /// Marks a node removed; the next refresh deletes it
+    fn tombstone(&self, id: &NodeId, conn: &mut SqliteConnection) {
+        let _ = diesel::update(node::table)
+            .filter(node::family.eq(self.scope_table))
+            .filter(node::id.eq(id.as_bytes()))
+            .set(node::removed.eq(true))
             .execute(conn)
             .inspect_err(|e| error!("{e}"));
     }
 
-    fn put_to_bucket(&self, nodee: NodeInfo, conn: &mut SqliteConnection) {
-        use crate::schema::node::dsl::*;
-
-        let index = self.index(&nodee.id());
-        let ip = nodee.end_point().ip();
-        let _ = insert_into(node)
-            .values(crate::models::NodeRow {
-                id: nodee.id().0.to_vec(),
+    fn put_to_bucket(&self, new_node: NodeInfo, conn: &mut SqliteConnection) {
+        let ip = new_node.end_point().ip();
+        let _ = diesel::insert_into(node::table)
+            .values(NodeRow {
+                id: new_node.id().0.to_vec(),
                 family: self.scope_table,
-                bucket: index,
+                bucket: self.index(&new_node.id()),
                 last_contacted: unix_timestmap_ms(),
                 ip_addr: ip.to_string(),
                 ip_group: sybil_group(&ip).map(|g| g.to_string()),
-                port: nodee.end_point().port() as i32,
+                port: new_node.end_point().port().into(),
                 failed_requests: 0,
                 removed: false,
-                bep42: Some(compliant(&nodee.id(), ip)),
+                bep42: Some(compliant(&new_node.id(), ip)),
             })
             .on_conflict_do_nothing()
             .execute(conn)
@@ -710,7 +664,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed, 2, "each failed RPC must increment the counter");
 
-        routing_table.marks_as_good(&a, &mut conn);
+        routing_table.mark_good(&a, &mut conn);
         let failed: i32 = node
             .filter(id.eq(a.0.to_vec()))
             .select(failed_requests)
@@ -730,7 +684,7 @@ mod tests {
         let newer = NodeId([0xFE; 20]);
         table.add(older, "1.1.1.1:6881".parse().unwrap());
         table.add(newer, "2.2.2.2:6881".parse().unwrap());
-        let mut conn = table.conn();
+        let mut conn = table.conn().unwrap();
         diesel::update(node.filter(id.eq(older.0.to_vec())))
             .set(last_contacted.eq(1))
             .execute(&mut conn)
@@ -814,12 +768,12 @@ mod tests {
             .set(last_contacted.eq(1))
             .execute(&mut conn)
             .unwrap();
-        let queued: Vec<Vec<u8>> = routing_table
+        let queued: Vec<NodeId> = routing_table
             .replacement_queue(routing_table.index(&dead), &mut conn)
             .into_iter()
-            .map(|row| row.id)
+            .map(|n| n.id())
             .collect();
-        assert_eq!(queued, vec![dead.0.to_vec()]);
+        assert_eq!(queued, vec![dead]);
     }
 
     #[tokio::test]
