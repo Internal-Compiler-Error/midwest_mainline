@@ -433,7 +433,18 @@ impl TorrentTask {
             tokio::select! {
                 resolved = &mut resolve => break resolved,
                 command = self.controls.recv() => match command {
-                    // removed while still resolving: nothing was written yet
+                    // a resume file is read in a moment, and has to go with the torrent;
+                    // anything else has written nothing yet
+                    Command::Act(Action::Remove { delete_files }) if self.resume_path.is_some() => {
+                        tokio::select! {
+                            resolved = &mut resolve => match resolved {
+                                Ok(resolved) => self.remove_files(&resolved.torrent, &resolved.root, delete_files),
+                                Err(_) => self.remove_unresolved(),
+                            },
+                            _ = self.controls.cancel.cancelled() => {}
+                        }
+                        return;
+                    }
                     Command::Act(Action::Remove { .. } | Action::Shutdown) => return,
                     Command::Act(Action::Pause) => pause_asked = true,
                     Command::Act(Action::Unpause) => pause_asked = false,
@@ -2436,6 +2447,35 @@ mod test {
             id,
             |s| matches!(s, Some(TorrentState::Downloading(p)) if p.completed),
         );
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Removed before its resume file has even been read: the file goes anyway, and the data
+    /// with it if asked, or the torrent would be back at the next start.
+    #[test]
+    fn removal_while_reading_the_resume_file_takes_it() {
+        let dir = scratch("remove-resuming");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        let resume_dir = dir.join("resume");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.shutdown();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let ids = session.resume_all();
+        session.remove(ids[0], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while root.join("session.bin").exists() || std::fs::read_dir(&resume_dir).unwrap().count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the resume file or the data survived removal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
