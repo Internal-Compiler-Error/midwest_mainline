@@ -386,6 +386,20 @@ impl Decoder for BtCodec {
     }
 }
 
+/// The longest message we accept. The big legitimate ones are a block (16 KiB, 128 KiB from
+/// the most generous clients), a bitfield (one bit per piece: 128 KiB covers a million pieces)
+/// and a ut_metadata piece (16 KiB plus a small dict). Anything longer is an attempt to make us
+/// buffer gigabytes, since the length prefix is the peer's to choose.
+pub const MAX_MESSAGE_LEN: usize = 1 << 20;
+
+fn invalid(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
+}
+
+fn be_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(buf[at..at + 4].try_into().unwrap())
+}
+
 impl Decoder for BtDecoder {
     type Item = BtMessage;
     type Error = io::Error;
@@ -398,8 +412,13 @@ impl Decoder for BtDecoder {
         let mut length_bytes = [0u8; 4];
         length_bytes.copy_from_slice(&src[..4]);
         let length = u32::from_be_bytes(length_bytes) as usize;
+        if length > MAX_MESSAGE_LEN {
+            return Err(invalid(&format!("message of {length} bytes is over the limit")));
+        }
 
         if src.len() < 4 + length {
+            // one allocation for the rest of the message instead of growing as it trickles in
+            src.reserve(4 + length - src.len());
             return Ok(None);
         }
 
@@ -414,63 +433,86 @@ impl Decoder for BtDecoder {
             // the byte range [5, 4 + length) is the payload following the 1-byte message id;
             // `length` counts the id byte itself, so the payload is `length - 1` bytes
             let buf = &src[5..4 + length];
+            // the payload size each fixed-layout message must have; the peer controls `length`,
+            // so a short one must be refused here rather than indexed past its end below
+            let exact = |n: usize| {
+                if buf.len() == n {
+                    Ok(())
+                } else {
+                    Err(invalid(&format!("message {msg_type} has {} payload bytes, expected {n}", buf.len())))
+                }
+            };
             match msg_type {
                 0 => BtMessage::Choke(Choke),
                 1 => BtMessage::Unchoke(Unchoke),
                 2 => BtMessage::Interested(Interested),
                 3 => BtMessage::NotInterested(NotInterested),
-                4 => BtMessage::Have(Have {
-                    checked: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-                }),
+                4 => {
+                    exact(4)?;
+                    BtMessage::Have(Have { checked: be_u32(buf, 0) })
+                }
                 5 => BtMessage::BitField(BitField { has: Box::from(buf) }),
                 6 => {
-                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                    BtMessage::Request(Request { index, begin, length })
+                    exact(12)?;
+                    BtMessage::Request(Request {
+                        index: be_u32(buf, 0),
+                        begin: be_u32(buf, 4),
+                        length: be_u32(buf, 8),
+                    })
                 }
                 7 => {
                     // on the wire a piece message is just <index><begin><block>, with no
                     // separate length field -- the block extends to the end of the message
-                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+                    if buf.len() < 8 {
+                        return Err(invalid("piece message without index and offset"));
+                    }
                     let data: Box<[u8]> = Box::from(&buf[8..]);
                     let length = data.len() as u32;
                     BtMessage::Piece(Piece {
-                        index,
-                        begin,
+                        index: be_u32(buf, 0),
+                        begin: be_u32(buf, 4),
                         length,
                         data,
                     })
                 }
                 8 => {
-                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                    BtMessage::Cancel(Cancel { index, begin, length })
+                    exact(12)?;
+                    BtMessage::Cancel(Cancel {
+                        index: be_u32(buf, 0),
+                        begin: be_u32(buf, 4),
+                        length: be_u32(buf, 8),
+                    })
                 }
                 9 if buf.len() == 2 => BtMessage::Port(Port {
                     port: u16::from_be_bytes([buf[0], buf[1]]),
                 }),
-                13 => BtMessage::SuggestPiece(SuggestPiece {
-                    piece: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-                }),
+                13 => {
+                    exact(4)?;
+                    BtMessage::SuggestPiece(SuggestPiece { piece: be_u32(buf, 0) })
+                }
                 14 => BtMessage::HaveAll(HaveAll),
                 15 => BtMessage::HaveNone(HaveNone),
                 16 => {
-                    let index = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-                    let begin = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-                    let length = u32::from_be_bytes(buf[8..12].try_into().unwrap());
-                    BtMessage::RejectRequest(RejectRequest { index, begin, length })
+                    exact(12)?;
+                    BtMessage::RejectRequest(RejectRequest {
+                        index: be_u32(buf, 0),
+                        begin: be_u32(buf, 4),
+                        length: be_u32(buf, 8),
+                    })
                 }
-                17 => BtMessage::AllowedFast(AllowedFast {
-                    piece: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
-                }),
+                17 => {
+                    exact(4)?;
+                    BtMessage::AllowedFast(AllowedFast { piece: be_u32(buf, 0) })
+                }
                 20 => {
                     // BEP 10: <ext_id><payload>, with no wire-level length field of its own
-                    let ext_id = buf[0];
-                    let payload = Box::from(&buf[1..]);
-                    BtMessage::Extended(Extended { ext_id, payload })
+                    let Some((&ext_id, payload)) = buf.split_first() else {
+                        return Err(invalid("extended message without an id"));
+                    };
+                    BtMessage::Extended(Extended {
+                        ext_id,
+                        payload: Box::from(payload),
+                    })
                 }
                 t => BtMessage::Unknown(t, Box::from(buf)),
             }
@@ -592,6 +634,34 @@ mod test {
     use super::*;
     use tokio::net::TcpListener;
     use tokio_util::bytes::BytesMut;
+
+    #[test]
+    fn short_and_oversized_messages_are_errors_not_panics() {
+        for frame in [
+            &b"\x00\x00\x00\x01\x04"[..],               // Have without its index
+            b"\x00\x00\x00\x05\x06\x00\x00\x00\x01",     // Request with 4 of 12 bytes
+            b"\x00\x00\x00\x03\x07\x00\x00",             // Piece without index and offset
+            b"\x00\x00\x00\x01\x08",                     // Cancel
+            b"\x00\x00\x00\x01\x0d",                     // Suggest
+            b"\x00\x00\x00\x01\x10",                     // Reject
+            b"\x00\x00\x00\x01\x11",                     // AllowedFast
+            b"\x00\x00\x00\x01\x14",                     // Extended without an id
+            b"\x00\x00\x00\x06\x04\x00\x00\x00\x01\x00", // Have with a trailing byte
+        ] {
+            let mut src = BytesMut::from(frame);
+            assert!(BtDecoder.decode(&mut src).is_err(), "{frame:?}");
+        }
+
+        let mut huge = BytesMut::from(&b"\xff\xff\xff\xff\x07"[..]);
+        assert!(BtDecoder.decode(&mut huge).is_err(), "a 4 GiB length is refused before buffering");
+    }
+
+    #[test]
+    fn a_well_formed_have_still_decodes() {
+        let mut src = BytesMut::from(&b"\x00\x00\x00\x05\x04\x00\x00\x00\x2a"[..]);
+        assert!(matches!(BtDecoder.decode(&mut src).unwrap(), Some(BtMessage::Have(Have { checked: 42 }))));
+        assert!(src.is_empty());
+    }
 
     /// Exercises the outbound (`shake_hands`) and inbound (`read_handshake` then
     /// `send_handshake`) halves against each other over a real loopback socket, since
