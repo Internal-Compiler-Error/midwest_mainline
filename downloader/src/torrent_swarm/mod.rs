@@ -700,6 +700,14 @@ impl TorrentSwarm {
             self.peers[idx].forget_piece(piece);
         }
         if self.in_flight.release(piece, peer).is_some() {
+            self.put_back(piece);
+        }
+    }
+
+    /// Puts a piece that's no longer in flight back up for grabs, unless its files have been
+    /// deselected meanwhile; `select_files` brings it back if they're selected again.
+    fn put_back(&mut self, piece: u32) {
+        if self.stat.wanted[piece as usize] {
             self.missing.push(piece);
         }
     }
@@ -813,39 +821,7 @@ mod test {
     /// it again fetches the third.
     #[tokio::test]
     async fn deselected_files_pieces_are_not_requested() {
-        let bytes = content();
-        let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
-        let mut info = format!(
-            "d5:filesld6:lengthi60000e4:pathl1:aeed6:lengthi40000e4:pathl1:beee4:name5:multi12:piece lengthi{PIECE}e6:pieces{}:",
-            pieces.len()
-        )
-        .into_bytes();
-        info.extend_from_slice(&pieces);
-        info.push(b'e');
-        let mut torrent = parse_torrent(&build_torrent_file(&info, &[])).unwrap();
-        assert_eq!((torrent.pieces_of_file(0), torrent.pieces_of_file(1)), (0..2, 1..3));
-
-        let dir = std::env::temp_dir().join(format!("downloader-swarm-select-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut handles = vec![];
-        for crate::TorrentFile { len: size, path, .. } in &mut torrent.files {
-            *path = dir.join(path.file_name().unwrap());
-            let file = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
-            file.set_len(*size).unwrap();
-            handles.push(Some(file));
-        }
-        let torrent = Arc::new(torrent);
-        let storage = Arc::new(TorrentStorage::new(torrent.clone(), handles));
-        let verified = bitvec![u8, Msb0; 0; 3].into_boxed_bitslice();
-        let shared = shared(crate::bt_client::default_settings());
-        let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
+        let (swarm, handle, dir) = two_file_swarm("select");
         let stats = handle.stats();
         tokio::spawn(swarm.work_loop());
         handle.select_files(vec![true, false]).await;
@@ -902,6 +878,37 @@ mod test {
             .expect("selecting the file again fetches its piece");
         assert_eq!(std::fs::read(dir.join("a")).unwrap(), &content()[..60_000]);
         assert_eq!(std::fs::read(dir.join("b")).unwrap(), &content()[60_000..]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A piece in flight when its file is deselected may finish, but once its peer lets it go
+    /// it isn't put back up for grabs.
+    #[tokio::test]
+    async fn a_released_piece_of_a_deselected_file_stays_unwanted() {
+        let (mut swarm, _handle, dir) = two_file_swarm("deselect-release");
+        let (connected, _theirs) = fake_connection("10.0.0.1:6881", true).await;
+        let addr = connected.remote_addr;
+        swarm.add_peer(connected);
+        swarm.on_peer_message(0, BtMessage::HaveAll(crate::wire::HaveAll));
+        swarm.on_peer_message(0, BtMessage::Unchoke(crate::wire::Unchoke));
+        // two of the three pieces fill the peer's first window: 0 or 2 (each in one file only)
+        // is among them
+        let held = swarm.in_flight.held_by(addr);
+        let (unwanted, selection) = if held.contains(&2) {
+            (2, vec![true, false])
+        } else {
+            (0, vec![false, true])
+        };
+        assert!(held.contains(&unwanted), "{held:?}");
+
+        swarm.select_files(&selection);
+        swarm.on_peer_message(0, BtMessage::Choke(crate::wire::Choke));
+        assert!(swarm.in_flight.held_by(addr).is_empty(), "a choke releases its pieces");
+        assert!(
+            !swarm.missing.contains(&unwanted),
+            "piece {unwanted} is to be downloaded again: {:?}",
+            swarm.missing
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

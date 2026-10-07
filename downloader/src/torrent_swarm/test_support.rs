@@ -103,6 +103,45 @@ pub(super) fn single_file_torrent() -> crate::torrent::Torrent {
     parse_torrent(&build_torrent_file(&info, &["wss://unused.test/announce".to_string()])).unwrap()
 }
 
+/// `content()` as two files over three pieces: `a` is pieces 0 and 1, `b` is pieces 1 and 2.
+/// Returns the directory the files are in.
+pub(super) fn two_file_swarm(name: &str) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
+    let bytes = content();
+    let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
+    let mut info = format!(
+        "d5:filesld6:lengthi60000e4:pathl1:aeed6:lengthi40000e4:pathl1:beee4:name5:multi12:piece lengthi{PIECE}e6:pieces{}:",
+        pieces.len()
+    )
+    .into_bytes();
+    info.extend_from_slice(&pieces);
+    info.push(b'e');
+    let mut torrent = parse_torrent(&build_torrent_file(&info, &[])).unwrap();
+    assert_eq!((torrent.pieces_of_file(0), torrent.pieces_of_file(1)), (0..2, 1..3));
+
+    let dir = std::env::temp_dir().join(format!("downloader-swarm-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut handles = vec![];
+    for crate::TorrentFile { len: size, path, .. } in &mut torrent.files {
+        *path = dir.join(path.file_name().unwrap());
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(*size).unwrap();
+        handles.push(Some(file));
+    }
+    let torrent = Arc::new(torrent);
+    let storage = Arc::new(TorrentStorage::new(torrent.clone(), handles));
+    let verified = bitvec![u8, Msb0; 0; 3].into_boxed_bitslice();
+    let shared = shared(crate::bt_client::default_settings());
+    let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
+    (swarm, handle, dir)
+}
+
 /// The client-wide services, as a client without DHT or uTP has them.
 pub(super) fn shared(settings: crate::config::SettingsWatch) -> Shared {
     Shared {

@@ -227,7 +227,7 @@ impl TorrentSwarm {
             }
             None => warn!("piece {piece} failed hash verification, and came from {senders:?}; will retry"),
         }
-        self.missing.push(piece);
+        self.put_back(piece);
         self.schedule();
     }
 
@@ -235,7 +235,7 @@ impl TorrentSwarm {
     /// torrent stops here and says why; the resume data keeps what was verified so far.
     fn storage_failed(&mut self, piece: u32, e: String) {
         warn!("couldn't write piece {piece}: {e}; stopping the download");
-        self.missing.push(piece);
+        self.put_back(piece);
         if self.stat.storage_error.is_none() {
             self.stat.storage_error = Some(e);
             for (piece, f) in self.in_flight.take_all() {
@@ -244,7 +244,7 @@ impl TorrentSwarm {
                         self.peers[idx].forget_piece(piece);
                     }
                 }
-                self.missing.push(piece);
+                self.put_back(piece);
             }
         }
         self.publish_stats();
