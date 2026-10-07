@@ -47,7 +47,7 @@
       const restart = await api.updateSettings(settings)
       onsaved(settings)
       if (restart) {
-        notice = 'The listen port or DHT setting takes effect after a restart.'
+        notice = 'Some of these changes take effect after a restart.'
       } else {
         isOpen = false
       }

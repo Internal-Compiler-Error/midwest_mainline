@@ -15,10 +15,10 @@
 
 <div class="mb-2 flex items-center gap-2">
   <span class="font-medium">Resume an earlier download</span>
-  <Button variant="ghost" size="icon-xs" title="rescan ./resume" onclick={onrescan}><RefreshCw /></Button>
+  <Button variant="ghost" size="icon-xs" title="look for resume files again" onclick={onrescan}><RefreshCw /></Button>
 </div>
 {#if entries.length === 0}
-  <div class="text-muted-foreground">(nothing in ./resume)</div>
+  <div class="text-muted-foreground">(nothing to resume)</div>
 {:else}
   <Table.Root>
     <Table.Body>
