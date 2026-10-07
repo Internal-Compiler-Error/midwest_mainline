@@ -94,6 +94,13 @@
     window.addEventListener('pointerup', stop)
   }
 
+  function nudge(e: KeyboardEvent, col: Column) {
+    const by = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0
+    if (!by) return
+    e.preventDefault()
+    col.width = Math.max(MIN_WIDTH, col.width + by * (e.shiftKey ? 40 : 10))
+  }
+
   let width = $derived(columns.reduce((sum, c) => sum + c.width, 0))
 </script>
 
@@ -113,14 +120,23 @@
             {col.label}
             {#if sortKey === col.key}<span class="text-muted-foreground">{descending ? '▼' : '▲'}</span>{/if}
           </button>
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <!-- a visible divider, wider than it looks so it's easy to grab -->
+          <!-- a visible divider, wider than it looks so it's easy to grab; the arrow keys move
+               it too. A focusable separator is a widget (ARIA's window splitter), which
+               Svelte's checks don't know -->
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
           <span
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="{col.label} column width"
+            aria-valuenow={col.width}
+            aria-valuemin={MIN_WIDTH}
+            tabindex={0}
             class={[
-              'absolute top-1 right-0 bottom-1 w-2 cursor-col-resize border-r-2 hover:border-primary',
+              'absolute top-1 right-0 bottom-1 w-2 cursor-col-resize border-r-2 outline-none hover:border-primary focus-visible:border-primary',
               resizing === col.key ? 'border-primary' : 'border-border',
             ]}
             onpointerdown={(e) => resize(e, col)}
+            onkeydown={(e) => nudge(e, col)}
           ></span>
         </Table.Head>
       {/each}
