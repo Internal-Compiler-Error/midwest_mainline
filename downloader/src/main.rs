@@ -141,20 +141,28 @@ fn download(source: String, dir: Option<PathBuf>, seed: bool, super_seed: bool) 
         Err(e) => return Err(e),
     };
 
-    let id = match existing_resume_file(&session, &source) {
+    let id = start(&mut session, source, root, super_seed);
+    let status = report_until_done(&mut session, id, seed, &interrupted);
+    // stops the swarms (resume data is written on the way out) and the runtime
+    session.shutdown();
+    Ok(status)
+}
+
+/// Adds `source` to the session, or picks it up from its resume file, and gets it going.
+fn start(session: &mut Session, source: String, root: PathBuf, super_seed: bool) -> TorrentId {
+    let id = match existing_resume_file(session, &source) {
         Some(path) => {
             tracing::info!("carrying on from {}", path.display());
             session.resume(path)
         }
         None => session.add(source, root),
     };
+    // a torrent last paused in the app: running the command is asking for it to download
+    session.unpause(id);
     if super_seed {
         session.set_super_seed(id, true);
     }
-    let status = report_until_done(&mut session, id, seed, &interrupted);
-    // stops the swarms (resume data is written on the way out) and the runtime
-    session.shutdown();
-    Ok(status)
+    id
 }
 
 /// Logs the torrent's progress every few seconds until it's done with, and returns the exit
@@ -393,6 +401,24 @@ mod test {
         let (mut session, path, dir) = complete_torrent("ratio", 80, false, 1.5);
         let id = session.resume(&path);
         assert_eq!(report_within(&mut session, id, true), 0);
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A torrent paused in the app downloads when the command line is asked for it.
+    #[test]
+    fn a_paused_torrent_is_started() {
+        let (mut session, path, dir) = complete_torrent("paused", 0, true, 0.0);
+        let id = start(&mut session, path.display().to_string(), dir.clone(), false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = session.torrents().into_iter().find(|(i, _)| *i == id).map(|(_, s)| s);
+            if matches!(state, Some(TorrentState::Downloading(_))) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{state:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
