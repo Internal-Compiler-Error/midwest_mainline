@@ -63,8 +63,12 @@ def show(x):
 def query(sock, addr, q, args):
     msg = {"t": os.urandom(2), "y": "q", "q": q, "a": {"id": MY_ID, **args}}
     sock.sendto(enc(msg), addr)
-    reply, _ = sock.recvfrom(65536)
-    reply, _ = dec(reply)
+    # the node pings a querier it doesn't know before it may join its table: skip that
+    while True:
+        reply, _ = sock.recvfrom(65536)
+        reply, _ = dec(reply)
+        if reply.get(b"t") == msg["t"] and reply.get(b"y") in (b"r", b"e"):
+            break
     print(q, "->", show(reply))
     return reply
 
