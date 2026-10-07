@@ -117,36 +117,17 @@ terminal.
 
 ## Direct invocation
 
-Everything the GUI does goes through `downloader::Session`; a throwaway example is the
-quickest way to poke a library change without either binary:
+Everything the GUI does goes through `downloader::Session`. `downloader/examples/probe.rs`
+(committed) drives one directly: it adds a source, then every 5 s prints the rate, verified
+pieces, and a uTP-vs-TCP breakdown of the peers. Arguments: source, then seconds (default 90).
+Edit it in place to poke a library change without either binary:
 
 ```bash
-mkdir -p downloader/examples && cat > downloader/examples/probe.rs <<'RS'
-use downloader::{Session, SessionConfig, Settings, TorrentState, data_dir};
-fn main() {
-    let magnet = std::env::args().nth(1).unwrap();
-    let mut session = Session::new(SessionConfig {
-        peer_id: *b"-DL0100-probe-probe.",
-        data_dir: data_dir(),
-        settings: Settings { listen_port: 0, ..Settings::default() },
-    })
-    .unwrap();
-    let id = session.add(magnet, std::env::temp_dir().join("probe"));
-    for _ in 0..60 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if let Some((_, TorrentState::Downloading(p))) = session.torrents().into_iter().find(|(i, _)| *i == id) {
-            println!("{} peers, {:.0} B/s, {}/{} pieces", p.peers.len(), p.download_bps, p.verified_pieces, p.total_pieces);
-        }
-    }
-    session.remove(id, true);
-}
-RS
-DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader --example probe -- "$ARCH"
-rm -r downloader/examples
+DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader --example probe -- "$ARCH" 40
+# t= 40s total    8829 KiB/s pieces 121/3068 | uTP 61 peers (0 sending) ... | TCP 140 peers (56 sending)    8806 KiB/s best   1354
 ```
 
-Delete the example afterwards; `examples/` isn't part of the repo. It prints a line a
-second; expect ~200 peers and 10+ MB/s by the end of the minute.
+Nothing in the first ~30 s is normal (DHT lookup, then metadata).
 
 The DHT crate's internals (store, retention, routing table, KRPC parsing) are covered by its
 unit tests on in-memory SQLite, which is the fastest loop for a change there:
@@ -157,9 +138,12 @@ cargo test -p midwest_mainline
 
 ## Run (human path)
 
+Without `DOWNLOADER_DATA_DIR` both use the user's real data directory (`~/Library/Application
+Support/downloader`), resuming their torrents; keep it set unless that's the point.
+
 ```bash
-cd gui && pnpm tauri dev      # Vite plus the debug app with hot reload; Ctrl-C stops both
-cargo run -p downloader -- "$ARCH" ~/Downloads   # the CLI; Ctrl-C sends the trackers a farewell and exits
+cd gui && DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data pnpm tauri dev   # Vite plus the debug app, window in ~10 s; Ctrl-C stops both (pnpm then says "Command failed", harmless)
+DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader -- "$ARCH" /tmp/midwest-mainline-run/human   # Ctrl-C: "interrupted ..., stopping tracker announces" and exits
 ```
 
 ## Test
