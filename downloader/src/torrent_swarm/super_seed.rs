@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use super::TorrentSwarm;
 
 impl TorrentSwarm {
-    /// BEP 21: everything selected is in, but not everything there is.
+    /// BEP 16: super-seeding is on, and there's every piece to show.
     pub(super) fn super_seeding(&self) -> bool {
         self.super_seed && self.stat.all_verified()
     }
@@ -48,15 +48,14 @@ impl TorrentSwarm {
                 let seen = self.availability[p as usize] + self.super_seed_offers[p as usize];
                 (seen, p.wrapping_mul(0x9E37_79B9) ^ scatter)
             });
-        let others = pick.map(|p| self.availability[p as usize]);
         let peer = &mut self.peers[idx];
         let view = peer.super_seed.as_mut().expect("checked above");
-        let (Some(piece), Some(others)) = (pick, others) else {
+        let Some(piece) = pick else {
             view.current = None;
             return;
         };
         view.offered.insert(piece);
-        view.current = Some((piece, others, Instant::now()));
+        view.current = Some((piece, self.availability[piece as usize], Instant::now()));
         self.super_seed_offers[piece as usize] += 1;
         if peer.send_have(piece).is_err() {
             self.drop_peer(idx, "send failed");
@@ -92,6 +91,7 @@ impl TorrentSwarm {
         }
     }
 
+    /// BEP 21: everything selected is in, but not everything there is.
     pub(super) fn partial_seed(&self) -> bool {
         self.stat.completed && !self.stat.all_verified()
     }
