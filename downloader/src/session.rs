@@ -1559,6 +1559,11 @@ impl Session {
     pub fn resume(&mut self, path: impl AsRef<Path>) -> TorrentId {
         let path = path.as_ref().to_path_buf();
         let info_hash = ResumeSummary::read(&path).ok().map(|s| s.info_hash);
+        self.resume_known(path, info_hash)
+    }
+
+    /// `resume` for a file whose info hash has been read already, if it could be.
+    fn resume_known(&mut self, path: PathBuf, info_hash: Option<InfoHash>) -> TorrentId {
         self.launch(
             path.display().to_string(),
             info_hash,
@@ -1581,14 +1586,26 @@ impl Session {
     /// becomes a failed entry with the reason, rather than the torrent silently vanishing.
     pub fn resume_all(&mut self) -> Vec<TorrentId> {
         let sources: HashSet<String> = self.torrents.values().map(|e| e.source.clone()).collect();
-        let mut paths: Vec<PathBuf> = self.resumable().into_iter().map(|f| f.path).collect();
-        paths.extend(
-            scan_resume_files(&self.resume_dir)
-                .into_iter()
-                .filter(|(path, read)| read.is_err() && !sources.contains(&path.display().to_string()))
-                .map(|(path, _)| path),
-        );
-        paths.into_iter().map(|path| self.resume(path)).collect()
+        let running: HashSet<InfoHash> = self.torrents.values().filter_map(Entry::info_hash).collect();
+        let (readable, broken): (Vec<_>, Vec<_>) = scan_resume_files(&self.resume_dir)
+            .into_iter()
+            .partition(|(_, read)| read.is_ok());
+        let mut readable: Vec<ResumeSummary> = readable
+            .into_iter()
+            .filter_map(|(_, read)| read.ok())
+            .filter(|summary| !running.contains(&summary.info_hash))
+            .collect();
+        readable.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut ids: Vec<TorrentId> = readable
+            .into_iter()
+            .map(|summary| self.resume_known(summary.path, Some(summary.info_hash)))
+            .collect();
+        for (path, _) in broken {
+            if !sources.contains(&path.display().to_string()) {
+                ids.push(self.resume_known(path, None));
+            }
+        }
+        ids
     }
 
     /// The resume files in this session's resume dir for torrents it isn't running.
