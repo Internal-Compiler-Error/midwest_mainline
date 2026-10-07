@@ -8,7 +8,6 @@
 //! from then on; the old one keeps seeding until it's removed, marked superseded.
 
 use crate::dht::DhtWatch;
-use crate::events::info_hash_hex;
 use anyhow::{bail, ensure};
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 use midwest_mainline::dht::client::DhtClient;
@@ -76,7 +75,7 @@ impl Version {
     pub fn exact_topic(&self) -> String {
         match &self.info_hash_v2 {
             Some(v2) => format!("urn:btmh:1220{}", hex(v2)),
-            None => format!("urn:btih:{}", info_hash_hex(&self.info_hash)),
+            None => format!("urn:btih:{}", self.info_hash),
         }
     }
 }
@@ -349,12 +348,12 @@ pub(crate) async fn follow(
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Hex of any even length, for a salt
-pub(crate) fn unhex(s: &str) -> anyhow::Result<Vec<u8>> {
+/// Hex of any even length
+pub fn unhex(s: &str) -> anyhow::Result<Vec<u8>> {
     ensure!(s.len().is_multiple_of(2), "odd number of hex digits");
     (0..s.len())
         .step_by(2)

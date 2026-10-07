@@ -255,13 +255,9 @@ pub enum Event {
     },
 }
 
-fn hex<S: serde::Serializer>(hash: &InfoHash, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&info_hash_hex(hash))
-}
-
 /// The 40 hex digits of an info hash, how the events name a torrent.
-pub fn info_hash_hex(hash: &InfoHash) -> String {
-    hash.0.iter().map(|b| format!("{b:02x}")).collect()
+fn hex<S: serde::Serializer>(hash: &InfoHash, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(hash)
 }
 
 /// The sender side; clone it into whatever emits. Cheap to clone, shares the stream.

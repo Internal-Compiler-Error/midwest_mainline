@@ -4,10 +4,10 @@
 //! resume data either way, so running the same command again carries on where it stopped.
 
 use anyhow::Context;
-use downloader::feed::{FeedKey, Version};
+use downloader::feed::{FeedKey, Version, hex, unhex};
 use downloader::{
-    ResumeData, Session, SessionConfig, Settings, Telemetry, TorrentState, data_dir, is_magnet_uri, parse_magnet,
-    parse_torrent, random_peer_id,
+    ResumeData, Session, SessionConfig, Settings, Telemetry, TorrentId, TorrentState, data_dir, is_magnet_uri,
+    parse_magnet, parse_torrent, random_peer_id,
 };
 use midwest_mainline::dht::item::SigningKey;
 use midwest_mainline::types::InfoHash;
@@ -29,42 +29,96 @@ const USAGE: &str = "usage: downloader [--seed] [--super-seed] <path-to-.torrent
 
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Help,
+    Download {
+        source: String,
+        /// the settings' download directory if not given
+        dir: Option<PathBuf>,
+        seed: bool,
+        super_seed: bool,
+    },
+    Publish {
+        key_file: PathBuf,
+        /// a `.torrent` path or 40 hex digits
+        target: String,
+        salt: Vec<u8>,
+    },
+}
+
+impl Cli {
+    /// From the arguments after the program name; an error is a usage mistake.
+    fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
+        let mut args = args.into_iter().peekable();
+        let publish = args.next_if(|arg| arg == "publish").is_some();
+        let (mut seed, mut super_seed, mut salt) = (false, false, vec![]);
+        let mut positional = vec![];
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(Cli::Help),
+                "--seed" if !publish => seed = true,
+                "--super-seed" if !publish => (seed, super_seed) = (true, true),
+                "--salt" if publish => salt = args.next().context("--salt needs a value")?.into_bytes(),
+                _ if arg.starts_with("--") => anyhow::bail!("unknown option {arg}"),
+                _ => positional.push(arg),
+            }
+        }
+        let mut positional = positional.into_iter();
+        match (publish, positional.next(), positional.next(), positional.next()) {
+            (false, Some(source), dir, None) => Ok(Cli::Download {
+                source,
+                dir: dir.map(PathBuf::from),
+                seed,
+                super_seed,
+            }),
+            (true, Some(key_file), Some(target), None) => Ok(Cli::Publish {
+                key_file: key_file.into(),
+                target,
+                salt,
+            }),
+            _ => anyhow::bail!("wrong number of arguments"),
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // RUST_LOG picks the console's verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`;
     // OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 also sends the traces to a collector
     let telemetry = Telemetry::install(tracing_subscriber::fmt::layer().pretty().boxed())?;
 
-    if std::env::args().nth(1).as_deref() == Some("publish") {
-        let status = match publish(std::env::args().skip(2).collect()) {
+    let status = match Cli::parse(std::env::args().skip(1)) {
+        Ok(Cli::Help) => {
+            println!("{USAGE}");
+            0
+        }
+        Ok(Cli::Download {
+            source,
+            dir,
+            seed,
+            super_seed,
+        }) => download(source, dir, seed, super_seed)?,
+        Ok(Cli::Publish { key_file, target, salt }) => match publish(&key_file, &target, &salt) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("downloader publish: {e:#}");
                 1
             }
-        };
-        drop(telemetry);
-        std::process::exit(status);
-    }
-
-    let mut seed = false;
-    let mut super_seed = false;
-    let mut positional = Vec::new();
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--seed" => seed = true,
-            "--super-seed" => (seed, super_seed) = (true, true),
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return Ok(());
-            }
-            _ => positional.push(arg),
+        },
+        Err(e) => {
+            eprintln!("downloader: {e}\n{USAGE}");
+            2
         }
-    }
-    let Some(source) = positional.first().cloned() else {
-        eprintln!("{USAGE}");
-        std::process::exit(2);
     };
+    // exit skips destructors, and this one flushes the last traces
+    drop(telemetry);
+    std::process::exit(status);
+}
 
+/// Downloads `source` until it's complete (and, with `seed`, after), or until Ctrl-C.
+/// Returns the exit status.
+fn download(source: String, dir: Option<PathBuf>, seed: bool, super_seed: bool) -> anyhow::Result<i32> {
     let interrupted = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let interrupted = interrupted.clone();
@@ -73,10 +127,7 @@ fn main() -> anyhow::Result<()> {
 
     let data_dir = data_dir();
     let settings = Settings::load(&data_dir);
-    let root = positional
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| settings.download_dir.clone());
+    let root = dir.unwrap_or_else(|| settings.download_dir.clone());
     let mut session = match Session::new(SessionConfig {
         peer_id: random_peer_id(),
         data_dir,
@@ -85,7 +136,7 @@ fn main() -> anyhow::Result<()> {
         Ok(session) => session,
         Err(e) if e.is::<downloader::session::AlreadyRunning>() => {
             eprintln!("downloader: {e}");
-            std::process::exit(1);
+            return Ok(1);
         }
         Err(e) => return Err(e),
     };
@@ -100,24 +151,33 @@ fn main() -> anyhow::Result<()> {
     if super_seed {
         session.set_super_seed(id, true);
     }
+    let status = report_until_done(&mut session, id, seed, &interrupted);
+    // stops the swarms (resume data is written on the way out) and the runtime
+    session.shutdown();
+    Ok(status)
+}
 
+/// Logs the torrent's progress every few seconds until it's done with, and returns the exit
+/// status: 0 complete, 1 failed, 130 interrupted.
+fn report_until_done(session: &mut Session, id: TorrentId, seed: bool, interrupted: &AtomicBool) -> i32 {
     let mut last_report = Instant::now();
     let mut announced_metadata = false;
-    let status = loop {
+    loop {
         std::thread::sleep(Duration::from_millis(250));
         if interrupted.load(Ordering::SeqCst) {
             tracing::info!("interrupted, saving progress and stopping");
-            break 130;
+            return 130;
         }
         let Some((_, state)) = session.torrents().into_iter().find(|(i, _)| *i == id) else {
-            break 1;
+            return 1;
         };
+        let due = last_report.elapsed() >= REPORT_EVERY;
         match state {
             TorrentState::Failed { error, .. } => {
                 tracing::error!("{error}");
-                break 1;
+                return 1;
             }
-            TorrentState::Resolving { elapsed, .. } if last_report.elapsed() >= REPORT_EVERY => {
+            TorrentState::Resolving { elapsed, .. } if due => {
                 tracing::info!("resolving, {}s so far", elapsed.as_secs());
                 last_report = Instant::now();
             }
@@ -128,9 +188,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 if p.completed && !seed {
                     tracing::info!("{} is complete in {}", p.name, p.root);
-                    break 0;
+                    return 0;
                 }
-                if last_report.elapsed() >= REPORT_EVERY {
+                if due {
                     tracing::info!(
                         "{:.1}%  {}/{} pieces  down {}  up {}  {} peers{}",
                         p.fraction() * 100.0,
@@ -146,38 +206,14 @@ fn main() -> anyhow::Result<()> {
             }
             _ => {}
         }
-    };
-
-    // stops the swarms (resume data is written on the way out) and the runtime
-    session.shutdown();
-    // exit skips destructors, and this one flushes the last traces
-    drop(telemetry);
-    std::process::exit(status);
+    }
 }
 
 /// `downloader publish`: signs and puts the BEP 46 item for a torrent
-fn publish(args: Vec<String>) -> anyhow::Result<()> {
-    let mut salt = vec![];
-    let mut positional = vec![];
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--salt" => salt = args.next().context("--salt needs a value")?.into_bytes(),
-            _ => positional.push(arg),
-        }
-    }
-    let [key_file, target] = positional.as_slice() else {
-        anyhow::bail!("{USAGE}");
-    };
-    let signing = signing_key(Path::new(key_file))?;
-    let (version, name) = match target.len() {
-        40 if !Path::new(target).exists() => {
-            let mut hash = [0u8; 20];
-            for (i, byte) in hash.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&target[i * 2..i * 2 + 2], 16).context("not a hex info hash")?;
-            }
-            (Version::v1(InfoHash(hash)), None)
-        }
+fn publish(key_file: &Path, target: &str, salt: &[u8]) -> anyhow::Result<()> {
+    let signing = signing_key(key_file)?;
+    let (version, name) = match parse_info_hash(target) {
+        Some(info_hash) if !Path::new(target).exists() => (Version::v1(info_hash), None),
         _ => {
             let torrent = parse_torrent(&std::fs::read(target).with_context(|| format!("reading {target}"))?)?;
             let version = match &torrent.v2 {
@@ -198,8 +234,8 @@ fn publish(args: Vec<String>) -> anyhow::Result<()> {
         settings: Settings::load(&data_dir),
         data_dir,
     })?;
-    let published = session.publish_update(&signing, &salt, &version, Duration::from_secs(90))?;
-    let key = FeedKey::of(&signing, &salt);
+    let published = session.publish_update(&signing, salt, &version, Duration::from_secs(90))?;
+    let key = FeedKey::of(&signing, salt);
     println!(
         "{} at seq {}, stored by {} DHT nodes",
         version.info_hash, published.seq, published.stored
@@ -208,30 +244,30 @@ fn publish(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 40 hex digits as an info hash.
+fn parse_info_hash(text: &str) -> Option<InfoHash> {
+    InfoHash::try_from_bytes(&unhex(text).ok()?)
+}
+
 /// The ed25519 secret key in `path` (64 hex digits), or a new one written there
 fn signing_key(path: &Path) -> anyhow::Result<SigningKey> {
-    let mut seed = [0u8; 32];
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let text = text.trim();
-            anyhow::ensure!(text.len() == 64, "{} must hold 64 hex digits", path.display());
-            for (i, byte) in seed.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
-                    .with_context(|| format!("{} isn't hex", path.display()))?;
-            }
-        }
+    let seed: [u8; 32] = match std::fs::read_to_string(path) {
+        Ok(text) => unhex(text.trim())
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .with_context(|| format!("{} must hold 64 hex digits", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            seed = rand::random();
-            let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+            let seed: [u8; 32] = rand::random();
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            std::io::Write::write_all(&mut options.open(path)?, format!("{hex}\n").as_bytes())?;
+            std::io::Write::write_all(&mut options.open(path)?, format!("{}\n", hex(&seed)).as_bytes())?;
             eprintln!("made a new key in {}", path.display());
+            seed
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+    };
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -256,5 +292,54 @@ fn rate(bps: f64) -> String {
         format!("{:.1} MiB/s", bps / (1024.0 * 1024.0))
     } else {
         format!("{:.0} KiB/s", bps / 1024.0)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn parse(args: &[&str]) -> anyhow::Result<Cli> {
+        Cli::parse(args.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn arguments() {
+        assert_eq!(
+            parse(&["--super-seed", "x.torrent", "out"]).unwrap(),
+            Cli::Download {
+                source: "x.torrent".into(),
+                dir: Some("out".into()),
+                seed: true,
+                super_seed: true,
+            }
+        );
+        assert_eq!(
+            parse(&["publish", "key", "x.torrent", "--salt", "v1"]).unwrap(),
+            Cli::Publish {
+                key_file: "key".into(),
+                target: "x.torrent".into(),
+                salt: b"v1".to_vec(),
+            }
+        );
+        assert_eq!(parse(&["x", "--help"]).unwrap(), Cli::Help);
+        for wrong in [
+            &[][..],
+            &["a", "b", "c"],
+            &["--sed", "x.torrent"],
+            &["publish", "key"],
+            &["publish", "key", "x", "--salt"],
+            &["publish", "--seed", "key", "x"],
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn info_hashes_in_hex() {
+        assert_eq!(parse_info_hash(&"ab".repeat(20)), Some(InfoHash([0xab; 20])));
+        assert_eq!(parse_info_hash(&"ab".repeat(19)), None);
+        // 40 bytes, but not 40 hex digits; slicing it by byte would split the 'é'
+        assert_eq!(parse_info_hash(&format!("é{}", "a".repeat(38))), None);
     }
 }
