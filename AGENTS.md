@@ -11,3 +11,7 @@ Default vocabulary: needs-triage, needs-info, ready-for-agent, ready-for-human, 
 ### Domain docs
 
 Single-context: one root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+
+### BEPs
+
+What's implemented, in progress, and next (in order) is in `docs/beps.md`. Keep it current when you implement one.
