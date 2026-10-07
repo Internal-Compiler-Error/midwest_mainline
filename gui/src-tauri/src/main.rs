@@ -6,10 +6,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloader::feed::Feed;
 use downloader::{
-    Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings, Telemetry,
-    TorrentId, TorrentState, TraceSnapshot, TrackerInfo, TrackerState, data_dir, random_peer_id,
+    Events, LogBuffer, ResumeSummary, Session, SessionConfig, SessionStatus, Settings, Telemetry, TorrentId,
+    TorrentState, TraceSnapshot, data_dir, random_peer_id,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,257 +38,12 @@ impl App {
 struct TorrentRow {
     id: TorrentId,
     #[serde(flatten)]
-    state: StateDto,
-}
-
-/// `TorrentState` in the shape JS wants: a tag, milliseconds, and plain strings.
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum StateDto {
-    Resolving {
-        source: String,
-        elapsed_ms: u64,
-    },
-    Downloading(ProgressDto),
-    Paused(ProgressDto),
-    Queued(ProgressDto),
-    Checking {
-        name: String,
-        checked_pieces: usize,
-        total_pieces: usize,
-    },
-    Failed {
-        source: String,
-        error: String,
-    },
-}
-
-/// `Progress` field for field; the library stays free of serde.
-#[derive(Serialize)]
-struct ProgressDto {
-    /// 40 hex digits, how the event bus names the torrent
-    info_hash: String,
-    name: String,
-    root: String,
-    files: Vec<FileDto>,
-    total_size: u64,
-    downloaded: u64,
-    wasted: u64,
-    uploaded: u64,
-    left: u64,
-    verified_pieces: usize,
-    total_pieces: usize,
-    completed: bool,
-    download_bps: f64,
-    upload_bps: f64,
-    peers: Vec<PeerDto>,
-    sequential: bool,
-    super_seed: bool,
-    trackers: Vec<TrackerDto>,
-    feed: Option<FeedDto>,
-}
-
-/// BEP 46's key, in hex
-#[derive(Serialize)]
-struct FeedDto {
-    key: String,
-    salt: String,
-    seq: Option<i64>,
-    superseded: Option<i64>,
-}
-
-impl From<Feed> for FeedDto {
-    fn from(f: Feed) -> Self {
-        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect();
-        Self {
-            key: hex(&f.key.public),
-            salt: hex(&f.key.salt),
-            seq: f.seq,
-            superseded: f.superseded,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct TrackerDto {
-    url: String,
-    /// "pending", "working" or "failed"
-    state: &'static str,
-    /// what went wrong, for "failed"
-    error: Option<String>,
-    peers: usize,
-    next_announce_secs: Option<u64>,
-    seeders: Option<u32>,
-    leechers: Option<u32>,
-    downloaded: Option<u32>,
-}
-
-impl From<TrackerInfo> for TrackerDto {
-    fn from(t: TrackerInfo) -> Self {
-        let (state, error) = match t.state {
-            TrackerState::Pending => ("pending", None),
-            TrackerState::Working => ("working", None),
-            TrackerState::Failed(why) => ("failed", Some(why)),
-        };
-        Self {
-            url: t.url,
-            state,
-            error,
-            peers: t.peers,
-            next_announce_secs: t.next_announce_secs,
-            seeders: t.seeders,
-            leechers: t.leechers,
-            downloaded: t.downloaded,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct FileDto {
-    path: String,
-    size: u64,
-    selected: bool,
-    pad: bool,
-}
-
-impl From<FileInfo> for FileDto {
-    fn from(f: FileInfo) -> Self {
-        Self {
-            path: f.path,
-            size: f.size,
-            selected: f.selected,
-            pad: f.pad,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct PeerDto {
-    addr: String,
-    client: String,
-    progress: f32,
-    downloaded: u64,
-    uploaded: u64,
-    download_bps: f64,
-    upload_bps: f64,
-    choked_us: bool,
-    choked_them: bool,
-    interested_us: bool,
-    interested_them: bool,
-    encrypted: bool,
-    utp: bool,
-}
-
-impl From<PeerInfo> for PeerDto {
-    fn from(p: PeerInfo) -> Self {
-        Self {
-            addr: p.addr,
-            client: p.client,
-            progress: p.progress,
-            downloaded: p.downloaded,
-            uploaded: p.uploaded,
-            download_bps: p.download_bps,
-            upload_bps: p.upload_bps,
-            choked_us: p.choked_us,
-            choked_them: p.choked_them,
-            interested_us: p.interested_us,
-            interested_them: p.interested_them,
-            encrypted: p.encrypted,
-            utp: p.utp,
-        }
-    }
-}
-
-impl From<Progress> for ProgressDto {
-    fn from(p: Progress) -> Self {
-        Self {
-            info_hash: p.info_hash,
-            name: p.name,
-            root: p.root,
-            files: p.files.into_iter().map(FileDto::from).collect(),
-            total_size: p.total_size,
-            downloaded: p.downloaded,
-            wasted: p.wasted,
-            uploaded: p.uploaded,
-            left: p.left,
-            verified_pieces: p.verified_pieces,
-            total_pieces: p.total_pieces,
-            completed: p.completed,
-            download_bps: p.download_bps,
-            upload_bps: p.upload_bps,
-            peers: p.peers.into_iter().map(PeerDto::from).collect(),
-            sequential: p.sequential,
-            super_seed: p.super_seed,
-            trackers: p.trackers.into_iter().map(TrackerDto::from).collect(),
-            feed: p.feed.map(FeedDto::from),
-        }
-    }
-}
-
-impl From<TorrentState> for StateDto {
-    fn from(state: TorrentState) -> Self {
-        match state {
-            TorrentState::Resolving { source, elapsed } => StateDto::Resolving {
-                source,
-                elapsed_ms: elapsed.as_millis() as u64,
-            },
-            TorrentState::Downloading(progress) => StateDto::Downloading(progress.into()),
-            TorrentState::Paused(progress) => StateDto::Paused(progress.into()),
-            TorrentState::Queued(progress) => StateDto::Queued(progress.into()),
-            TorrentState::Checking {
-                name,
-                checked_pieces,
-                total_pieces,
-            } => StateDto::Checking {
-                name,
-                checked_pieces,
-                total_pieces,
-            },
-            TorrentState::Failed { source, error } => StateDto::Failed { source, error },
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ResumableDto {
-    path: String,
-    name: String,
-    root: String,
-    verified_pieces: usize,
-    total_pieces: usize,
-    total_size: u64,
-    paused: bool,
-}
-
-#[derive(Serialize)]
-struct StatusDto {
-    download_bps: f64,
-    upload_bps: f64,
-    dht_nodes: Option<usize>,
-    listen_port: u16,
-    /// "off", "searching", "mapped", or "unavailable"
-    port_mapping: &'static str,
-    external_ip: Option<String>,
+    state: TorrentState,
 }
 
 #[tauri::command]
-fn status(app: State<App>) -> StatusDto {
-    let status = app.session().status();
-    let (port_mapping, external_ip) = match status.port_mapping {
-        MappingState::Off => ("off", None),
-        MappingState::Searching => ("searching", None),
-        MappingState::Mapped { external_ip } => ("mapped", external_ip.map(|ip| ip.to_string())),
-        MappingState::Unavailable => ("unavailable", None),
-    };
-    StatusDto {
-        download_bps: status.download_bps,
-        upload_bps: status.upload_bps,
-        dht_nodes: status.dht_nodes,
-        listen_port: status.listen_port,
-        port_mapping,
-        // the gateway's word first; failing that, what peers and trackers say
-        external_ip: external_ip.or(status.external_ip.map(|ip| ip.to_string())),
-    }
+fn status(app: State<App>) -> SessionStatus {
+    app.session().status()
 }
 
 #[derive(Serialize)]
@@ -303,10 +57,7 @@ fn torrents(app: State<App>) -> Vec<TorrentRow> {
     app.session()
         .torrents()
         .into_iter()
-        .map(|(id, state)| TorrentRow {
-            id,
-            state: state.into(),
-        })
+        .map(|(id, state)| TorrentRow { id, state })
         .collect()
 }
 
@@ -356,20 +107,8 @@ fn set_super_seed(app: State<App>, id: TorrentId, on: bool) {
 }
 
 #[tauri::command]
-fn resumable(app: State<App>) -> Vec<ResumableDto> {
-    app.session()
-        .resumable()
-        .into_iter()
-        .map(|r| ResumableDto {
-            path: r.path.display().to_string(),
-            name: r.name,
-            root: r.root.display().to_string(),
-            verified_pieces: r.verified_pieces,
-            total_pieces: r.total_pieces,
-            total_size: r.total_size,
-            paused: r.paused,
-        })
-        .collect()
+fn resumable(app: State<App>) -> Vec<ResumeSummary> {
+    app.session().resumable()
 }
 
 #[tauri::command]

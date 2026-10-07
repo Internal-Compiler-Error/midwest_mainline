@@ -25,6 +25,7 @@ use crate::{BtClient, Loaded, load_source};
 use anyhow::Context;
 use bitvec::prelude::*;
 use midwest_mainline::types::InfoHash;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::future::Future;
@@ -40,13 +41,17 @@ use tokio_util::sync::CancellationToken;
 pub type TorrentId = u64;
 
 /// Everything a front end needs to render one torrent, with no channels or futures in sight.
-#[derive(Debug, Clone, PartialEq)]
+/// Serializes as JSON a web front end can take as it is: tagged by `kind`, `elapsed` in
+/// milliseconds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TorrentState {
     /// Resolving a source into a torrent. For a magnet this means announcing to its trackers
     /// and fetching metadata from a peer, which can take a while; `elapsed` is for showing
     /// that something is still happening.
     Resolving {
         source: String,
+        #[serde(rename = "elapsed_ms", serialize_with = "json::millis")]
         elapsed: Duration,
     },
     Downloading(Progress),
@@ -67,7 +72,7 @@ pub enum TorrentState {
 }
 
 /// A flat snapshot of download progress, in the units a UI wants to display.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Progress {
     /// 40 hex digits, what the event bus names the torrent by
     pub info_hash: String,
@@ -98,10 +103,12 @@ pub struct Progress {
     pub feed: Option<Feed>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrackerInfo {
     /// the announce URL, or "DHT"
     pub url: String,
+    /// as `state` ("pending", "working" or "failed") and, when failed, `error`
+    #[serde(flatten, serialize_with = "json::tracker_state")]
     pub state: TrackerState,
     /// peers the last announce returned
     pub peers: usize,
@@ -126,7 +133,7 @@ impl Progress {
 }
 
 /// One of a torrent's files.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileInfo {
     pub path: String,
     pub size: u64,
@@ -137,7 +144,7 @@ pub struct FileInfo {
 }
 
 /// One connected peer, ready to render.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PeerInfo {
     pub addr: String,
     pub client: String,
@@ -1078,7 +1085,7 @@ impl Phase {
 }
 
 /// The whole session at a glance, for a status bar.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionStatus {
     /// summed over every torrent
     pub download_bps: f64,
@@ -1086,9 +1093,11 @@ pub struct SessionStatus {
     /// nodes in the DHT routing table; `None` with no node (off, or not up yet)
     pub dht_nodes: Option<usize>,
     pub listen_port: u16,
+    /// as its name alone: "off", "searching", "mapped" or "unavailable"
+    #[serde(serialize_with = "json::mapping_state")]
     pub port_mapping: MappingState,
-    /// our public address as peers and trackers report it (BEP 10 `yourip`, BEP 24), once two
-    /// of them agree
+    /// our public address: what the gateway says, else what peers and trackers report
+    /// (BEP 10 `yourip`, BEP 24) once two of them agree
     pub external_ip: Option<std::net::IpAddr>,
 }
 
@@ -1589,13 +1598,18 @@ impl Session {
             .values()
             .map(|e| (e.rates.download_bps, e.rates.upload_bps))
             .fold((0.0, 0.0), |(d, u), (dd, uu)| (d + dd, u + uu));
+        let port_mapping = self.client.port_mapping().borrow().clone();
+        let gateway_ip = match port_mapping {
+            MappingState::Mapped { external_ip } => external_ip,
+            _ => None,
+        };
         SessionStatus {
             download_bps,
             upload_bps,
             dht_nodes: self.client.dht().borrow().as_ref().map(|dht| dht.node_count()),
             listen_port: self.identity.serving.port(),
-            port_mapping: self.client.port_mapping().borrow().clone(),
-            external_ip: self.client.external_address(),
+            port_mapping: port_mapping.clone(),
+            external_ip: gateway_ip.or_else(|| self.client.external_address()),
         }
     }
 
@@ -1971,6 +1985,38 @@ impl Rates {
     }
 }
 
+/// How the front-end types serialize where the derived shape isn't the one a UI wants.
+mod json {
+    use super::*;
+    use serde::Serializer;
+    use serde::ser::SerializeMap;
+
+    pub fn millis<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_millis() as u64)
+    }
+
+    pub fn tracker_state<S: Serializer>(state: &TrackerState, s: S) -> Result<S::Ok, S::Error> {
+        let (name, error) = match state {
+            TrackerState::Pending => ("pending", None),
+            TrackerState::Working => ("working", None),
+            TrackerState::Failed(why) => ("failed", Some(why)),
+        };
+        let mut map = s.serialize_map(Some(2))?;
+        map.serialize_entry("state", name)?;
+        map.serialize_entry("error", &error)?;
+        map.end()
+    }
+
+    pub fn mapping_state<S: Serializer>(state: &MappingState, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match state {
+            MappingState::Off => "off",
+            MappingState::Searching => "searching",
+            MappingState::Mapped { .. } => "mapped",
+            MappingState::Unavailable => "unavailable",
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2007,6 +2053,69 @@ mod test {
 
         p.verified_pieces = 4;
         assert_eq!(p.fraction(), 1.0);
+    }
+
+    /// The JSON the GUI's `api.ts` reads.
+    #[test]
+    fn states_serialize_the_way_the_gui_reads_them() {
+        fn json(value: &impl Serialize) -> serde_json::Value {
+            serde_json::to_value(value).unwrap()
+        }
+        let resolving = TorrentState::Resolving {
+            source: "s".into(),
+            elapsed: Duration::from_millis(1500),
+        };
+        assert_eq!(
+            json(&resolving),
+            serde_json::json!({"kind": "resolving", "source": "s", "elapsed_ms": 1500})
+        );
+        let tracker = TrackerInfo {
+            url: "udp://t".into(),
+            state: TrackerState::Failed("timed out".into()),
+            peers: 0,
+            next_announce_secs: None,
+            seeders: Some(3),
+            leechers: None,
+            downloaded: None,
+        };
+        let t = json(&tracker);
+        assert_eq!(
+            (&t["state"], &t["error"], &t["seeders"]),
+            (&"failed".into(), &"timed out".into(), &3.into())
+        );
+        let working = json(&TrackerInfo {
+            state: TrackerState::Working,
+            ..tracker
+        });
+        assert_eq!(
+            (&working["state"], &working["error"]),
+            (&"working".into(), &serde_json::Value::Null)
+        );
+        let feed = Feed {
+            key: FeedKey {
+                public: [0xab; 32],
+                salt: b"v".to_vec(),
+            },
+            seq: Some(2),
+            superseded: None,
+        };
+        assert_eq!(
+            json(&feed),
+            serde_json::json!({"key": "ab".repeat(32), "salt": "76", "seq": 2, "superseded": null})
+        );
+        let status = SessionStatus {
+            download_bps: 0.0,
+            upload_bps: 0.0,
+            dht_nodes: None,
+            listen_port: 1,
+            port_mapping: MappingState::Mapped { external_ip: None },
+            external_ip: Some("203.0.113.9".parse().unwrap()),
+        };
+        let s = json(&status);
+        assert_eq!(
+            (&s["port_mapping"], &s["external_ip"]),
+            (&"mapped".into(), &"203.0.113.9".into())
+        );
     }
 
     /// Hand-builds a tiny single-file `.torrent` (no peers will ever have it, which is fine:

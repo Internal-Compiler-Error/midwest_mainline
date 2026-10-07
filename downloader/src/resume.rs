@@ -606,11 +606,14 @@ impl ResumeInputs {
     }
 }
 /// What a front end needs to list a resume file without loading the whole thing into a client.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ResumeSummary {
+    #[serde(serialize_with = "display_path")]
     pub path: PathBuf,
     pub name: String,
+    #[serde(serialize_with = "display_path")]
     pub root: PathBuf,
+    #[serde(serialize_with = "display")]
     pub info_hash: InfoHash,
     pub verified_pieces: usize,
     pub total_pieces: usize,
@@ -640,6 +643,15 @@ impl ResumeSummary {
         }
         self.verified_pieces as f32 / self.total_pieces as f32
     }
+}
+
+/// Lossily where a path isn't UTF-8, rather than failing the whole listing.
+fn display_path<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(&path.display())
+}
+
+fn display<S: serde::Serializer>(value: &impl std::fmt::Display, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(value)
 }
 
 /// Every `*.resume` in `dir` that parses, sorted by name. Unparseable files are skipped with a

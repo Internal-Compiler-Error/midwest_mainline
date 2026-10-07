@@ -44,9 +44,21 @@ impl FeedKey {
     }
 }
 
+/// As `key` and `salt`, in hex.
+impl serde::Serialize for FeedKey {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut key = s.serialize_struct("FeedKey", 2)?;
+        key.serialize_field("key", &self.public_hex())?;
+        key.serialize_field("salt", &hex(&self.salt))?;
+        key.end()
+    }
+}
+
 /// A torrent's place in its key's history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Feed {
+    #[serde(flatten)]
     pub key: FeedKey,
     /// the seq of the item that named this torrent; `None` when it came from the magnet's
     /// own `xt` because the DHT had nothing yet
