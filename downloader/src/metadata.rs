@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -69,11 +70,6 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// addresses are unreachable and each costs a `CONNECT_TIMEOUT` to find out.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
-/// BEP 3 wants the number of bytes still needed, which is unknowable before we have the
-/// metadata that would tell us. Real clients send a small placeholder here for the
-/// pre-metadata announce; the value only has to be non-zero so we aren't mistaken for a seed.
-const UNKNOWN_BYTES_LEFT: usize = METADATA_PIECE_SIZE;
-
 /// Resolves a magnet link into a full `Torrent` by fetching its metadata from peers.
 #[tracing::instrument(
     name = "metadata",
@@ -96,44 +92,20 @@ pub async fn fetch(
             "magnet URI has no trackers (`tr=`) or peers (`x.pe=`) and the DHT is off, so there's no way to find peers"
         );
     }
-    // The announcers report progress they can't possibly know yet; they only need something
-    // shaped like stats to read `left`/`uploaded`/`downloaded` out of.
-    let placeholder_stats = TorrentSwarmStats {
-        uploaded: 0,
-        downloaded: 0,
-        wasted: 0,
-        left: UNKNOWN_BYTES_LEFT,
-        written: 0,
-        verified: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
-        wanted: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
-        completed: false,
-        storage_error: None,
-    };
-    let (_stat_tx, stat_rx) = watch::channel(placeholder_stats);
     let (event_tx, mut event_rx) = mpsc::channel(256);
-
-    /// Stops the metadata phase's announcers however this function exits -- success, error, or
-    /// early `bail!`. Without it they'd keep announcing to the trackers forever, since they
-    /// outlive this call and only ever stop on a cancelled token.
-    struct StopAnnouncersOnDrop(CancellationToken);
-    impl Drop for StopAnnouncersOnDrop {
-        fn drop(&mut self) {
-            self.0.cancel();
-        }
-    }
-    // a child token so an outer shutdown still propagates down, but finishing here doesn't
-    // cancel anything the caller still needs
-    let announcer_shutdown = StopAnnouncersOnDrop(shutdown.child_token());
-
+    // a child token so an outer shutdown still reaches the announcers, while this fetch ending
+    // (however it ends) stops them without cancelling anything the caller still needs
+    let announcers = shutdown.child_token();
+    let _stop_announcers = announcers.clone().drop_guard();
     spawn_announcers(Announcing {
         trackers: magnet.trackers.clone(),
         info_hash: magnet.info_hash,
         identity: identity.clone(),
-        stats: stat_rx,
+        stats: watch::channel(placeholder_stats()).1,
         // announcers hold weak senders (see `TorrentSwarmHandle`); `event_tx` itself lives in
         // this frame, so the channel stays open exactly as long as this fetch does
         events: event_tx.downgrade(),
-        shutdown: announcer_shutdown.0.clone(),
+        shutdown: announcers,
         dht,
         bus: bus.clone(),
         // trackers' word on our address before there's a client to tell; it isn't kept
@@ -141,54 +113,32 @@ pub async fn fetch(
         v2: magnet.hybrid_v2_hash(),
     });
 
-    let started = tokio::time::Instant::now();
-    let (result_tx, mut result_rx) = mpsc::channel::<(SocketAddr, anyhow::Result<Vec<u8>>)>(MAX_CONCURRENT_FETCHES);
+    let started = Instant::now();
+    let give_up = started + OVERALL_TIMEOUT;
+    let mut idle_deadline = started + IDLE_TIMEOUT;
+    let (result_tx, mut result_rx) = mpsc::channel(MAX_CONCURRENT_FETCHES);
     let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
-    // Peers discovered but not yet dialled, because the concurrency limit was already reached.
-    // These have to be queued rather than dropped: a tracker typically returns dozens of peers
-    // in one go, and if the first few happen to be dead, dropping the rest would leave us idle
-    // until the *next* announce -- which is an interval (often 30 minutes) away, i.e. well past
-    // any timeout here.
-    // a magnet's own x.pe peers go first: they need no tracker or DHT to find
+    // Peers heard of but not dialled yet, for want of a free slot. A tracker typically returns
+    // dozens at once, and if the first few are dead the rest are what's left to try until its
+    // next announce, an interval (often 30 minutes) away. A magnet's own x.pe peers go first:
+    // they need no tracker or DHT to find.
     let mut pending: VecDeque<SocketAddr> = magnet.peers.iter().copied().filter(|p| tried.insert(*p)).collect();
     let mut in_flight = 0usize;
-    let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
-    let give_up = tokio::time::Instant::now() + OVERALL_TIMEOUT;
 
     let (from, raw_info) = loop {
-        // top up to the concurrency limit from whatever's queued
-        while in_flight < MAX_CONCURRENT_FETCHES {
-            let Some(peer) = pending.pop_front() else { break };
+        while in_flight < MAX_CONCURRENT_FETCHES
+            && let Some(peer) = pending.pop_front()
+        {
             in_flight += 1;
-            let info_hash = magnet.info_hash;
-            let v2 = magnet.v2_support();
-            let identity = identity.clone();
-            let result_tx = result_tx.clone();
-            let utp = utp.borrow().clone();
-            let span = tracing::info_span!("metadata.peer", info_hash = %info_hash, peer = %peer, outcome = tracing::field::Empty);
-            tokio::spawn(
-                async move {
-                    let result =
-                        tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, v2, identity, utp))
-                            .await
-                            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
-                    let outcome = match &result {
-                        Ok(raw) => format!("{} bytes", raw.len()),
-                        Err(e) => format!("{e:#}"),
-                    };
-                    tracing::Span::current().record("outcome", outcome);
-                    let _ = result_tx.send((peer, result)).await;
-                }
-                .instrument(span),
-            );
+            spawn_fetch_from(peer, magnet, identity.clone(), utp.borrow().clone(), result_tx.clone());
         }
 
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline.min(give_up)) => {
+            _ = tokio::time::sleep_until(idle_deadline.min(give_up)) => {
                 bail!(
                     "no metadata for {:?} after {}s (tried {} peers)",
                     magnet.display_name.as_deref().unwrap_or("magnet"),
-                    tokio::time::Instant::now().duration_since(give_up - OVERALL_TIMEOUT).as_secs(),
+                    started.elapsed().as_secs(),
                     tried.len(),
                 );
             }
@@ -198,17 +148,15 @@ pub async fn fetch(
                 let SwarmEvent::PeersDiscovered(peers, _) = event else {
                     continue;
                 };
-                // queue every peer we haven't already tried; the loop head dials as many as
-                // the concurrency limit allows and keeps the rest for when a slot frees up
                 let before = pending.len();
                 pending.extend(peers.into_iter().filter(|peer| tried.insert(*peer)));
                 if pending.len() > before {
-                    deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                    idle_deadline = Instant::now() + IDLE_TIMEOUT;
                 }
             }
 
             Some((peer, result)) = result_rx.recv() => {
-                in_flight = in_flight.saturating_sub(1);
+                in_flight -= 1;
                 match result {
                     Ok(raw_info) => break (peer, raw_info),
                     Err(e) => debug!("metadata fetch from a peer failed: {e:#}"),
@@ -244,6 +192,52 @@ pub async fn fetch(
         torrent,
         peers: tried.into_iter().collect(),
     })
+}
+
+/// What the pre-metadata announces report: progress we can't know yet. BEP 3 wants the bytes
+/// still needed, which only the metadata would tell; real clients send a small placeholder,
+/// which only has to be non-zero so we aren't mistaken for a seed.
+fn placeholder_stats() -> TorrentSwarmStats {
+    TorrentSwarmStats {
+        uploaded: 0,
+        downloaded: 0,
+        wasted: 0,
+        left: METADATA_PIECE_SIZE,
+        written: 0,
+        verified: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
+        wanted: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
+        completed: false,
+        storage_error: None,
+    }
+}
+
+/// Fetches the metadata from `peer` on a task of its own, within PER_PEER_TIMEOUT, and sends
+/// the outcome to `results`.
+fn spawn_fetch_from(
+    peer: SocketAddr,
+    magnet: &MagnetLink,
+    identity: Arc<Identity>,
+    utp: Option<Arc<UtpSocketUdp>>,
+    results: mpsc::Sender<(SocketAddr, anyhow::Result<Vec<u8>>)>,
+) {
+    let info_hash = magnet.info_hash;
+    let v2 = magnet.v2_support();
+    let span =
+        tracing::info_span!("metadata.peer", info_hash = %info_hash, peer = %peer, outcome = tracing::field::Empty);
+    tokio::spawn(
+        async move {
+            let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, v2, identity, utp))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+            let outcome = match &result {
+                Ok(raw) => format!("{} bytes", raw.len()),
+                Err(e) => format!("{e:#}"),
+            };
+            tracing::Span::current().record("outcome", outcome);
+            let _ = results.send((peer, result)).await;
+        }
+        .instrument(span),
+    );
 }
 
 /// A torrent built from fetched metadata, and every peer the fetch heard of on the way: the
@@ -297,20 +291,15 @@ async fn fetch_from_peer(
         }
     };
 
-    ensure!(metadata_size > 0, "{addr} advertised a zero-length metadata size");
     ensure!(
         metadata_size <= MAX_METADATA_SIZE,
         "{addr} advertised an implausible metadata size of {metadata_size} bytes"
     );
-
-    let total_pieces = metadata_size.div_ceil(METADATA_PIECE_SIZE);
-    // sized on the first piece that arrives, so a peer that only claims a size costs nothing
-    let mut buffer = Vec::new();
-    let mut have: Vec<bool> = vec![false; total_pieces];
+    let mut metadata = Assembly::new(metadata_size);
 
     // Ask for everything up front rather than one at a time: metadata is at most a few
     // hundred KiB, and a round trip per 16KiB piece would dominate the transfer.
-    for piece in 0..total_pieces {
+    for piece in 0..metadata.pieces() {
         writer
             .send(BtMessage::Extended(Extended {
                 ext_id: their_id,
@@ -321,40 +310,26 @@ async fn fetch_from_peer(
             .await?;
     }
 
-    while have.iter().any(|got| !got) {
+    while metadata.missing() > 0 {
         let Some(msg) = reader.next().await else {
             bail!(
                 "{addr} disconnected with {} metadata pieces still missing",
-                have.iter().filter(|g| !**g).count()
+                metadata.missing()
             );
         };
         let BtMessage::Extended(ext) = msg? else { continue };
         if ext.ext_id != UT_METADATA_ID {
             continue;
         }
-
-        let (piece, data) = match parse_data_message(&ext.payload) {
-            Ok(UtMetadata::Data(piece, data)) => (piece, data),
+        match parse_data_message(&ext.payload) {
+            Ok(UtMetadata::Data(piece, data)) => metadata.add(piece, data).with_context(|| format!("from {addr}"))?,
             Ok(UtMetadata::Reject) => bail!("{addr} rejected a metadata request"),
             // a request for our metadata (we have none to serve), or an unknown msg_type
             Ok(UtMetadata::Other) => continue,
             Err(e) => bail!("{addr} sent a malformed ut_metadata message: {e:#}"),
-        };
-
-        ensure!(piece < total_pieces, "{addr} sent out-of-range metadata piece {piece}");
-        let start = piece * METADATA_PIECE_SIZE;
-        let end = (start + METADATA_PIECE_SIZE).min(metadata_size);
-        ensure!(
-            data.len() == end - start,
-            "{addr} sent metadata piece {piece} with {} bytes, expected {}",
-            data.len(),
-            end - start
-        );
-
-        buffer.resize(metadata_size, 0);
-        buffer[start..end].copy_from_slice(data);
-        have[piece] = true;
+        }
     }
+    let buffer = metadata.buffer;
 
     // The whole reason this is safe to accept from an untrusted peer: the bytes have to hash
     // to the info hash we asked for, otherwise they're someone else's (or fabricated) metadata.
@@ -365,6 +340,48 @@ async fn fetch_from_peer(
     );
 
     Ok(buffer)
+}
+
+/// Metadata of a known size, as its pieces arrive in any order.
+struct Assembly {
+    size: usize,
+    /// sized on the first piece that arrives, so a peer that only claims a size costs nothing
+    buffer: Vec<u8>,
+    have: Vec<bool>,
+}
+
+impl Assembly {
+    fn new(size: usize) -> Self {
+        Assembly {
+            size,
+            buffer: Vec::new(),
+            have: vec![false; size.div_ceil(METADATA_PIECE_SIZE)],
+        }
+    }
+
+    fn pieces(&self) -> usize {
+        self.have.len()
+    }
+
+    fn missing(&self) -> usize {
+        self.have.iter().filter(|got| !**got).count()
+    }
+
+    fn add(&mut self, piece: usize, data: &[u8]) -> anyhow::Result<()> {
+        ensure!(piece < self.pieces(), "out-of-range metadata piece {piece}");
+        let start = piece * METADATA_PIECE_SIZE;
+        let end = (start + METADATA_PIECE_SIZE).min(self.size);
+        ensure!(
+            data.len() == end - start,
+            "metadata piece {piece} has {} bytes, expected {}",
+            data.len(),
+            end - start
+        );
+        self.buffer.resize(self.size, 0);
+        self.buffer[start..end].copy_from_slice(data);
+        self.have[piece] = true;
+        Ok(())
+    }
 }
 
 /// Pulls `m.ut_metadata` and `metadata_size` out of a peer's BEP 10 extended handshake.
@@ -551,6 +568,22 @@ mod test {
         assert_eq!(data, b"RAWBYTES");
     }
 
+    #[test]
+    fn metadata_assembles_from_pieces_in_any_order() {
+        let size = METADATA_PIECE_SIZE + 10;
+        let mut metadata = Assembly::new(size);
+        assert_eq!((metadata.pieces(), metadata.missing()), (2, 2));
+        metadata.add(1, &[7; 10]).unwrap();
+        assert!(metadata.add(1, &[7; 11]).is_err(), "the last piece is short");
+        assert!(metadata.add(2, &[7; 10]).is_err(), "out of range");
+        assert!(metadata.add(0, &[1; 10]).is_err(), "a full piece is full");
+        assert_eq!(metadata.missing(), 1);
+        metadata.add(0, &[1; METADATA_PIECE_SIZE]).unwrap();
+        assert_eq!(metadata.missing(), 0);
+        assert_eq!(metadata.buffer.len(), size);
+        assert_eq!(metadata.buffer[METADATA_PIECE_SIZE..], [7; 10]);
+    }
+
     /// A reject is a peer legitimately saying "I don't have that", not a malformed message.
     #[test]
     fn reject_message_is_not_an_error() {
@@ -561,176 +594,10 @@ mod test {
         assert!(matches!(parse_data_message(msg).unwrap(), UtMetadata::Other));
     }
 
-    /// End-to-end over a real loopback socket: a peer serving metadata (using this crate's own
-    /// `build_ut_metadata_data_message`, the same serializer the real serve path uses) against
-    /// `fetch_from_peer`. Exercises handshake, extension negotiation, multi-piece reassembly,
-    /// and the info-hash check in one go.
-    ///
-    /// The mock deliberately advertises ut_metadata id **5**, not the id we advertise (1), so
-    /// this fails if the fetcher ever assumes a fixed id instead of using the negotiated one.
-    #[tokio::test]
-    async fn fetches_multi_piece_metadata_from_a_real_peer() {
-        use crate::peer::build_ut_metadata_data_message;
-        use crate::wire::{read_handshake, send_handshake};
-        use tokio::net::TcpListener;
-
-        const THEIR_UT_METADATA_ID: u8 = 5;
-
-        // big enough to span three 16KiB pieces, so reassembly and the short final piece both
-        // get exercised rather than fitting in a single message
-        let mut raw_info = sample_info_dict();
-        let padding_needed = METADATA_PIECE_SIZE * 2 + 1234 - raw_info.len();
-        let mut padded = raw_info[..raw_info.len() - 1].to_vec(); // drop trailing 'e'
-        padded.extend_from_slice(&bencode_str(b"padding"));
-        padded.extend_from_slice(&bencode_str(&vec![b'x'; padding_needed - 20]));
-        padded.push(b'e');
-        raw_info = padded;
-
-        let info_hash = InfoHash::from_bytes(Sha1::digest(&raw_info).as_slice());
-        let metadata_size = raw_info.len();
-        assert!(
-            metadata_size > METADATA_PIECE_SIZE * 2,
-            "want a genuinely multi-piece fetch"
-        );
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let served = raw_info.clone();
-        let server = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let their_handshake = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &their_handshake.info_hash, &test_identity(), V2Support::None)
-                .await
-                .unwrap();
-
-            let (reader, writer) = tcp.into_split();
-            let mut reader = FramedRead::new(reader, BtDecoder);
-            let mut writer = FramedWrite::new(writer, BtEncoder);
-
-            // our extended handshake: note the non-default ut_metadata id
-            writer
-                .send(BtMessage::Extended(Extended {
-                    ext_id: 0,
-                    payload: format!(
-                        "d1:md11:ut_metadatai{THEIR_UT_METADATA_ID}ee13:metadata_sizei{}ee",
-                        served.len()
-                    )
-                    .into_bytes()
-                    .into_boxed_slice(),
-                }))
-                .await
-                .unwrap();
-
-            let total_pieces = served.len().div_ceil(METADATA_PIECE_SIZE);
-            let mut answered = 0;
-            while answered < total_pieces {
-                let Some(Ok(BtMessage::Extended(ext))) = reader.next().await else {
-                    continue;
-                };
-                // ext_id 0 is the fetcher's own extended handshake, not a metadata request
-                if ext.ext_id == 0 {
-                    continue;
-                }
-                assert_eq!(
-                    ext.ext_id, THEIR_UT_METADATA_ID,
-                    "fetcher must use the id we advertised"
-                );
-
-                let (_, dict) = juicy_bencode::parse_bencode_dict(&ext.payload).unwrap();
-                let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
-                    panic!("request had no piece index")
-                };
-                let piece = *piece as usize;
-
-                let start = piece * METADATA_PIECE_SIZE;
-                let end = (start + METADATA_PIECE_SIZE).min(served.len());
-                let payload = build_ut_metadata_data_message(piece as u32, served.len() as u32, &served[start..end]);
-
-                writer
-                    .send(BtMessage::Extended(Extended {
-                        // reply on the id *they* advertised, which the fetcher declares as 1
-                        ext_id: UT_METADATA_ID,
-                        payload: payload.into_boxed_slice(),
-                    }))
-                    .await
-                    .unwrap();
-                answered += 1;
-            }
-        });
-
-        let fetched = fetch_from_peer(addr, info_hash, V2Support::None, Arc::new(test_identity()), None)
-            .await
-            .unwrap();
-        assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
-        server.await.unwrap();
-    }
-
-    /// The security property that makes it safe to take metadata from an untrusted peer: bytes
-    /// that don't hash to the requested info hash must be rejected, not handed back.
-    #[tokio::test]
-    async fn rejects_metadata_that_doesnt_match_the_info_hash() {
-        use crate::peer::build_ut_metadata_data_message;
-        use crate::wire::{read_handshake, send_handshake};
-        use tokio::net::TcpListener;
-
-        let honest = sample_info_dict();
-        let real_hash = InfoHash::from_bytes(Sha1::digest(&honest).as_slice());
-
-        // what the peer actually serves: same length, different bytes
-        let mut tampered = honest.clone();
-        let last = tampered.len() - 2;
-        tampered[last] ^= 0xff;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let hs = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &hs.info_hash, &test_identity(), V2Support::None)
-                .await
-                .unwrap();
-
-            let (reader, writer) = tcp.into_split();
-            let mut reader = FramedRead::new(reader, BtDecoder);
-            let mut writer = FramedWrite::new(writer, BtEncoder);
-
-            writer
-                .send(BtMessage::Extended(Extended {
-                    ext_id: 0,
-                    payload: format!("d1:md11:ut_metadatai1ee13:metadata_sizei{}ee", tampered.len())
-                        .into_bytes()
-                        .into_boxed_slice(),
-                }))
-                .await
-                .unwrap();
-
-            while let Some(Ok(msg)) = reader.next().await {
-                if let BtMessage::Extended(_) = msg {
-                    let payload = build_ut_metadata_data_message(0, tampered.len() as u32, &tampered);
-                    let _ = writer
-                        .send(BtMessage::Extended(Extended {
-                            ext_id: UT_METADATA_ID,
-                            payload: payload.into_boxed_slice(),
-                        }))
-                        .await;
-                }
-            }
-        });
-
-        let err = fetch_from_peer(addr, real_hash, V2Support::None, Arc::new(test_identity()), None)
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("doesn't match the requested info hash"),
-            "expected an info-hash mismatch, got: {err:#}"
-        );
-    }
-
-    /// Serves metadata for `raw_info` to one peer, using this crate's real serializer. Returns
-    /// the address to point a fetcher at.
-    async fn spawn_metadata_peer(raw_info: Vec<u8>) -> SocketAddr {
+    /// Serves `raw_info` as metadata to every peer that connects, using this crate's real
+    /// serializer, advertising ut_metadata as `their_id` and hanging up on a request sent to
+    /// any other id. Returns the address to point a fetcher at.
+    async fn spawn_metadata_peer(raw_info: Vec<u8>, their_id: u8) -> SocketAddr {
         use crate::peer::build_ut_metadata_data_message;
         use crate::wire::{read_handshake, send_handshake};
         use tokio::net::TcpListener;
@@ -754,7 +621,7 @@ mod test {
                     let mut reader = FramedRead::new(reader, BtDecoder);
                     let mut writer = FramedWrite::new(writer, BtEncoder);
 
-                    let handshake = format!("d1:md11:ut_metadatai1ee13:metadata_sizei{}ee", served.len());
+                    let handshake = format!("d1:md11:ut_metadatai{their_id}ee13:metadata_sizei{}ee", served.len());
                     if writer
                         .send(BtMessage::Extended(Extended {
                             ext_id: 0,
@@ -768,8 +635,12 @@ mod test {
 
                     while let Some(Ok(msg)) = reader.next().await {
                         let BtMessage::Extended(ext) = msg else { continue };
+                        // ext_id 0 is the fetcher's own extended handshake
                         if ext.ext_id == 0 {
                             continue;
+                        }
+                        if ext.ext_id != their_id {
+                            return;
                         }
                         let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(&ext.payload) else {
                             continue;
@@ -784,6 +655,7 @@ mod test {
                             build_ut_metadata_data_message(*piece as u32, served.len() as u32, &served[start..end]);
                         let _ = writer
                             .send(BtMessage::Extended(Extended {
+                                // the id the fetcher declared for its ut_metadata messages
                                 ext_id: UT_METADATA_ID,
                                 payload: payload.into_boxed_slice(),
                             }))
@@ -796,6 +668,54 @@ mod test {
         addr
     }
 
+    /// End-to-end over a real loopback socket: handshake, extension negotiation, multi-piece
+    /// reassembly, and the info-hash check in one go. The peer advertises ut_metadata id 5, not
+    /// the 1 we advertise, so this fails if the fetcher ever assumes a fixed id instead of
+    /// using the negotiated one.
+    #[tokio::test]
+    async fn fetches_multi_piece_metadata_from_a_real_peer() {
+        // big enough to span three 16KiB pieces, so reassembly and the short final piece both
+        // get exercised rather than fitting in a single message
+        let mut raw_info = sample_info_dict();
+        let padding_needed = METADATA_PIECE_SIZE * 2 + 1234 - raw_info.len();
+        raw_info.pop(); // the trailing 'e'
+        raw_info.extend_from_slice(&bencode_str(b"padding"));
+        raw_info.extend_from_slice(&bencode_str(&vec![b'x'; padding_needed - 20]));
+        raw_info.push(b'e');
+        assert!(
+            raw_info.len() > METADATA_PIECE_SIZE * 2,
+            "want a genuinely multi-piece fetch"
+        );
+        let info_hash = InfoHash::from_bytes(Sha1::digest(&raw_info).as_slice());
+
+        let addr = spawn_metadata_peer(raw_info.clone(), 5).await;
+        let fetched = fetch_from_peer(addr, info_hash, V2Support::None, Arc::new(test_identity()), None)
+            .await
+            .unwrap();
+        assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
+    }
+
+    /// The security property that makes it safe to take metadata from an untrusted peer: bytes
+    /// that don't hash to the requested info hash must be rejected, not handed back.
+    #[tokio::test]
+    async fn rejects_metadata_that_doesnt_match_the_info_hash() {
+        let honest = sample_info_dict();
+        let real_hash = InfoHash::from_bytes(Sha1::digest(&honest).as_slice());
+        // what the peer actually serves: same length, different bytes
+        let mut tampered = honest.clone();
+        let last = tampered.len() - 2;
+        tampered[last] ^= 0xff;
+
+        let addr = spawn_metadata_peer(tampered, UT_METADATA_ID).await;
+        let err = fetch_from_peer(addr, real_hash, V2Support::None, Arc::new(test_identity()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("doesn't match the requested info hash"),
+            "expected an info-hash mismatch, got: {err:#}"
+        );
+    }
+
     /// A barely-HTTP tracker that answers every announce with a compact peer list containing
     /// exactly `peers`, in order.
     async fn spawn_http_tracker_with(peers: Vec<SocketAddr>) -> String {
@@ -804,15 +724,7 @@ mod test {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
-        let mut compact = Vec::new();
-        for peer in peers {
-            let SocketAddr::V4(peer_v4) = peer else {
-                panic!("test peer must be v4")
-            };
-            compact.extend_from_slice(&peer_v4.ip().octets());
-            compact.extend_from_slice(&peer_v4.port().to_be_bytes());
-        }
+        let compact: Vec<u8> = peers.iter().flat_map(midwest_mainline::message::compact_addr).collect();
 
         tokio::spawn(async move {
             while let Ok((mut tcp, _)) = listener.accept().await {
@@ -840,114 +752,67 @@ mod test {
         format!("http://{addr}/announce")
     }
 
+    /// Resolves a magnet for `raw_info` that names `tracker`, with no DHT.
+    async fn resolve(raw_info: &[u8], tracker: String, within: Duration) -> Torrent {
+        let magnet = MagnetLink {
+            info_hash: InfoHash::from_bytes(Sha1::digest(raw_info).as_slice()),
+            info_hash_v2: None,
+            display_name: Some("hello".to_string()),
+            trackers: vec![tracker],
+            web_seeds: vec![],
+            peers: vec![],
+            select_only: None,
+            feed: None,
+        };
+        let fetching = fetch(
+            &magnet,
+            Arc::new(test_identity()),
+            CancellationToken::new(),
+            crate::dht::Dht::none(),
+            crate::utp::none(),
+            EventBus::new(),
+        );
+        tokio::time::timeout(within, fetching)
+            .await
+            .expect("magnet resolution timed out")
+            .expect("magnet resolution failed")
+            .torrent
+    }
+
     /// The whole magnet path end to end: announce to a tracker, take the peer it returns, fetch
     /// the metadata from that peer over BEP 9, verify it, and build a usable `Torrent` -- with
     /// no DHT anywhere, which is the point.
     #[tokio::test]
     async fn resolves_a_magnet_link_into_a_torrent_via_a_tracker() {
         let raw_info = sample_info_dict();
-        let info_hash = InfoHash::from_bytes(Sha1::digest(&raw_info).as_slice());
+        let peer = spawn_metadata_peer(raw_info.clone(), UT_METADATA_ID).await;
+        let tracker = spawn_http_tracker_with(vec![peer]).await;
 
-        let peer_addr = spawn_metadata_peer(raw_info.clone()).await;
-        let tracker_url = spawn_http_tracker_with(vec![peer_addr]).await;
-
-        let magnet = MagnetLink {
-            info_hash,
-            info_hash_v2: None,
-            display_name: Some("hello".to_string()),
-            trackers: vec![tracker_url],
-            web_seeds: vec![],
-            peers: vec![],
-            select_only: None,
-            feed: None,
-        };
-        let identity = Arc::new(Identity {
-            peer_id: *b"-TEST01-000000000000",
-            serving: "127.0.0.1:6881".parse().unwrap(),
-            dht: false,
-            encryption: crate::config::Encryption::Disabled,
-        });
-
-        let torrent = tokio::time::timeout(
-            Duration::from_secs(20),
-            fetch(
-                &magnet,
-                identity,
-                CancellationToken::new(),
-                crate::dht::Dht::none(),
-                crate::utp::none(),
-                EventBus::new(),
-            ),
-        )
-        .await
-        .expect("magnet resolution timed out")
-        .expect("magnet resolution failed")
-        .torrent;
-
-        assert_eq!(torrent.info_hash, info_hash);
+        let torrent = resolve(&raw_info, tracker, Duration::from_secs(20)).await;
+        assert_eq!(torrent.info_hash.0, Sha1::digest(&raw_info).as_slice());
         assert_eq!(torrent.raw_info, raw_info);
         assert_eq!(torrent.total_size, 12);
         assert_eq!(torrent.files.len(), 1);
     }
 
-    /// Regression: a tracker returning more peers than `MAX_CONCURRENT_FETCHES` used to have
-    /// the overflow silently dropped, so if the first batch of peers were all dead we'd sit
-    /// idle until the *next* announce -- an interval (often 30 minutes) later, i.e. far past
-    /// any timeout. Here every peer before the last is a closed port, so this only passes if
-    /// the overflow is queued and dialled as slots free up.
+    /// More peers than MAX_CONCURRENT_FETCHES from one announce, every one before the last a
+    /// closed port: the overflow must be queued and dialled as slots free up, not dropped
+    /// until the tracker's next announce, which is far past any timeout.
     #[tokio::test]
     async fn works_through_more_dead_peers_than_the_concurrency_limit() {
         use tokio::net::TcpListener;
 
         let raw_info = sample_info_dict();
-        let info_hash = InfoHash::from_bytes(Sha1::digest(&raw_info).as_slice());
-
         // bind then immediately drop, so the addresses are real but refuse connections
-        let dead_count = MAX_CONCURRENT_FETCHES + 4;
         let mut peers = Vec::new();
-        for _ in 0..dead_count {
+        for _ in 0..MAX_CONCURRENT_FETCHES + 4 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             peers.push(listener.local_addr().unwrap());
-            drop(listener);
         }
-        // the one live peer sits at the very end of the list
-        let live = spawn_metadata_peer(raw_info.clone()).await;
-        peers.push(live);
+        peers.push(spawn_metadata_peer(raw_info.clone(), UT_METADATA_ID).await);
+        let tracker = spawn_http_tracker_with(peers).await;
 
-        let tracker_url = spawn_http_tracker_with(peers).await;
-        let magnet = MagnetLink {
-            info_hash,
-            info_hash_v2: None,
-            display_name: None,
-            trackers: vec![tracker_url],
-            web_seeds: vec![],
-            peers: vec![],
-            select_only: None,
-            feed: None,
-        };
-        let identity = Arc::new(Identity {
-            peer_id: *b"-TEST01-000000000000",
-            serving: "127.0.0.1:6881".parse().unwrap(),
-            dht: false,
-            encryption: crate::config::Encryption::Disabled,
-        });
-
-        let torrent = tokio::time::timeout(
-            Duration::from_secs(25),
-            fetch(
-                &magnet,
-                identity,
-                CancellationToken::new(),
-                crate::dht::Dht::none(),
-                crate::utp::none(),
-                EventBus::new(),
-            ),
-        )
-        .await
-        .expect("should reach the live peer well before the timeout")
-        .expect("magnet resolution failed")
-        .torrent;
-
-        assert_eq!(torrent.info_hash, info_hash);
+        let torrent = resolve(&raw_info, tracker, Duration::from_secs(25)).await;
+        assert_eq!(torrent.raw_info, raw_info);
     }
 }
