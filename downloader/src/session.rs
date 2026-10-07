@@ -54,8 +54,11 @@ pub enum TorrentState {
         #[serde(rename = "elapsed_ms", serialize_with = "json::millis")]
         elapsed: Duration,
     },
+    /// Running: downloading, or seeding once `Progress::completed`, which is the same thing to
+    /// a front end (peers, rates, the pause button) but for the label
     Downloading(Progress),
-    /// Stopped by the user: no connections, files and progress kept, ready to `unpause`
+    /// Stopped by the user, or by the seeding ratio limit: no connections, files and
+    /// progress kept, ready to `unpause`
     Paused(Progress),
     /// Waiting for one of `Settings::max_active_downloads` slots; starts by itself
     Queued(Progress),
@@ -69,6 +72,17 @@ pub enum TorrentState {
         source: String,
         error: String,
     },
+}
+
+impl TorrentState {
+    /// The progress of a torrent that's known and not being checked: running, paused or
+    /// queued.
+    pub fn progress(&self) -> Option<&Progress> {
+        match self {
+            TorrentState::Downloading(p) | TorrentState::Paused(p) | TorrentState::Queued(p) => Some(p),
+            TorrentState::Resolving { .. } | TorrentState::Checking { .. } | TorrentState::Failed { .. } => None,
+        }
+    }
 }
 
 /// A flat snapshot of download progress, in the units a UI wants to display.

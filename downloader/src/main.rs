@@ -180,8 +180,7 @@ fn report_until_done(session: &mut Session, id: TorrentId, seed: bool, interrupt
             return 1;
         };
         let due = last_report.elapsed() >= REPORT_EVERY;
-        let paused = matches!(state, TorrentState::Paused(_));
-        match state {
+        match &state {
             TorrentState::Failed { error, .. } => {
                 tracing::error!("{error}");
                 return 1;
@@ -190,35 +189,36 @@ fn report_until_done(session: &mut Session, id: TorrentId, seed: bool, interrupt
                 tracing::info!("resolving, {}s so far", elapsed.as_secs());
                 last_report = Instant::now();
             }
-            TorrentState::Downloading(p) | TorrentState::Paused(p) | TorrentState::Queued(p) => {
-                if !announced_metadata {
-                    tracing::info!("got metadata for {} files, downloading into {}", p.files.len(), p.root);
-                    announced_metadata = true;
-                }
-                if p.completed && !seed {
-                    tracing::info!("{} is complete in {}", p.name, p.root);
-                    return 0;
-                }
-                // the session stops a complete torrent once it has seeded to the ratio limit
-                if p.completed && paused {
-                    tracing::info!("{} has seeded to the ratio limit", p.name);
-                    return 0;
-                }
-                if due {
-                    tracing::info!(
-                        "{:.1}%  {}/{} pieces  down {}  up {}  {} peers{}",
-                        p.fraction() * 100.0,
-                        p.verified_pieces,
-                        p.total_pieces,
-                        rate(p.download_bps),
-                        rate(p.upload_bps),
-                        p.peers.len(),
-                        if p.completed { "  seeding" } else { "" }
-                    );
-                    last_report = Instant::now();
-                }
-            }
             _ => {}
+        }
+        let Some(p) = state.progress() else {
+            continue;
+        };
+        if !announced_metadata {
+            tracing::info!("got metadata for {} files, downloading into {}", p.files.len(), p.root);
+            announced_metadata = true;
+        }
+        if p.completed && !seed {
+            tracing::info!("{} is complete in {}", p.name, p.root);
+            return 0;
+        }
+        // the session stops a complete torrent once it has seeded to the ratio limit
+        if p.completed && matches!(state, TorrentState::Paused(_)) {
+            tracing::info!("{} has seeded to the ratio limit", p.name);
+            return 0;
+        }
+        if due {
+            tracing::info!(
+                "{:.1}%  {}/{} pieces  down {}  up {}  {} peers{}",
+                p.fraction() * 100.0,
+                p.verified_pieces,
+                p.total_pieces,
+                rate(p.download_bps),
+                rate(p.upload_bps),
+                p.peers.len(),
+                if p.completed { "  seeding" } else { "" }
+            );
+            last_report = Instant::now();
         }
     }
 }
