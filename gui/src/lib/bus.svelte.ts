@@ -15,6 +15,9 @@ const PICKS_KEPT = 400
 /** peers gone for good are kept this long in the table */
 const DEPARTED_KEPT = 200
 const LOG_KEPT = 100
+/** the backend sends a batch every 100 ms; the charts take them in on the UI's 250 ms beat, so
+ * each animation gets to run rather than restarting at every batch */
+const PUBLISH_MS = 250
 
 function bump<K>(counts: Map<K, number>, key: K, by = 1) {
   counts.set(key, (counts.get(key) ?? 0) + by)
@@ -117,7 +120,20 @@ export class Insights {
   private newPicks: Pick[] = []
   private ratesChanged = false
 
+  private queued: Stamped[] = []
+  private flush: ReturnType<typeof setTimeout> | null = null
+
   ingest(batch: Stamped[]) {
+    this.queued = this.queued.concat(batch)
+    this.flush ??= setTimeout(() => {
+      this.flush = null
+      const queued = this.queued
+      this.queued = []
+      this.take(queued)
+    }, PUBLISH_MS)
+  }
+
+  private take(batch: Stamped[]) {
     for (const e of batch) this.one(e)
     this.feed = this.feed.concat(batch).slice(-FEED_LINES)
     this.received += batch.length
@@ -346,6 +362,7 @@ export class Insights {
   }
 
   clear() {
+    this.queued = []
     this.feed = []
     this.counts.clear()
     this.received = 0
