@@ -383,6 +383,38 @@ fn parse_info<'a>(mut info: Dict<'a>) -> anyhow::Result<Info<'a>> {
     })
 }
 
+/// Renames files whose path an earlier file already has on disk (`a.txt` becomes `a.1.txt`), as
+/// libtorrent does: two entries writing one file would overwrite each other's verified pieces.
+/// On macOS's and Windows' case-insensitive disks, paths differing only in case are the same.
+fn give_each_file_its_own_path(files: &mut [TorrentFile]) {
+    let key = |path: &Path| {
+        let path = path.to_string_lossy();
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            path.to_lowercase()
+        } else {
+            path.into_owned()
+        }
+    };
+    let mut taken = std::collections::HashSet::new();
+    for file in files.iter_mut().filter(|f| !f.attr.pad) {
+        if taken.insert(key(&file.path)) {
+            continue;
+        }
+        let stem = file.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let ext = file
+            .path
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
+            .unwrap_or_default();
+        let renamed = (1u64..)
+            .map(|n| file.path.with_file_name(format!("{stem}.{n}{ext}")))
+            .find(|path| !taken.contains(&key(path)))
+            .expect("some number is free");
+        taken.insert(key(&renamed));
+        file.path = renamed;
+    }
+}
+
 /// The tracker tiers of `announce-list`, or `announce` alone. Neither is required: a torrent
 /// built from a tracker-less magnet finds its peers over the DHT.
 fn announce_tiers(torrent: &mut Dict) -> anyhow::Result<Vec<Vec<String>>> {
@@ -440,7 +472,8 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         roots,
     } = parse_info(info)?;
 
-    let files = layout.files;
+    let mut files = layout.files;
+    give_each_file_its_own_path(&mut files);
     if files.is_empty() {
         bail!("torrent has no files");
     }

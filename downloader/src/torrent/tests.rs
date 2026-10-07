@@ -804,3 +804,20 @@ fn a_v2_torrent_claiming_billions_of_pieces_is_refused() {
     let err = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap_err();
     assert!(format!("{err:#}").contains("too many pieces"), "{err:#}");
 }
+
+/// Two entries of a v1 list may name the same path (and on a case-insensitive disk, two that
+/// differ only in case are the same file too); each needs a file of its own, or one's pieces
+/// overwrite the other's after they've been verified. The web seed path stays as given.
+#[test]
+fn files_sharing_a_path_get_one_each() {
+    let info = b"d5:filesld6:lengthi4e4:pathl5:a.txteed6:lengthi4e4:pathl5:a.txteed6:lengthi4e4:pathl5:A.TXTeed6:lengthi4e4:pathl7:a.1.txteee4:name1:t12:piece lengthi16e6:pieces20:01234567890123456789e";
+    let t = parse_torrent(&crate::metadata::build_torrent_file(info, &[])).unwrap();
+    let paths: Vec<_> = t.files.iter().map(|f| f.path.to_str().unwrap()).collect();
+    let folded = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        ["t/a.txt", "t/a.1.txt", "t/A.2.TXT", "t/a.1.1.txt"]
+    } else {
+        ["t/a.txt", "t/a.1.txt", "t/A.TXT", "t/a.1.1.txt"]
+    };
+    assert_eq!(paths, folded);
+    assert_eq!(t.files[1].raw_path, ["t", "a.txt"]);
+}
