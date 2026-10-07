@@ -140,6 +140,20 @@ impl Holepunch {
     }
 }
 
+/// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
+pub(crate) struct ConnectedPeer {
+    pub stream: PeerStream,
+    /// we opened it (as opposed to accepting it), so its encryption says what the peer takes
+    pub dialed: bool,
+    pub remote_addr: SocketAddr,
+    pub remote_supports_extensions: bool,
+    pub remote_supports_fast: bool,
+    pub remote_supports_dht: bool,
+    /// BEP 52: the connection can carry hash requests (see `V2Support::v2_peer`)
+    pub remote_supports_v2: bool,
+    pub peer_id: [u8; 20],
+}
+
 /// What a peer's reader (or a failing writer) hands the swarm: the next message, `None` when the
 /// peer hung up, or the error that ended the connection. `conn` tells this connection apart from
 /// a later one to the same address, whose messages must not be mixed up with a dead one's.
@@ -344,15 +358,16 @@ pub(crate) struct ProtocolViolation(pub String);
 impl Peer {
     /// Starts the connection's reader and writer tasks on the current runtime; the reader
     /// delivers to `inbox` tagged with `conn`.
-    pub fn new(
-        stream: PeerStream,
-        remote_addr: SocketAddr,
-        num_pieces: usize,
-        remote_supports_fast: bool,
-        peer_id: [u8; 20],
-        conn: u64,
-        inbox: Inbox,
-    ) -> Self {
+    pub fn new(connected: ConnectedPeer, num_pieces: usize, conn: u64, inbox: Inbox) -> Self {
+        let ConnectedPeer {
+            stream,
+            dialed,
+            remote_addr,
+            remote_supports_fast,
+            remote_supports_v2,
+            peer_id,
+            ..
+        } = connected;
         let encrypted = stream.is_encrypted();
         let utp = stream.is_utp();
         // room for a whole block and then some, so a 16 KiB Piece doesn't grow the buffer
@@ -373,7 +388,7 @@ impl Peer {
             remote_addr,
             remote_supports_fast,
             encrypted,
-            v2: false,
+            v2: remote_supports_v2,
             utp,
             their_ids: [None; Extension::ALL.len()],
             upload_only: false,
@@ -381,7 +396,7 @@ impl Peer {
             dht_port: None,
             listen_port: None,
             their_reqq: None,
-            dialed: false,
+            dialed,
             super_seed: None,
             conn,
             outbox,
@@ -1094,6 +1109,30 @@ impl PeerStatistics {
 mod test {
     use super::*;
 
+    /// A peer of a torrent of `pieces` over a localhost socket, the socket's other end, and
+    /// where the peer's reader delivers.
+    async fn test_peer(pieces: usize) -> (Peer, tokio::net::TcpStream, mpsc::Receiver<Incoming>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (other_end, _) = listener.accept().await.unwrap();
+        let connected = ConnectedPeer {
+            stream: PeerStream::Tcp(tcp),
+            dialed: false,
+            remote_addr: "10.0.0.1:1".parse().unwrap(),
+            remote_supports_extensions: false,
+            remote_supports_fast: false,
+            remote_supports_dht: false,
+            remote_supports_v2: false,
+            peer_id: [0; 20],
+        };
+        let (inbox, incoming) = mpsc::channel(8);
+        (Peer::new(connected, pieces, 0, inbox), other_end, incoming)
+    }
+
     #[test]
     fn holepunch_messages_round_trip_and_junk_is_refused() {
         for msg in [
@@ -1121,23 +1160,7 @@ mod test {
 
     #[tokio::test]
     async fn their_handshake_sets_ids_upload_only_and_yourip_and_donthave_clears_a_piece() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let _other_end = listener.accept().await.unwrap();
-        let (inbox, _incoming) = mpsc::channel(8);
-        let mut peer = Peer::new(
-            PeerStream::Tcp(tcp),
-            "10.0.0.1:1".parse().unwrap(),
-            9,
-            false,
-            [0u8; 20],
-            0,
-            inbox,
-        );
+        let (mut peer, _other_end, _incoming) = test_peer(9).await;
 
         let mut payload = b"d1:md11:ut_metadatai3e6:ut_pexi300ee11:upload_onlyi1e6:yourip4:".to_vec();
         payload.extend_from_slice(&[203, 0, 113, 9]);
@@ -1180,23 +1203,7 @@ mod test {
     /// so a peer repeating it can't have us ping over and over.
     #[tokio::test]
     async fn only_the_first_dht_port_reaches_the_swarm() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let _other_end = listener.accept().await.unwrap();
-        let (inbox, _incoming) = mpsc::channel(8);
-        let mut peer = Peer::new(
-            PeerStream::Tcp(tcp),
-            "10.0.0.1:1".parse().unwrap(),
-            4,
-            false,
-            [0u8; 20],
-            0,
-            inbox,
-        );
+        let (mut peer, _other_end, _incoming) = test_peer(4).await;
         let port = || BtMessage::Port(Port { port: 6881 });
         assert!(matches!(peer.apply(port()), Ok(Some(BtMessage::Port(_)))));
         for _ in 0..3 {
@@ -1464,23 +1471,7 @@ mod test {
 
     #[tokio::test]
     async fn stalled_means_no_delivery_not_old_requests() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let _other_end = listener.accept().await.unwrap();
-        let (inbox, _incoming) = mpsc::channel(8);
-        let mut peer = Peer::new(
-            PeerStream::Tcp(tcp),
-            "10.0.0.1:1".parse().unwrap(),
-            4,
-            false,
-            [0u8; 20],
-            0,
-            inbox,
-        );
+        let (mut peer, _other_end, _incoming) = test_peer(4).await;
         let limit = Duration::from_millis(50);
 
         assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");

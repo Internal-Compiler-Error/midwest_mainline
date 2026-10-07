@@ -121,23 +121,14 @@ impl TorrentSwarm {
         }
 
         self.next_conn += 1;
-        let mut peer = Peer::new(
-            connected.stream,
+        let (extensions, dht) = (connected.remote_supports_extensions, connected.remote_supports_dht);
+        let connected = ConnectedPeer {
             remote_addr,
-            self.torrent.num_pieces(),
-            connected.remote_supports_fast,
-            connected.peer_id,
-            self.next_conn,
-            self.inbox.clone(),
-        );
+            ..connected
+        };
+        let mut peer = Peer::new(connected, self.torrent.num_pieces(), self.next_conn, self.inbox.clone());
         peer.stats = known.stats.clone();
-        peer.dialed = connected.dialed;
-        peer.v2 = connected.remote_supports_v2;
-        let opened = self.open(
-            &mut peer,
-            connected.remote_supports_extensions,
-            connected.remote_supports_dht,
-        );
+        let opened = self.open(&mut peer, extensions, dht);
         if let Err(e) = opened {
             info!("{remote_addr} went away during the opening exchange ({e})");
             self.known
@@ -155,7 +146,7 @@ impl TorrentSwarm {
             client = %crate::peer::client_name(&peer.peer_id),
             transport = if peer.utp { "utp" } else { "tcp" },
             encrypted = peer.encrypted,
-            dialed = connected.dialed,
+            dialed = peer.dialed,
             downloaded = tracing::field::Empty,
             uploaded = tracing::field::Empty,
             reason = tracing::field::Empty,
@@ -164,7 +155,7 @@ impl TorrentSwarm {
             info_hash: self.torrent.info_hash,
             addr: remote_addr,
             client: crate::peer::client_name(&peer.peer_id),
-            dialed: connected.dialed,
+            dialed: peer.dialed,
             encrypted: peer.encrypted,
             utp: peer.utp,
         });

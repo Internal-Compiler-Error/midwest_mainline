@@ -7,12 +7,12 @@ use crate::external::ExternalAddress;
 use crate::layers::LayerFetch;
 use crate::limiter::RateLimiter;
 use crate::merkle::Hash;
+pub(crate) use crate::peer::ConnectedPeer;
 use crate::peer::{Inbox, Incoming, Peer, PeerSnapshot};
 use crate::settings::{
     BLOCK_REQUEST_TIMEOUT, CHOKING_ROUND_INTERVAL, KEEPALIVE_INTERVAL, PEER_TIMEOUT, PEX_INTERVAL, SWARM_INBOX,
 };
 use crate::storage::TorrentStorage;
-use crate::stream::PeerStream;
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
 use crate::webseed::{Failure, WebSeed};
@@ -197,20 +197,6 @@ pub(crate) struct Shared {
     pub external: ExternalAddress,
     /// the client's: its announcers say goodbye when this goes, not only when the swarm does
     pub shutdown: CancellationToken,
-}
-
-/// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
-pub(crate) struct ConnectedPeer {
-    pub stream: PeerStream,
-    /// we opened it (as opposed to accepting it), so its encryption says what the peer takes
-    pub dialed: bool,
-    pub remote_addr: SocketAddr,
-    pub remote_supports_extensions: bool,
-    pub remote_supports_fast: bool,
-    pub remote_supports_dht: bool,
-    /// BEP 52: the connection can carry hash requests (see `V2Support::v2_peer`)
-    pub remote_supports_v2: bool,
-    pub peer_id: [u8; 20],
 }
 
 /// Everything that reaches the swarm's event loop from outside it: things that happened in
