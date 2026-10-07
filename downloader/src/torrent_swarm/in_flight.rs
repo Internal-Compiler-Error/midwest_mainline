@@ -15,6 +15,34 @@ struct Claim {
     /// walk the piece from the end: the second peer racing for a piece goes the other way,
     /// so the two meet in the middle and the bytes fetched twice are roughly halved
     reverse: bool,
+    /// blocks the claimant rejected, to ask for again before moving on
+    retry: Vec<usize>,
+    /// how many of this piece's requests it has rejected
+    rejects: u8,
+}
+
+impl Claim {
+    fn from(cursor: usize, reverse: bool) -> Self {
+        Claim {
+            cursor,
+            reverse,
+            retry: Vec::new(),
+            rejects: 0,
+        }
+    }
+}
+
+/// Rejects of one piece's requests after which a claimant gives the piece up: the first few
+/// are usually a full request queue, not a refusal.
+const MAX_REJECTS: u8 = 3;
+
+/// What becomes of a claim when its claimant rejects one of its requests.
+#[derive(Debug, PartialEq)]
+pub(super) enum Rejected {
+    /// the block will be asked for again
+    Retry,
+    /// it rejected too often; the claim should go
+    GiveUp,
 }
 
 /// Who "delivered" a block of padding (BEP 47): nobody, it's zeros from the start.
@@ -25,6 +53,9 @@ const PADDING: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net:
 /// failed hash can still convict a lone sender.
 pub(super) struct InFlight {
     pub(super) buf: Vec<u8>,
+    /// where the piece ends as peers see it (`Torrent::wire_piece_len`); a request never runs
+    /// past it
+    wire_len: usize,
     /// per block, the claimant it arrived from
     received: Vec<Option<SocketAddr>>,
     claims: BTreeMap<SocketAddr, Claim>,
@@ -66,14 +97,9 @@ impl InFlight {
         }
         Self {
             buf: vec![0u8; size],
+            wire_len: torrent.wire_piece_len(piece).expect("piece index in range"),
             received,
-            claims: BTreeMap::from([(
-                claimant,
-                Claim {
-                    cursor: 0,
-                    reverse: false,
-                },
-            )]),
+            claims: BTreeMap::from([(claimant, Claim::from(0, false))]),
             span: tracing::info_span!(
                 "piece",
                 info_hash = %torrent.info_hash,
@@ -111,7 +137,7 @@ impl InFlight {
         Request {
             index: piece,
             begin: begin as u32,
-            length: (self.buf.len() - begin).min(BLOCK_SIZE) as u32,
+            length: self.wire_len.saturating_sub(begin).min(BLOCK_SIZE) as u32,
         }
     }
 
@@ -119,6 +145,11 @@ impl InFlight {
     /// arrived from anyone yet.
     fn next_request(&mut self, piece: u32, claimant: SocketAddr) -> Option<Request> {
         let claim = self.claims.get_mut(&claimant)?;
+        while let Some(block) = claim.retry.pop() {
+            if self.received[block].is_none() {
+                return Some(self.request(piece, block));
+            }
+        }
         loop {
             let block = claim.cursor;
             if block >= self.received.len() {
@@ -140,15 +171,32 @@ impl InFlight {
         let Some(claim) = self.claims.get(&claimant) else {
             return 0;
         };
+        let retries = claim.retry.iter().filter(|&&b| self.received[b].is_none()).count();
         if claim.cursor >= self.received.len() {
-            return 0;
+            return retries;
         }
         let ahead = if claim.reverse {
             &self.received[..=claim.cursor]
         } else {
             &self.received[claim.cursor..]
         };
-        ahead.iter().filter(|r| r.is_none()).count()
+        retries + ahead.iter().filter(|r| r.is_none()).count()
+    }
+
+    /// `claimant` rejected its request for the block at `begin`.
+    fn rejected(&mut self, claimant: SocketAddr, begin: u32) -> Rejected {
+        let Some(claim) = self.claims.get_mut(&claimant) else {
+            return Rejected::GiveUp;
+        };
+        claim.rejects += 1;
+        if claim.rejects >= MAX_REJECTS {
+            return Rejected::GiveUp;
+        }
+        let block = begin as usize / BLOCK_SIZE;
+        if block < self.received.len() && !claim.retry.contains(&block) {
+            claim.retry.push(block);
+        }
+        Rejected::Retry
     }
 
     pub(super) fn blocks_left(&self) -> usize {
@@ -233,7 +281,7 @@ impl InFlightPieces {
         let f = self.pieces.get_mut(&piece).expect("racing a piece in flight");
         let reverse = f.claims.len() % 2 == 1;
         let cursor = if reverse { f.received.len() - 1 } else { 0 };
-        f.claims.insert(racer, Claim { cursor, reverse });
+        f.claims.insert(racer, Claim::from(cursor, reverse));
         f.span.record("racers", f.claims.len());
         tracing::debug!(parent: &f.span, peer = %racer, "racer joined");
         self.holdings.entry(racer).or_default().insert(piece);
@@ -243,7 +291,7 @@ impl InFlightPieces {
     pub(super) fn claim_rest(&mut self, piece: u32, claimant: SocketAddr) {
         let f = self.pieces.get_mut(&piece).expect("claiming a piece in flight");
         let cursor = f.received.len();
-        f.claims.insert(claimant, Claim { cursor, reverse: false });
+        f.claims.insert(claimant, Claim::from(cursor, false));
         f.span.record("racers", f.claims.len());
         self.holdings.entry(claimant).or_default().insert(piece);
     }
@@ -274,6 +322,15 @@ impl InFlightPieces {
         let held = self.holdings.get(&claimant)?;
         held.iter()
             .find_map(|&piece| self.pieces.get_mut(&piece)?.next_request(piece, claimant))
+    }
+
+    /// `claimant` rejected `request`: the block is asked for again later, unless it has
+    /// rejected this piece too often, when the claim should be released.
+    pub(super) fn rejected(&mut self, claimant: SocketAddr, request: Request) -> Rejected {
+        match self.pieces.get_mut(&request.index) {
+            Some(f) => f.rejected(claimant, request.begin),
+            None => Rejected::GiveUp,
+        }
     }
 
     /// Takes `claimant` off `piece`. A piece left with no claimant isn't in flight any more,
@@ -409,5 +466,19 @@ mod test {
         assert!(pieces.finish(0).is_some());
         assert!(pieces.held_by(addr(1)).is_empty());
         assert_eq!(pieces.len(), 0);
+    }
+
+    /// A v2-only piece that ends with its file: the block across the file's end is asked for
+    /// only up to it, as a peer would refuse more.
+    #[test]
+    fn a_request_stops_where_a_v2_file_ends() {
+        let files: &[(&[&str], Vec<u8>)] = &[(&["a"], vec![1; 40_000]), (&["b"], vec![2; 10])];
+        let torrent =
+            crate::parse_torrent(&crate::torrent::fixtures::torrent_file("wire", files, 32_768, false)).unwrap();
+        let mut pieces = InFlightPieces::default();
+        pieces.start(1, InFlight::new(&torrent, 1, addr(1), "a"));
+        let first = pieces.next_request(addr(1)).unwrap();
+        assert_eq!((first.begin, first.length), (0, 40_000 - 32_768));
+        assert_eq!(pieces.next_request(addr(1)), None, "the rest is padding");
     }
 }

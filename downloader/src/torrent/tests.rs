@@ -454,6 +454,10 @@ fn lays_out_a_v2_torrent_with_padding() {
     );
     assert!(t.padding_in_piece(2).is_empty());
     assert_eq!(t.files[2].raw_path, ["v2", "b", "c"]);
+    // on the wire, `a`'s last piece ends with `a`; the padding is only ours
+    assert_eq!(t.wire_piece_len(1), Some(40_000 - P));
+    assert_eq!(t.wire_piece_len(2), Some(P));
+    assert_eq!(t.wire_piece_len(4), Some(70_000 - 2 * P));
 
     let stream = stream(&files);
     for piece in 0..5u32 {
@@ -720,6 +724,7 @@ fn parses_padding_and_attributes() {
     assert_eq!(t.files[3].attr.symlink, Some(PathBuf::from("b")));
     assert!(t.files[3].attr.virtual_file());
     assert_eq!(t.padding_in_piece(0), [Range { start: 10, end: 16 }]);
+    assert_eq!(t.wire_piece_len(0), Some(16), "v1 padding is part of the piece");
     assert!(t.padding_in_piece(1).is_empty());
     // only the pieces of selected real files are wanted, never padding's
     assert_eq!(

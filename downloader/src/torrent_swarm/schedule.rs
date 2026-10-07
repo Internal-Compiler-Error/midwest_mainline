@@ -549,6 +549,41 @@ mod test {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// A peer whose queue is full rejects a request now and then: the block is asked for
+    /// again, from the same peer, and what the piece already has is kept.
+    #[tokio::test]
+    async fn a_rejected_block_is_asked_for_again() {
+        let (swarm, handle, path) = swarm("reject-once");
+        tokio::spawn(swarm.work_loop());
+        let mut a = fake_peer(&handle, "10.0.0.6:6881").await;
+        open_as_seeder(&mut a).await;
+        let Some(Ok(BtMessage::Request(first))) = a.next().await else {
+            panic!("expected a request");
+        };
+        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
+            index: first.index,
+            begin: first.begin,
+            length: first.length,
+        }))
+        .await
+        .unwrap();
+        // it serves everything else, which drains its queue
+        let again = async {
+            loop {
+                match a.next().await {
+                    Some(Ok(BtMessage::Request(req))) if req == first => break,
+                    Some(Ok(BtMessage::Request(req))) => a.send(block(req)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("a's socket ended: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), again)
+            .await
+            .expect("the rejected block was never asked for again");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// A piece one peer rejects must be re-requested from the *other* ready peer. This used to
     /// fail: after its first request the picked peer's UCB score was NaN, which sorts above the
     /// fresh peer's infinity, so it was picked again and again.
@@ -570,13 +605,25 @@ mod test {
         // the swarm a moment to have seen them, or a is the only ready peer when it reschedules
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
-            index: rejected.index,
-            begin: rejected.begin,
-            length: rejected.length,
-        }))
-        .await
-        .unwrap();
+        // a rejects every request for that piece, as one that won't serve it would; one
+        // reject is taken for a full queue and retried, a few mean the piece goes elsewhere
+        let reject = |req: Request| {
+            BtMessage::RejectRequest(crate::wire::RejectRequest {
+                index: req.index,
+                begin: req.begin,
+                length: req.length,
+            })
+        };
+        a.send(reject(rejected)).await.unwrap();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = a.next().await {
+                if let BtMessage::Request(req) = msg
+                    && req.index == rejected.index
+                {
+                    let _ = a.send(reject(req)).await;
+                }
+            }
+        });
 
         let b_gets_it = async {
             loop {

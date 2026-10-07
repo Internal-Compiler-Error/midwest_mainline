@@ -1,6 +1,7 @@
 //! What peers send: messages about the connection's own state are applied by the `Peer`, and
 //! the swarm follows up on what changed; the rest go to the part of the swarm they concern.
 
+use super::in_flight::Rejected;
 use crate::events::Event;
 use crate::peer::{Extension, Holepunch, ProtocolViolation};
 use crate::wire::{BtMessage, Extended, RejectRequest, Request};
@@ -138,17 +139,28 @@ impl TorrentSwarm {
         }
     }
 
-    /// BEP 6: the peer is declining a request we made; the piece it belonged to goes back on
-    /// the pile rather than idling out BLOCK_REQUEST_TIMEOUT.
+    /// BEP 6: the peer is declining a request we made. Mostly its queue was full, so the
+    /// block is asked for again as its queue drains, and what the piece has already stays; a
+    /// peer that keeps rejecting the piece gives it up, and it goes back on the pile rather
+    /// than idling out BLOCK_REQUEST_TIMEOUT.
     fn request_rejected(&mut self, idx: usize, reject: RejectRequest) {
         let req = Request::from(reject);
         let peer = &mut self.peers[idx];
-        if peer.requested.remove(&req).is_some() {
-            let addr = peer.remote_addr;
-            tracing::debug!("{addr} rejected {req:?}, giving up piece {} there", req.index);
-            self.release_claim(req.index, addr);
-            self.schedule();
+        if peer.requested.remove(&req).is_none() {
+            return;
         }
+        // what it still holds of ours is as deep as its queue goes
+        let held = peer.requested.len().max(1);
+        peer.their_reqq = Some(peer.their_reqq.map_or(held, |reqq| reqq.min(held)));
+        let addr = peer.remote_addr;
+        match self.in_flight.rejected(addr, req) {
+            Rejected::Retry => tracing::debug!("{addr} rejected {req:?}, asking again later"),
+            Rejected::GiveUp => {
+                tracing::debug!("{addr} rejected {req:?} too often, giving up piece {} there", req.index);
+                self.release_claim(req.index, addr);
+            }
+        }
+        self.schedule();
     }
 
     /// BEP 54: the peer dropped a piece; it can't be given that piece any more.

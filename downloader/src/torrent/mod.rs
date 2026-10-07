@@ -351,6 +351,18 @@ impl Torrent {
             })
     }
 
+    /// How long `piece` is as peers see it on the wire. A v2-only torrent's piece ends where
+    /// its file does (BEP 52): the padding after it that lines the next file up on a piece
+    /// boundary is ours, not part of the piece. Everywhere else, the piece's full size.
+    pub fn wire_piece_len(&self, piece: u32) -> Option<usize> {
+        let size = self.nth_piece_size(piece)?;
+        if !self.v2_only() {
+            return Some(size);
+        }
+        let trailing = self.padding_in_piece(piece).into_iter().find(|pad| pad.end == size);
+        Some(trailing.map_or(size, |pad| pad.start))
+    }
+
     /// Returns the size of the ith piece in bytes
     pub fn nth_piece_size<T: Into<u64>>(&self, i: T) -> Option<usize> {
         let i = i.into();

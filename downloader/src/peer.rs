@@ -185,6 +185,8 @@ pub(crate) struct Peer {
     pub upload_only: bool,
     /// BEP 10 `p`: the port the peer listens on, which an inbound TCP connection's own port isn't
     pub listen_port: Option<u16>,
+    /// BEP 10 `reqq`: how many requests the peer queues; past it, it rejects or drops them
+    pub their_reqq: Option<usize>,
     /// we dialed it, so `remote_addr` is where it listens
     pub dialed: bool,
     /// BEP 16: what super-seeding has shown this peer; `None` when it saw our real bitfield
@@ -361,6 +363,7 @@ impl Peer {
             upload_only: false,
             yourip: None,
             listen_port: None,
+            their_reqq: None,
             dialed: false,
             super_seed: None,
             conn,
@@ -427,8 +430,11 @@ impl Peer {
         !self.choked_us
     }
 
+    /// Requests to keep outstanding: what the measured rate calls for, within what the peer
+    /// says it will queue.
     pub fn request_window(&self) -> usize {
-        self.stats.request_window()
+        let ours = self.stats.request_window();
+        self.their_reqq.map_or(ours, |reqq| ours.min(reqq.max(1)))
     }
 
     pub fn snapshot(&self) -> PeerSnapshot {
@@ -523,6 +529,9 @@ impl Peer {
                     };
                 }
             }
+        }
+        if let Some(BencodeItemView::Integer(reqq)) = dict.get(b"reqq".as_slice()) {
+            self.their_reqq = usize::try_from(*reqq).ok().filter(|n| *n > 0);
         }
         if let Some(BencodeItemView::Integer(port)) = dict.get(b"p".as_slice()) {
             self.listen_port = u16::try_from(*port).ok().filter(|p| *p != 0);
