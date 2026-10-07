@@ -18,7 +18,6 @@ use crate::{dht::rpc_manager::Routable, models::NodeNoMetaInfo, utils::base64_en
 
 pub const NODE_ID_LEN: usize = 20;
 pub const ZERO_DIST: [u8; NODE_ID_LEN] = [0; NODE_ID_LEN];
-pub const MAX_DIST: [u8; NODE_ID_LEN] = [u8::MAX; NODE_ID_LEN];
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct NodeId(pub [u8; NODE_ID_LEN]);
@@ -26,7 +25,6 @@ pub struct NodeId(pub [u8; NODE_ID_LEN]);
 impl Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::prelude::*;
-        // let hex = hex::encode(self.0);
         let str = BASE64_STANDARD.encode(self.0);
         write!(f, "{}", str)
     }
@@ -110,7 +108,6 @@ impl std::fmt::Display for InfoHash {
 impl Debug for InfoHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::prelude::*;
-        // let hex = hex::encode(self.0);
         let str = BASE64_STANDARD.encode(self.0);
         write!(f, "{}", str)
     }
@@ -141,7 +138,6 @@ impl Token {
 impl Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::prelude::*;
-        // let hex = hex::encode(self.0);
         let str = BASE64_STANDARD.encode(&self.0);
         write!(f, "{}", str)
     }

@@ -40,7 +40,7 @@ use crate::{
     dht::state::SharedState,
     message::KrpcBody,
     our_error::{OurError, naur},
-    types::{Family, InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
+    types::{Family, InfoHash, NodeId, NodeInfo},
     utils::{base64_dec, base64_enc, db_get, db_put},
 };
 use diesel::{
@@ -107,21 +107,14 @@ impl CustomizeConnection<SqliteConnection, r2d2::Error> for SensibleOptions {
         )
         .map_err(diesel::r2d2::Error::QueryError)?;
 
+        // a panic here would unwind into SQLite, so blobs of other lengths (none we write) are
+        // xored as far as both go rather than indexed
         xor_utils::register_impl(conn, |x: *const [u8], y: *const [u8]| {
-            // safety: they came from C, not my problem if they're wonky
-            let x = unsafe { &*x };
-            let y = unsafe { &*y };
-
-            let mut buf = [0u8; NODE_ID_LEN];
-            for i in 0..NODE_ID_LEN {
-                buf[i] = x[i] ^ y[i]
-            }
-
-            buf
+            // SAFETY: SQLite hands over its two BLOB arguments, valid for the call
+            let (x, y) = unsafe { (&*x, &*y) };
+            x.iter().zip(y).map(|(a, b)| a ^ b).collect::<Vec<u8>>()
         })
-        .unwrap();
-
-        Ok(())
+        .map_err(diesel::r2d2::Error::QueryError)
     }
 
     fn on_release(&self, _conn: SqliteConnection) {}
@@ -160,7 +153,7 @@ fn resume_identity(
     let id_key = scope.key("id");
     conn.transaction(|conn| {
         let prev_ip = db_get(&ip_key, conn)?.and_then(|ip| ip.parse::<IpAddr>().ok());
-        let prev_id = db_get(&id_key, conn)?.and_then(|id| NodeId::try_from_bytes(&base64_dec(id)));
+        let prev_id = db_get(&id_key, conn)?.and_then(|id| NodeId::try_from_bytes(&base64_dec(id)?));
 
         if let (Some(prev_ip), Some(prev_id)) = (prev_ip, prev_id)
             && prev_ip == public_ip
@@ -256,7 +249,7 @@ impl DhtSession {
             .test_on_check_out(true)
             .connection_customizer(Box::new(SensibleOptions {}))
             .build(manager)
-            .expect("Could not build DB connection pool");
+            .map_err(|e| naur!("could not open the database {database_url}: {e}"))?;
 
         let mut conn = db
             .get()
@@ -544,91 +537,6 @@ impl DhtSession {
     /// Returns a cheap handle to the lookup client; cloning is a single refcount bump
     pub fn handle(&self) -> DhtClient {
         self.client.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        dht::DhtSession,
-        // types::{InfoHash /* , NodeId */},
-    };
-    // use opentelemetry::global;
-    // use rand::RngCore;
-    use std::{
-        env,
-        net::SocketAddrV4,
-        str::FromStr,
-        sync::{Arc, Once},
-    };
-    use tokio::net::UdpSocket;
-    use tracing::info;
-    use tracing_subscriber::{Layer, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-
-    static TEST_INIT: Once = Once::new();
-
-    fn set_up_tracing() {
-        let _ = color_eyre::install();
-        let fmt_layer = fmt::layer()
-            .compact()
-            .with_line_number(true)
-            .with_filter(LevelFilter::DEBUG);
-
-        // global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-        // let tracer = opentelemetry_jaeger::new_pipeline().install_simple().unwrap();
-
-        // let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-
-        tracing_subscriber::registry()
-            .with(console_subscriber::spawn())
-            // .with(telemetry)
-            .with(fmt_layer)
-            .init();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "integration test: needs network access, DATABASE_URL, and live DHT bootstrap nodes"]
-    async fn bootstrap() -> color_eyre::Result<()> {
-        TEST_INIT.call_once(set_up_tracing);
-
-        let socket = UdpSocket::bind(SocketAddrV4::from_str("0.0.0.0:44444").unwrap())
-            .await
-            .unwrap();
-        let dht = DhtSession::with_stable_id(socket, None, &env::var("DATABASE_URL").unwrap()).unwrap();
-
-        let dht = Arc::new(dht);
-        let dhtt = Arc::clone(&dht);
-        let dht_eventloop = tokio::spawn(async move {
-            dhtt.run().await;
-        });
-        dht.bootstrap(vec![
-            // dht.tansmissionbt.com
-            "87.98.162.88:6881".parse().unwrap(),
-            // routing_table.utorrent.com
-            "67.215.246.10:6881".parse().unwrap(),
-            // routing_table.bittorrent.com, ironically that this almost never responds
-            "82.221.103.244:8991".parse().unwrap(),
-            // dht.aelitis.com
-            "174.129.43.152:6881".parse().unwrap(),
-        ])
-        .await
-        .unwrap();
-        info!("Now I'm bootstrapped!");
-
-        // let server = dht.handle();
-        // let mut rng = rand::thread_rng();
-        // let mut bytes = [0u8; 20];
-        // rng.fill_bytes(&mut bytes);
-        //
-        // let node = server.find_node(NodeId(bytes)).await;
-        // if let Ok(node) = node {
-        //     println!("found node {:?}", node);
-        // } else {
-        //     println!("I guess we just didn't find anything")
-        // }
-
-        drop(dht_eventloop);
-        Ok(())
     }
 }
 

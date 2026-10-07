@@ -316,7 +316,6 @@ impl RpcManager {
     }
 
     pub fn subscribe_inbound(&self) -> mpsc::Receiver<Inbound> {
-        // TODO: make this configurable
         let (tx, rx) = mpsc::channel(1024);
         let mut subscribers = self.inbound_subscribers.lock().unwrap();
         subscribers.push(tx);

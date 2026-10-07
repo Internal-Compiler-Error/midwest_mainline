@@ -19,7 +19,6 @@ use crate::types::{Family, InfoHash, NodeId};
 use crate::utils::unix_timestmap_ms;
 use tracing::warn;
 
-// TODO: make these configurable some day
 /// How long to wait for a node to answer. Nodes that answer at all do so within a second
 /// or two; a dead one held up an entire lookup round when this was 15 s.
 pub const REQ_TIMEOUT: Duration = Duration::from_secs(3);

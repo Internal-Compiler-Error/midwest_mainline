@@ -3035,7 +3035,6 @@ dependencies = [
  "base64 0.23.1",
  "bendy",
  "color-eyre",
- "console-subscriber",
  "crc32c",
  "diesel",
  "diesel_migrations",
@@ -3046,7 +3045,6 @@ dependencies = [
  "libsqlite3-sys",
  "num",
  "rand 0.10.2",
- "serde_json",
  "sha1",
  "sha3",
  "smallvec",
@@ -3054,7 +3052,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-subscriber",
  "zerocopy",
 ]
 

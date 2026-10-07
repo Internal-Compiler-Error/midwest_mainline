@@ -13,25 +13,16 @@ pub enum OurError {
     UnsupportedQuery(TransactionId),
     #[error(transparent)]
     DecodeError(eyre::Error),
-    // stupid ass bendy library's error type only implements Debug + Display and not actually Error
-    #[error("Bendy complained {0}")]
-    BendyDecodeError(bendy::decoding::Error),
 
     /// The queried node answered with a KRPC error
     #[error("the node answered with error {0:?}")]
     Remote(KrpcError),
-
-    #[error("Something went wrong in the DHT: {0}")]
-    DhtFailure(String),
 
     #[error("I'm sorry, {0}")]
     IoError(#[from] io::Error),
 
     #[error(transparent)]
     Generic(#[from] eyre::Error),
-
-    #[error("Join Error")]
-    JoinError(#[from] tokio::task::JoinError),
 
     #[error("Timed out")]
     Timeout(#[from] tokio::time::error::Elapsed),

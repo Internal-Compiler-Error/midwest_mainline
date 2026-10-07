@@ -17,10 +17,11 @@ pub fn base64_enc<T: AsRef<[u8]>>(data: T) -> String {
     BASE64_STANDARD.encode(data)
 }
 
-pub fn base64_dec<T: AsRef<[u8]>>(data: T) -> Vec<u8> {
+/// `None` for anything that isn't base64
+pub fn base64_dec<T: AsRef<[u8]>>(data: T) -> Option<Vec<u8>> {
     use base64::prelude::*;
 
-    BASE64_STANDARD.decode(data).unwrap()
+    BASE64_STANDARD.decode(data).ok()
 }
 
 pub fn db_put(keyy: String, vall: String, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
