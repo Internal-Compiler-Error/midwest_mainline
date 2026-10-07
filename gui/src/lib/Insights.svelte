@@ -311,7 +311,7 @@
 
     <Panel title="Announces">
       <ul class="mt-1 max-h-44 overflow-auto font-mono text-[11px] leading-4">
-        {#each [...insights.announces].reverse() as a (a.at + a.url)}
+        {#each [...insights.announces].reverse() as a (a.seq)}
           <li class="truncate" class:text-destructive={!a.ok}>
             {timeOfDay(a.at)} {a.url.replace(/^\w+:\/\//, '').slice(0, 32)} → {a.ok ? `${a.peers} peers, ${a.detail}` : a.detail}
           </li>

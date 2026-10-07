@@ -69,6 +69,8 @@ export interface PieceMap {
 }
 
 export interface Announce {
+  /** the event's, to tell two apart that landed in the same millisecond */
+  seq: number
   at: number
   url: string
   ok: boolean
@@ -278,13 +280,13 @@ export class Insights {
         break
       }
       case 'announced':
-        this.announce({ at: e.at_ms, url: e.url, ok: true, peers: e.peers, detail: `next in ${e.interval_secs}s` })
+        this.announce({ seq: e.seq, at: e.at_ms, url: e.url, ok: true, peers: e.peers, detail: `next in ${e.interval_secs}s` })
         break
       case 'announce_failed':
-        this.announce({ at: e.at_ms, url: e.url, ok: false, peers: 0, detail: e.error })
+        this.announce({ seq: e.seq, at: e.at_ms, url: e.url, ok: false, peers: 0, detail: e.error })
         break
       case 'dht_lookup':
-        this.announce({ at: e.at_ms, url: 'DHT', ok: true, peers: e.peers, detail: `${e.took_ms} ms` })
+        this.announce({ seq: e.seq, at: e.at_ms, url: 'DHT', ok: true, peers: e.peers, detail: `${e.took_ms} ms` })
         break
     }
   }
