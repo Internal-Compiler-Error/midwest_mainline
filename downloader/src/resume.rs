@@ -20,6 +20,7 @@ use bitvec::prelude::*;
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 use midwest_mainline::types::InfoHash;
 use sha1::{Digest, Sha1};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,12 +203,13 @@ impl ResumeData {
         })
     }
 
-    /// Atomically writes this to `path`: a crash mid-write leaves the previous file intact
-    /// rather than a truncated one that would parse as "nothing verified".
+    /// Atomically and durably writes this to `path`: a crash mid-write leaves the previous file
+    /// intact rather than a truncated one that would parse as "nothing verified", and once this
+    /// returns the new file survives power loss. It says nothing about the torrent's data; see
+    /// [`save_durably`] for writing a bitfield whose pieces may not have reached the disk yet.
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         let tmp = path.with_extension(format!("{EXTENSION}.tmp"));
-        std::fs::write(&tmp, self.encode()).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+        replace_file(path, &tmp, &self.encode()).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Reads and validates a resume file. The file name is not consulted: the info hash comes
@@ -216,6 +218,77 @@ impl ResumeData {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::decode(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
+}
+
+/// Replaces `path` with `bytes` by way of `tmp`, so that a crash leaves either the old file or
+/// the new one, and the new one survives power loss once this returns. On macOS std's
+/// `sync_all` is `F_FULLFSYNC`, which also flushes the drive's own cache; a plain `fsync`
+/// there doesn't.
+pub(crate) fn replace_file(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)?;
+    // the rename itself lives in the directory; some file systems refuse to sync one, and the
+    // file is complete either way
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = std::fs::File::open(if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        })
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Flushes to disk the data of every file holding a byte of a piece in `pieces`. The files are
+/// opened afresh, which is enough: a sync flushes the file, not just one descriptor's writes.
+pub fn sync_pieces(torrent: &Torrent, root: &Path, pieces: &BitSlice<u8, Msb0>) -> std::io::Result<()> {
+    for (index, (_, relative)) in torrent.files.iter().enumerate() {
+        let range = torrent.pieces_of_file(index);
+        if pieces[range.start as usize..range.end as usize].any() {
+            std::fs::File::open(root.join(relative))?.sync_data()?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `data` to `path` without ever claiming a piece that a power loss could take back:
+/// pieces verified since `persisted` (the bitfield the file held so far) have their files
+/// flushed first. If that fails they're left out this time, to be tried again with the next
+/// write. Returns the bitfield the file now holds. Blocking.
+pub fn save_durably(
+    torrent: &Torrent,
+    path: &Path,
+    mut data: ResumeData,
+    persisted: &BitSlice<u8, Msb0>,
+) -> anyhow::Result<BitBox<u8, Msb0>> {
+    let new: BitVec<u8, Msb0> = data
+        .verified
+        .iter()
+        .by_vals()
+        .enumerate()
+        .map(|(piece, verified)| verified && !persisted.get(piece).is_some_and(|had| *had))
+        .collect();
+    if new.any()
+        && let Err(e) = sync_pieces(torrent, &data.root, &new)
+    {
+        tracing::warn!(
+            "couldn't flush {}'s data, its newest pieces aren't saved yet: {e}",
+            torrent.name
+        );
+        for piece in new.iter_ones() {
+            data.verified.set(piece, false);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    data.write(path)?;
+    Ok(data.verified)
 }
 
 /// The file indices a selection leaves out, as the resume file stores them.
@@ -232,66 +305,131 @@ pub fn skipped(selected: &[bool]) -> Vec<u32> {
 /// it one last time. Meant to be spawned alongside `BtClient::work`.
 ///
 /// The first write happens immediately, before any piece is verified: for a magnet-sourced
-/// torrent that's what makes the metadata survive a restart. Writes are then rate-limited to
-/// one per `MIN_INTERVAL`, since `stats` changes on every verified piece.
+/// torrent that's what makes the metadata survive a restart. After that a change to the
+/// bitfield or the user's choices is written once things have been quiet for `SETTLE`, while
+/// the upload counter, which moves all the time on a seeding torrent, only makes it into the
+/// file every `COUNTERS`. The files are written off the async workers, and durably (see
+/// `save_durably`). Returns the bitfield the file holds at the end.
 pub async fn keep_saving(
+    torrent: Arc<Torrent>,
+    root: PathBuf,
+    stats: watch::Receiver<TorrentSwarmStats>,
+    inputs: ResumeInputs,
+    dir: PathBuf,
+    shutdown: CancellationToken,
+) -> BitBox<u8, Msb0> {
+    const SETTLE: Duration = Duration::from_secs(5);
+    const COUNTERS: Duration = Duration::from_secs(60);
+    save_every(torrent, root, stats, inputs, dir, shutdown, (SETTLE, COUNTERS)).await
+}
+
+/// What a resume file holds that changes while the torrent runs.
+#[derive(Clone, PartialEq)]
+struct Saved {
+    verified: BitBox<u8, Msb0>,
+    skip: Vec<u32>,
+    sequential: bool,
+    uploaded: u64,
+}
+
+impl Saved {
+    /// Worth a write straight away, rather than only with the next round of counters.
+    fn differs_beyond_counters(&self, other: &Saved) -> bool {
+        (&self.verified, &self.skip, self.sequential) != (&other.verified, &other.skip, other.sequential)
+    }
+}
+
+async fn save_every(
     torrent: Arc<Torrent>,
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
     inputs: ResumeInputs,
     dir: PathBuf,
     shutdown: CancellationToken,
-) {
+    (settle, counters): (Duration, Duration),
+) -> BitBox<u8, Msb0> {
     let ResumeInputs {
-        selected,
-        sequential,
+        mut selected,
+        mut sequential,
         uploaded_before,
+        mut persisted,
     } = inputs;
-    const MIN_INTERVAL: Duration = Duration::from_secs(5);
-
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
-    let save = |stats: &watch::Receiver<TorrentSwarmStats>| {
+    let snapshot = |stats: &watch::Receiver<TorrentSwarmStats>,
+                    selected: &watch::Receiver<Vec<bool>>,
+                    sequential: &watch::Receiver<bool>| {
         let stats = stats.borrow();
-        let mut data = ResumeData::from_torrent(&torrent, &root, &stats.verified);
-        data.skip = skipped(&selected.borrow());
-        data.sequential = *sequential.borrow();
-        data.uploaded = uploaded_before + stats.uploaded;
-        let written = std::fs::create_dir_all(&dir)
-            .map_err(anyhow::Error::from)
-            .and_then(|()| data.write(&path));
-        if let Err(e) = written {
-            tracing::warn!("couldn't write resume file {}: {e:#}", path.display());
+        Saved {
+            verified: stats.verified.clone(),
+            skip: skipped(&selected.borrow()),
+            sequential: *sequential.borrow(),
+            uploaded: uploaded_before + stats.uploaded,
+        }
+    };
+    let save = async |saved: &Saved, persisted: &mut BitBox<u8, Msb0>| {
+        let mut data = ResumeData::from_torrent(&torrent, &root, &saved.verified);
+        data.skip = saved.skip.clone();
+        data.sequential = saved.sequential;
+        data.uploaded = saved.uploaded;
+        let written = {
+            let (torrent, path, had) = (torrent.clone(), path.clone(), persisted.clone());
+            tokio::task::spawn_blocking(move || save_durably(&torrent, &path, data, &had)).await
+        };
+        match written {
+            Ok(Ok(now)) => *persisted = now,
+            Ok(Err(e)) => tracing::warn!("couldn't write resume file {}: {e:#}", path.display()),
+            Err(e) => tracing::warn!("writing resume file {} failed: {e}", path.display()),
         }
     };
 
-    save(&stats);
+    let mut last = snapshot(&stats, &selected, &sequential);
+    save(&last, &mut persisted).await;
+    let mut last_write = tokio::time::Instant::now();
+    // set while only the counters have changed since the last write
+    let mut counters_due: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            changed = stats.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                // debounce: wait for the interval, absorbing further changes meanwhile, but
-                // still stop promptly on shutdown
-                tokio::select! {
-                    _ = tokio::time::sleep(MIN_INTERVAL) => {}
-                    _ = shutdown.cancelled() => break,
-                }
-                stats.mark_unchanged();
-                save(&stats);
-            }
+            changed = stats.changed() => if changed.is_err() { break },
+            changed = selected.changed() => if changed.is_err() { break },
+            changed = sequential.changed() => if changed.is_err() { break },
+            _ = tokio::time::sleep_until(counters_due.unwrap_or_else(tokio::time::Instant::now)),
+                if counters_due.is_some() => {}
             _ = shutdown.cancelled() => break,
         }
+        // let a burst of changes settle, but still stop promptly on shutdown
+        tokio::select! {
+            _ = tokio::time::sleep(settle) => {}
+            _ = shutdown.cancelled() => break,
+        }
+        stats.mark_unchanged();
+        selected.mark_unchanged();
+        sequential.mark_unchanged();
+        let now = snapshot(&stats, &selected, &sequential);
+        if now.differs_beyond_counters(&last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters) {
+            save(&now, &mut persisted).await;
+            last = now;
+            last_write = tokio::time::Instant::now();
+            counters_due = None;
+        } else if now.uploaded != last.uploaded {
+            counters_due = Some(last_write + counters);
+        }
     }
-    save(&stats);
+    let now = snapshot(&stats, &selected, &sequential);
+    if now != last {
+        save(&now, &mut persisted).await;
+    }
+    persisted
 }
 
 /// What goes into the resume file besides the torrent and its progress: the user's choices,
-/// read live, and the upload count from before this run.
+/// read live, the upload count from before this run, and the bitfield the file already holds.
 pub struct ResumeInputs {
     pub selected: watch::Receiver<Vec<bool>>,
     pub sequential: watch::Receiver<bool>,
     pub uploaded_before: u64,
+    /// pieces already claimed by the resume file on disk, so known to be on disk themselves;
+    /// anything verified beyond these gets its data flushed before the file claims it
+    pub persisted: BitBox<u8, Msb0>,
 }
 
 /// What a front end needs to list a resume file without loading the whole thing into a client.
@@ -332,16 +470,12 @@ impl ResumeSummary {
 }
 
 /// Every `*.resume` in `dir` that parses, sorted by name. Unparseable files are skipped with a
-/// warning rather than failing the listing, since one bad file shouldn't hide the rest.
+/// warning rather than failing the listing, since one bad file shouldn't hide the rest; see
+/// `scan_resume_files` for those.
 pub fn list_resume_files(dir: &Path) -> Vec<ResumeSummary> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return vec![];
-    };
-    let mut found: Vec<ResumeSummary> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == EXTENSION))
-        .filter_map(|p| match ResumeSummary::read(&p) {
+    let mut found: Vec<ResumeSummary> = scan_resume_files(dir)
+        .into_iter()
+        .filter_map(|(p, read)| match read {
             Ok(summary) => Some(summary),
             Err(e) => {
                 tracing::warn!("skipping {}: {e:#}", p.display());
@@ -351,6 +485,26 @@ pub fn list_resume_files(dir: &Path) -> Vec<ResumeSummary> {
         .collect();
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
+}
+
+/// Every `*.resume` in `dir`, with its summary or why it couldn't be read, sorted by path.
+pub fn scan_resume_files(dir: &Path) -> Vec<(PathBuf, anyhow::Result<ResumeSummary>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == EXTENSION))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let read = ResumeSummary::read(&p);
+            (p, read)
+        })
+        .collect()
 }
 
 /// The bencoded bytes of the top-level "info" value, verbatim, so the info hash recomputed
@@ -628,11 +782,8 @@ mod test {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[tokio::test]
-    async fn keep_saving_writes_first_and_last() {
-        let dir = scratch_dir("saver");
-        let torrent = Arc::new(test_torrent(&content(100), 16, &["udp://a.test:1"]));
-        let stats = TorrentSwarmStats {
+    fn no_progress() -> TorrentSwarmStats {
+        TorrentSwarmStats {
             uploaded: 0,
             downloaded: 0,
             wasted: 0,
@@ -642,7 +793,113 @@ mod test {
             wanted: bitvec![u8, Msb0; 1; 7].into_boxed_bitslice(),
             completed: false,
             storage_error: None,
-        };
+        }
+    }
+
+    /// Waits for what's in the resume file at `path` to satisfy `pred`.
+    async fn file_comes_to(path: &Path, pred: impl Fn(&ResumeData) -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ResumeData::read(path).is_ok_and(|data| pred(&data)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the file never got there: {:?}", ResumeData::read(path).ok()));
+    }
+
+    /// The bitfield and the user's choices are written once they settle; the upload counter
+    /// alone only every so often, or along with something that matters more.
+    #[tokio::test]
+    async fn counters_alone_are_written_lazily() {
+        let dir = scratch_dir("lazy");
+        let torrent = Arc::new(test_torrent(&content(100), 16, &["udp://a.test:1"]));
+        std::fs::write(dir.join("resume-test.bin"), content(100)).unwrap();
+        let (tx, rx) = watch::channel(no_progress());
+        let (selected_tx, selected_rx) = watch::channel(vec![true]);
+        let (_sequential_tx, sequential_rx) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let saver = tokio::spawn(save_every(
+            torrent.clone(),
+            dir.clone(),
+            rx,
+            ResumeInputs {
+                selected: selected_rx,
+                sequential: sequential_rx,
+                uploaded_before: 1000,
+                persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
+            },
+            dir.clone(),
+            shutdown.clone(),
+            (Duration::from_millis(20), Duration::from_millis(500)),
+        ));
+        let path = dir.join(ResumeData::file_name(&torrent.info_hash));
+        file_comes_to(&path, |data| data.uploaded == 1000).await;
+
+        tx.send_modify(|stats| stats.uploaded = 10);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ResumeData::read(&path).unwrap().uploaded,
+            1000,
+            "too soon for the counters"
+        );
+
+        tx.send_modify(|stats| stats.verified.set(1, true));
+        file_comes_to(&path, |data| data.verified.count_ones() == 1).await;
+        assert_eq!(ResumeData::read(&path).unwrap().uploaded, 1010, "they come along");
+
+        tx.send_modify(|stats| stats.uploaded = 20);
+        selected_tx.send(vec![false]).unwrap();
+        file_comes_to(&path, |data| data.skip == [0]).await;
+        tx.send_modify(|stats| stats.uploaded = 30);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(ResumeData::read(&path).unwrap().uploaded, 1020);
+        // nothing changes from here on, and the counters still make it in time
+        file_comes_to(&path, |data| data.uploaded == 1030).await;
+
+        shutdown.cancel();
+        assert_eq!(saver.await.unwrap().count_ones(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A piece whose file can't be flushed isn't claimed, so a power cut can't leave the
+    /// resume file promising data the disk never got; it's claimed once the flush works.
+    #[test]
+    fn unflushed_pieces_are_not_claimed() {
+        let dir = scratch_dir("durable");
+        let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
+        let path = dir.join(ResumeData::file_name(&torrent.info_hash));
+        let mut verified = bitvec![u8, Msb0; 0; 7];
+        verified.set(2, true);
+        let data = ResumeData::from_torrent(&torrent, &dir, &verified);
+        let none = bitvec![u8, Msb0; 0; 7];
+
+        // no data file at all to flush
+        let written = save_durably(&torrent, &path, data.clone(), &none).unwrap();
+        assert_eq!(written.count_ones(), 0);
+        assert_eq!(ResumeData::read(&path).unwrap().verified.count_ones(), 0);
+        // what the file already claimed needs no flush and stays claimed
+        assert_eq!(
+            save_durably(&torrent, &path, data.clone(), &verified).unwrap(),
+            verified
+        );
+
+        std::fs::write(dir.join("resume-test.bin"), content(100)).unwrap();
+        let written = save_durably(&torrent, &path, data, &none).unwrap();
+        assert_eq!(written, verified);
+        assert_eq!(ResumeData::read(&path).unwrap().verified, written);
+        assert!(
+            !dir.join(format!("{}.tmp", path.file_name().unwrap().display()))
+                .exists()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn keep_saving_writes_first_and_last() {
+        let dir = scratch_dir("saver");
+        let torrent = Arc::new(test_torrent(&content(100), 16, &["udp://a.test:1"]));
+        std::fs::write(dir.join("resume-test.bin"), content(100)).unwrap();
+        let stats = no_progress();
         let (tx, rx) = watch::channel(stats.clone());
         let (_selected_tx, selected_rx) = watch::channel(vec![true]);
         let (_sequential_tx, sequential_rx) = watch::channel(false);
@@ -655,6 +912,7 @@ mod test {
                 selected: selected_rx,
                 sequential: sequential_rx,
                 uploaded_before: 0,
+                persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
             },
             dir.join("nested"),
             shutdown.clone(),
@@ -675,11 +933,12 @@ mod test {
         later.verified.set(2, true);
         tx.send(later).unwrap();
         shutdown.cancel();
-        tokio::time::timeout(Duration::from_secs(2), saver)
+        let persisted = tokio::time::timeout(Duration::from_secs(2), saver)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(ResumeData::read(&path).unwrap().verified.count_ones(), 1);
+        assert_eq!(persisted, ResumeData::read(&path).unwrap().verified);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

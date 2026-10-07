@@ -14,19 +14,22 @@ use crate::dht::Dht;
 use crate::events::{Event, EventBus, Events, info_hash_hex};
 use crate::peer::PeerSnapshot;
 use crate::portmap::MappingState;
-use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files};
+use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files, scan_resume_files};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
+use anyhow::Context;
 use bitvec::prelude::*;
 use midwest_mainline::types::InfoHash;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{File, TryLockError};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Identifies a torrent within one session, from `add`/`resume` until `remove`.
@@ -183,14 +186,57 @@ struct TorrentTask {
     /// same for the sequential switch
     sequential: watch::Sender<bool>,
     /// the session's active-download slots, see `Settings::max_active_downloads`
-    slots: Arc<Semaphore>,
+    slots: Arc<Slots>,
     /// known before resolving for a magnet or a resume file; names the resume file to
     /// delete if removal comes before the torrent is known
     info_hash: Option<InfoHash>,
+    /// the resume file this came from, if it did: what a failed torrent is retried from
+    /// when its info hash isn't known (the file doesn't parse)
+    resume_path: Option<PathBuf>,
+    /// the info hashes the session's entries have to themselves, see `Claim`
+    claimed: Claimed,
     settings: SettingsWatch,
     /// bytes uploaded in earlier stretches of this torrent's life, including earlier
     /// sessions (from the resume file); the running swarm's own count is added on top
     uploaded_before: u64,
+    /// the bitfield the resume file on disk holds, see `ResumeInputs::persisted`
+    persisted: BitBox<u8, Msb0>,
+}
+
+type Claimed = Arc<std::sync::Mutex<HashSet<InfoHash>>>;
+
+/// An info hash one entry has to itself: a second entry for the same torrent fails rather
+/// than sharing (or truncating) its files and resume file. Let go when the entry's task ends.
+struct Claim {
+    claimed: Claimed,
+    info_hash: InfoHash,
+}
+
+impl Claim {
+    fn take(claimed: &Claimed, info_hash: InfoHash) -> Option<Self> {
+        claimed.lock().unwrap().insert(info_hash).then(|| Self {
+            claimed: claimed.clone(),
+            info_hash,
+        })
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.claimed.lock().unwrap().remove(&self.info_hash);
+    }
+}
+
+/// What of a failed torrent belongs to its entry, to clean up on removal and retry from.
+enum Owned {
+    /// it duplicates another entry's torrent, and everything on disk is that one's
+    Nothing,
+    Torrent {
+        torrent: Arc<Torrent>,
+        root: PathBuf,
+    },
+    /// it failed before the torrent was known; see `TorrentTask::info_hash` and `resume_path`
+    Unresolved,
 }
 
 /// What ended a running or paused stretch of a torrent's life.
@@ -208,6 +254,17 @@ impl TorrentTask {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = anyhow::Result<Resolved>>,
     {
+        // a magnet or resume file names its torrent up front, so a duplicate fails at once
+        let mut claim = None;
+        if let Some(info_hash) = self.info_hash {
+            claim = Claim::take(&self.claimed, info_hash);
+            if claim.is_none() {
+                self.info_hash = None;
+                self.fail("this torrent is already added".to_string(), &Owned::Nothing)
+                    .await;
+                return;
+            }
+        }
         let mut resolve = std::pin::pin!(resolve(self.cancel.clone()));
         // a pause asked for while still resolving applies once resolved
         let mut pause_asked = false;
@@ -228,6 +285,68 @@ impl TorrentTask {
                 },
             }
         };
+        let mut resolved = resolved.map(|mut resolved| {
+            resolved.paused |= pause_asked;
+            resolved.sequential = sequential_asked.unwrap_or(resolved.sequential);
+            resolved
+        });
+
+        let mut recheck_first = false;
+        loop {
+            let (error, owned) = match resolved {
+                Err(e) => (format!("{e:#}"), Owned::Unresolved),
+                Ok(resolved) => {
+                    if claim.is_none() {
+                        claim = Claim::take(&self.claimed, resolved.torrent.info_hash);
+                    }
+                    if claim.is_none() {
+                        self.info_hash = None;
+                        (format!("{} is already added", resolved.torrent.name), Owned::Nothing)
+                    } else {
+                        match self.drive(resolved, recheck_first).await {
+                            Some(failed) => failed,
+                            None => return,
+                        }
+                    }
+                }
+            };
+            let Some((path, recheck)) = self.fail(error, &owned).await else {
+                return;
+            };
+            recheck_first = recheck;
+            resolved = self.reload(path, recheck).await;
+        }
+    }
+
+    /// Rereads a failed torrent's resume file to try it again. A retry by recheck leaves it
+    /// paused if the file says so; one by unpause starts it.
+    async fn reload(&mut self, path: PathBuf, recheck: bool) -> anyhow::Result<Resolved> {
+        let _ = self.phase.send(Phase::Resolving {
+            started: Instant::now(),
+        });
+        tracing::info!("retrying {}", path.display());
+        let read = tokio::task::spawn_blocking(move || {
+            let data = ResumeData::read(&path)?;
+            let torrent = data.to_torrent()?;
+            anyhow::Ok((data, torrent))
+        });
+        let (data, torrent) = read.await??;
+        Ok(Resolved {
+            selected: data.selected(torrent.files.len()),
+            torrent,
+            root: data.root,
+            verified: data.verified,
+            resumed: true,
+            paused: recheck && data.paused,
+            peers: vec![],
+            uploaded: data.uploaded,
+            sequential: data.sequential,
+        })
+    }
+
+    /// Runs a resolved torrent until it's removed or the session shuts down, or until it
+    /// fails, which is returned along with what of it is this entry's.
+    async fn drive(&mut self, resolved: Resolved, recheck_first: bool) -> Option<(String, Owned)> {
         let Resolved {
             torrent,
             root,
@@ -238,14 +357,12 @@ impl TorrentTask {
             selected,
             uploaded,
             sequential,
-        } = match resolved {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                self.fail(format!("{e:#}"), None).await;
-                return;
-            }
-        };
+        } = resolved;
         let torrent = Arc::new(torrent);
+        self.persisted = match resumed {
+            true => verified.clone(),
+            false => bitvec![u8, Msb0; 0; verified.len()].into_boxed_bitslice(),
+        };
         self.bus.emit(Event::TorrentResolved {
             info_hash: torrent.info_hash,
             name: torrent.name.clone(),
@@ -255,13 +372,15 @@ impl TorrentTask {
             files: torrent.files.len(),
         });
         let _ = self.selected.send(selected);
-        let _ = self.sequential.send(sequential_asked.unwrap_or(sequential));
+        let _ = self.sequential.send(sequential);
         self.uploaded_before = uploaded;
-        paused |= pause_asked;
 
         let mut last_stats = None;
+        let mut next = recheck_first.then_some(Ok((Stop::Recheck, None)));
         let stop = loop {
-            let stop = if paused {
+            let stop = if let Some(stop) = next.take() {
+                stop
+            } else if paused {
                 self.wait_while_paused(&torrent, &root, &verified, last_stats.take())
                     .await
             } else {
@@ -285,10 +404,7 @@ impl TorrentTask {
                     Err(stop) => break stop,
                 },
                 Ok((stop, _)) => break stop,
-                Err(e) => {
-                    self.fail(format!("{e:#}"), Some((&torrent, &root))).await;
-                    return;
-                }
+                Err(e) => return Some((format!("{e:#}"), Owned::Torrent { torrent, root })),
             }
         };
 
@@ -299,6 +415,7 @@ impl TorrentTask {
                 deleted_files: delete_files,
             });
         }
+        None
     }
 
     /// Re-hashes the files off the runtime, publishing progress meanwhile. Only removal and
@@ -339,6 +456,9 @@ impl TorrentTask {
                                 pieces: bits.len(),
                             });
                             *verified = bits;
+                            // a piece found bad and fetched again must have its new data
+                            // flushed before the resume file claims it once more
+                            self.persisted &= verified.clone();
                         }
                         Err(e) => tracing::warn!("rechecking {} failed: {e}", torrent.name),
                     }
@@ -365,27 +485,59 @@ impl TorrentTask {
     /// Publishes the failure and stays around so the torrent can still be removed, and its
     /// resume file (and data, if asked) with it; a task that simply returned here would leave
     /// the entry unremovable and the resume file to resurrect it at the next start.
-    async fn fail(&mut self, error: String, torrent: Option<(&Arc<Torrent>, &Path)>) {
+    ///
+    /// With a resume file to go back to, unpause or recheck tries again (say the drive the
+    /// files are on wasn't mounted yet): returns the file, and whether it was a recheck.
+    async fn fail(&mut self, error: String, owned: &Owned) -> Option<(PathBuf, bool)> {
+        tracing::warn!("{}: {error}", self.source);
         self.bus.emit(Event::TorrentFailed {
             source: self.source.clone(),
             error: error.clone(),
         });
         let _ = self.phase.send(Phase::Failed { error });
+        let retry_from = match owned {
+            Owned::Nothing => None,
+            Owned::Torrent { torrent, .. } => Some(self.resume_dir.join(ResumeData::file_name(&torrent.info_hash))),
+            Owned::Unresolved => self.resume_path.clone().or_else(|| {
+                self.info_hash
+                    .map(|info_hash| self.resume_dir.join(ResumeData::file_name(&info_hash)))
+            }),
+        };
         loop {
             tokio::select! {
-                _ = self.cancel.cancelled() => return,
+                _ = self.cancel.cancelled() => return None,
                 command = self.commands.recv() => match command {
                     Some(Command::Remove { delete_files }) => {
-                        if let Some((torrent, root)) = torrent {
-                            self.remove_files(torrent, root, delete_files);
-                        } else if let Some(info_hash) = self.info_hash {
-                            let _ = std::fs::remove_file(self.resume_dir.join(ResumeData::file_name(&info_hash)));
+                        match owned {
+                            Owned::Nothing => {}
+                            Owned::Torrent { torrent, root } => self.remove_files(torrent, root, delete_files),
+                            Owned::Unresolved => self.remove_unresolved(),
                         }
-                        return;
+                        return None;
                     }
-                    None => return,
+                    None => return None,
+                    Some(command @ (Command::Unpause | Command::Recheck)) => {
+                        if let Some(path) = retry_from.as_ref().filter(|path| path.exists()) {
+                            return Some((path.clone(), matches!(command, Command::Recheck)));
+                        }
+                    }
                     Some(_) => {}
                 },
+            }
+        }
+    }
+
+    /// The resume file of a torrent that failed before it was known goes with it. One that
+    /// doesn't even parse is moved aside instead, out of the way of the next start but kept
+    /// for whoever wants to look at it.
+    fn remove_unresolved(&self) {
+        if let Some(info_hash) = self.info_hash {
+            let _ = std::fs::remove_file(self.resume_dir.join(ResumeData::file_name(&info_hash)));
+        } else if let Some(path) = self.resume_path.as_ref().filter(|path| path.exists()) {
+            let aside = path.with_extension(format!("{}.bad", crate::resume::EXTENSION));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => tracing::info!("moved {} aside to {}", path.display(), aside.display()),
+                Err(e) => tracing::warn!("couldn't move {} aside: {e}", path.display()),
             }
         }
     }
@@ -439,10 +591,10 @@ impl TorrentTask {
         if *self.sequential.borrow() {
             self.client.set_sequential(&torrent.info_hash, true);
         }
-        let stats = self
-            .client
-            .stats(torrent)
-            .ok_or_else(|| anyhow::anyhow!("torrent was added but reported no stats"))?;
+        let Some(stats) = self.client.stats(torrent) else {
+            self.client.remove_torrent(&torrent.info_hash);
+            anyhow::bail!("torrent was added but reported no stats");
+        };
         let peers = self.client.peers(torrent).unwrap_or_else(|| watch::channel(vec![]).1);
         let trackers = self
             .client
@@ -457,6 +609,7 @@ impl TorrentTask {
                 selected: self.selected.subscribe(),
                 sequential: self.sequential.subscribe(),
                 uploaded_before: self.uploaded_before,
+                persisted: self.persisted.clone(),
             },
             self.resume_dir.clone(),
             stop_saving.clone(),
@@ -493,14 +646,14 @@ impl TorrentTask {
             // a torrent that comes back already over its ratio stops before waiting for
             // anything to change
             if self.seeded_enough(torrent, &ratio_stats.borrow_and_update()) {
-                break Stop::Pause;
+                break Ok(Stop::Pause);
             }
             tokio::select! {
-                _ = self.cancel.cancelled() => break Stop::Shutdown,
+                _ = self.cancel.cancelled() => break Ok(Stop::Shutdown),
                 command = self.commands.recv() => match command {
-                    Some(Command::Pause) => break Stop::Pause,
-                    Some(Command::Recheck) => break Stop::Recheck,
-                    Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
+                    Some(Command::Pause) => break Ok(Stop::Pause),
+                    Some(Command::Recheck) => break Ok(Stop::Recheck),
+                    Some(Command::Remove { delete_files }) => break Ok(Stop::Remove { delete_files }),
                     Some(Command::SelectFiles(selected)) => {
                         self.client.select_files(&torrent.info_hash, selected.clone());
                         let _ = self.selected.send(selected);
@@ -510,21 +663,25 @@ impl TorrentTask {
                         let _ = self.sequential.send(on);
                     }
                     Some(Command::Unpause) => {}
-                    None => break Stop::Shutdown,
+                    None => break Ok(Stop::Shutdown),
                 },
                 // the stats change on every verified piece and uploaded block, the settings
                 // when the user edits the limit; either can be what tips the ratio over
                 changed = ratio_stats.changed() => {
+                    // the swarm's end closes its stats; one the session didn't stop died
                     if changed.is_err() {
-                        break Stop::Shutdown;
+                        break match self.cancel.is_cancelled() {
+                            true => Ok(Stop::Shutdown),
+                            false => Err(anyhow::anyhow!("the torrent stopped running unexpectedly")),
+                        };
                     }
                     if self.seeded_enough(torrent, &ratio_stats.borrow()) {
-                        break Stop::Pause;
+                        break Ok(Stop::Pause);
                     }
                 }
                 _ = self.settings.changed() => {
                     if self.seeded_enough(torrent, &stats.borrow()) {
-                        break Stop::Pause;
+                        break Ok(Stop::Pause);
                     }
                 }
             }
@@ -533,11 +690,13 @@ impl TorrentTask {
         // is deleted, or the deletion would race it
         self.client.remove_torrent(&torrent.info_hash);
         stop_saving.cancel();
-        let _ = saver.await;
+        if let Ok(persisted) = saver.await {
+            self.persisted = persisted;
+        }
         let last = stats.borrow().clone();
         *verified = last.verified.clone();
         self.uploaded_before += last.uploaded;
-        Ok((stop, Some(last)))
+        Ok((stop?, Some(last)))
     }
 
     /// Waits for an active-download slot, showing the torrent as queued meanwhile and still
@@ -547,9 +706,9 @@ impl TorrentTask {
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &BitBox<u8, Msb0>,
-    ) -> Result<OwnedSemaphorePermit, Stop> {
+    ) -> Result<SlotPermit, Stop> {
         let slots = self.slots.clone();
-        let acquire = slots.acquire_owned();
+        let acquire = slots.acquire();
         tokio::pin!(acquire);
         self.bus.emit(Event::TorrentQueued {
             info_hash: torrent.info_hash,
@@ -566,7 +725,7 @@ impl TorrentTask {
                 uploaded_before: self.uploaded_before,
             });
             tokio::select! {
-                permit = &mut acquire => return Ok(permit.expect("the slots are never closed")),
+                permit = &mut acquire => return Ok(permit),
                 _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
                 command = self.commands.recv() => match command {
                     Some(Command::Pause) => return Err(Stop::Pause),
@@ -633,8 +792,15 @@ impl TorrentTask {
         data.skip = crate::resume::skipped(&self.selected.borrow());
         data.sequential = *self.sequential.borrow();
         data.uploaded = self.uploaded_before;
-        if let Err(e) = data.write(&self.resume_dir.join(ResumeData::file_name(&torrent.info_hash))) {
-            tracing::warn!("couldn't mark {} paused in its resume file: {e:#}", torrent.name);
+        let written = {
+            let (torrent, persisted) = (torrent.clone(), self.persisted.clone());
+            let path = self.resume_dir.join(ResumeData::file_name(&torrent.info_hash));
+            tokio::task::spawn_blocking(move || crate::resume::save_durably(&torrent, &path, data, &persisted)).await
+        };
+        match written {
+            Ok(Ok(persisted)) => self.persisted = persisted,
+            Ok(Err(e)) => tracing::warn!("couldn't mark {} paused in its resume file: {e:#}", torrent.name),
+            Err(e) => tracing::warn!("marking {} paused in its resume file failed: {e}", torrent.name),
         }
         let stop = loop {
             tokio::select! {
@@ -753,13 +919,68 @@ pub struct Session {
     /// where resume files are written, `<data dir>/resume`
     resume_dir: PathBuf,
     /// the DHT node, kept so it lives as long as the session; none if it was turned off
-    _dht: Option<Dht>,
+    dht: Option<Dht>,
     /// active-download slots, `Settings::max_active_downloads` of them
-    slots: Arc<Semaphore>,
+    slots: Arc<Slots>,
+    claimed: Claimed,
+    /// every torrent's task that may still be running, so shutdown can wait for their last
+    /// resume writes
+    tasks: Vec<JoinHandle<()>>,
     events: EventBus,
     data_dir: PathBuf,
     settings: watch::Sender<Settings>,
+    /// the exclusive lock on `<data dir>/lock`, held until shutdown
+    lock: Option<File>,
 }
+
+/// `Session::new`'s error when another session, in this process or another (the GUI and the
+/// command line share a data directory), already uses the data directory. Two sessions would
+/// download into the same files, write the same resume files, and share one DHT database.
+#[derive(Debug)]
+pub struct AlreadyRunning {
+    pub data_dir: PathBuf,
+}
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another downloader (the app or the command line) is already using {}; quit it first",
+            self.data_dir.display()
+        )
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// Takes the exclusive advisory lock on `<data dir>/lock`, which goes with the process if it
+/// dies. A file system that can't lock at all only gets a warning: refusing to start there
+/// would be worse than the risk the lock guards against.
+fn lock_data_dir(data_dir: &Path) -> anyhow::Result<Option<File>> {
+    let path = data_dir.join("lock");
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(AlreadyRunning {
+            data_dir: data_dir.to_path_buf(),
+        }
+        .into()),
+        Err(TryLockError::Error(e)) => {
+            tracing::warn!("couldn't lock {}, carrying on without: {e}", path.display());
+            Ok(None)
+        }
+    }
+}
+
+/// How long shutdown waits for the torrents' last resume writes, and then for the trackers'
+/// `stopped` announces and the like.
+const SAVE_BUDGET: Duration = Duration::from_secs(10);
+const ANNOUNCE_BUDGET: Duration = Duration::from_secs(2);
 
 /// What a session needs to start.
 pub struct SessionConfig {
@@ -786,10 +1007,14 @@ impl Session {
     /// hash>.resume` for every torrent; finding those files again and handing them to
     /// [`Session::resume`] is the caller's job, see `Session::resume_dir` and
     /// `list_resume_files`.
+    ///
+    /// Only one session at a time can use a data directory: another one there, in this process
+    /// or another, makes this fail with [`AlreadyRunning`].
     pub fn new(config: SessionConfig) -> anyhow::Result<Self> {
         raise_fd_limit();
         let resume_dir = config.data_dir.join("resume");
         std::fs::create_dir_all(&resume_dir)?;
+        let lock = lock_data_dir(&config.data_dir)?;
         let rt = Runtime::new()?;
         let port = config.settings.listen_port;
         let identity = Identity {
@@ -819,7 +1044,9 @@ impl Session {
         };
         Ok(Self {
             events,
-            slots: Arc::new(Semaphore::new(slot_count(&config.settings))),
+            slots: Slots::new(slot_count(&config.settings)),
+            claimed: Claimed::default(),
+            tasks: vec![],
             handle: rt.handle().clone(),
             rt: Some(rt),
             identity: Arc::new(identity),
@@ -828,9 +1055,10 @@ impl Session {
             torrents: BTreeMap::new(),
             next_id: 1,
             resume_dir,
-            _dht: dht,
+            dht,
             data_dir: config.data_dir,
             settings: settings_tx,
+            lock,
         })
     }
 
@@ -853,19 +1081,7 @@ impl Session {
     /// arrange.
     pub fn update_settings(&mut self, settings: Settings) -> anyhow::Result<()> {
         settings.save(&self.data_dir)?;
-        let before = slot_count(&self.settings.borrow());
-        let after = slot_count(&settings);
-        if after > before {
-            self.slots.add_permits(after - before);
-        } else if after < before {
-            // taken out of circulation as they free up: a running download keeps its place
-            let slots = self.slots.clone();
-            self.handle.spawn(async move {
-                if let Ok(permits) = slots.acquire_many_owned((before - after) as u32).await {
-                    permits.forget();
-                }
-            });
-        }
+        self.slots.set_limit(slot_count(&settings));
         let _ = self.settings.send(settings);
         Ok(())
     }
@@ -887,7 +1103,7 @@ impl Session {
         let utp = self.client.utp();
         let bus = self.events.clone();
         let info_hash = crate::magnet::parse_magnet(&source).ok().map(|m| m.info_hash);
-        self.launch(source.clone(), info_hash, |cancel| async move {
+        self.launch(source.clone(), info_hash, None, |cancel| async move {
             let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
             let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
             Ok(Resolved {
@@ -906,31 +1122,50 @@ impl Session {
 
     /// Picks a download back up from a resume file (see `ResumeData`), in the root it was
     /// started in. A torrent that was paused when its file was last written comes back paused.
+    /// One that fails, even for a file that doesn't parse, stays listed as failed, and unpause
+    /// or recheck tries the file again.
     pub fn resume(&mut self, path: impl AsRef<Path>) -> TorrentId {
         let path = path.as_ref().to_path_buf();
         let info_hash = ResumeSummary::read(&path).ok().map(|s| s.info_hash);
-        self.launch(path.display().to_string(), info_hash, |_cancel| async move {
-            let data = ResumeData::read(&path)?;
-            let torrent = data.to_torrent()?;
-            Ok(Resolved {
-                selected: data.selected(torrent.files.len()),
-                torrent,
-                root: data.root,
-                verified: data.verified,
-                resumed: true,
-                paused: data.paused,
-                peers: vec![],
-                uploaded: data.uploaded,
-                sequential: data.sequential,
-            })
-        })
+        self.launch(
+            path.display().to_string(),
+            info_hash,
+            Some(path.clone()),
+            |_cancel| async move {
+                let data = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || ResumeData::read(&path)
+                })
+                .await??;
+                let torrent = data.to_torrent()?;
+                Ok(Resolved {
+                    selected: data.selected(torrent.files.len()),
+                    torrent,
+                    root: data.root,
+                    verified: data.verified,
+                    resumed: true,
+                    paused: data.paused,
+                    peers: vec![],
+                    uploaded: data.uploaded,
+                    sequential: data.sequential,
+                })
+            },
+        )
     }
 
     /// Resumes every torrent that has a resume file in this session's resume dir and isn't
-    /// already in the session. What a client does at startup.
+    /// already in the session. What a client does at startup. A file that doesn't parse
+    /// becomes a failed entry with the reason, rather than the torrent silently vanishing.
     pub fn resume_all(&mut self) -> Vec<TorrentId> {
-        let files = self.resumable();
-        files.into_iter().map(|f| self.resume(f.path)).collect()
+        let sources: HashSet<String> = self.torrents.values().map(|e| e.source.clone()).collect();
+        let mut paths: Vec<PathBuf> = self.resumable().into_iter().map(|f| f.path).collect();
+        paths.extend(
+            scan_resume_files(&self.resume_dir)
+                .into_iter()
+                .filter(|(path, read)| read.is_err() && !sources.contains(&path.display().to_string()))
+                .map(|(path, _)| path),
+        );
+        paths.into_iter().map(|path| self.resume(path)).collect()
     }
 
     /// The resume files in this session's resume dir for torrents it isn't running.
@@ -989,7 +1224,13 @@ impl Session {
     /// Shared tail of `add`/`resume`: `resolve` produces the torrent, where its files go,
     /// which pieces are already had, and whether the target files are expected to exist. The
     /// task it spawns owns the torrent for the rest of its life, including its removal.
-    fn launch<F, Fut>(&mut self, source: String, info_hash: Option<InfoHash>, resolve: F) -> TorrentId
+    fn launch<F, Fut>(
+        &mut self,
+        source: String,
+        info_hash: Option<InfoHash>,
+        resume_path: Option<PathBuf>,
+        resolve: F,
+    ) -> TorrentId
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<Resolved>> + Send + 'static,
@@ -1026,10 +1267,15 @@ impl Session {
             sequential: watch::channel(false).0,
             slots: self.slots.clone(),
             info_hash,
+            resume_path,
+            claimed: self.claimed.clone(),
             settings: self.settings.subscribe(),
             uploaded_before: 0,
+            persisted: BitBox::default(),
         };
-        self.handle.spawn(task.run(resolve));
+        // a session that runs for weeks sees many torrents come and go
+        self.tasks.retain(|task| !task.is_finished());
+        self.tasks.push(self.handle.spawn(task.run(resolve)));
         id
     }
 
@@ -1058,14 +1304,35 @@ impl Session {
             .collect()
     }
 
-    /// Stops everything, keeping files and resume data, and shuts the runtime down with a
-    /// bounded wait so a slow or unreachable tracker can't stall process exit.
+    /// Stops everything, keeping files and resume data, and shuts the runtime down. Every
+    /// torrent's last resume write is waited for, then the trackers get a moment for their
+    /// `stopped` announces; both waits are bounded so a hung disk or an unreachable tracker
+    /// can't stall process exit. Releases the data directory for the next session.
     pub fn shutdown(&mut self) {
         self.shutdown.cancel();
         self.torrents.clear();
         if let Some(rt) = self.rt.take() {
+            let tasks = std::mem::take(&mut self.tasks);
+            rt.block_on(async {
+                if tokio::time::timeout(SAVE_BUDGET, futures::future::join_all(tasks))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("gave up waiting for the torrents to save their progress");
+                }
+            });
+            // the node has no goodbye to say, and its tasks would keep the wait below going
+            self.dht.take();
+            let metrics = rt.metrics();
+            rt.block_on(async {
+                let deadline = Instant::now() + ANNOUNCE_BUDGET;
+                while metrics.num_alive_tasks() > 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
             rt.shutdown_timeout(Duration::from_millis(500));
         }
+        self.lock.take();
     }
 }
 
@@ -1242,12 +1509,113 @@ fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
     }
 }
 
-/// `max_active_downloads` as semaphore permits; 0 means no limit, which is a count no session
-/// reaches (and small enough to shrink from with `acquire_many`).
+/// `max_active_downloads` as a slot count, with 0 read as no limit.
 fn slot_count(settings: &Settings) -> usize {
     match settings.max_active_downloads {
-        0 => 1 << 20,
+        0 => usize::MAX,
         n => n,
+    }
+}
+
+/// The active-download slots. Unlike a semaphore's permits the limit can drop below the
+/// slots in use: a running download keeps its slot, and nobody gets a new one until enough
+/// have been given back. Waiters are served in the order they came.
+struct Slots {
+    state: std::sync::Mutex<SlotState>,
+    changed: Notify,
+}
+
+struct SlotState {
+    limit: usize,
+    taken: usize,
+    next_ticket: u64,
+    /// tickets of the tasks waiting, the lowest first in line
+    waiting: BTreeSet<u64>,
+}
+
+impl Slots {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(SlotState {
+                limit,
+                taken: 0,
+                next_ticket: 0,
+                waiting: BTreeSet::new(),
+            }),
+            changed: Notify::new(),
+        })
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.state.lock().unwrap().limit = limit;
+        self.changed.notify_waiters();
+    }
+
+    async fn acquire(self: &Arc<Self>) -> SlotPermit {
+        let mut ticket = {
+            let mut state = self.state.lock().unwrap();
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.waiting.insert(ticket);
+            Ticket {
+                slots: self.clone(),
+                ticket,
+                served: false,
+            }
+        };
+        loop {
+            // registered before looking, so a change between the look and the wait isn't missed
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.taken < state.limit && state.waiting.first() == Some(&ticket.ticket) {
+                    state.waiting.remove(&ticket.ticket);
+                    state.taken += 1;
+                    drop(state);
+                    ticket.served = true;
+                    // the next in line may fit as well
+                    self.changed.notify_waiters();
+                    return SlotPermit { slots: self.clone() };
+                }
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn taken(&self) -> usize {
+        self.state.lock().unwrap().taken
+    }
+}
+
+/// A place in the line for a slot; leaving it (the wait was abandoned) lets the next one up.
+struct Ticket {
+    slots: Arc<Slots>,
+    ticket: u64,
+    served: bool,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if self.served {
+            return;
+        }
+        self.slots.state.lock().unwrap().waiting.remove(&self.ticket);
+        self.slots.changed.notify_waiters();
+    }
+}
+
+/// One active-download slot, given back on drop.
+struct SlotPermit {
+    slots: Arc<Slots>,
+}
+
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        self.slots.state.lock().unwrap().taken -= 1;
+        self.slots.changed.notify_waiters();
     }
 }
 
@@ -1667,6 +2035,173 @@ mod test {
         }
         assert!(root.join("session.bin").exists(), "the data stays");
         session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Shrinking the limit below what's taken keeps the running ones going and lets nobody
+    /// new in until it's back under; growing it again, or lifting it, adds exactly that much.
+    #[tokio::test]
+    async fn slots_follow_the_limit_both_ways() {
+        let slots = Slots::new(2);
+        let a = slots.acquire().await;
+        let b = slots.acquire().await;
+        let try_acquire = |slots: &Arc<Slots>| {
+            let slots = slots.clone();
+            tokio::spawn(async move { slots.acquire().await })
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(20));
+
+        slots.set_limit(1);
+        let c = try_acquire(&slots);
+        drop(a);
+        settle().await;
+        assert!(!c.is_finished(), "one taken, one allowed");
+        // flapping the limit must not leak or swallow slots
+        for _ in 0..5 {
+            slots.set_limit(usize::MAX);
+            slots.set_limit(1);
+        }
+        drop(b);
+        let c = c.await.unwrap();
+        assert_eq!(slots.taken(), 1);
+
+        let d = try_acquire(&slots);
+        let e = try_acquire(&slots);
+        settle().await;
+        assert!(!d.is_finished() && !e.is_finished());
+        slots.set_limit(2);
+        let d = d.await.unwrap();
+        settle().await;
+        assert!(!e.is_finished(), "first come first served, and only one more fits");
+        slots.set_limit(usize::MAX);
+        let e = e.await.unwrap();
+        assert_eq!(slots.taken(), 3);
+
+        slots.set_limit(1);
+        drop((c, d, e));
+        assert_eq!(slots.taken(), 0);
+        let f = slots.acquire().await;
+        let g = try_acquire(&slots);
+        let h = try_acquire(&slots);
+        settle().await;
+        // the one first in line giving up lets the next one have its turn
+        g.abort();
+        drop(f);
+        drop(h.await.unwrap());
+        assert_eq!(slots.taken(), 0);
+    }
+
+    /// One data directory, one session: the second one is refused while the first runs, and
+    /// gets in once it has shut down.
+    #[test]
+    fn a_second_session_on_the_same_data_dir_is_refused() {
+        let dir = scratch("lock");
+        let mut first = Session::new(test_config(&dir)).unwrap();
+        let Err(e) = Session::new(test_config(&dir)) else {
+            panic!("two sessions on one data dir");
+        };
+        assert!(e.is::<AlreadyRunning>(), "{e:#}");
+        assert!(e.to_string().contains("already using"), "{e}");
+        first.shutdown();
+        Session::new(test_config(&dir)).unwrap().shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A torrent whose files are missing at startup (a drive not mounted yet) fails, keeps
+    /// its resume file, and starts once the files are back and it's unpaused.
+    #[test]
+    fn a_failed_torrent_is_retried_from_its_resume_file() {
+        let dir = scratch("retry");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        let elsewhere = dir.join("unmounted");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        session.shutdown();
+        std::fs::rename(&root, &elsewhere).unwrap();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let ids = session.resume_all();
+        wait_for(&mut session, ids[0], |s| matches!(s, Some(TorrentState::Paused(_))));
+        session.unpause(ids[0]);
+        wait_for(&mut session, ids[0], |s| matches!(s, Some(TorrentState::Failed { .. })));
+        // nothing to retry with yet: it fails again, and the resume file is still there
+        session.unpause(ids[0]);
+        wait_for(&mut session, ids[0], |s| matches!(s, Some(TorrentState::Failed { .. })));
+        assert_eq!(std::fs::read_dir(dir.join("resume")).unwrap().count(), 1);
+
+        std::fs::rename(&elsewhere, &root).unwrap();
+        session.unpause(ids[0]);
+        wait_for(&mut session, ids[0], |s| {
+            matches!(s, Some(TorrentState::Downloading(_)))
+        });
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A resume file that doesn't parse shows up as a failed entry saying why, instead of
+    /// the torrent quietly vanishing; removing it moves the file aside rather than deleting it.
+    #[test]
+    fn a_broken_resume_file_is_listed_as_failed() {
+        let dir = scratch("broken");
+        let resume_dir = dir.join("resume");
+        std::fs::create_dir_all(&resume_dir).unwrap();
+        let broken = resume_dir.join("0123.resume");
+        std::fs::write(&broken, b"d4:junke").unwrap();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let ids = session.resume_all();
+        assert_eq!(ids.len(), 1);
+        wait_for(&mut session, ids[0], |s| matches!(s, Some(TorrentState::Failed { .. })));
+        let Some((_, TorrentState::Failed { error, source })) = session.torrents().into_iter().next() else {
+            panic!()
+        };
+        assert!(error.contains("0123.resume"), "{error}");
+        assert_eq!(source, broken.display().to_string());
+        assert!(session.resume_all().is_empty(), "listed once");
+
+        session.remove(ids[0], true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while broken.exists() {
+            assert!(Instant::now() < deadline, "the broken file wasn't moved aside");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read(resume_dir.join("0123.resume.bad")).unwrap(), b"d4:junke");
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Adding a torrent the session has paused is refused like adding a running one, and
+    /// removing the refused entry leaves the paused one's files and resume file alone.
+    #[test]
+    fn a_duplicate_of_a_paused_torrent_is_refused() {
+        let dir = scratch("dup-paused");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        std::fs::write(root.join("session.bin"), [7u8; 40]).unwrap();
+
+        let dup = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, dup, |s| matches!(s, Some(TorrentState::Failed { .. })));
+        session.remove(dup, true);
+        wait_for(&mut session, dup, |s| s.is_none());
+        session.recheck(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.completed),
+        );
+        session.shutdown();
+        assert_eq!(Session::new(test_config(&dir)).unwrap().resumable().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

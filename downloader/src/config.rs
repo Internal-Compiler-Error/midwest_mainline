@@ -89,12 +89,24 @@ impl Settings {
     }
 
     /// The settings in `data_dir`, or the defaults if there's no file yet. A file that
-    /// doesn't parse is reported and treated as absent rather than blocking startup.
+    /// doesn't parse is treated as absent rather than blocking startup, and moved aside to
+    /// `settings.json.bad` so the next save doesn't destroy what the user had.
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(FILE_NAME);
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!("ignoring {}: {e}", path.display());
+                let bad = path.with_extension("json.bad");
+                match std::fs::rename(&path, &bad) {
+                    Ok(()) => tracing::warn!(
+                        "{} doesn't parse ({e}); using the defaults, the old file is kept as {}",
+                        path.display(),
+                        bad.display()
+                    ),
+                    Err(rename) => tracing::warn!(
+                        "{} doesn't parse ({e}), using the defaults; couldn't move it aside: {rename}",
+                        path.display()
+                    ),
+                }
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -105,8 +117,7 @@ impl Settings {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(FILE_NAME);
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::resume::replace_file(&path, &tmp, &serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
 }
@@ -138,6 +149,15 @@ mod test {
 
         std::fs::write(dir.join(FILE_NAME), "not json").unwrap();
         assert_eq!(Settings::load(&dir), Settings::default(), "garbage is ignored");
+        assert!(!dir.join(FILE_NAME).exists());
+        assert_eq!(
+            std::fs::read(dir.join("settings.json.bad")).unwrap(),
+            b"not json",
+            "but kept where the next save won't overwrite it"
+        );
+        changed.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir), changed);
+        assert!(!dir.join("settings.json.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -56,11 +56,18 @@ fn main() -> anyhow::Result<()> {
         .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| settings.download_dir.clone());
-    let mut session = Session::new(SessionConfig {
+    let mut session = match Session::new(SessionConfig {
         peer_id: random_peer_id(),
         data_dir,
         settings,
-    })?;
+    }) {
+        Ok(session) => session,
+        Err(e) if e.is::<downloader::session::AlreadyRunning>() => {
+            eprintln!("downloader: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
 
     let id = match existing_resume_file(&session, &source) {
         Some(path) => {
