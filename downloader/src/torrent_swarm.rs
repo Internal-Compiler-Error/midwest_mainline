@@ -1152,7 +1152,7 @@ impl TorrentSwarm {
                     .dht
                     .borrow()
                     .as_ref()
-                    .and_then(|dht| dht.client_for(&peer.remote_addr).cloned());
+                    .and_then(|dht| dht.client_for(&peer.remote_addr));
                 if let Some(client) = client {
                     let node = SocketAddr::new(peer.remote_addr.ip(), port.port);
                     tokio::spawn(async move {
