@@ -32,6 +32,8 @@ pub const PEER_LIFETIME: Duration = Duration::from_secs(45 * 60);
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Info hashes in a BEP 51 sample; 20 of them and 8 nodes fit a UDP packet comfortably
 pub const MAX_SAMPLES: i64 = 20;
+/// Ports of one address a swarm keeps: a few clients behind one NAT, not one host on every port
+pub const MAX_PORTS_PER_ADDRESS: usize = 4;
 
 /// What happens to an announced peer once it's older than [`PEER_LIFETIME`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -245,6 +247,20 @@ impl SharedState {
                     .do_update()
                     .set((peer::last_announced.eq(now), peer::seed.eq(seed)))
                     .execute(conn)?;
+                let this_address = peer::table
+                    .filter(peer::swarm.eq(info_hash))
+                    .filter(peer::ip_addr.eq(addr.ip().to_string()));
+                let ports: Vec<i32> = this_address
+                    .clone()
+                    .order((
+                        peer::last_announced.desc(),
+                        peer::port.eq(i32::from(addr.port())).desc(),
+                    ))
+                    .select(peer::port)
+                    .load(conn)?;
+                if let Some(oldest) = ports.get(MAX_PORTS_PER_ADDRESS..) {
+                    diesel::delete(this_address.filter(peer::port.eq_any(oldest))).execute(conn)?;
+                }
                 Ok(())
             })
         })
@@ -363,6 +379,30 @@ mod tests {
         let mut conn = state.conn.get().unwrap();
         let swarms: i64 = swarm::table.count().get_result(&mut conn).unwrap();
         assert_eq!(swarms, 1, "a swarm with no peers left goes too");
+    }
+
+    #[tokio::test]
+    async fn one_address_holds_a_few_ports_of_a_swarm_not_every_port() {
+        let state = state().await;
+        let info_hash = InfoHash([4; 20]);
+        let ip = Ipv4Addr::new(10, 0, 0, 3);
+        for port in 1000..1100 {
+            state
+                .store_peer(&info_hash, SocketAddr::from((ip, port)), false)
+                .unwrap();
+        }
+        let stored = state.stored_peers(&info_hash);
+        assert_eq!(stored.len(), MAX_PORTS_PER_ADDRESS);
+        assert!(stored.iter().any(|p| p.addr.port() == 1099), "the latest is kept");
+        // another swarm, and another address, have their own
+        state
+            .store_peer(&InfoHash([5; 20]), SocketAddr::from((ip, 1)), false)
+            .unwrap();
+        state
+            .store_peer(&info_hash, SocketAddr::from(([10, 0, 0, 4], 1)), false)
+            .unwrap();
+        assert_eq!(state.stored_peers(&InfoHash([5; 20])).len(), 1);
+        assert_eq!(state.stored_peers(&info_hash).len(), MAX_PORTS_PER_ADDRESS + 1);
     }
 
     #[tokio::test]
