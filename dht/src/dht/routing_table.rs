@@ -184,7 +184,7 @@ impl RoutingTable {
         let Some(mut conn) = self.conn() else {
             return;
         };
-        self.mark_good(&sender, &mut conn);
+        self.mark_good(&NodeInfo::new(sender, from), &mut conn);
         self.add_with(sender, from, &mut conn);
         // the other family's nodes are the session's business (see `DhtSession::pair_with`)
         if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
@@ -410,7 +410,7 @@ impl RoutingTable {
                 .is_ok();
             if let Some(mut conn) = self.conn() {
                 match answered {
-                    true => self.mark_good(&target.id(), &mut conn),
+                    true => self.mark_good(&target, &mut conn),
                     false => self.tombstone(&target.id(), &mut conn),
                 }
             }
@@ -434,10 +434,13 @@ impl RoutingTable {
         info!("{} routing table: {all} nodes, {good} with BEP 42 ids", self.family);
     }
 
-    fn mark_good(&self, id: &NodeId, conn: &mut SqliteConnection) {
+    /// We heard from `node`; another address claiming its id doesn't count
+    fn mark_good(&self, node: &NodeInfo, conn: &mut SqliteConnection) {
         let _ = diesel::update(node::table)
             .filter(node::family.eq(self.scope_table))
-            .filter(node::id.eq(id.as_bytes()))
+            .filter(node::id.eq(node.id().as_bytes()))
+            .filter(node::ip_addr.eq(node.end_point().ip().to_string()))
+            .filter(node::port.eq(i32::from(node.end_point().port())))
             .set((
                 node::last_contacted.eq(unix_timestmap_ms()),
                 node::failed_requests.eq(0),
@@ -670,7 +673,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed, 2, "each failed RPC must increment the counter");
 
-        routing_table.mark_good(&a, &mut conn);
+        routing_table.mark_good(&NodeInfo::new(a, addr(1)), &mut conn);
         let failed: i32 = node
             .filter(id.eq(a.0.to_vec()))
             .select(failed_requests)
@@ -780,6 +783,48 @@ mod tests {
             .map(|n| n.id())
             .collect();
         assert_eq!(queued, vec![dead]);
+    }
+
+    #[tokio::test]
+    async fn only_the_node_at_its_own_address_vouches_for_its_id() {
+        use crate::schema::node::dsl::*;
+
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
+        let dead = id_with_first_byte(0xF0);
+        routing_table.add(dead, addr(1));
+        for _ in 0..3 {
+            routing_table.mark_failed(&dead);
+        }
+        let mut conn = routing_table.table.get().unwrap();
+        diesel::update(node.filter(id.eq(dead.0.to_vec())))
+            .set(last_contacted.eq(1))
+            .execute(&mut conn)
+            .unwrap();
+        drop(conn);
+
+        // someone elsewhere claiming the dead node's id doesn't keep it in the table
+        let claim = Krpc::new(
+            types::TransactionId::from_bytes(b"aa"),
+            KrpcBody::PingQuery(PingQuery::new(dead)),
+        );
+        routing_table.learn_from(addr(2), &claim);
+        let mut conn = routing_table.table.get().unwrap();
+        let queued: Vec<NodeId> = routing_table
+            .replacement_queue(routing_table.index(&dead), &mut conn)
+            .into_iter()
+            .map(|n| n.id())
+            .collect();
+        assert_eq!(queued, vec![dead]);
+        drop(conn);
+
+        // the node itself does
+        routing_table.learn_from(addr(1), &claim);
+        let mut conn = routing_table.table.get().unwrap();
+        assert!(
+            routing_table
+                .replacement_queue(routing_table.index(&dead), &mut conn)
+                .is_empty()
+        );
     }
 
     #[tokio::test]
