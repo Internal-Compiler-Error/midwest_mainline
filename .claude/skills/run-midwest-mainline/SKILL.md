@@ -1,6 +1,6 @@
 ---
 name: run-midwest-mainline
-description: Build, run, test, and drive this workspace's subsystems - the `downloader` CLI, the Tauri GUI, and the DHT node (`json_rpc_server`, standalone or as a long-term index). Use when asked to start or run the downloader, the GUI, or the DHT node, run their tests, build them, take a screenshot of the GUI, watch logs, query or announce to the DHT, or check a download against a real swarm.
+description: Build, run, test, and drive this workspace's subsystems - the `downloader` CLI, the Tauri GUI (incl. its live Traces pane), the DHT node (`json_rpc_server`, standalone or as a long-term index), and OpenTelemetry traces in Jaeger. Use when asked to start or run the downloader, the GUI, or the DHT node, run their tests, build them, take a screenshot of the GUI, watch logs or traces, profile or measure throughput, query or announce to the DHT, or check a download against a real swarm.
 ---
 
 A Rust workspace: `downloader/` (the BitTorrent library plus a CLI), `gui/` (a Tauri 2 +
@@ -40,24 +40,27 @@ itself.
 Both commands run against `/tmp/midwest-mainline-run/data` (override with `RUN_DIR`), so
 the user's own resume files, settings, and DHT table in `~/Library/Application
 Support/downloader` are never touched. A good test torrent is the Arch Linux ISO, which is
-tracker-less and finds a couple of hundred peers over the DHT, though the lookup alone takes
-20-30 s:
+tracker-less and finds a couple of hundred peers over the DHT; metadata arrives about 7-10 s
+after the DHT node is up:
 
 ```bash
 ARCH='magnet:?xt=urn:btih:f45add9d1a5185d8588df7dd6cd89993dd0174fa&dn=archlinux-2026.09.01-x86_64.iso'
 ```
 
-**CLI** - runs for N seconds, then prints a one-line summary of what happened:
+**CLI** - runs for N seconds (or until the download completes, when the CLI exits by
+itself), then prints a one-line summary of what happened:
 
 ```bash
-.claude/skills/run-midwest-mainline/driver.sh cli "$ARCH" 40
-# metadata: 1  dht up: 1  dht lookups: 1  peer connections: 203  pieces: 112  complete: 0  warn/error lines: 3
-#  56M	/tmp/midwest-mainline-run/cli-download
+.claude/skills/run-midwest-mainline/driver.sh cli "$ARCH" 120
+# metadata: 1  dht up: 1  dht lookups: 2  peer connections: 274  pieces: 3068  complete: 1  warn/error lines: 2
+# 1.5G	/tmp/midwest-mainline-run/cli-download
 ```
 
 The full log is `/tmp/midwest-mainline-run/cli.log` (timestamped; `RUST_LOG=debug` for
-more). "pieces" is verified pieces; most of the 40 s goes on the DHT lookup and metadata,
-so anything from about a hundred up is normal.
+more); the CLI logs a progress line every 5 s (`77.3%  2371/3068 pieces  down 31.1 MiB/s ...`).
+"pieces" is verified pieces. The whole 1.5 GB ISO takes about 40-60 s in a debug build. The
+CLI resumes from its resume file when run again on the same source; `--seed` keeps it
+uploading after completion.
 
 **GUI** - launches the debug app, optionally adding a source at startup (the app takes one
 as its first argument), waits N seconds (default 45), screenshots the window, quits:
@@ -66,11 +69,15 @@ as its first argument), waits N seconds (default 45), screenshots the window, qu
 .claude/skills/run-midwest-mainline/driver.sh gui "$ARCH" 45
 # screenshot: /tmp/midwest-mainline-run/gui.png (window 552)
 # metadata: 0  dht up: 1  dht lookups: 2  peer connections: 225  pieces: 224  ...
+PANE=traces .claude/skills/run-midwest-mainline/driver.sh gui "$ARCH" 20   # open the Traces pane instead
 ```
 
 Look at `gui.png`: it should show the torrent row with a progress bar and rates, the details
-panel (the first torrent is selected by itself), and the console pane with piece completions
-scrolling. The GUI downloads into `$RUN_DIR/gui-download` (the driver writes a scratch
+panel (the first torrent is selected by itself), and the bottom pane: `PANE` (`console`,
+`insights` (default), or `traces`; passed to the app as `DOWNLOADER_PANE`) picks which. The
+Traces pane is a live timeline of the torrent's spans: lanes for metadata, trackers, DHT,
+dials, peers and pieces, coloured by outcome, with a header of counts (`240 peers · 256
+pieces in flight · 100 dialling · 1028 verified`). The GUI downloads into `$RUN_DIR/gui-download` (the driver writes a scratch
 `settings.json` saying so; without it the app's default is `~/Downloads`). The GUI's console is also streamed to
 `/tmp/midwest-mainline-run/gui.log`, which is how the summary is computed ("metadata" stays
 0 there because only the CLI logs that line).
@@ -98,6 +105,34 @@ $D dht-down
 the same way, and deletes stale peers on a timer. The node's log (DEBUG, fixed in
 `json_rpc_server`) is `$RUN_DIR/dht.log`.
 
+**Traces in Jaeger** (optional, for developers; users get the Traces pane). The image is
+pulled already (`docker.io/jaegertracing/jaeger:latest` in Podman). Any run with
+`OTEL_EXPORTER_OTLP_ENDPOINT` set exports its spans over OTLP/HTTP:
+
+```bash
+podman run -d --name jaeger -p 127.0.0.1:16686:16686 -p 127.0.0.1:4317:4317 -p 127.0.0.1:4318:4318 docker.io/jaegertracing/jaeger:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 .claude/skills/run-midwest-mainline/driver.sh cli "$ARCH" 25
+curl -s "http://127.0.0.1:16686/api/v3/operations?service=downloader"   # dht.lookup, dial, metadata, metadata.peer, peer, piece, piece.check, shake_hands, ...
+```
+
+The UI is http://127.0.0.1:16686 (search service `downloader`, tag `info_hash=<hex>`). Jaeger
+v2 serves its API under `/api/v3`; `/api/services` is a 404.
+
+**Throughput** - measure in a release build; a debug build is CPU-bound at roughly a tenth
+of the speed. The Ubuntu ISO has HTTPS trackers and a big swarm (`releases.ubuntu.com`, the
+user offered it for testing):
+
+```bash
+curl -sfL -o /tmp/midwest-mainline-run/ubuntu-26.04.1-desktop-amd64.iso.torrent https://releases.ubuntu.com/26.04/ubuntu-26.04.1-desktop-amd64.iso.torrent
+cargo build -q --release -p downloader
+DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data timeout -s INT 60 target/release/downloader /tmp/midwest-mainline-run/ubuntu-26.04.1-desktop-amd64.iso.torrent /tmp/midwest-mainline-run/rel
+# 75.8%  18738/24729 pieces  down 111.2 MiB/s  up 0 KiB/s  339 peers
+```
+
+110-125 MiB/s on the user's line at ~220% CPU. To see where the CPU goes, `sample` the
+process mid-run (release builds keep line tables): `sample $(pgrep -x downloader) 6 -file
+/tmp/midwest-mainline-run/sample.txt`, then read the "Sort by top of stack" section.
+
 **Logs of a GUI the user is running**: start the GUI with
 `DOWNLOADER_LOG_ADDR=127.0.0.1:9999` and run `driver.sh logs` to tail its console from a
 terminal.
@@ -123,11 +158,11 @@ pieces, and a uTP-vs-TCP breakdown of the peers. Arguments: source, then seconds
 Edit it in place to poke a library change without either binary:
 
 ```bash
-DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader --example probe -- "$ARCH" 40
-# t= 40s total    8829 KiB/s pieces 121/3068 | uTP 61 peers (0 sending) ... | TCP 140 peers (56 sending)    8806 KiB/s best   1354
+DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader --example probe -- "$ARCH" 60
+# t= 60s total   52572 KiB/s pieces 768/3068 | uTP 14 peers (11 sending)     892 KiB/s best    204 | TCP 144 peers (126 sending)   78366 KiB/s best   4560
 ```
 
-Nothing in the first ~30 s is normal (DHT lookup, then metadata).
+Nothing for the first several seconds is normal (DHT lookup, then metadata).
 
 The DHT crate's internals (store, retention, routing table, KRPC parsing) are covered by its
 unit tests on in-memory SQLite, which is the fastest loop for a change there:
@@ -152,9 +187,10 @@ DOWNLOADER_DATA_DIR=/tmp/midwest-mainline-run/data cargo run -q -p downloader --
 .claude/skills/run-midwest-mainline/driver.sh test
 ```
 
-119 downloader tests and 43 dht tests (one more is ignored: it needs the live DHT), all in
-about two seconds; `pnpm check` reports 0 errors.
-Tests use free ports and no DHT, so they run offline.
+145 downloader tests and 44 dht tests (one more is ignored: it needs the live DHT), in about
+six seconds (the uTP dialing tests wait out real timeouts); `pnpm check` reports 0 errors.
+Tests use free ports on loopback only (so macOS's firewall doesn't prompt for each new test
+binary) and no DHT, so they run offline.
 
 ## Gotchas
 
@@ -182,13 +218,22 @@ Tests use free ports and no DHT, so they run offline.
 - **Never run the dev server from `gui/src-tauri`**: before resume files and downloads moved
   to the data directory, a run from there once committed a 1.5 GB video into the repo.
 
-- **A trackerless magnet's resume file doesn't load on the next start** ("skipping
-  .../<hash>.resume: ... not a bencoded dict"): `juicy_bencode` rejects the empty list `le`
-  that an empty `trackers` field encodes to. The run carries on as a fresh add, so the
-  driver still works, but resumed progress is lost. A bug, not the environment.
-- **The DHT lookup is the slow part of a magnet run.** The node is up in ~5 s, but the
-  lookup that finds peers finishes 20-30 s in. A GUI run of 30 s once ended with 0 peers
-  because the node came up late; hence the 45 s default.
+- **A trackerless magnet's resume file didn't load on the next start** ("skipping
+  .../<hash>.resume: ... not a bencoded dict"): `juicy_bencode` rejected the empty list `le`
+  that an empty `trackers` field encodes to. Fixed in `../juicy_bencode` (a separate repo,
+  `many1` -> `many0`); if it recurs, check that repo's state.
+- **A persisted DHT routing table can be poisoned.** Sybil nodes (many ids on one IP, next
+  to popular hashes) answer get_peers with a token and nothing else; once they filled the
+  table near the Arch hash every lookup came back empty, run after run. The node now keeps
+  one node per IP and evicts empty answerers, and the startup purge logs "dropped N routing
+  table nodes sharing an IP". If lookups still find 0 peers, compare against a fresh table
+  (move `$RUN_DIR/data/dht.db*` aside).
+- **Debug builds are slow at full speed.** Dependencies are optimised in dev
+  (`[profile.dev.package."*"]`), but our own swarm code isn't: a debug download of a big
+  swarm runs ~10 MB/s where release does 110+. Measure throughput in release.
+- **The uTP crate parents its connection spans on the current span**, so anything that
+  connects uTP inside one of our spans keeps that span open for the connection's life (it
+  showed as 408 "dialling" with a 256-dial cap). `stream.rs` gives uTP connects a root span.
 - **`krpc.py` adds itself to the node's routing table** as a `127.0.0.1` contact, one per
   run (the node learns from everyone who talks to it). Harmless in the scratch database,
   but don't point it at the user's own.
@@ -211,6 +256,13 @@ Tests use free ports and no DHT, so they run offline.
   says "on another Space"; `/tmp/midwest-mainline-run/windowid --list` shows what's on
   screen. Wait until the user is on a normal desktop, or ask them; the capture is retried
   once anyway.
+
+- **The Traces pane drew only the first lanes** (pieces empty though the header counted
+  them): ECharts' progressive rendering restarts with every `setOption`, and the pane redraws
+  ~15 times a second. The series sets `progressive: 0`.
+- **The GUI showed nothing and exited**: a second session on the same data dir (the user's
+  GUI, or a CLI run) holds `<data_dir>/lock`. Now a dialog says so; it's drawn by
+  `UserNotificationCenter`, not `downloader-gui`, so `windowid downloader-gui` won't find it.
 
 - **`Vite never came up, see /tmp/midwest-mainline-run/vite.log`**: the port check used
   `127.0.0.1` while Vite listens on `[::1]`; fixed in the driver, but the same shape
