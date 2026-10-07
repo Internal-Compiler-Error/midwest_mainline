@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -10,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use bendy::value;
 use diesel::{
     SqliteConnection,
     r2d2::{ConnectionManager, Pool},
@@ -24,13 +22,16 @@ use tokio::{
 use tracing::{info, instrument, trace, warn};
 
 use crate::{
-    message::{Krpc, KrpcBody, ParseKrpc},
+    message::{Krpc, KrpcBody, error::KrpcError},
     our_error::{OurError, naur},
     types::{Family, NodeInfo, TransactionId},
     utils::{db_put, unix_timestmap_ms},
 };
 
 use super::{TxnIdGenerator, external_ip::ExternalIp, routing_table::update_last_sent, scope::Scope};
+
+/// BEP 5's `v`, which every message we send carries
+const CLIENT_VERSION: &[u8] = b"MW01";
 
 /// A message and who sent it
 pub type Inbound = (Krpc, SocketAddr);
@@ -153,7 +154,7 @@ impl RpcManager {
                     }
                 };
                 trace!("received packet from {socket_addr}");
-                match (&buf[..amount]).parse() {
+                match Krpc::decode(&buf[..amount]) {
                     Ok(msg) => {
                         trace!("{} sent {:?}", socket_addr, msg);
 
@@ -206,8 +207,8 @@ impl RpcManager {
                     // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
                     // we're read-only (BEP 43) and answer nothing
                     Err(OurError::UnsupportedQuery(txn)) if !this.is_read_only() => {
-                        let response = Krpc::new_unsupported_error(txn);
-                        this.send_msg_background(&response, socket_addr);
+                        let response = Krpc::new(txn, KrpcBody::ErrorResponse(KrpcError::new_method_unknown()));
+                        this.send_msg_background(response, socket_addr);
                     }
                     Err(e) => {
                         tracing::debug!("ignoring an unparseable packet from {socket_addr}: {e}")
@@ -257,26 +258,19 @@ impl RpcManager {
         });
     }
 
-    fn encode_for(&self, msg: &Krpc, peer: SocketAddr) -> Box<[u8]> {
-        let mut additional = HashMap::new();
-        // BEP 5: every message should carry our client version
-        additional.insert(&b"v"[..], value::Value::Bytes(Cow::Borrowed(&b"MW01"[..])));
-
+    fn encode_for(&self, mut msg: Krpc, peer: SocketAddr) -> Box<[u8]> {
         if msg.body.is_query() {
             // BEP 43: so nobody puts us in a routing table only to find we don't answer
-            let mut msg = msg.clone();
             msg.read_only = self.is_read_only();
-            msg.encode_with_additional(&additional)
         } else {
             // BEP 42: a response tells the querier the external address we see for it
-            let mut msg = msg.clone();
             msg.ip = Some(peer);
-            msg.encode_with_additional(&additional)
         }
+        msg.encode_with_version(CLIENT_VERSION)
     }
 
-    /// Send a message, fires up a new stask in background
-    fn send_msg_background(&self, msg: &Krpc, peer: SocketAddr) {
+    /// Sends `msg` from a task of its own
+    fn send_msg_background(&self, msg: Krpc, peer: SocketAddr) {
         let socket = self.socket.clone();
         let buf = self.encode_for(msg, peer);
 
@@ -294,7 +288,7 @@ impl RpcManager {
         let sent_time = unix_timestmap_ms();
         let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
         self.socket
-            .send_to(&self.encode_for(&message, endpoint), endpoint)
+            .send_to(&self.encode_for(message, endpoint), endpoint)
             .await?;
         let (response, _addr) = rx
             .await
@@ -344,13 +338,13 @@ impl RpcManager {
     /// thing in KRPC, so there is nothing to wait for (and waiting leaked a task per
     /// inbound query).
     pub fn reply(&self, body: KrpcBody, node: &NodeInfo, txn_id: TransactionId) {
-        let message = Krpc::new_with_body(txn_id, body);
-        self.send_msg_background(&message, node.end_point());
+        let message = Krpc::new(txn_id, body);
+        self.send_msg_background(message, node.end_point());
     }
 
     pub async fn query<E: Routable>(&self, body: KrpcBody, endpoint: &E, timeout: Duration) -> Result<Krpc, OurError> {
         let endpoint = endpoint.endpoint();
-        let message = Krpc::new_with_body(self.txn_id_generator.next().into(), body);
+        let message = Krpc::new(self.txn_id_generator.next().into(), body);
 
         self.send_and_wait_timeout(message, endpoint, timeout).await
     }
@@ -468,7 +462,7 @@ mod tests {
         let mut rx = broker.subscribe_one(txn.clone(), legit_addr);
         let broker_addr = broker.socket.local_addr().unwrap();
 
-        let pkt = Krpc::new_with_body(
+        let pkt = Krpc::new(
             txn,
             KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(NodeId([3u8; 20]))),
         )

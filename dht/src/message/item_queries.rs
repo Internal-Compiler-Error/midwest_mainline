@@ -53,8 +53,7 @@ impl GetQuery {
 }
 
 impl ToKrpcBody for GetQuery {
-    #[allow(unused_must_use)]
-    fn encode_body(&self, enc: SingleItemEncoder) {
+    fn encode_body(&self, enc: SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         enc.emit_unsorted_dict(|enc| {
             enc.emit_pair(b"id", self.requestor)?;
             if let Some(seq) = self.seq {
@@ -65,7 +64,6 @@ impl ToKrpcBody for GetQuery {
             }
             enc.emit_pair(b"target", self.target)
         })
-        .unwrap()
     }
 }
 
@@ -129,8 +127,7 @@ impl PutQuery {
 }
 
 impl ToKrpcBody for PutQuery {
-    #[allow(unused_must_use)]
-    fn encode_body(&self, enc: SingleItemEncoder) {
+    fn encode_body(&self, enc: SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         enc.emit_unsorted_dict(|enc| {
             enc.emit_pair(b"id", self.requestor)?;
             enc.emit_pair(b"token", &self.token)?;
@@ -148,6 +145,5 @@ impl ToKrpcBody for PutQuery {
             }
             Ok(())
         })
-        .unwrap()
     }
 }

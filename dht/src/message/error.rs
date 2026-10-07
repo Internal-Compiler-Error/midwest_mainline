@@ -2,6 +2,7 @@ use bendy::encoding::SingleItemEncoder;
 
 use crate::message::ToKrpcBody;
 
+/// A KRPC error: a code (BEP 5's 201-204, BEP 44's 205-302) and a description
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct KrpcError {
     code: u32,
@@ -9,40 +10,31 @@ pub struct KrpcError {
 }
 
 impl KrpcError {
-    pub fn new(code: u32, message: String) -> Self {
-        Self { code, message }
+    pub fn new(code: u32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn code(&self) -> u32 {
         self.code
     }
 
-    pub fn new_generic() -> Self {
-        Self {
-            code: 201,
-            message: "Generic Error".to_string(),
-        }
+    pub fn message(&self) -> &str {
+        &self.message
     }
 
     pub fn new_server() -> Self {
-        Self {
-            code: 202,
-            message: "Server Error".to_string(),
-        }
+        Self::new(202, "Server Error")
     }
 
     pub fn new_protocol() -> Self {
-        Self {
-            code: 203,
-            message: "Protocol Error".to_string(),
-        }
+        Self::new(203, "Protocol Error")
     }
 
     pub fn new_method_unknown() -> Self {
-        Self {
-            code: 204,
-            message: "Method Unknown".to_string(),
-        }
+        Self::new(204, "Method Unknown")
     }
 }
 
@@ -54,12 +46,10 @@ impl From<diesel::result::Error> for KrpcError {
 }
 
 impl ToKrpcBody for KrpcError {
-    #[allow(unused_must_use)]
-    fn encode_body(&self, enc: SingleItemEncoder) {
+    fn encode_body(&self, enc: SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         enc.emit_list(|e| {
             e.emit(self.code)?;
             e.emit(&self.message)
         })
-        .unwrap()
     }
 }

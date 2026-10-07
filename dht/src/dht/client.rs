@@ -171,8 +171,8 @@ impl DhtClient {
         return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
             // the routing table learns of it from the broker too, but in its own time; a
             // lookup right after the ping (bootstrapping) needs it there now
-            self.state.routing_table.add(*response.target_id(), peer);
-            Ok(*response.target_id())
+            self.state.routing_table.add(response.queried(), peer);
+            Ok(response.queried())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
             Err(naur!("Unexpected response to ping"))
@@ -368,7 +368,7 @@ impl DhtClient {
                     return Err(naur!("{dest} answered sample_infohashes without samples"));
                 };
                 Ok(Sampled {
-                    node: NodeInfo::new(*res.queried(), dest),
+                    node: NodeInfo::new(res.queried(), dest),
                     interval: Duration::from_secs(samples.interval.into()),
                     num: samples.num,
                     samples: samples.samples.clone(),
@@ -763,8 +763,8 @@ mod tests {
     use crate::dht::routing_table::RoutingTable;
     use crate::dht::rpc_manager::RpcManager;
     use crate::dht::txn_id_generator::TxnIdGenerator;
+    use crate::message::Krpc;
     use crate::message::find_node_get_peers_response::Builder as ResBuilder;
-    use crate::message::{Krpc, ParseKrpc};
     use crate::test_support::memory_pool;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
@@ -774,11 +774,11 @@ mod tests {
         let mut buf = [0u8; 1500];
         loop {
             let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
-            let Ok(msg) = (&buf[..n]).parse() else { continue };
+            let Ok(msg) = Krpc::decode(&buf[..n]) else { continue };
             if !matches!(msg.body, KrpcBody::GetPeersQuery(_) | KrpcBody::FindNodeQuery(_)) {
                 continue;
             }
-            let resp = Krpc::new_with_body(msg.transaction_id().clone(), body.clone());
+            let resp = Krpc::new(msg.transaction_id().clone(), body.clone());
             let _ = socket.send_to(&resp.encode(), peer).await;
         }
     }

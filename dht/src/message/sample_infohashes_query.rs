@@ -41,8 +41,7 @@ impl SampleInfohashesQuery {
 }
 
 impl ToKrpcBody for SampleInfohashesQuery {
-    #[allow(unused_must_use)]
-    fn encode_body(&self, enc: SingleItemEncoder) {
+    fn encode_body(&self, enc: SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
         enc.emit_unsorted_dict(|enc| {
             enc.emit_pair(b"id", self.requestor)?;
             if let Some(want) = self.want {
@@ -50,6 +49,5 @@ impl ToKrpcBody for SampleInfohashesQuery {
             }
             enc.emit_pair(b"target", self.target)
         })
-        .unwrap()
     }
 }

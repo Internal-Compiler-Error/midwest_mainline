@@ -129,7 +129,7 @@ impl DhtServer {
 
     #[tracing::instrument(skip(self))]
     fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddr) -> KrpcBody {
-        let res = self.with_closest(ResBuilder::new(self.state.our_id), query.target_id(), query.want());
+        let res = self.with_closest(ResBuilder::new(self.state.our_id), query.target(), query.want());
         KrpcBody::FindNodeGetPeersResponse(res.build())
     }
 
@@ -137,12 +137,12 @@ impl DhtServer {
     fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddr) -> KrpcBody {
         let peers = self
             .state
-            .swarm_peers_preferring(query.info_hash(), self.state.family, query.noseed());
+            .swarm_peers_preferring(&query.info_hash(), self.state.family, query.noseed());
         let token = self.state.token_generator.token_for_ip(&origin.ip());
         let mut res = ResBuilder::new(self.state.our_id).with_token(token);
         // BEP 33: filters only when we hold something for the hash
         if query.scrape()
-            && let Some(filters) = self.state.scrape_filters(query.info_hash())
+            && let Some(filters) = self.state.scrape_filters(&query.info_hash())
         {
             res = res.with_scrape(filters);
         }
@@ -179,7 +179,7 @@ impl DhtServer {
         };
 
         let mut conn = self.state.conn.get().unwrap();
-        let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, announce.seed(), &mut conn)
+        let _ = Self::add_peers_to_db(&announce.info_hash(), peer_contact, announce.seed(), &mut conn)
             .inspect_err(|e| warn!("{e}"));
 
         KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
