@@ -22,7 +22,6 @@ use diesel::{
 use diesel::{insert_into, prelude::*};
 use futures::future::join_all;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 use tracing::{debug, error, info};
 
 use crate::dht::bep42::compliant;
@@ -117,6 +116,8 @@ pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
     bucket_idx.try_into().unwrap()
 }
 
+const REFRESH_EVERY: Duration = Duration::from_secs(180);
+
 #[derive(Debug, Clone)]
 /// A RoutingTable will tell you who are the closest nodes that we know
 pub struct RoutingTable {
@@ -181,6 +182,11 @@ impl RoutingTable {
     /// keep listening for all incoming responses and update our table; the inbox is the
     /// caller's subscription to the broker's inbound queue
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddr)>) {
+        // the refresh runs beside the inbox, which it would otherwise hold up for as long as
+        // it takes
+        let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_EVERY, REFRESH_EVERY);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut refreshing: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             tokio::select! {
                 maybe_msg = inbound.recv() => {
@@ -191,9 +197,11 @@ impl RoutingTable {
                         break;
                     }
                 }
-                // TODO: refresh duration, make it configurable
-                _ = sleep(Duration::from_secs(180)) => {
-                    self.refresh_table().await;
+                _ = refresh.tick() => {
+                    if refreshing.as_ref().is_none_or(|task| task.is_finished()) {
+                        let this = self.clone();
+                        refreshing = Some(tokio::spawn(async move { this.refresh_table().await }));
+                    }
                 }
             }
         }
