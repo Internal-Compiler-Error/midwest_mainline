@@ -206,8 +206,11 @@ fn set_up_tracing() {
         .compact()
         .with_line_number(true)
         .with_filter(LevelFilter::DEBUG);
+    // tokio-console keeps every task it has seen for an hour, and the node spawns one per
+    // answer and per ping: on for a session of looking, not always
+    let console = env::var("TOKIO_CONSOLE").is_ok_and(|v| v == "1");
     tracing_subscriber::registry()
-        .with(console_subscriber::spawn())
+        .with(console.then(console_subscriber::spawn))
         .with(fmt_layer)
         .init();
 }
