@@ -195,6 +195,8 @@ pub(crate) struct Peer {
     pub super_seed: Option<SuperSeedView>,
     /// BEP 10 `yourip`: our address as the peer sees it, until the swarm takes it to vote with
     pub yourip: Option<IpAddr>,
+    /// BEP 5: it told us where its DHT node listens
+    dht_port: Option<u16>,
 
     /// identifies this connection in `Incoming`
     pub conn: u64,
@@ -376,6 +378,7 @@ impl Peer {
             their_ids: [None; Extension::ALL.len()],
             upload_only: false,
             yourip: None,
+            dht_port: None,
             listen_port: None,
             their_reqq: None,
             dialed: false,
@@ -520,6 +523,12 @@ impl Peer {
             // BEP 6: both are advisory-only, and we don't implement request-while-choked
             BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {}
             BtMessage::Extended(ext) if ext.ext_id == 0 => self.handle_extended_handshake(&ext.payload),
+            // only the first is the swarm's business: it pings the node, once
+            BtMessage::Port(port) => {
+                if self.dht_port.replace(port.port).is_none() {
+                    return Ok(Some(BtMessage::Port(port)));
+                }
+            }
             BtMessage::Unknown(msg_type, _) => {
                 tracing::debug!("{} sent unsupported message type {msg_type}", self.remote_addr)
             }
@@ -1196,6 +1205,34 @@ mod test {
             peer.apply(BtMessage::Have(Have { checked: 9 })).is_err(),
             "a Have past the last piece"
         );
+    }
+
+    /// BEP 5's Port comes once after the handshake; each one the swarm sees costs a DHT ping,
+    /// so a peer repeating it can't have us ping over and over.
+    #[tokio::test]
+    async fn only_the_first_dht_port_reaches_the_swarm() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let _other_end = listener.accept().await.unwrap();
+        let (inbox, _incoming) = mpsc::channel(8);
+        let mut peer = Peer::new(
+            PeerStream::Tcp(tcp),
+            "10.0.0.1:1".parse().unwrap(),
+            4,
+            false,
+            [0u8; 20],
+            0,
+            inbox,
+        );
+        let port = || BtMessage::Port(Port { port: 6881 });
+        assert!(matches!(peer.apply(port()), Ok(Some(BtMessage::Port(_)))));
+        for _ in 0..3 {
+            assert!(matches!(peer.apply(port()), Ok(None)));
+        }
     }
 
     #[test]
