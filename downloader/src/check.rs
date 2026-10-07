@@ -66,22 +66,11 @@ enum Slot {
 /// Fills `buf` from the torrent's files as one long stream starting at `start`; false if any
 /// of it is missing.
 fn read_at(torrent: &Torrent, files: &[Slot], start: u64, buf: &mut [u8]) -> bool {
-    let end = start + buf.len() as u64;
-    let mut filled = 0usize;
-    for (i, slot) in files.iter().enumerate().skip(torrent.file_at(start)) {
-        let file_start = torrent.file_offset(i);
-        if file_start >= end {
-            break;
-        }
-        let file_end = file_start + torrent.files[i].0;
-        if file_end <= start {
-            continue;
-        }
-        let from = start.max(file_start);
-        let to = end.min(file_end);
-        let chunk = &mut buf[filled..filled + (to - from) as usize];
-        match slot {
-            Slot::File(file) if file.read_exact_at(chunk, from - file_start).is_ok() => {}
+    let mut filled = 0;
+    for (file, within) in torrent.file_segments(start..start + buf.len() as u64) {
+        let chunk = &mut buf[filled..filled + (within.end - within.start) as usize];
+        match &files[file] {
+            Slot::File(f) if f.read_exact_at(chunk, within.start).is_ok() => {}
             Slot::Zeros => chunk.fill(0),
             _ => return false,
         }

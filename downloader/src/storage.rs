@@ -30,16 +30,24 @@ impl TorrentStorage {
         Ok(start..start + piece_size as u64)
     }
 
-    pub fn write_piece(&self, piece: u32, complete_piece: &[u8]) -> anyhow::Result<()> {
-        let mut written = 0;
-        for (file, range) in self.file_segments(self.piece_range(piece)?) {
-            let size = (range.end - range.start) as usize;
-            if let Some(file) = file {
-                file.write_all_at(&complete_piece[written..written + size], range.start)?;
-            }
-            written += size;
+    /// Writes a whole piece; `data` must be exactly the piece's size.
+    pub fn write_piece(&self, piece: u32, data: &[u8]) -> anyhow::Result<()> {
+        let range = self.piece_range(piece)?;
+        if data.len() as u64 != range.end - range.start {
+            anyhow::bail!(
+                "{} bytes for piece {piece}, which is {}",
+                data.len(),
+                range.end - range.start
+            );
         }
-
+        let mut at = 0;
+        for (file, within) in self.torrent.file_segments(range) {
+            let len = (within.end - within.start) as usize;
+            if let Some(file) = &self.files[file] {
+                file.write_all_at(&data[at..at + len], within.start)?;
+            }
+            at += len;
+        }
         Ok(())
     }
 
@@ -62,34 +70,15 @@ impl TorrentStorage {
 
     fn read_range(&self, range: Range<u64>) -> anyhow::Result<Box<[u8]>> {
         let mut buf = vec![0u8; (range.end - range.start) as usize];
-        let mut read = 0;
-        for (file, interval) in self.file_segments(range) {
-            let len = (interval.end - interval.start) as usize;
-            if let Some(file) = file {
-                file.read_exact_at(&mut buf[read..read + len], interval.start)?;
+        let mut at = 0;
+        for (file, within) in self.torrent.file_segments(range) {
+            let len = (within.end - within.start) as usize;
+            if let Some(file) = &self.files[file] {
+                file.read_exact_at(&mut buf[at..at + len], within.start)?;
             }
-            read += len;
+            at += len;
         }
         Ok(buf.into_boxed_slice())
-    }
-
-    /// Maps a byte range of the conceptual single file onto the actual files it spans, with
-    /// each file's part expressed as a range within that file.
-    fn file_segments(&self, range: Range<u64>) -> Vec<(Option<&File>, Range<u64>)> {
-        let mut ret = vec![];
-        for f in self.torrent.file_at(range.start)..self.files.len() {
-            let f_start = self.torrent.file_offset(f);
-            if f_start >= range.end {
-                break;
-            }
-            let f_end = f_start + self.torrent.files[f].0;
-            let overlap_start = range.start.max(f_start);
-            let overlap_end = range.end.min(f_end);
-            if overlap_start < overlap_end {
-                ret.push((self.files[f].as_ref(), overlap_start - f_start..overlap_end - f_start));
-            }
-        }
-        ret
     }
 }
 
@@ -157,6 +146,11 @@ mod test {
         assert!(storage.read_block(0, 8, 9).is_err());
         assert!(storage.read_block(3, 0, 3).is_err(), "the last piece is only 2 bytes");
         assert!(storage.read_block(4, 0, 1).is_err(), "there is no piece 4");
+        assert!(
+            storage.write_piece(3, &[0; 3]).is_err(),
+            "more than the last piece holds"
+        );
+        assert!(storage.write_piece(0, &[0; 15]).is_err(), "less than a whole piece");
         assert!(
             storage.read_block(0, 16, 0).is_ok(),
             "an empty block at the very end is in range"

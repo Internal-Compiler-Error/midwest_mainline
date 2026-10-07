@@ -373,21 +373,30 @@ impl Torrent {
             return vec![];
         };
         let start = piece as u64 * self.piece_size as u64;
-        let end = start + size as u64;
-        let mut out = vec![];
-        for file in self.file_at(start)..self.files.len() {
-            let (from, len) = (self.offsets[file], self.files[file].0);
-            if from >= end {
-                break;
-            }
-            if self.attrs[file].pad {
-                let (a, b) = (from.max(start), (from + len).min(end));
-                if a < b {
-                    out.push((a - start) as usize..(b - start) as usize);
-                }
-            }
-        }
-        out
+        self.file_segments(start..start + size as u64)
+            .filter(|(file, _)| self.attrs[*file].pad)
+            .map(|(file, within)| {
+                let at = (self.offsets[file] + within.start - start) as usize;
+                at..at + (within.end - within.start) as usize
+            })
+            .collect()
+    }
+
+    /// The pieces of the files that stream bytes `range` covers, in stream order: each one's
+    /// file and the byte range within that file. Empty files are skipped, so the segments of a
+    /// range inside the stream add up to it exactly.
+    pub fn file_segments(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> impl Iterator<Item = (usize, std::ops::Range<u64>)> + '_ {
+        let std::ops::Range { start, end } = range;
+        (self.file_at(start)..self.files.len())
+            .map(|file| (file, self.offsets[file], self.offsets[file] + self.files[file].0))
+            .take_while(move |&(_, from, _)| from < end)
+            .filter_map(move |(file, from, to)| {
+                let (a, b) = (start.max(from), end.min(to));
+                (a < b).then(|| (file, a - from..b - from))
+            })
     }
 
     /// Returns the size of the ith piece in bytes
