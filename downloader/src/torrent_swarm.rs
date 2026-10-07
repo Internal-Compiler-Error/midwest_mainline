@@ -4,7 +4,7 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
 use crate::external::ExternalAddress;
-use crate::layers::{self, LayerFetch, Received};
+use crate::layers::{self, LayerFetch, MAX_HASH_READS, Received};
 use crate::limiter::RateLimiter;
 use crate::merkle::Hash;
 use crate::peer::{
@@ -22,7 +22,7 @@ use crate::stream::{DialHints, PeerStream};
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
 use crate::webseed::{self, Failure, WebJob, WebSeed};
-use crate::wire::{BitField, BtMessage, Piece, Request, V2Support};
+use crate::wire::{BitField, BtMessage, HashRequest, Piece, Request, V2Support};
 use anyhow::Context;
 use bitvec::prelude::*;
 use rand::RngExt;
@@ -236,6 +236,8 @@ pub(crate) enum SwarmEvent {
     DialFailed(SocketAddr),
     /// a hybrid's pieces that failed `recheck_by_layer`
     Rechecked(Vec<u32>),
+    /// the answer to a hash request below the piece layer, see `answer_from_data`
+    HashesRead { to: SocketAddr, reply: BtMessage },
     /// a web seed's job (see `start_web_job`) fetched a block
     WebSeedBlock {
         seed: usize,
@@ -531,6 +533,8 @@ pub struct TorrentSwarm {
     layers: LayerFetch,
     /// per file, the Merkle tree above its piece layer, built for the first hash request
     hash_trees: BTreeMap<usize, Vec<Vec<Hash>>>,
+    /// hash requests being answered from data on disk, at most `MAX_HASH_READS`
+    hash_reads: usize,
     /// BEP 19, in `torrent.web_seeds` order; the index is how their jobs report back
     web_seeds: Vec<WebSeed>,
     next_web_job: u64,
@@ -635,6 +639,7 @@ impl TorrentSwarm {
             availability: vec![0; pieces],
             layers: LayerFetch::new(&torrent),
             hash_trees: BTreeMap::new(),
+            hash_reads: 0,
             inbox,
             incoming,
             next_conn: 0,
@@ -782,6 +787,7 @@ impl TorrentSwarm {
                 outcome,
             } => self.piece_done(piece, len, senders, outcome).await,
             SwarmEvent::Rechecked(failed) => self.recheck_done(failed).await,
+            SwarmEvent::HashesRead { to, reply } => self.hashes_read(to, reply).await,
             SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block).await,
             SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome).await,
             SwarmEvent::DialFailed(addr) => {
@@ -1296,9 +1302,19 @@ impl TorrentSwarm {
                 );
             }
             BtMessage::HashRequest(req) => {
-                let reply = match layers::answer(&self.torrent, &mut self.hash_trees, &req) {
-                    Some(hashes) => BtMessage::Hashes(hashes),
-                    None => BtMessage::HashReject(req),
+                let reply = match layers::pieces_for(&self.torrent, &req) {
+                    Some(pieces) => {
+                        let had = pieces.clone().all(|p| self.stat.verified[p as usize]);
+                        if had && self.hash_reads < MAX_HASH_READS {
+                            self.answer_from_data(self.peers[idx].remote_addr, req, pieces);
+                            return;
+                        }
+                        BtMessage::HashReject(req)
+                    }
+                    None => match layers::answer(&self.torrent, &mut self.hash_trees, &req) {
+                        Some(hashes) => BtMessage::Hashes(hashes),
+                        None => BtMessage::HashReject(req),
+                    },
                 };
                 if self.peers[idx].send_message(reply).await.is_err() {
                     self.drop_peer(idx, "send failed");
@@ -1387,6 +1403,39 @@ impl TorrentSwarm {
 
     /// Second half of `serve_request`: the bytes are in hand (or the read failed, in which
     /// case the request is declined). The peer may have been choked or dropped meanwhile.
+    /// Answers a hash request below the piece layer from `pieces`' data, read and hashed on the
+    /// blocking pool; the answer (or a reject, if the data didn't hash right) comes back as
+    /// `HashesRead`.
+    fn answer_from_data(&mut self, to: SocketAddr, req: HashRequest, pieces: std::ops::Range<u32>) {
+        self.hash_reads += 1;
+        let (torrent, storage, events) = (self.torrent.clone(), self.storage.clone(), self.events_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let answer = layers::answer_from_data(&torrent, &req, |piece| {
+                debug_assert!(pieces.contains(&piece));
+                storage.read_piece(piece).ok()
+            });
+            let reply = match answer {
+                Some(hashes) => BtMessage::Hashes(hashes),
+                None => {
+                    warn!("couldn't answer {to}'s hash request from pieces {pieces:?} on disk");
+                    BtMessage::HashReject(req)
+                }
+            };
+            if let Some(events) = events.upgrade() {
+                let _ = events.blocking_send(SwarmEvent::HashesRead { to, reply });
+            }
+        });
+    }
+
+    async fn hashes_read(&mut self, to: SocketAddr, reply: BtMessage) {
+        self.hash_reads -= 1;
+        if let Some(idx) = self.peer_index(to)
+            && self.peers[idx].send_message(reply).await.is_err()
+        {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
     async fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
         let Some(idx) = self.peer_index(to) else {
             return;

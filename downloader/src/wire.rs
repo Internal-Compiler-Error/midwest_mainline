@@ -856,7 +856,7 @@ mod test {
         ) -> (Handshake, io::Result<Handshake>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let id = identity.clone();
+            let id = *identity;
             let server = tokio::spawn(async move {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let theirs = read_handshake(&mut sock).await.unwrap();

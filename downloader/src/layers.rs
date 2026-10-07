@@ -1,5 +1,6 @@
 //! BEP 52 hash requests, both ways: fetching the piece layers a v2 torrent from a magnet
-//! lacks (the info dict has only each file's root), and answering peers who ask us.
+//! lacks (the info dict has only each file's root), and answering peers who ask us: from the
+//! piece layer up out of the layers, below it (down to the 16 KiB leaves) out of the data.
 //!
 //! A layer is fetched whole from one peer, in chunks of at most 512 hashes and without proof
 //! hashes: once every chunk is in, the layer either rolls up to the file's root or the peer
@@ -8,6 +9,7 @@
 use crate::merkle::{self, Hash};
 use crate::torrent::Torrent;
 use crate::wire::{HashRequest, Hashes};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -173,33 +175,171 @@ impl LayerFetch {
     }
 }
 
-/// Answers a peer's hash request from the piece layers we have, if it's for a whole-file
-/// piece layer we know and within the tree; `trees` caches each file's tree above it.
+/// Hash requests answered from data on disk at once, per torrent; more are rejected.
+pub const MAX_HASH_READS: usize = 4;
+/// The most hashes we send in one answer; what libtorrent caps them at too.
+const MAX_ANSWER: u32 = 8192;
+/// The most 16 KiB blocks of data a request below the piece layer may make us read: 8 MiB,
+/// or one piece if pieces are bigger.
+const MAX_ANSWER_BLOCKS: usize = 512;
+
+/// Checks a request's shape against a tree `height` layers tall above its base, whose base
+/// layer is `width` wide: BEP 52's rules, and proofs that stop below the root.
+fn well_formed(req: &HashRequest, width: usize, height: u32) -> bool {
+    let (index, length) = (req.index as usize, req.length as usize);
+    req.length.is_power_of_two()
+        && (2..=MAX_ANSWER).contains(&req.length)
+        && index.is_multiple_of(length)
+        && index + length <= width
+        && req.proof_layers < height
+}
+
+/// The answer to `req`: the requested hashes from layer `base` (`node(level, index)` counts
+/// levels up from the base), then, as libtorrent lays it out, the uncles from the layer
+/// where the requested hashes stop implying the tree, up to `proof_layers`.
+fn hashes(req: &HashRequest, mut node: impl FnMut(u32, usize) -> Hash) -> Hashes {
+    let (index, length) = (req.index as usize, req.length as usize);
+    let mut hashes: Vec<Hash> = (index..index + length).map(|i| node(0, i)).collect();
+    for level in length.trailing_zeros()..=req.proof_layers {
+        hashes.push(node(level, (index >> level) ^ 1));
+    }
+    Hashes {
+        request: *req,
+        hashes: hashes.into(),
+    }
+}
+
+/// Answers a peer's hash request for the piece layer of a file we have it for, or a layer
+/// above it; `trees` caches each file's tree above its piece layer. Requests below the piece
+/// layer need the data (see `pieces_for`).
 pub fn answer(torrent: &Torrent, trees: &mut BTreeMap<usize, Vec<Vec<Hash>>>, req: &HashRequest) -> Option<Hashes> {
     let file = torrent.file_with_root(&req.root)?;
     let layer = torrent.layer(file)?;
-    if req.base != piece_layer_base(torrent) || !req.length.is_power_of_two() || req.length < 2 || req.length > 8192 {
-        return None;
-    }
+    let up = req.base.checked_sub(piece_layer_base(torrent))? as usize;
     let tree = trees.entry(file).or_insert_with(|| {
         let pad = merkle::zero_subtree(piece_layer_base(torrent));
         merkle::layers_above(layer, pad)
     });
-    let (index, length) = (req.index as usize, req.length as usize);
-    let height = tree.len() - 1;
-    if !index.is_multiple_of(length) || index + length > tree[0].len() || req.proof_layers as usize >= height {
+    let height = (tree.len() - 1).checked_sub(up)? as u32;
+    if !well_formed(req, tree[up].len(), height) {
         return None;
     }
-    let mut hashes = tree[0][index..index + length].to_vec();
-    // as libtorrent does: uncles from the layer where the requested hashes stop implying
-    // the tree, up to `proof_layers`
-    for level in length.trailing_zeros() as usize..=req.proof_layers as usize {
-        hashes.push(tree[level][(index >> level) ^ 1]);
+    Some(hashes(req, |level, i| tree[up + level as usize][i]))
+}
+
+/// Where a file's tree hashes data rather than the piece layer: from the leaves up to its
+/// pieces' roots, `piece_level` above them. A file of one piece has no piece layer; its
+/// whole tree, `file_leaves` wide, is the one piece's.
+struct Below {
+    file: usize,
+    /// the file's pieces, in the torrent's numbering
+    pieces: std::ops::Range<u32>,
+    piece_level: u32,
+    /// the tree's leaves, a power of two
+    width: usize,
+    /// layers above the leaves, the root's
+    height: u32,
+}
+
+impl Below {
+    fn of(torrent: &Torrent, req: &HashRequest) -> Option<Self> {
+        let file = torrent.file_with_root(&req.root)?;
+        let pieces = torrent.pieces_of_file(file);
+        let n = pieces.len();
+        let (piece_level, width) = if n == 1 {
+            let leaves = merkle::file_leaves(torrent.files[file].0);
+            (leaves.trailing_zeros(), leaves)
+        } else {
+            let base = piece_layer_base(torrent);
+            (base, n.next_power_of_two() << base)
+        };
+        let below = Self {
+            file,
+            pieces,
+            piece_level,
+            width,
+            height: width.trailing_zeros(),
+        };
+        (req.base < piece_level).then_some(below)
     }
-    Some(Hashes {
-        request: *req,
-        hashes: hashes.into(),
-    })
+
+    /// The pieces (in the torrent's numbering) whose data the hashes of `req` come from.
+    fn data(&self, req: &HashRequest) -> std::ops::Range<u32> {
+        let per_piece = 1usize << (self.piece_level - req.base);
+        let first = (req.index as usize / per_piece) as u32;
+        let end = (req.index as usize + req.length as usize).div_ceil(per_piece) as u32;
+        let n = self.pieces.len() as u32;
+        self.pieces.start + first.min(n)..self.pieces.start + end.min(n)
+    }
+}
+
+/// For a hash request below the piece layer (the leaves, say): the pieces whose data answering
+/// it takes, all of which must be verified; `None` if it's not such a request, or one we won't
+/// answer. Reading them and hashing is `answer_from_data`'s, off the event loop.
+pub fn pieces_for(torrent: &Torrent, req: &HashRequest) -> Option<std::ops::Range<u32>> {
+    let below = Below::of(torrent, req)?;
+    let blocks = (req.length as usize) << req.base;
+    let piece_blocks = 1usize << below.piece_level;
+    if !well_formed(req, below.width >> req.base, below.height - req.base)
+        || blocks > MAX_ANSWER_BLOCKS.max(piece_blocks)
+        || (below.pieces.len() > 1 && torrent.layer(below.file).is_none())
+    {
+        return None;
+    }
+    Some(below.data(req))
+}
+
+/// Answers a request `pieces_for` took, with `read` giving the data of each of its pieces. A
+/// piece whose data doesn't hash to what the tree says (read wrong, or changed on disk) fails
+/// the answer.
+pub fn answer_from_data(
+    torrent: &Torrent,
+    req: &HashRequest,
+    mut read: impl FnMut(u32) -> Option<Box<[u8]>>,
+) -> Option<Hashes> {
+    let below = Below::of(torrent, req)?;
+    let (file, level) = (below.file, below.piece_level);
+    let layer = torrent.layer(file);
+    let root = torrent.v2.as_ref()?.roots[file]?;
+    let len = torrent.files[file].0;
+    let mut trees = BTreeMap::new();
+    for piece in below.data(req) {
+        let k = (piece - below.pieces.start) as usize;
+        let data = read(piece)?;
+        let start = k as u64 * torrent.piece_size as u64;
+        let used = (len - start).min(torrent.piece_size as u64) as usize;
+        let mut leaves: Vec<Hash> = data
+            .get(..used)?
+            .chunks(merkle::BLOCK)
+            .map(|block| sha2::Sha256::digest(block).into())
+            .collect();
+        leaves.resize(1 << level, [0; 32]);
+        let tree = merkle::layers_above(&leaves, [0; 32]);
+        let expected = match layer {
+            Some(layer) => layer[k],
+            None => root,
+        };
+        if tree[level as usize][0] != expected {
+            return None;
+        }
+        trees.insert(k, tree);
+    }
+    let above = layer.map(|layer| merkle::layers_above(layer, merkle::zero_subtree(level)));
+    let n = below.pieces.len();
+    Some(hashes(req, |up, i| {
+        let at = req.base + up;
+        if at >= level {
+            let above = above
+                .as_ref()
+                .expect("a proof above the piece layer is of a file with one");
+            return above[(at - level) as usize][i];
+        }
+        let k = i >> (level - at);
+        if k >= n {
+            return merkle::zero_subtree(at);
+        }
+        trees[&k][at as usize][i & ((1 << (level - at)) - 1)]
+    }))
 }
 
 #[cfg(test)]
@@ -207,6 +347,7 @@ mod test {
     use super::*;
     use crate::torrent::fixtures::{self, sorted};
     use crate::torrent::parse_torrent;
+    use sha2::Sha256;
 
     const P: usize = 32768;
 
@@ -225,6 +366,115 @@ mod test {
 
     fn addr(n: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, n], 6881))
+    }
+
+    /// The piece stream of a v2 torrent of `files`: each padded to a piece boundary but the last.
+    fn stream(files: &[(&[&str], Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![];
+        let last = files.iter().rposition(|(_, d)| !d.is_empty()).unwrap();
+        for (i, (_, d)) in files.iter().enumerate() {
+            out.extend_from_slice(d);
+            if i != last {
+                out.resize(out.len().next_multiple_of(P), 0);
+            }
+        }
+        out
+    }
+
+    /// Every layer of `data`'s tree from the leaves up, straight from BEP 52's definition.
+    fn full_tree(data: &[u8]) -> Vec<Vec<Hash>> {
+        let mut leaves: Vec<Hash> = data.chunks(merkle::BLOCK).map(|b| Sha256::digest(b).into()).collect();
+        leaves.resize(merkle::file_leaves(data.len() as u64), [0; 32]);
+        merkle::layers_above(&leaves, [0; 32])
+    }
+
+    /// What a request of `tree`'s layer `base` must be answered with.
+    fn expected(tree: &[Vec<Hash>], req: &HashRequest) -> Vec<Hash> {
+        let (base, index, length) = (req.base as usize, req.index as usize, req.length as usize);
+        let mut out = tree[base][index..index + length].to_vec();
+        for level in length.trailing_zeros()..=req.proof_layers {
+            out.push(tree[base + level as usize][(index >> level) ^ 1]);
+        }
+        out
+    }
+
+    fn answer_on(t: &Torrent, data: &[u8], req: &HashRequest) -> Option<Vec<Hash>> {
+        if pieces_for(t, req).is_none() {
+            return answer(t, &mut BTreeMap::new(), req).map(|h| h.hashes.to_vec());
+        }
+        let read = |piece: u32| {
+            let start = piece as usize * P;
+            Some(data[start..(start + P).min(data.len())].into())
+        };
+        answer_from_data(t, req, read).map(|h| h.hashes.to_vec())
+    }
+
+    /// Leaf (and other below-the-piece-layer) requests are answered from the data, with proofs
+    /// that reach through the piece layer; layers above it come from the piece layer.
+    #[test]
+    fn answers_leaf_requests_from_the_data() {
+        let files = files();
+        let t = parse_torrent(&fixtures::torrent_file("v2", &files, P, false)).unwrap();
+        let data = stream(&files);
+        let req = |root, base, index, length, proof_layers| HashRequest {
+            root,
+            base,
+            index,
+            length,
+            proof_layers,
+        };
+
+        // "more": 6 pieces of 2 blocks, the last 1 byte; 16 leaves, 4 layers above them
+        let more = &files[3].1;
+        let tree = full_tree(more);
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree[4][0], fixtures::root(more));
+        let root = fixtures::root(more);
+        for r in [
+            req(root, 0, 2, 2, 3),  // one piece's leaves, proven up to the root's children
+            req(root, 0, 0, 4, 2),  // two pieces'
+            req(root, 0, 10, 2, 0), // the short last piece's
+            req(root, 0, 12, 4, 3), // past the file: zeros, proven by real hashes
+            req(root, 0, 0, 16, 3), // all of them
+            req(root, 2, 0, 4, 1),  // above the piece layer
+            req(root, 3, 0, 2, 0),
+        ] {
+            assert_eq!(answer_on(&t, &data, &r), Some(expected(&tree, &r)), "{r:?}");
+        }
+        assert_eq!(
+            pieces_for(&t, &req(root, 0, 12, 4, 3)),
+            Some(
+                t.pieces_of_file(t.file_with_root(&root).unwrap()).end
+                    ..t.pieces_of_file(t.file_with_root(&root).unwrap()).end
+            ),
+            "no data to read"
+        );
+
+        // "dir/small": one piece, a tree of two leaves and no piece layer
+        let small = &files[2].1;
+        assert_eq!(files[2].0, ["dir", "small"]);
+        let tree = full_tree(small);
+        let r = req(fixtures::root(small), 0, 0, 2, 0);
+        assert_eq!(answer_on(&t, &data, &r), Some(expected(&tree, &r)));
+
+        for (bad, why) in [
+            (req(root, 0, 1, 2, 0), "index not a multiple of length"),
+            (req(root, 0, 0, 3, 0), "length not a power of two"),
+            (req(root, 0, 16, 2, 0), "past the tree"),
+            (req(root, 0, 0, 2, 4), "proof past the root"),
+            (req(fixtures::root(small), 0, 0, 2, 1), "proof past the small root"),
+        ] {
+            assert_eq!(answer_on(&t, &data, &bad), None, "{why}");
+        }
+
+        // data that doesn't hash to the piece layer isn't answered for
+        let mut corrupt = data.clone();
+        corrupt[t.pieces_of_file(t.file_with_root(&root).unwrap()).start as usize * P + 1] ^= 1;
+        assert_eq!(answer_on(&t, &corrupt, &req(root, 0, 0, 2, 0)), None);
+        // nor is a file whose piece layer we lack (a magnet's, early on)
+        let info = fixtures::info("v2", &files, P, false);
+        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+        assert_eq!(pieces_for(&bare, &req(root, 0, 0, 2, 0)), None);
     }
 
     #[test]
@@ -367,9 +617,11 @@ mod test {
     /// `scratch/seed`, the leecher starting from `bare` (its info dict alone, as from a magnet)
     /// under `scratch/leech` with `leech` verified, there already if any.
     struct TwoClients {
-        seeder: crate::BtClient,
+        // kept for the swarm it runs
+        _seeder: crate::BtClient,
         leecher: crate::BtClient,
         scratch: std::path::PathBuf,
+        seed_port: u16,
     }
 
     fn two_clients(
@@ -425,9 +677,10 @@ mod test {
         }
         leecher.add_peers(&bare.info_hash, vec![SocketAddr::from(([127, 0, 0, 1], seed_port))]);
         TwoClients {
-            seeder,
+            _seeder: seeder,
             leecher,
             scratch,
+            seed_port,
         }
     }
 
@@ -518,5 +771,57 @@ mod test {
             .unwrap();
         assert_eq!(stats.borrow().verified.count_zeros(), 1, "only that one");
         assert!(bare.layer(file).is_some());
+    }
+
+    /// A seeder answers a leaf-layer request on the wire, from what it has on disk.
+    #[tokio::test]
+    async fn a_seeder_answers_leaf_requests_over_the_wire() {
+        use crate::wire::{BtCodec, BtMessage, V2Support};
+        use futures::{SinkExt, StreamExt};
+
+        let files = files();
+        let full = parse_torrent(&fixtures::torrent_file("v2leaves", &files, P, false)).unwrap();
+        let none = bitvec::bitbox![u8, bitvec::order::Msb0; 0; full.num_pieces()];
+        let clients = two_clients("v2leaves", &full, &full.clone(), &files, none);
+
+        // the listener comes up in a task of its own
+        let mut tcp = loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", clients.seed_port)).await {
+                Ok(tcp) => break tcp,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let us = crate::defs::Identity {
+            peer_id: *b"-DL0100-v2-asker....",
+            serving: SocketAddr::from(([127, 0, 0, 1], 1)),
+            dht: false,
+            encryption: crate::config::Encryption::Disabled,
+        };
+        crate::wire::shake_hands(&mut tcp, &full.info_hash, &us, V2Support::Only)
+            .await
+            .unwrap();
+        let mut wire = tokio_util::codec::Framed::new(tcp, BtCodec);
+        let more = &files[3].1;
+        let request = HashRequest {
+            root: fixtures::root(more),
+            base: 0,
+            index: 4,
+            length: 4,
+            proof_layers: 3,
+        };
+        wire.send(BtMessage::HashRequest(request)).await.unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match wire.next().await.unwrap().unwrap() {
+                    BtMessage::Hashes(hashes) => break hashes,
+                    BtMessage::HashReject(r) => panic!("rejected {r:?}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer.request, request);
+        assert_eq!(&*answer.hashes, expected(&full_tree(more), &request));
     }
 }
