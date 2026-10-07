@@ -11,6 +11,7 @@ use bitvec::prelude::*;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
+use midwest_mainline::message::{compact_addr, parse_compact_addr};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -840,43 +841,28 @@ pub(crate) const PEX_UTP: u8 = 0x04;
 /// PEX is a discovery hint, not authoritative membership, and a peer we no longer know about
 /// simply stops being resent next round.
 fn build_pex_message(added: &[(SocketAddr, u8)]) -> Vec<u8> {
-    let mut added4 = Vec::new();
-    let mut flags4 = Vec::new();
-    let mut added6 = Vec::new();
-    let mut flags6 = Vec::new();
-    for (addr, flags) in added {
-        match addr {
-            SocketAddr::V4(a) => {
-                added4.extend_from_slice(&a.ip().octets());
-                added4.extend_from_slice(&a.port().to_be_bytes());
-                flags4.push(*flags);
-            }
-            SocketAddr::V6(a) => {
-                added6.extend_from_slice(&a.ip().octets());
-                added6.extend_from_slice(&a.port().to_be_bytes());
-                flags6.push(*flags);
-            }
-        }
-    }
-
     let mut out = b"d".to_vec();
-    let mut field = |key: &str, bytes: &[u8]| {
-        out.extend_from_slice(format!("{}:{key}{}:", key.len(), bytes.len()).as_bytes());
-        out.extend_from_slice(bytes);
-    };
-    // keys in sorted order; a family's keys are left out entirely when there's nothing to
-    // say, rather than sent as empty strings, which is the shape every other client produces
-    if !added4.is_empty() {
-        field("added", &added4);
-        field("added.f", &flags4);
-    }
-    if !added6.is_empty() {
-        field("added6", &added6);
-        field("added6.f", &flags6);
+    for (key, flags_key, is_v6) in PEX_FAMILIES {
+        let family: Vec<_> = added.iter().filter(|(addr, _)| addr.is_ipv6() == is_v6).collect();
+        // a family's keys are left out entirely when there's nothing to say, rather than sent
+        // as empty strings, which is the shape every other client produces
+        if family.is_empty() {
+            continue;
+        }
+        let addrs: Vec<u8> = family.iter().flat_map(|(addr, _)| compact_addr(addr)).collect();
+        let flags: Vec<u8> = family.iter().map(|(_, flags)| *flags).collect();
+        for (key, bytes) in [(key, addrs), (flags_key, flags)] {
+            out.extend_from_slice(format!("{}:{key}{}:", key.len(), bytes.len()).as_bytes());
+            out.extend_from_slice(&bytes);
+        }
     }
     out.push(b'e');
     out
 }
+
+/// BEP 11's per-family keys, in bencode order: the compact addresses, their flags, and
+/// whether they're IPv6 (18 bytes each, against IPv4's 6).
+const PEX_FAMILIES: [(&str, &str, bool); 2] = [("added", "added.f", false), ("added6", "added6.f", true)];
 
 /// BEP 11 (PEX): the "added"/"added6" compact peer lists of an incoming message, each with its
 /// "added.f" flags (0 when the sender didn't say). "dropped"/"dropped6" are ignored: PEX is
@@ -885,27 +871,18 @@ pub(crate) fn parse_pex_message(payload: &[u8]) -> Vec<(SocketAddr, u8)> {
     let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
         return vec![];
     };
-    let flags_of = |key: &[u8]| -> Vec<u8> {
-        match dict.get(key) {
-            Some(BencodeItemView::ByteString(bytes)) => bytes.to_vec(),
-            _ => vec![],
-        }
+    let bytes = |key: &str| match dict.get(key.as_bytes()) {
+        Some(BencodeItemView::ByteString(bytes)) => *bytes,
+        _ => &[][..],
     };
-
     let mut peers = Vec::new();
-    if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added".as_slice()) {
-        let flags = flags_of(b"added.f");
-        for (i, [a, b, c, d, p0, p1]) in bytes.as_chunks::<6>().0.iter().enumerate() {
-            let addr = SocketAddr::from(([*a, *b, *c, *d], u16::from_be_bytes([*p0, *p1])));
-            peers.push((addr, flags.get(i).copied().unwrap_or(0)));
-        }
-    }
-    if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added6".as_slice()) {
-        let flags = flags_of(b"added6.f");
-        for (i, chunk) in bytes.as_chunks::<18>().0.iter().enumerate() {
-            let (ip, port) = chunk.split_first_chunk::<16>().expect("18 bytes");
-            let addr = SocketAddr::from((*ip, u16::from_be_bytes([port[0], port[1]])));
-            peers.push((addr, flags.get(i).copied().unwrap_or(0)));
+    for (key, flags_key, is_v6) in PEX_FAMILIES {
+        let flags = bytes(flags_key);
+        let size = if is_v6 { 18 } else { 6 };
+        for (i, raw) in bytes(key).chunks(size).enumerate() {
+            if let Some(addr) = parse_compact_addr(raw) {
+                peers.push((addr, flags.get(i).copied().unwrap_or(0)));
+            }
         }
     }
     peers
@@ -1243,6 +1220,11 @@ mod test {
         assert_eq!(parse_pex_message(&message), vec![(v4, PEX_UTP | PEX_SEED), (v6, 0)]);
         // a message without flags, as older clients send, still parses
         assert_eq!(parse_pex_message(b"d5:added6:\x01\x02\x03\x04\x1a\xe1e"), vec![(v4, 0)]);
+        assert_eq!(
+            parse_pex_message(b"d5:added7:\x01\x02\x03\x04\x1a\xe1\x09e"),
+            vec![(v4, 0)],
+            "a trailing partial entry is dropped"
+        );
     }
 
     #[test]
