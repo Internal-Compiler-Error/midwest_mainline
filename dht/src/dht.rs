@@ -240,6 +240,11 @@ impl DhtSession {
         conn.batch_execute("PRAGMA journal_mode = WAL")?;
         conn.run_pending_migrations(MIGRATIONS)
             .map_err(|e| naur!("could not migrate the database: {e}"))?;
+        match routing_table::purge_shared_ips(&mut conn) {
+            Ok(0) => {}
+            Ok(n) => info!("dropped {n} routing table nodes sharing an IP with another"),
+            Err(e) => warn!("couldn't apply one node per IP to the routing table: {e}"),
+        }
         let observed = known_external_ip(&mut conn)?;
         let external_addr = match external_addr.or(observed) {
             Some(ip) => {

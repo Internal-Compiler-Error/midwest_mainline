@@ -180,9 +180,18 @@ async fn dht_announcer(
 
     loop {
         let started = Instant::now();
+        // peers go to the swarm as nodes return them; waiting for the lookup to converge
+        // would leave them idle for the seconds that takes
+        let early = events.clone();
+        let streamed = handle.client.get_peers_with(info_hash, move |peers| {
+            if let Some(events) = early.upgrade() {
+                let peers = peers.iter().copied().map(SocketAddr::V4).collect();
+                let _ = events.try_send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht));
+            }
+        });
         let lookup = tokio::select! {
             _ = shutdown.cancelled() => return,
-            lookup = handle.client.get_peers(info_hash) => lookup,
+            lookup = streamed => lookup,
         };
         let wait = match &lookup {
             Ok(result) if !result.peers.is_empty() => {
@@ -212,6 +221,8 @@ async fn dht_announcer(
                     row.peers = result.peers.len();
                     row.next_announce = Some(Instant::now() + wait);
                 });
+                // the whole set again, in case a batch above found the queue full; the swarm
+                // and the metadata fetch both skip addresses they already have
                 let Some(events) = events.upgrade() else { return };
                 let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
                 if events
@@ -221,15 +232,19 @@ async fn dht_announcer(
                 {
                     return;
                 }
-                for (node, token) in result.announce_candidates {
-                    if let Err(e) = handle
-                        .client
-                        .announce_peers(node.end_point(), info_hash, port, token)
-                        .await
-                    {
-                        tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
-                    }
-                }
+                // all at once and in the background: one at a time, each dead node held the next
+                // lookup back by a full request timeout
+                let client = handle.client.clone();
+                tokio::spawn(futures::future::join_all(result.announce_candidates.into_iter().map(
+                    move |(node, token)| {
+                        let client = client.clone();
+                        async move {
+                            if let Err(e) = client.announce_peers(node.end_point(), info_hash, port, token).await {
+                                tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
+                            }
+                        }
+                    },
+                )));
             }
             Err(e) => {
                 warn!("DHT lookup for {info_hash:?} failed: {e:#}");

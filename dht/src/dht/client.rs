@@ -2,12 +2,15 @@
 //! announce_peer, using the shared state. Clone it freely, everything it touches is
 //! shared.
 
+use futures::StreamExt;
 use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::dht::routing_table::one_node_per_ip;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
     KrpcBody, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
@@ -20,9 +23,18 @@ use crate::types::{InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>);
 
 const ROUNDS_LIMIT: i32 = 8;
-/// Nodes queried per lookup round. BEP 5 suggests 3; more costs little on UDP and finishes
+/// Queries in flight at once in a lookup. BEP 5 suggests 3; more costs little on UDP and finishes
 /// a lookup in seconds rather than a minute when many nodes are dead.
 const CONCURRENT_REQS: usize = 8;
+/// A get_peers lookup ends once the closest nodes that answered number this many and nothing
+/// closer is left to ask: Kademlia's k, where announced peers are stored.
+const LOOKUP_K: usize = 8;
+/// Nodes from our routing table a get_peers lookup starts from. More than k, so a cluster of
+/// unhelpful nodes nearest the target can't dead-end every path.
+const LOOKUP_SEEDS: u16 = 32;
+/// Bounds on one get_peers lookup, for a routing table so sparse or stale it never converges.
+const LOOKUP_MAX_QUERIES: usize = 200;
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
 #[derive(Debug)]
@@ -172,9 +184,20 @@ impl DhtClient {
 
     #[tracing::instrument(skip(self))]
     pub async fn get_peers(&self, info_hash: InfoHash) -> Result<GetPeersResult, OurError> {
+        self.get_peers_with(info_hash, |_| {}).await
+    }
+
+    /// `get_peers`, also handing each batch of peers to `found` the moment a node returns it,
+    /// seconds before the lookup as a whole converges.
+    pub async fn get_peers_with(
+        &self,
+        info_hash: InfoHash,
+        mut found: impl FnMut(&[SocketAddrV4]) + Send,
+    ) -> Result<GetPeersResult, OurError> {
         // peers others announced *to us* are served from the local store immediately
         let known_peers = self.state.swarm_peers(&info_hash);
         if !known_peers.is_empty() {
+            found(&known_peers);
             return Ok(GetPeersResult {
                 peers: known_peers,
                 announce_candidates: vec![],
@@ -182,57 +205,84 @@ impl DhtClient {
         }
 
         // iterative lookup: query the closest-known nodes, follow their `nodes` referrals
-        // towards the info hash, and harvest peers and tokens along the way
+        // towards the info hash, and harvest peers and tokens along the way. Queries stream
+        // rather than going in rounds: CONCURRENT_REQS are always in flight, and each answer
+        // starts the next query at once instead of waiting for the round's slowest node.
         let target = NodeId(info_hash.0);
-        let mut closest = self.state.routing_table.find_closest(target);
+        let by_distance = |l: &NodeInfo, r: &NodeInfo| cmp_resp(&l.id(), &r.id(), &target);
+        // one node per public IP (see `RoutingTable::ip_taken`), here too: a Sybil's many ids
+        // around the target would otherwise fill every slot of the lookup
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut seen_ips: HashSet<Ipv4Addr> = HashSet::new();
+        let mut fresh_node = move |n: &NodeInfo| {
+            let ip = *n.end_point().ip();
+            seen.insert(n.id()) && (!one_node_per_ip(&ip) || seen_ips.insert(ip))
+        };
+        let mut known = self.state.routing_table.find_closest_n(target, LOOKUP_SEEDS);
+        known.sort_unstable_by(by_distance);
+        known.retain(|n| fresh_node(n));
         let mut queried: HashSet<NodeId> = HashSet::new();
+        // nodes that answered usefully, closest first; the lookup is done when nothing
+        // unqueried is closer than the LOOKUP_K-th of these
+        let mut answered: Vec<NodeInfo> = vec![];
         let mut peers: Vec<SocketAddrV4> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
+        let mut in_flight = FuturesUnordered::new();
+        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
 
-        let mut round = 0;
         loop {
-            if round == ROUNDS_LIMIT {
-                break;
-            }
-            round += 1;
-
-            let querying: Vec<NodeInfo> = closest
-                .iter()
-                .filter(|n| !queried.contains(&n.id()))
-                .take(CONCURRENT_REQS)
-                .cloned()
-                .collect();
-            if querying.is_empty() {
-                break;
-            }
-            for node in &querying {
-                queried.insert(node.id());
-            }
-
-            let results = querying
-                .iter()
-                .map(|node| async move { (*node, self.send_get_peers_rpc(node.end_point(), info_hash).await) })
-                .collect::<Vec<_>>();
-            let results = join_all(results).await;
-
-            let mut returned_nodes = vec![];
-            for (node, result) in results {
-                match result {
-                    Ok((token, nodes, values)) => {
-                        peers.extend(values);
-                        if let Some(token) = token {
-                            announce_candidates.push((node, token));
-                        }
-                        returned_nodes.extend(nodes);
-                    }
-                    Err(_) => self.state.routing_table.mark_failed(&node.id()),
+            while in_flight.len() < CONCURRENT_REQS && queried.len() < LOOKUP_MAX_QUERIES {
+                let Some(node) = known.iter().find(|n| !queried.contains(&n.id())).copied() else {
+                    break;
+                };
+                if let Some(kth) = answered.get(LOOKUP_K - 1)
+                    && by_distance(&node, kth).is_gt()
+                {
+                    break;
                 }
+                queried.insert(node.id());
+                in_flight.push(async move { (node, self.send_get_peers_rpc(node.end_point(), info_hash).await) });
             }
-
-            closest.append(&mut returned_nodes);
-            closest.sort_unstable_by_key(|n| n.id().0);
-            closest.dedup_by(|l, r| l.id() == r.id());
-            closest.sort_unstable_by(|l, r| cmp_resp(&l.id(), &r.id(), &target));
+            let Ok(Some((node, result))) = tokio::time::timeout_at(deadline, in_flight.next()).await else {
+                break;
+            };
+            match result {
+                Ok((token, nodes, values)) => {
+                    let nodes_len = nodes.len();
+                    if !values.is_empty() {
+                        found(&values);
+                    }
+                    let values_len = values.len();
+                    peers.extend(values);
+                    if let Some(token) = token {
+                        announce_candidates.push((node, token));
+                    }
+                    // BEP 5 has a node without peers return closer nodes; one that sends
+                    // neither (typically a crawler parked next to popular hashes to collect
+                    // announces) gets no say in when the lookup is done, and leaves the table
+                    if values_len == 0 && nodes_len == 0 {
+                        self.state.routing_table.evict(&node.id());
+                    } else {
+                        let at = answered.partition_point(|a| by_distance(a, &node).is_lt());
+                        answered.insert(at, node);
+                    }
+                    let fresh: Vec<NodeInfo> = nodes.into_iter().filter(|n| fresh_node(n)).collect();
+                    debug!(
+                        "get_peers: {} answered with {} peers, {} nodes ({} new); {} known, {} queried",
+                        node.end_point(),
+                        values_len,
+                        nodes_len,
+                        fresh.len(),
+                        known.len(),
+                        queried.len()
+                    );
+                    if !fresh.is_empty() {
+                        known.extend(fresh);
+                        known.sort_unstable_by(by_distance);
+                    }
+                }
+                Err(_) => self.state.routing_table.mark_failed(&node.id()),
+            }
         }
 
         peers.sort_unstable();

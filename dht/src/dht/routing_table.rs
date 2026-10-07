@@ -34,6 +34,30 @@ use crate::{
 use super::rpc_manager::RpcManager;
 use super::state::REQ_TIMEOUT;
 
+/// Whether the one-node-per-IP rule applies to `ip` (see `RoutingTable::ip_taken`).
+pub(crate) fn one_node_per_ip(ip: &Ipv4Addr) -> bool {
+    !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified())
+}
+
+/// Applies the one-node-per-IP rule to a table saved before it existed (or by a version that
+/// didn't enforce it): of the nodes sharing a public IP, the one heard from last stays.
+pub(crate) fn purge_shared_ips(conn: &mut SqliteConnection) -> Result<usize, diesel::result::Error> {
+    use crate::schema::node::dsl::*;
+    let mut rows: Vec<(Vec<u8>, String, i64)> = node
+        .filter(removed.eq(false))
+        .select((id, ip_addr, last_contacted))
+        .load(conn)?;
+    rows.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
+    let mut doomed = vec![];
+    for pair in rows.windows(2) {
+        let shared = pair[0].1 == pair[1].1 && pair[1].1.parse::<Ipv4Addr>().is_ok_and(|ip| one_node_per_ip(&ip));
+        if shared {
+            doomed.push(pair[1].0.clone());
+        }
+    }
+    diesel::delete(node.filter(id.eq_any(&doomed))).execute(conn)
+}
+
 /// Which of the 160 buckets `target` falls into, relative to `our_id`.
 pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
     let dist = our_id.dist(target);
@@ -145,12 +169,15 @@ impl RoutingTable {
     }
 
     pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
+        self.find_closest_n(target, 8)
+    }
+
+    /// The `total` nodes we know closest to `target`, closest first.
+    pub fn find_closest_n(&self, target: NodeId, total: u16) -> Vec<NodeInfo> {
         // NOTE: Start with the center and alternating left and right expansion, none of this is
         // done in a transaction so we don't block other writers due to sqlite only allowing one
         // writers at anytime. It's possible that other writers may modify the table while we
         // fetch, that's ok, the DHT is allowed to be somewhat sloppy.
-
-        let total: u16 = 8; // TODO: make this as a param
 
         let mut conn = self.conn();
 
@@ -222,10 +249,14 @@ impl RoutingTable {
             debug!("Already contains this node in routing table, skipping");
             return;
         }
+        if self.ip_taken(addr.ip()) {
+            debug!("{addr} already has a node in the routing table, skipping {new_node_id:?}");
+            return;
+        }
 
         let bucket_idx = self.index(&new_node_id);
         if !self.full_bucket(bucket_idx) {
-            info!("Bucket {bucket_idx} has capacity, inserting");
+            debug!("Bucket {bucket_idx} has capacity, inserting");
             let node = NodeInfo::new(new_node_id, addr);
             let mut conn = self.conn();
             self.put_to_bucket(node, &mut conn);
@@ -252,6 +283,22 @@ impl RoutingTable {
             this.put_to_bucket(node, &mut conn);
         };
         tokio::spawn(work);
+    }
+
+    /// One node per public IP, as libtorrent does: someone running a thousand node ids from one
+    /// machine (a Sybil parked next to popular info hashes, typically) gets one slot, not a
+    /// thousand. Private and loopback addresses are exempt, a LAN can hold many real nodes.
+    fn ip_taken(&self, ip: &Ipv4Addr) -> bool {
+        use crate::schema::node::dsl::*;
+        if !one_node_per_ip(ip) {
+            return false;
+        }
+        let mut conn = self.conn();
+        node.filter(ip_addr.eq(ip.to_string()))
+            .filter(removed.eq(false))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .is_ok_and(|n| n > 0)
     }
 
     fn conn(&self) -> PooledConnection<ConnectionManager<SqliteConnection>> {
@@ -369,6 +416,12 @@ impl RoutingTable {
             .inspect_err(|e| error!("{e}"));
     }
 
+    /// Takes a node out of the table now, for misbehaving rather than for being unreachable.
+    pub fn evict(&self, nodee: &NodeId) {
+        let mut conn = self.conn();
+        self.mark_as_dead(nodee, &mut conn);
+    }
+
     fn mark_as_dead(&self, nodee: &NodeId, conn: &mut SqliteConnection) {
         use crate::schema::node::dsl::*;
 
@@ -418,6 +471,48 @@ mod tests {
     use crate::test_support::memory_pool;
     use std::sync::Arc;
     use tokio::net::UdpSocket;
+
+    #[test]
+    fn one_node_per_public_ip_survives_the_purge() {
+        let pool = memory_pool();
+        let mut conn = pool.get().unwrap();
+        let row = |byte: u8, ip: &str, contacted: i64| crate::models::NodeRow {
+            id: vec![byte; 20],
+            bucket: 0,
+            last_contacted: contacted,
+            ip_addr: ip.to_string(),
+            port: 6881,
+            failed_requests: 0,
+            removed: false,
+        };
+        let rows = [
+            row(1, "35.167.186.212", 10),
+            row(2, "35.167.186.212", 30),
+            row(3, "35.167.186.212", 20),
+            row(4, "192.168.1.5", 10),
+            row(5, "192.168.1.5", 20),
+            row(6, "8.8.8.8", 10),
+        ];
+        diesel::insert_into(crate::schema::node::table)
+            .values(&rows[..])
+            .execute(&mut *conn)
+            .unwrap();
+
+        assert_eq!(purge_shared_ips(&mut conn).unwrap(), 2);
+        let mut left: Vec<u8> = crate::schema::node::table
+            .select(crate::schema::node::id)
+            .load::<Vec<u8>>(&mut *conn)
+            .unwrap()
+            .into_iter()
+            .map(|id| id[0])
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [2, 4, 5, 6],
+            "the latest of the shared public IP, and all of the LAN's"
+        );
+    }
 
     async fn test_routing_table(our_id: NodeId) -> RoutingTable {
         let pool = memory_pool();
