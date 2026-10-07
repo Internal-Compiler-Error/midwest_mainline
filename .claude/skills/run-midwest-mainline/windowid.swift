@@ -1,5 +1,6 @@
 // Prints the CGWindowID of the first on-screen window owned by the process named in argv[1],
-// for `screencapture -l<id>`. Needs no accessibility permission.
+// for `screencapture -l<id>`. Needs no accessibility permission. Exits 3 when the window is
+// open but not on the current Space, 1 when there's no window at all.
 import CoreGraphics
 import Foundation
 
@@ -27,5 +28,10 @@ for window in windows {
         print(id)
         exit(0)
     }
+}
+// not on screen: on another Space (the user is in a full-screen app, say), or not open yet
+let everywhere = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+if everywhere.contains(where: { ($0[kCGWindowOwnerName as String] as? String) == owner && ($0[kCGWindowLayer as String] as? Int ?? 0) == 5 }) {
+    exit(3)
 }
 exit(1)

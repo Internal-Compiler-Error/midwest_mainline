@@ -116,11 +116,11 @@ async fn resolve_v4(s: &str) -> anyhow::Result<SocketAddrV4> {
 
 async fn bootstrap_nodes() -> Vec<SocketAddrV4> {
     let bootstrap = vec![
-        "dht.tansmissionbt.com:6881",
-        "router.utorrent.com:6881",
         "router.bittorrent.com:6881",
+        "router.utorrent.com:6881",
+        "dht.transmissionbt.com:6881",
+        "dht.libtorrent.org:25401",
         "dht.aelitis.com:6881",
-        "router.bitcomet.com:6881",
     ];
 
     let tasks = bootstrap.into_iter().map(resolve_v4);
@@ -167,7 +167,9 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     set_up_tracing();
 
-    let dht_socket = UdpSocket::bind("0.0.0.0:44444".parse::<SocketAddr>()?).await?;
+    let dht_port: u16 = env::var("DHT_PORT").map_or(Ok(44444), |p| p.parse())?;
+    let rpc_addr = env::var("RPC_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let dht_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], dht_port))).await?;
     // DHT_RETENTION=forever keeps every announced peer, making this node a long-term index
     let retention = match env::var("DHT_RETENTION").as_deref() {
         Ok("forever") => Retention::Forever,
@@ -194,8 +196,10 @@ async fn main() -> anyhow::Result<()> {
     let json_rpc_server = Router::new().route("/json_rpc", post(handle_rpc)).with_state(state);
 
     // server event loop
+    let listener = TcpListener::bind(&rpc_addr).await?;
+    info!("JSON-RPC on http://{}/json_rpc", listener.local_addr()?);
     event_loops.spawn(async {
-        let _ = axum::serve(TcpListener::bind("0.0.0.0:3000").await.unwrap(), json_rpc_server).await;
+        let _ = axum::serve(listener, json_rpc_server).await;
     });
 
     // populate the DHT routing table

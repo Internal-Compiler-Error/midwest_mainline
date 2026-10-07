@@ -1,7 +1,7 @@
 #!/bin/zsh
-# Builds, launches, and drives this workspace's two binaries: the `downloader` CLI and the
-# Tauri GUI (`downloader-gui`). Everything runs against a scratch data directory so the
-# user's own downloads, resume files, and DHT table are never touched.
+# Builds, launches, and drives this workspace's binaries: the `downloader` CLI, the Tauri GUI
+# (`downloader-gui`), and the standalone DHT node (`json_rpc_server`). Everything runs against
+# a scratch directory so the user's own downloads, resume files, and DHT table are never touched.
 #
 #   driver.sh build                     cargo + pnpm builds
 #   driver.sh test                      cargo tests for every crate, svelte-check for the GUI
@@ -9,7 +9,15 @@
 #                                       then print a summary; log at $RUN_DIR/cli.log
 #   driver.sh gui [source] [seconds]    launch the GUI (optionally adding a source at start),
 #                                       stream its console to $RUN_DIR/gui.log, screenshot the
-#                                       window to $RUN_DIR/gui.png after N seconds (default 20), quit
+#                                       window to $RUN_DIR/gui.png after N seconds (default 45), quit
+#   driver.sh dht-up [expire|forever]   start the standalone DHT node in the background (default
+#                                       forever: a long-term index), wait for its JSON-RPC; log at
+#                                       $RUN_DIR/dht.log, database $RUN_DIR/dht.db
+#   driver.sh rpc <method> [params]     call the node's JSON-RPC (node_count, stored_swarms,
+#                                       stored_peers '{"info_hash":"<hex>"}')
+#   driver.sh krpc <command> [args]     talk KRPC to the node over UDP (ping, get_peers <hash>,
+#                                       announce <hash> <port>), see krpc.py
+#   driver.sh dht-down                  stop the node
 #   driver.sh logs                      tail the console of a GUI started by `gui` (or any GUI
 #                                       started with DOWNLOADER_LOG_ADDR=127.0.0.1:9999)
 #   driver.sh clean                     delete the scratch directory
@@ -18,6 +26,8 @@ ROOT=${0:A:h:h:h:h}            # the workspace root, four levels up from this fi
 RUN_DIR=${RUN_DIR:-/tmp/midwest-mainline-run}
 DATA_DIR=$RUN_DIR/data
 LOG_PORT=9999
+DHT_PORT=${DHT_PORT:-44444}
+RPC_PORT=${RPC_PORT:-3000}
 mkdir -p "$RUN_DIR" "$DATA_DIR"
 
 summarize() {
@@ -60,9 +70,9 @@ case ${1:-} in
     ;;
   gui)
     source=${2:-}
-    secs=${3:-20}
+    secs=${3:-45}
     swift_bin=$RUN_DIR/windowid
-    [[ -x $swift_bin ]] || swiftc -O -o "$swift_bin" "${0:A:h}/windowid.swift"
+    [[ -x $swift_bin && $swift_bin -nt ${0:A:h}/windowid.swift ]] || swiftc -O -o "$swift_bin" "${0:A:h}/windowid.swift"
     # the GUI keeps its log in its console panel; DOWNLOADER_LOG_ADDR copies every line to
     # this listener as well
     pkill -f "nc -l 127.0.0.1 $LOG_PORT" 2>/dev/null || true
@@ -88,7 +98,12 @@ case ${1:-} in
     gui_pid=$!
     sleep "$secs"
     if id=$("$swift_bin" downloader-gui); then
-      screencapture -x -l"$id" "$RUN_DIR/gui.png" && echo "screenshot: $RUN_DIR/gui.png (window $id)"
+      # the capture occasionally fails with "could not create image from window" on the first
+      # try; a second one a moment later works
+      { screencapture -x -l"$id" "$RUN_DIR/gui.png" || { sleep 1; screencapture -x -l"$id" "$RUN_DIR/gui.png"; }; } &&
+        echo "screenshot: $RUN_DIR/gui.png (window $id)"
+    elif (( $? == 3 )); then
+      echo "the window is open but on another Space (a full-screen app is in front?); no screenshot" >&2
     else
       echo "no downloader window found; is the app still starting?" >&2
     fi
@@ -99,6 +114,38 @@ case ${1:-} in
     [[ ${started_vite:-0} == 1 ]] && pkill -f 'vite' 2>/dev/null || true
     summarize "$RUN_DIR/gui.log"
     ;;
+  dht-up)
+    retention=${2:-forever}
+    if [[ -f $RUN_DIR/dht.pid ]] && kill -0 "$(<$RUN_DIR/dht.pid)" 2>/dev/null; then
+      echo "already running (pid $(<$RUN_DIR/dht.pid))"; exit 0
+    fi
+    (cd "$ROOT" && cargo build -p json_rpc_server > "$RUN_DIR/dht-build.log" 2>&1) ||
+      { tail -20 "$RUN_DIR/dht-build.log" >&2; exit 1; }
+    DATABASE_URL=$RUN_DIR/dht.db DHT_RETENTION=$retention DHT_PORT=$DHT_PORT RPC_ADDR=127.0.0.1:$RPC_PORT \
+      "$ROOT/target/debug/json_rpc_server" > "$RUN_DIR/dht.log" 2>&1 &
+    echo $! > "$RUN_DIR/dht.pid"
+    # the RPC listener only opens once bootstrapping is over, ~10 s
+    if ! timeout 60 zsh -c "until curl -sf -o /dev/null -X POST -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"node_count\",\"id\":1}' http://127.0.0.1:$RPC_PORT/json_rpc; do sleep 0.5; done"; then
+      echo "the node never answered, see $RUN_DIR/dht.log" >&2; exit 1
+    fi
+    echo "DHT node up (pid $(<$RUN_DIR/dht.pid), retention $retention): UDP $DHT_PORT, JSON-RPC http://127.0.0.1:$RPC_PORT/json_rpc"
+    ;;
+  rpc)
+    method=${2:?usage: driver.sh rpc <method> [params-json]}
+    params=${3:-null}
+    curl -s -X POST -H 'content-type: application/json' \
+      -d "{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params,\"id\":1}" \
+      "http://127.0.0.1:$RPC_PORT/json_rpc"
+    echo
+    ;;
+  krpc)
+    shift
+    exec python3 "${0:A:h}/krpc.py" "127.0.0.1:$DHT_PORT" "$@"
+    ;;
+  dht-down)
+    [[ -f $RUN_DIR/dht.pid ]] && kill "$(<$RUN_DIR/dht.pid)" 2>/dev/null && echo stopped || echo "not running"
+    rm -f "$RUN_DIR/dht.pid"
+    ;;
   logs)
     echo "listening on 127.0.0.1:$LOG_PORT; start the GUI with DOWNLOADER_LOG_ADDR=127.0.0.1:$LOG_PORT"
     exec nc -l 127.0.0.1 $LOG_PORT
@@ -107,7 +154,7 @@ case ${1:-} in
     rm -rf "$RUN_DIR"
     ;;
   *)
-    sed -n '2,15p' "$0"
+    sed -n '2,25p' "$0"
     exit 2
     ;;
 esac
