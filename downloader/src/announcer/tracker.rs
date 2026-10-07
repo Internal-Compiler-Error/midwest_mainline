@@ -123,8 +123,12 @@ impl Client {
 /// Announces to one tracker until shutdown, scraping it now and then, and says goodbye.
 pub(super) async fn run(mut tracker: Tracker, mut client: Client) {
     let shutdown = tracker.announcer.shutdown.clone();
+    // the tracker may count us from the moment an announce goes out, before we've read its
+    // answer: a shutdown that cuts the first one short still owes it a goodbye
+    let mut announced_once = false;
     while tracker.due().await {
         let event = tracker.next_event();
+        announced_once = true;
         let span = tracker.announce_span(event);
         let announced = tokio::select! {
             announced = client.announce(&tracker, event).instrument(span.clone()) => announced,
@@ -144,7 +148,7 @@ pub(super) async fn run(mut tracker: Tracker, mut client: Client) {
         }
     }
     // best effort: we're on our way out regardless
-    if tracker.sent_started && client.connected() {
+    if announced_once && client.connected() {
         let _ = tokio::time::timeout(STOPPED_TIMEOUT, client.announce(&tracker, AnnounceEvent::Stopped)).await;
     }
 }
