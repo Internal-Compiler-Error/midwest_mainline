@@ -5,8 +5,10 @@ import { traces, type TraceSpan } from './api'
 import { humanBytes } from './format'
 import { every } from './poll'
 
-/** How far back finished spans are kept on this side; the recorder keeps more. */
+/** How far back finished spans are kept on this side, and at most how many: a big torrent at
+ * full speed finishes several hundred a second. */
 const KEEP_MS = 30 * 60 * 1000
+const KEEP_SPANS = 100_000
 const POLL_MS = 250
 
 export class Traces {
@@ -44,7 +46,7 @@ export class Traces {
     this.now = Date.now()
     const cutoff = this.now - KEEP_MS
     const kept = this.finished.filter((s) => (s.end_ms ?? 0) >= cutoff)
-    this.finished = snapshot.finished.length ? kept.concat(snapshot.finished) : kept
+    this.finished = snapshot.finished.length ? kept.concat(snapshot.finished).slice(-KEEP_SPANS) : kept
     this.open = snapshot.open
   }
 

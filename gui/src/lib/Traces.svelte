@@ -51,7 +51,7 @@
     const peer = traces.focus
     return peer === null ? all : all.filter((s) => involves(s, peer))
   })
-  let firstStart = $derived(Math.min(...pool.map((s) => s.start_ms), now - 10_000))
+  let firstStart = $derived(pool.reduce((min, s) => Math.min(min, s.start_ms), now - 10_000))
   let viewStart = $derived(
     windowMs > 0 ? now - windowMs : Math.max(firstStart - (now - firstStart) * 0.02, now - 1_800_000),
   )
