@@ -97,6 +97,7 @@ pub async fn fetch(
         verified: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
         wanted: BitVec::<u8, Msb0>::new().into_boxed_bitslice(),
         completed: false,
+        storage_error: None,
     };
     let (_stat_tx, stat_rx) = watch::channel(placeholder_stats);
     let (event_tx, mut event_rx) = mpsc::channel(256);

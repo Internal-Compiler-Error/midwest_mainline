@@ -50,18 +50,11 @@ pub const PEER_OUTBOX: usize = 1024;
 /// which pushes back on the peers through TCP rather than piling up here.
 pub const SWARM_INBOX: usize = 4096;
 
-/// Endgame: once every missing piece is in flight and a peer still has room, the pieces
-/// furthest from done are also requested from other peers, in the opposite block order,
-/// and whoever finishes second gets Cancel for the rest. This many peers may hold the
-/// same piece at once.
+/// Endgame: once every missing piece is in flight, a peer with room takes on the in-flight
+/// piece furthest from done, walking its blocks in the opposite order from the peer already on
+/// it. The slow peer keeps only the blocks it already asked for, and a block that arrives is
+/// cancelled at the other racers. This many peers may hold the same piece at once.
 pub const ENDGAME_RACERS: usize = 2;
-
-/// Endgame: at most this many bytes of pieces may be raced at any time, which bounds the
-/// bytes downloaded twice. A cap in pieces let a torrent with small pieces race far more of
-/// itself than one with large pieces (2% waste on a 512 KiB-piece ISO against 0.2% on a
-/// 4 MiB-piece video); the piece the user is waiting on always gets a racer even if it's
-/// bigger than this.
-pub const ENDGAME_MAX_RACED_BYTES: usize = 32 * 1024 * 1024;
 
 /// How long to leave an address alone after a failed dial. Doubles with each consecutive
 /// failure up to DIAL_BACKOFF_MAX; trackers and PEX keep handing out the same dead

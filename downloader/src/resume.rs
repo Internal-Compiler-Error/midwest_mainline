@@ -641,6 +641,7 @@ mod test {
             verified: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
             wanted: bitvec![u8, Msb0; 1; 7].into_boxed_bitslice(),
             completed: false,
+            storage_error: None,
         };
         let (tx, rx) = watch::channel(stats.clone());
         let (_selected_tx, selected_rx) = watch::channel(vec![true]);

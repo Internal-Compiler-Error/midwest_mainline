@@ -1161,6 +1161,7 @@ mod test {
             verified: bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::new().into_boxed_bitslice(),
             wanted: bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::new().into_boxed_bitslice(),
             completed,
+            storage_error: None,
         })
         .1
     }
