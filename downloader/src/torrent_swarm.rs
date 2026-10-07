@@ -8,8 +8,8 @@ use crate::layers::{self, LayerFetch, MAX_HASH_READS, Received};
 use crate::limiter::RateLimiter;
 use crate::merkle::Hash;
 use crate::peer::{
-    Holepunch, HolepunchError, Inbox, Incoming, LT_DONTHAVE_ID, PEX_UTP, Peer, PeerSnapshot, PeerStatistics,
-    ProtocolViolation, UT_HOLEPUNCH_ID, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
+    Extension, Holepunch, HolepunchError, Inbox, Incoming, PEX_UTP, Peer, PeerSnapshot, PeerStatistics,
+    ProtocolViolation, parse_pex_message, parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
@@ -1181,12 +1181,9 @@ impl TorrentSwarm {
                     self.schedule().await;
                 }
             }
-            BtMessage::Extended(ext) if ext.ext_id == UT_METADATA_ID => {
+            BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::UtMetadata) => {
                 // BEP 9: we always have the full metadata, so any in-range piece is served
-                // unconditionally. Without a negotiated id there's nothing to reply on.
-                if peer.their_ut_metadata_id.is_none() {
-                    return;
-                }
+                // unconditionally
                 let Some(piece) = parse_ut_metadata_request(&ext.payload) else {
                     return;
                 };
@@ -1201,12 +1198,12 @@ impl TorrentSwarm {
                     self.drop_peer(idx, "send failed");
                 }
             }
-            BtMessage::Extended(ext) if ext.ext_id == UT_HOLEPUNCH_ID => {
+            BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::UtHolepunch) => {
                 if let Some(msg) = Holepunch::decode(&ext.payload) {
                     self.on_holepunch(idx, msg).await;
                 }
             }
-            BtMessage::Extended(ext) if ext.ext_id == LT_DONTHAVE_ID => {
+            BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::LtDonthave) => {
                 // BEP 54: the peer dropped a piece; it can't be given that piece any more
                 let Ok(raw) = <[u8; 4]>::try_from(&ext.payload[..]) else {
                     return;
@@ -1221,7 +1218,7 @@ impl TorrentSwarm {
                     }
                 }
             }
-            BtMessage::Extended(ext) if ext.ext_id == UT_PEX_ID => {
+            BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::UtPex) => {
                 // BEP 27: don't act on PEX for a private torrent even if some peer sends it
                 // anyway (we don't advertise ut_pex when private, so a compliant peer won't)
                 if !self.torrent.private {
@@ -2599,7 +2596,7 @@ impl TorrentSwarm {
         };
         let Some(idx) = self
             .peer_index(relay)
-            .filter(|&idx| self.peers[idx].their_ut_holepunch_id.is_some())
+            .filter(|&idx| self.peers[idx].their_id(Extension::UtHolepunch).is_some())
         else {
             return;
         };
@@ -2635,7 +2632,9 @@ impl TorrentSwarm {
                         .position(|p| p.reachable_addr() == target || p.remote_addr == target)
                     {
                         None => Some(HolepunchError::NotConnected),
-                        Some(t) if self.peers[t].their_ut_holepunch_id.is_none() => Some(HolepunchError::NoSupport),
+                        Some(t) if self.peers[t].their_id(Extension::UtHolepunch).is_none() => {
+                            Some(HolepunchError::NoSupport)
+                        }
                         Some(t) => {
                             let initiator = self.peers[idx].reachable_addr();
                             tracing::debug!("introducing {from} and {target} (holepunch)");
@@ -3018,7 +3017,7 @@ mod test {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let ask = |msg: Holepunch| {
             BtMessage::Extended(crate::wire::Extended {
-                ext_id: UT_HOLEPUNCH_ID,
+                ext_id: Extension::UtHolepunch.id(),
                 payload: msg.encode().into_boxed_slice(),
             })
         };

@@ -7,6 +7,7 @@ use crate::wire::{
     BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece, Port,
     RejectRequest, Request, Unchoke,
 };
+use bitvec::prelude::*;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
@@ -19,15 +20,47 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::AbortHandle;
 use tokio_util::codec::Framed;
 
-/// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
-/// since it's entirely our own choice -- only the id the *remote* wants is negotiated.
-pub(crate) const UT_METADATA_ID: u8 = 1;
-/// BEP 10: same idea as `UT_METADATA_ID`, but for BEP 11 (PEX) messages.
-pub(crate) const UT_PEX_ID: u8 = 2;
-/// BEP 54: the id we take `lt_donthave` on. We never drop a piece, so we only ever receive it.
-pub(crate) const LT_DONTHAVE_ID: u8 = 3;
-/// BEP 55: the id we take `ut_holepunch` on.
-pub(crate) const UT_HOLEPUNCH_ID: u8 = 4;
+/// The BEP 10 extensions we speak. Each one's value is the message id we ask peers to send it
+/// to us on: entirely our own choice, only the ids peers want from us are negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Extension {
+    /// BEP 9
+    UtMetadata = 1,
+    /// BEP 11
+    UtPex = 2,
+    /// BEP 54; we never drop a piece, so we only ever receive it
+    LtDonthave = 3,
+    /// BEP 55
+    UtHolepunch = 4,
+}
+
+impl Extension {
+    /// In name order, which is the order bencode wants them in in the handshake's `m`.
+    const ALL: [Extension; 4] = [
+        Extension::LtDonthave,
+        Extension::UtHolepunch,
+        Extension::UtMetadata,
+        Extension::UtPex,
+    ];
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// Which extension a message sent to us on `id` is.
+    pub fn from_id(id: u8) -> Option<Extension> {
+        Self::ALL.into_iter().find(|e| e.id() == id)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Extension::UtMetadata => "ut_metadata",
+            Extension::UtPex => "ut_pex",
+            Extension::LtDonthave => "lt_donthave",
+            Extension::UtHolepunch => "ut_holepunch",
+        }
+    }
+}
 
 /// BEP 55 messages: ask a peer we share with `addr` to introduce us (`Rendezvous`), be told
 /// to connect to `addr` now (`Connect`), or hear why an introduction failed (`Error`).
@@ -119,9 +152,9 @@ pub(crate) type Inbox = mpsc::Sender<Incoming>;
 /// spread before revealing another.
 #[derive(Debug, Default)]
 pub(crate) struct SuperSeedView {
-    pub offered: std::collections::BTreeSet<u32>,
+    pub offered: BTreeSet<u32>,
     /// the latest piece shown, how many other peers had it then, and when it was shown
-    pub current: Option<(u32, u32, std::time::Instant)>,
+    pub current: Option<(u32, u32, Instant)>,
 }
 
 /// One connected peer, owned by its `TorrentSwarm`. The socket itself belongs to two tasks: a
@@ -144,15 +177,11 @@ pub(crate) struct Peer {
     pub v2: bool,
     /// same for running over uTP
     pub utp: bool,
-    /// the message id the remote wants us to use for ut_metadata messages, learned from
-    /// their extended handshake; `None` until then (or if they don't support it)
-    pub their_ut_metadata_id: Option<u8>,
-    /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
-    pub their_ut_pex_id: Option<u8>,
+    /// per `Extension`, the message id the remote wants it sent on, from its extended
+    /// handshake; `None` until then, or if it doesn't speak that one
+    their_ids: [Option<u8>; Extension::ALL.len()],
     /// BEP 21: the peer says it won't download anything more (a partial seed)
     pub upload_only: bool,
-    /// BEP 55: the id the remote wants holepunch messages on
-    pub their_ut_holepunch_id: Option<u8>,
     /// BEP 10 `p`: the port the peer listens on, which an inbound TCP connection's own port isn't
     pub listen_port: Option<u16>,
     /// we dialed it, so `remote_addr` is where it listens
@@ -169,9 +198,8 @@ pub(crate) struct Peer {
     /// the connection's lifetime, for the traces; set by the swarm once the peer is in
     pub span: tracing::Span,
 
-    /// BEP 3 bitfield layout: `ceil(num_pieces / 8)` bytes, piece 0 is the high bit of byte 0
-    they_have: Box<[u8]>,
-    num_pieces: usize,
+    /// the pieces it has, as its bitfield and Have messages say; one bit per piece
+    has: BitBox<u8, Msb0>,
 
     /// We choked the peer, i.e. we won't send data until we unchoke them
     pub choked_them: bool,
@@ -328,11 +356,9 @@ impl Peer {
             encrypted,
             v2: false,
             utp,
-            their_ut_metadata_id: None,
-            their_ut_pex_id: None,
+            their_ids: [None; Extension::ALL.len()],
             upload_only: false,
             yourip: None,
-            their_ut_holepunch_id: None,
             listen_port: None,
             dialed: false,
             super_seed: None,
@@ -340,8 +366,7 @@ impl Peer {
             outbox,
             io_tasks: [reader.abort_handle(), writer.abort_handle()],
             span: tracing::Span::none(),
-            they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
-            num_pieces,
+            has: bitbox![u8, Msb0; 0; num_pieces],
             // BEP 3: "At the start of the connection, both sides ... are choked."
             choked_them: true,
             choked_us: true,
@@ -356,15 +381,17 @@ impl Peer {
     }
 
     pub fn they_have(&self, piece: u32) -> bool {
-        let index = piece / 8;
-        let offset = piece % 8;
-        let flag = 0x80u8 >> offset;
-        (self.they_have[index as usize] & flag) != 0
+        self.has.get(piece as usize).is_some_and(|b| *b)
     }
 
     /// The pieces this peer has, as far as its bitfield and Have messages say.
     pub fn pieces(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..self.num_pieces as u32).filter(|&p| self.they_have(p))
+        self.has.iter_ones().map(|p| p as u32)
+    }
+
+    /// The message id the peer wants `ext` sent on, if it speaks it.
+    pub fn their_id(&self, ext: Extension) -> Option<u8> {
+        self.their_ids[ext as usize - 1]
     }
 
     /// The peer has sent us data on this connection or an earlier one, so it's a known
@@ -375,8 +402,7 @@ impl Peer {
 
     /// Every piece, as far as its bitfield and Have messages say.
     pub fn is_seed(&self) -> bool {
-        let have: usize = self.they_have.iter().map(|b| b.count_ones() as usize).sum();
-        self.num_pieces > 0 && have >= self.num_pieces
+        !self.has.is_empty() && self.has.all()
     }
 
     /// BEP 11 "added.f" flags for gossiping this peer to others.
@@ -405,14 +431,13 @@ impl Peer {
     }
 
     pub fn snapshot(&self) -> PeerSnapshot {
-        let have = self.they_have.iter().map(|b| b.count_ones() as usize).sum::<usize>();
         PeerSnapshot {
             addr: self.remote_addr,
             client: client_name(&self.peer_id),
-            progress: if self.num_pieces == 0 {
+            progress: if self.has.is_empty() {
                 0.0
             } else {
-                (have as f32 / self.num_pieces as f32).clamp(0.0, 1.0)
+                self.has.count_ones() as f32 / self.has.len() as f32
             },
             downloaded: self.stats.received as u64,
             uploaded: self.stats.sent as u64,
@@ -449,26 +474,30 @@ impl Peer {
             BtMessage::Interested(_) => self.interested_us = true,
             BtMessage::NotInterested(_) => self.interested_us = false,
             BtMessage::Have(have) => {
-                if have.checked as usize >= self.num_pieces {
+                let Some(mut bit) = self.has.get_mut(have.checked as usize) else {
                     return Err(ProtocolViolation(format!(
                         "Have for out-of-range piece {}",
                         have.checked
                     )));
-                }
-                self.they_have[(have.checked / 8) as usize] |= 0x80u8 >> (have.checked % 8);
+                };
+                *bit = true;
             }
             BtMessage::BitField(bit_field) => {
-                if bit_field.has.len() != self.num_pieces.div_ceil(8) {
+                let pieces = self.has.len();
+                if bit_field.has.len() != pieces.div_ceil(8) {
                     return Err(ProtocolViolation(format!(
-                        "bitfield of length {} for {} pieces",
+                        "bitfield of length {} for {pieces} pieces",
                         bit_field.has.len(),
-                        self.num_pieces
                     )));
                 }
-                self.they_have = bit_field.has;
+                // the spare bits past the last piece are meant to be zero; whatever they are,
+                // they name no piece
+                let mut has = BitVec::<u8, Msb0>::from_vec(bit_field.has.into_vec());
+                has.truncate(pieces);
+                self.has = has.into_boxed_bitslice();
             }
-            BtMessage::HaveAll(_) => self.they_have = vec![0xFFu8; self.num_pieces.div_ceil(8)].into(),
-            BtMessage::HaveNone(_) => self.they_have = vec![0u8; self.num_pieces.div_ceil(8)].into(),
+            BtMessage::HaveAll(_) => self.has.fill(true),
+            BtMessage::HaveNone(_) => self.has.fill(false),
             // BEP 6: both are advisory-only, and we don't implement request-while-choked
             BtMessage::SuggestPiece(_) | BtMessage::AllowedFast(_) => {}
             BtMessage::Extended(ext) if ext.ext_id == 0 => self.handle_extended_handshake(&ext.payload),
@@ -487,20 +516,15 @@ impl Peer {
         let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
             return;
         };
-        // a later handshake updates what it mentions; an id of 0 turns an extension off
-        let id = |item: &BencodeItemView| match item {
-            BencodeItemView::Integer(id) => u8::try_from(*id).ok().filter(|id| *id != 0),
-            _ => None,
-        };
         if let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) {
-            if let Some(item) = m.get(b"ut_metadata".as_slice()) {
-                self.their_ut_metadata_id = id(item);
-            }
-            if let Some(item) = m.get(b"ut_pex".as_slice()) {
-                self.their_ut_pex_id = id(item);
-            }
-            if let Some(item) = m.get(b"ut_holepunch".as_slice()) {
-                self.their_ut_holepunch_id = id(item);
+            for ext in Extension::ALL {
+                // a later handshake updates what it mentions; an id of 0 turns an extension off
+                if let Some(item) = m.get(ext.name().as_bytes()) {
+                    self.their_ids[ext as usize - 1] = match item {
+                        BencodeItemView::Integer(id) => u8::try_from(*id).ok().filter(|id| *id != 0),
+                        _ => None,
+                    };
+                }
             }
         }
         if let Some(BencodeItemView::Integer(port)) = dict.get(b"p".as_slice()) {
@@ -510,11 +534,10 @@ impl Peer {
             self.upload_only = *flag != 0;
         }
         if let Some(BencodeItemView::ByteString(ip)) = dict.get(b"yourip".as_slice()) {
-            self.yourip = match ip.len() {
-                4 => Some(IpAddr::from(<[u8; 4]>::try_from(*ip).expect("4 bytes"))),
-                16 => Some(IpAddr::from(<[u8; 16]>::try_from(*ip).expect("16 bytes"))),
-                _ => None,
-            };
+            self.yourip = <[u8; 4]>::try_from(*ip)
+                .map(IpAddr::from)
+                .or_else(|_| <[u8; 16]>::try_from(*ip).map(IpAddr::from))
+                .ok();
         }
     }
 
@@ -529,23 +552,31 @@ impl Peer {
 
     /// BEP 55; a silent no-op for a peer that never said it speaks holepunch.
     pub async fn send_holepunch(&mut self, msg: Holepunch) -> io::Result<()> {
-        let Some(their_id) = self.their_ut_holepunch_id else {
+        self.send_extended(Extension::UtHolepunch, msg.encode()).await
+    }
+
+    /// An extension message on the id the peer asked for it on; a silent no-op for a peer
+    /// that never said it speaks `ext`, there's no id to send it on.
+    async fn send_extended(&mut self, ext: Extension, payload: Vec<u8>) -> io::Result<()> {
+        let Some(ext_id) = self.their_id(ext) else {
             return Ok(());
         };
         self.send(BtMessage::Extended(Extended {
-            ext_id: their_id,
-            payload: msg.encode().into_boxed_slice(),
+            ext_id,
+            payload: payload.into_boxed_slice(),
         }))
         .await
     }
 
     /// BEP 54: the peer no longer has `piece`. False if it never said it had it.
     pub fn drop_have(&mut self, piece: u32) -> bool {
-        if (piece as usize) >= self.num_pieces || !self.they_have(piece) {
-            return false;
+        match self.has.get_mut(piece as usize) {
+            Some(mut bit) if *bit => {
+                *bit = false;
+                true
+            }
+            _ => false,
         }
-        self.they_have[(piece / 8) as usize] &= !(0x80u8 >> (piece % 8));
-        true
     }
 
     /// Records a block that answers one of our requests. `None` if we never asked for it (or
@@ -659,8 +690,6 @@ impl Peer {
         self.send(BtMessage::Have(Have { checked: index })).await
     }
 
-    /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
-    /// support -- the classic protocol has no "I'm declining this" message, and a plain drop
     /// Forgets every outstanding request for `piece`; the caller decides whether to tell the
     /// peer (`send_cancel`) or whether the peer already knows (it choked or rejected us).
     pub fn forget_piece(&mut self, piece: u32) -> Vec<Request> {
@@ -685,6 +714,8 @@ impl Peer {
         .await
     }
 
+    /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
+    /// support: the classic protocol has no "I'm declining this" message, and a plain drop
     /// is exactly what such a peer already expects.
     pub async fn send_reject(&mut self, req: Request) -> io::Result<()> {
         if !self.remote_supports_fast {
@@ -705,30 +736,15 @@ impl Peer {
         Ok(())
     }
 
-    /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict. A silent
-    /// no-op if the peer never declared ut_metadata support -- there's no sane id to send on.
+    /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict.
     pub async fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: &[u8]) -> io::Result<()> {
-        let Some(their_id) = self.their_ut_metadata_id else {
-            return Ok(());
-        };
-        self.send(BtMessage::Extended(Extended {
-            ext_id: their_id,
-            payload: build_ut_metadata_data_message(piece, total_size, data).into_boxed_slice(),
-        }))
-        .await
+        let payload = build_ut_metadata_data_message(piece, total_size, data);
+        self.send_extended(Extension::UtMetadata, payload).await
     }
 
-    /// BEP 11 (PEX): silent no-op if the peer never declared ut_pex support, same reasoning as
-    /// `send_metadata_piece`.
+    /// BEP 11 (PEX)
     pub async fn send_pex(&mut self, added: &[(SocketAddr, u8)]) -> io::Result<()> {
-        let Some(their_id) = self.their_ut_pex_id else {
-            return Ok(());
-        };
-        self.send(BtMessage::Extended(Extended {
-            ext_id: their_id,
-            payload: build_pex_message(added).into_boxed_slice(),
-        }))
-        .await
+        self.send_extended(Extension::UtPex, build_pex_message(added)).await
     }
 }
 
@@ -788,13 +804,11 @@ async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr:
     }
 }
 
-/// BEP 10 extended handshake payload: declares the message ids we want the remote to use for
-/// ut_metadata and (unless this is a BEP 27 private torrent) ut_pex, plus the total metadata
-/// size. BEP 27: a private torrent's peers must come only from its trackers -- not omitting
-/// "ut_pex" here would invite a compliant peer to use PEX with us, defeating the point of the
-/// flag even if we ourselves never act on what we'd receive.
-/// `yourip` (BEP 10) tells the peer where we see it from, which helps it learn its own public
-/// address; `v` names this client. Keys in bencode order.
+/// BEP 10 extended handshake payload: the message ids we want the remote to use for each
+/// `Extension`, minus ut_pex for a BEP 27 private torrent (offering it would invite a compliant
+/// peer to use PEX with us, whose peers must come only from the trackers), plus the total
+/// metadata size. `yourip` (BEP 10) tells the peer where we see it from, which helps it learn
+/// its own public address; `v` names this client. Keys in bencode order.
 fn build_extended_handshake(
     metadata_size: u32,
     private: bool,
@@ -802,14 +816,12 @@ fn build_extended_handshake(
     listen_port: u16,
     yourip: IpAddr,
 ) -> Vec<u8> {
-    let pex = if private {
-        String::new()
-    } else {
-        format!("6:ut_pexi{UT_PEX_ID}e")
-    };
-    let m = format!(
-        "d11:lt_donthavei{LT_DONTHAVE_ID}e12:ut_holepunchi{UT_HOLEPUNCH_ID}e11:ut_metadatai{UT_METADATA_ID}e{pex}e"
-    );
+    let m: String = Extension::ALL
+        .into_iter()
+        .filter(|&ext| !(private && ext == Extension::UtPex))
+        .map(|ext| format!("{}:{}i{}e", ext.name().len(), ext.name(), ext.id()))
+        .collect();
+    let m = format!("d{m}e");
     let upload_only = if upload_only { "11:upload_onlyi1e" } else { "" };
     let version = concat!("downloader ", env!("CARGO_PKG_VERSION"));
     let mut out = format!(
@@ -892,18 +904,17 @@ pub(crate) fn parse_pex_message(payload: &[u8]) -> Vec<(SocketAddr, u8)> {
     let mut peers = Vec::new();
     if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added".as_slice()) {
         let flags = flags_of(b"added.f");
-        for (i, chunk) in bytes.chunks_exact(6).enumerate() {
-            let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            peers.push((SocketAddr::from((ip, port)), flags.get(i).copied().unwrap_or(0)));
+        for (i, [a, b, c, d, p0, p1]) in bytes.as_chunks::<6>().0.iter().enumerate() {
+            let addr = SocketAddr::from(([*a, *b, *c, *d], u16::from_be_bytes([*p0, *p1])));
+            peers.push((addr, flags.get(i).copied().unwrap_or(0)));
         }
     }
     if let Some(BencodeItemView::ByteString(bytes)) = dict.get(b"added6".as_slice()) {
         let flags = flags_of(b"added6.f");
-        for (i, chunk) in bytes.chunks_exact(18).enumerate() {
-            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
-            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-            peers.push((SocketAddr::from((ip, port)), flags.get(i).copied().unwrap_or(0)));
+        for (i, chunk) in bytes.as_chunks::<18>().0.iter().enumerate() {
+            let (ip, port) = chunk.split_first_chunk::<16>().expect("18 bytes");
+            let addr = SocketAddr::from((*ip, u16::from_be_bytes([port[0], port[1]])));
+            peers.push((addr, flags.get(i).copied().unwrap_or(0)));
         }
     }
     peers
@@ -1011,34 +1022,26 @@ impl PeerStatistics {
         ((bytes / BLOCK_SIZE as f64) as usize).clamp(MIN_REQUEST_WINDOW, MAX_REQUEST_WINDOW)
     }
 
+    /// The two halves of the score: the measured rate relative to the swarm's fastest, and
+    /// the exploration bonus.
+    pub fn ucb_terms(&self, total_picks: usize, rate_scale: f64) -> (f64, f64) {
+        let t = total_picks as f64;
+        let n_t = self.picked_count as f64;
+        (self.rx_rate / rate_scale, (t.ln() / n_t).sqrt())
+    }
+
     /// UCB1: the peer's download throughput plus an exploration bonus that shrinks the more
     /// often it's been picked, relative to how often *anyone* has been picked (`total_picks`,
     /// block requests to every peer so far). UCB1's bonus is sized for rewards in `0..=1`,
     /// so the rate is divided by `rate_scale`, the fastest rate seen in the swarm; added to
     /// raw bytes per second the bonus would be invisible and exploration would end with each
-    /// peer's first pick.
-    pub fn rx_speed_ucb(&self, total_picks: usize, rate_scale: f64) -> f64 {
+    /// peer's first pick. An arm never played goes first.
+    pub fn score(&self, total_picks: usize, rate_scale: f64) -> f64 {
+        if total_picks == 0 || self.picked_count == 0 {
+            return f64::INFINITY;
+        }
         let (exploit, explore) = self.ucb_terms(total_picks, rate_scale);
         exploit + explore
-    }
-
-    /// The two halves of the score: the measured rate relative to the swarm's fastest, and
-    /// the exploration bonus.
-    pub fn ucb_terms(&self, total_picks: usize, rate_scale: f64) -> (f64, f64) {
-        let c = 1f64;
-        let t = total_picks as f64;
-        let n_t = self.picked_count as f64;
-        (self.rx_rate / rate_scale, c * (t.ln() / n_t).sqrt())
-    }
-
-    pub fn score(&self, total_picks: usize, rate_scale: f64) -> f64 {
-        // In UCB, when an arm hasn't been played yet, it should be picked first, we just assign an
-        // infinite score to peers who haven't been requested yet
-        if total_picks == 0 || self.picked_count == 0 {
-            f64::INFINITY
-        } else {
-            self.rx_speed_ucb(total_picks, rate_scale)
-        }
     }
 }
 
@@ -1095,12 +1098,12 @@ mod test {
         payload.extend_from_slice(&[203, 0, 113, 9]);
         payload.push(b'e');
         peer.handle_extended_handshake(&payload);
-        assert_eq!(peer.their_ut_metadata_id, Some(3));
-        assert_eq!(peer.their_ut_pex_id, None, "300 isn't a one-byte id");
+        assert_eq!(peer.their_id(Extension::UtMetadata), Some(3));
+        assert_eq!(peer.their_id(Extension::UtPex), None, "300 isn't a one-byte id");
         assert!(peer.upload_only);
         assert_eq!(peer.yourip, Some("203.0.113.9".parse().unwrap()));
         peer.handle_extended_handshake(b"d1:md11:ut_metadatai0eee");
-        assert_eq!(peer.their_ut_metadata_id, None, "0 turns it off");
+        assert_eq!(peer.their_id(Extension::UtMetadata), None, "0 turns it off");
         assert!(peer.upload_only, "what a later handshake doesn't mention stays");
 
         assert!(!peer.drop_have(4), "it never had it");
@@ -1108,6 +1111,34 @@ mod test {
         assert!(peer.drop_have(4));
         assert!(!peer.they_have(4));
         assert!(!peer.drop_have(100), "out of range");
+
+        // 9 pieces take two bytes; the 7 spare bits name nothing even when a peer sets them
+        peer.apply(BtMessage::BitField(BitField {
+            has: Box::new([0xFF, 0x7F]),
+        }))
+        .unwrap();
+        assert!(!peer.is_seed(), "piece 8 is missing, however many spare bits are set");
+        peer.apply(BtMessage::BitField(BitField {
+            has: Box::new([0xFF, 0xFF]),
+        }))
+        .unwrap();
+        assert!(peer.is_seed());
+        assert_eq!(peer.pieces().count(), 9);
+        assert_eq!(peer.snapshot().progress, 1.0);
+        assert!(
+            peer.apply(BtMessage::Have(Have { checked: 9 })).is_err(),
+            "a Have past the last piece"
+        );
+    }
+
+    #[test]
+    fn extensions_are_found_by_our_ids() {
+        for ext in Extension::ALL {
+            assert_eq!(Extension::from_id(ext.id()), Some(ext));
+        }
+        assert_eq!(Extension::from_id(0), None, "0 is the handshake itself");
+        let names: Vec<_> = Extension::ALL.iter().map(|e| e.name()).collect();
+        assert!(names.is_sorted(), "bencode wants the keys sorted");
     }
 
     #[test]
@@ -1125,12 +1156,12 @@ mod test {
         let BencodeItemView::Integer(ut_metadata_id) = m.get(b"ut_metadata".as_slice()).unwrap() else {
             panic!("\"m\".\"ut_metadata\" must be an integer");
         };
-        assert_eq!(*ut_metadata_id, UT_METADATA_ID as i64);
+        assert_eq!(*ut_metadata_id, Extension::UtMetadata.id() as i64);
 
         let BencodeItemView::Integer(ut_pex_id) = m.get(b"ut_pex".as_slice()).unwrap() else {
             panic!("\"m\".\"ut_pex\" must be an integer");
         };
-        assert_eq!(*ut_pex_id, UT_PEX_ID as i64);
+        assert_eq!(*ut_pex_id, Extension::UtPex.id() as i64);
 
         let BencodeItemView::Integer(metadata_size) = dict.get(b"metadata_size".as_slice()).unwrap() else {
             panic!("\"metadata_size\" must be an integer");
