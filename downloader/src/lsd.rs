@@ -132,7 +132,7 @@ fn multicast_socket() -> std::io::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT).into())?;
+    socket.bind(&SocketAddrV4::new(crate::defs::BIND_V4, PORT).into())?;
     socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED)?;
     // BEP 14: link-local only
     socket.set_multicast_ttl_v4(1)?;

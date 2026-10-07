@@ -10,7 +10,7 @@ use crate::settings::{PEER_TIMEOUT, UTP_MAX_CONNECTIONS, UTP_UDP_RECV_BUFFER, UT
 use dontfrag::UdpSocketExt;
 use librqbit_utp::{SocketOpts, UtpSocketUdp};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -42,8 +42,8 @@ pub(crate) fn none() -> UtpWatch {
 async fn bind(port: u16, shutdown: CancellationToken) -> anyhow::Result<Arc<UtpSocketUdp>> {
     // dual-stack when the platform allows it, else v4 only; like the TCP listener
     let attempts = [
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        SocketAddr::from((crate::defs::BIND_V6, port)),
+        SocketAddr::from((crate::defs::BIND_V4, port)),
     ];
     for addr in attempts {
         match bind_udp(addr) {
@@ -52,7 +52,7 @@ async fn bind(port: u16, shutdown: CancellationToken) -> anyhow::Result<Arc<UtpS
         }
     }
     warn!("UDP port {port} is taken; uTP is on some free port instead, which inbound peers can't know about");
-    let udp = bind_udp((Ipv4Addr::UNSPECIFIED, 0).into())?;
+    let udp = bind_udp((crate::defs::BIND_V4, 0).into())?;
     Ok(UtpSocketUdp::new_with_opts(udp, Default::default(), opts(shutdown))?)
 }
 
@@ -122,7 +122,9 @@ mod test {
 
     #[tokio::test]
     async fn the_receive_buffer_grows_as_far_as_the_os_allows() {
-        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let udp = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
         let before = socket2::SockRef::from(&udp).recv_buffer_size().unwrap();
         let after = grow_recv_buffer(&udp, UTP_UDP_RECV_BUFFER).unwrap();
         assert!(after >= before, "{before} -> {after}");

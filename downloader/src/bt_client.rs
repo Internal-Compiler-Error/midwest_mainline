@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::net::SocketAddr;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddrV4, SocketAddrV6};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::net::TcpListener;
@@ -303,7 +303,7 @@ impl BtClient {
         let port = id.serving.port();
         let mut listeners = Vec::new();
 
-        match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)).await {
+        match TcpListener::bind(SocketAddrV6::new(crate::defs::BIND_V6, port, 0, 0)).await {
             Ok(listener) => {
                 tracing::info!(
                     "listening for inbound peer connections on {}",
@@ -317,7 +317,7 @@ impl BtClient {
             }
             Err(e) => tracing::warn!("no ipv6 inbound listener on port {port} ({e}); ipv6 peers can't dial us"),
         }
-        match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).await {
+        match TcpListener::bind(SocketAddrV4::new(crate::defs::BIND_V4, port)).await {
             Ok(listener) => {
                 tracing::info!(
                     "listening for inbound peer connections on {}",

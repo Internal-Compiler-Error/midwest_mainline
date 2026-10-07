@@ -880,8 +880,8 @@ impl UdpAnnouncer {
 
     async fn open_at(address: SocketAddr, attempts: u32) -> anyhow::Result<(UdpSocket, (i64, Instant))> {
         let ours: SocketAddr = match address {
-            SocketAddr::V4(_) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into(),
-            SocketAddr::V6(_) => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into(),
+            SocketAddr::V4(_) => SocketAddrV4::new(crate::defs::BIND_V4, 0).into(),
+            SocketAddr::V6(_) => SocketAddrV6::new(crate::defs::BIND_V6, 0, 0, 0).into(),
         };
         let socket = UdpSocket::bind(ours)
             .await

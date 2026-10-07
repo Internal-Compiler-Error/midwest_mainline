@@ -634,6 +634,10 @@ impl TorrentTask {
         // one that starts complete finished some other time
         let mut completion_told = ratio_stats.borrow().completed;
         let stop = loop {
+            // the swarm stopped itself: Unpause retries once the disk has room again
+            if let Some(e) = ratio_stats.borrow().storage_error.clone() {
+                break Err(anyhow::anyhow!("couldn't write the files: {e}"));
+            }
             if ratio_stats.borrow().completed {
                 drop(slot.take());
                 if !completion_told {

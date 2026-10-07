@@ -9,7 +9,7 @@
 use crate::events::{Event, EventBus};
 use midwest_mainline::dht::DhtSession;
 use midwest_mainline::dht::client::DhtClient;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UdpSocket, lookup_host};
@@ -123,11 +123,11 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
 }
 
 async fn bind(port: u16) -> std::io::Result<UdpSocket> {
-    match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).await {
+    match UdpSocket::bind(SocketAddrV4::new(crate::defs::BIND_V4, port)).await {
         Ok(socket) => Ok(socket),
         Err(e) => {
             warn!("UDP port {port} is taken ({e}), the DHT node will use any free port");
-            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await
+            UdpSocket::bind(SocketAddrV4::new(crate::defs::BIND_V4, 0)).await
         }
     }
 }

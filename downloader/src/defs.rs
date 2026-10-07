@@ -1,5 +1,5 @@
 use crate::config::Encryption;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Debug, Clone, Eq, PartialEq, Copy)]
 pub struct Identity {
@@ -21,3 +21,16 @@ pub fn random_peer_id() -> [u8; 20] {
     rand::Rng::fill_bytes(&mut rand::rng(), &mut id[8..]);
     id
 }
+
+/// Where sockets bind: every interface, except in unit tests, which keep to loopback so macOS's
+/// firewall doesn't ask about each freshly built test binary.
+pub(crate) const BIND_V4: Ipv4Addr = if cfg!(test) {
+    Ipv4Addr::LOCALHOST
+} else {
+    Ipv4Addr::UNSPECIFIED
+};
+pub(crate) const BIND_V6: Ipv6Addr = if cfg!(test) {
+    Ipv6Addr::LOCALHOST
+} else {
+    Ipv6Addr::UNSPECIFIED
+};
