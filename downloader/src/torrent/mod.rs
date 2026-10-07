@@ -107,10 +107,8 @@ pub struct Torrent {
     /// BEP 52 metadata, for v2 and hybrid torrents
     pub v2: Option<V2>,
 
-    /// The raw bencoded bytes of the "info" dict, exactly as they appeared in the .torrent
-    /// file. Kept around so we can serve it to peers over BEP 9 (ut_metadata) -- we always
-    /// have the full metadata already, having started from a .torrent file rather than a
-    /// magnet link.
+    /// The bencoded "info" dict exactly as the .torrent has it, which the info hashes are
+    /// taken over and BEP 9 (ut_metadata) serves to peers
     pub raw_info: Vec<u8>,
 
     /// BEP 27: if set, peers for this torrent must only come from the trackers named in this
