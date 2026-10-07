@@ -142,8 +142,7 @@ fn searched<S: Discoverable>(swarms: &HashMap<InfoHash, S>, search: &BtSearch) -
 fn bt_search(tcp_port: u16, hashes: &[InfoHash], cookie: &str) -> String {
     let mut message = format!("BT-SEARCH * HTTP/1.1\r\nHost: {GROUP}:{PORT}\r\nPort: {tcp_port}\r\n");
     for hash in hashes {
-        let hex: String = hash.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
-        message.push_str(&format!("Infohash: {hex}\r\n"));
+        message.push_str(&format!("Infohash: {}\r\n", hex::encode_upper(hash.as_bytes())));
     }
     message.push_str(&format!("cookie: {cookie}\r\n\r\n\r\n"));
     message
