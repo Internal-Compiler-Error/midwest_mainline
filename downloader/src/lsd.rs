@@ -189,7 +189,7 @@ pub(crate) fn parse_bt_search(bytes: &[u8]) -> Option<BtSearch> {
         };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
-            "port" => port = value.parse().ok(),
+            "port" => port = value.parse().ok().filter(|&port: &u16| port != 0),
             "infohash" => info_hashes.extend(decode_hex::<20>(value).map(InfoHash)),
             "cookie" => cookie = Some(value.to_string()),
             _ => {}
@@ -232,6 +232,13 @@ mod test {
             parse_bt_search(b"BT-SEARCH * HTTP/1.1\r\nInfohash: 000102030405060708090A0B0C0D0E0F10111213\r\n\r\n")
                 .is_none(),
             "no port"
+        );
+        assert!(
+            parse_bt_search(
+                b"BT-SEARCH * HTTP/1.1\r\nPort: 0\r\nInfohash: 000102030405060708090A0B0C0D0E0F10111213\r\n\r\n"
+            )
+            .is_none(),
+            "port 0 is nowhere to dial"
         );
         assert!(parse_bt_search(&[0xff, 0xfe]).is_none());
 
