@@ -2,7 +2,7 @@
 //! room at the connection cap by BEP 40), and our side of the opening exchange.
 
 use crate::defs::Identity;
-use crate::events::Event;
+use crate::events::{Event, PeerSource};
 use crate::peer::Peer;
 use crate::settings::MAX_HALF_OPEN;
 use crate::stream::DialHints;
@@ -205,10 +205,27 @@ impl TorrentSwarm {
         peer.show_interest()
     }
 
-    /// Dials every address in `peers` we're not already connected to or dialing. Shared by
-    /// tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
-    pub(super) fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
+    /// Addresses from a tracker, the DHT, LSD or the metadata fetch.
+    pub(super) fn peers_discovered(&mut self, peers: Vec<SocketAddr>, source: PeerSource) {
+        self.bus.emit(Event::PeersDiscovered {
+            info_hash: self.torrent.info_hash,
+            source,
+            count: peers.len(),
+        });
         self.connect_to_peers(peers.into_iter().map(|addr| (addr, false)).collect(), None);
+    }
+
+    /// A dial has failed: the address waits out a backoff, and one PEX told us about may be
+    /// reachable through a holepunch.
+    pub(super) fn dial_failed(&mut self, addr: SocketAddr) {
+        self.bus.emit(Event::DialFailed {
+            info_hash: self.torrent.info_hash,
+            addr,
+        });
+        self.dialing.remove(&addr);
+        let addr = canonical(addr);
+        self.known.entry(addr).or_default().dial_failed(Instant::now());
+        self.try_holepunch(addr);
     }
 
     /// Dials what a tracker, the DHT, LSD or PEX handed out, as far as the peer cap allows.

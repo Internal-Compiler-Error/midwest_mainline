@@ -53,7 +53,7 @@ pub struct TorrentSwarmStats {
     pub wasted: u64,
     /// how many bytes we don't have yet
     pub left: usize,
-    // how many bytes we've written
+    /// how many bytes we've written
     pub written: usize,
     /// indexed by piece number, indicates which pieces have been verified, note it also implies we
     /// have a piece if it's verified
@@ -566,14 +566,7 @@ impl TorrentSwarm {
 
     fn process_event(&mut self, event: SwarmEvent) {
         match event {
-            SwarmEvent::PeersDiscovered(peers, source) => {
-                self.bus.emit(Event::PeersDiscovered {
-                    info_hash: self.torrent.info_hash,
-                    source,
-                    count: peers.len(),
-                });
-                self.connect_to_discovered_peers(peers)
-            }
+            SwarmEvent::PeersDiscovered(peers, source) => self.peers_discovered(peers, source),
             SwarmEvent::FilesSelected(selected) => self.select_files(&selected),
             SwarmEvent::Sequential(on) => self.sequential = on,
             SwarmEvent::SuperSeed(on) => self.set_super_seed(on),
@@ -587,18 +580,7 @@ impl TorrentSwarm {
             SwarmEvent::HashesRead { to, reply } => self.hashes_read(to, reply),
             SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block),
             SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome),
-            SwarmEvent::DialFailed(addr) => {
-                self.bus.emit(Event::DialFailed {
-                    info_hash: self.torrent.info_hash,
-                    addr,
-                });
-                self.dialing.remove(&addr);
-                self.known
-                    .entry(canonical(addr))
-                    .or_default()
-                    .dial_failed(Instant::now());
-                self.try_holepunch(canonical(addr));
-            }
+            SwarmEvent::DialFailed(addr) => self.dial_failed(addr),
         }
     }
 
@@ -624,6 +606,21 @@ impl TorrentSwarm {
     /// Once a second: time out stalled requests, drop silent peers, keep the request pipeline
     /// full, and publish progress.
     fn housekeeping(&mut self) {
+        self.time_out_peers();
+        self.request_layers();
+        self.schedule();
+        self.send_held_uploads();
+        self.prune_known();
+        self.publish_stats();
+        self.sample_peers();
+        let peers = self.peers.iter().map(Peer::snapshot).chain(self.web_seed_snapshots());
+        let _ = self.peers_snapshot_tx.send(peers.collect());
+    }
+
+    /// Drops the peers that have gone silent, and takes back the pieces of those that stopped
+    /// delivering (as opposed to disconnecting outright), which would otherwise hold their
+    /// slots forever.
+    fn time_out_peers(&mut self) {
         let mut stalled = Vec::new();
         let mut silent = Vec::new();
         for (idx, peer) in self.peers.iter().enumerate() {
@@ -631,8 +628,6 @@ impl TorrentSwarm {
                 silent.push(idx);
                 continue;
             }
-            // a peer that accepted requests and then went quiet (as opposed to disconnecting
-            // outright) would otherwise hold its pieces' slots forever
             if peer.stalled(BLOCK_REQUEST_TIMEOUT) {
                 stalled.extend(peer.requested.keys().map(|req| (req.index, peer.remote_addr)));
             }
@@ -650,37 +645,6 @@ impl TorrentSwarm {
             info!("piece {piece} stalled at {peer}, will retry");
             self.release_claim(piece, peer);
         }
-
-        self.request_layers();
-        self.schedule();
-        self.send_held_uploads();
-        self.prune_known();
-        self.publish_stats();
-        self.sample_peers();
-        let piece_size = self.torrent.piece_size;
-        let web_seeds = self
-            .web_seeds
-            .iter()
-            .filter(|w| w.gave_up.is_none())
-            .map(|w| PeerSnapshot {
-                addr: w.addr,
-                client: "web seed".to_string(),
-                progress: 1.0,
-                downloaded: w.stats.received as u64,
-                uploaded: 0,
-                download_bps: w.stats.rx_rate,
-                choked_us: false,
-                choked_them: true,
-                interested_us: false,
-                interested_them: true,
-                outstanding: w.outstanding_blocks(piece_size),
-                encrypted: w.url.starts_with("https:"),
-                utp: false,
-                web_seed: Some(w.url.clone()),
-            });
-        let _ = self
-            .peers_snapshot_tx
-            .send(self.peers.iter().map(Peer::snapshot).chain(web_seeds).collect());
     }
 
     /// Whether `piece` can be checked once it's in; only a v2 piece whose file's layer

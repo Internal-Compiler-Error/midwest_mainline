@@ -1,6 +1,7 @@
 //! BEP 19 web seeds: runs of pieces scheduled next to the peers, fetched by jobs on tasks of
 //! their own, and their part in the endgame.
 
+use crate::peer::PeerSnapshot;
 use crate::settings::BLOCK_SIZE;
 use crate::webseed::{self, Failure, WebJob};
 use crate::wire::Piece;
@@ -12,6 +13,30 @@ use tracing::{info, warn};
 use super::{SwarmEvent, TorrentSwarm, in_flight::InFlight};
 
 impl TorrentSwarm {
+    /// The web seeds still in use, as the peer list shows them.
+    pub(super) fn web_seed_snapshots(&self) -> impl Iterator<Item = PeerSnapshot> + '_ {
+        let piece_size = self.torrent.piece_size;
+        self.web_seeds
+            .iter()
+            .filter(|w| w.gave_up.is_none())
+            .map(move |w| PeerSnapshot {
+                addr: w.addr,
+                client: "web seed".to_string(),
+                progress: 1.0,
+                downloaded: w.stats.received as u64,
+                uploaded: 0,
+                download_bps: w.stats.rx_rate,
+                choked_us: false,
+                choked_them: true,
+                interested_us: false,
+                interested_them: true,
+                outstanding: w.outstanding_blocks(piece_size),
+                encrypted: w.url.starts_with("https:"),
+                utp: false,
+                web_seed: Some(w.url.clone()),
+            })
+    }
+
     pub(super) fn web_seed_index(&self, addr: SocketAddr) -> Option<usize> {
         self.web_seeds.iter().position(|w| w.addr == addr)
     }
