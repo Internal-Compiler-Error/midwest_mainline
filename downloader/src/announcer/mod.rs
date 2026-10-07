@@ -174,7 +174,10 @@ pub(crate) fn spawn_announcers(torrent: Announcing) -> watch::Receiver<Vec<Track
                 .map(|(label, hash)| (label, Ok(Source::Dht), hash)),
         );
     }
-    for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
+    // a tracker listed twice (in two tiers, say) is announced to once
+    let mut seen = std::collections::HashSet::new();
+    let urls = trackers.iter().filter_map(|t| Url::parse(t).ok());
+    for url in urls.filter(|url| seen.insert(url.clone())) {
         match Source::of(&url) {
             Ok(source) => planned.extend(
                 per_hash(url.as_str())
@@ -433,6 +436,25 @@ mod test {
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);
         drop(dht_tx);
+        shutdown.cancel();
+    }
+
+    /// A tracker in two tiers, or named twice in a magnet, gets one announcer.
+    #[tokio::test]
+    async fn a_tracker_listed_twice_is_announced_to_once() {
+        let (events, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let rows = spawn_announcers(Announcing {
+            trackers: vec![
+                "udp://t.test:1".to_string(),
+                "http://t.test/announce".to_string(),
+                "udp://t.test:1".to_string(),
+            ],
+            shutdown: shutdown.clone(),
+            ..announcing(&events)
+        });
+        let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(urls, ["udp://t.test:1", "http://t.test/announce"]);
         shutdown.cancel();
     }
 
