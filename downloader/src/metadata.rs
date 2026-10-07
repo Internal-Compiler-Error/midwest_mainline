@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
@@ -118,21 +119,21 @@ pub async fn fetch(
     let started = Instant::now();
     let give_up = started + OVERALL_TIMEOUT;
     let mut idle_deadline = started + IDLE_TIMEOUT;
-    let (result_tx, mut result_rx) = mpsc::channel(MAX_CONCURRENT_FETCHES);
+    // dropped with this frame, which aborts what's still running: connections the swarm
+    // will want to make itself, or that nobody wants after a cancel
+    let mut fetches = JoinSet::new();
     let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
     // Peers heard of but not dialled yet, for want of a free slot. A tracker typically returns
     // dozens at once, and if the first few are dead the rest are what's left to try until its
     // next announce, an interval (often 30 minutes) away. A magnet's own x.pe peers go first:
     // they need no tracker or DHT to find.
     let mut pending: VecDeque<SocketAddr> = magnet.peers.iter().copied().filter(|p| tried.insert(*p)).collect();
-    let mut in_flight = 0usize;
 
     let (from, raw_info) = loop {
-        while in_flight < MAX_CONCURRENT_FETCHES
+        while fetches.len() < MAX_CONCURRENT_FETCHES
             && let Some(peer) = pending.pop_front()
         {
-            in_flight += 1;
-            spawn_fetch_from(peer, magnet, identity.clone(), utp.borrow().clone(), result_tx.clone());
+            fetches.spawn(fetch_from(peer, magnet, identity.clone(), utp.borrow().clone()));
         }
 
         tokio::select! {
@@ -157,8 +158,7 @@ pub async fn fetch(
                 }
             }
 
-            Some((peer, result)) = result_rx.recv() => {
-                in_flight -= 1;
+            Some(Ok((peer, result))) = fetches.join_next() => {
                 match result {
                     Ok(raw_info) => break (peer, raw_info),
                     Err(e) => debug!("metadata fetch from a peer failed: {e:#}"),
@@ -213,33 +213,29 @@ fn placeholder_stats() -> TorrentSwarmStats {
     }
 }
 
-/// Fetches the metadata from `peer` on a task of its own, within PER_PEER_TIMEOUT, and sends
-/// the outcome to `results`.
-fn spawn_fetch_from(
+/// Fetches the metadata from `peer` within PER_PEER_TIMEOUT.
+fn fetch_from(
     peer: SocketAddr,
     magnet: &MagnetLink,
     identity: Arc<Identity>,
     utp: Option<Arc<UtpSocketUdp>>,
-    results: mpsc::Sender<(SocketAddr, anyhow::Result<Vec<u8>>)>,
-) {
+) -> impl Future<Output = (SocketAddr, anyhow::Result<Vec<u8>>)> + use<> {
     let info_hash = magnet.info_hash;
     let v2 = magnet.v2_support();
     let span =
         tracing::info_span!("metadata.peer", info_hash = %info_hash, peer = %peer, outcome = tracing::field::Empty);
-    tokio::spawn(
-        async move {
-            let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, v2, identity, utp))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
-            let outcome = match &result {
-                Ok(raw) => format!("{} bytes", raw.len()),
-                Err(e) => format!("{e:#}"),
-            };
-            tracing::Span::current().record("outcome", outcome);
-            let _ = results.send((peer, result)).await;
-        }
-        .instrument(span),
-    );
+    async move {
+        let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, v2, identity, utp))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+        let outcome = match &result {
+            Ok(raw) => format!("{} bytes", raw.len()),
+            Err(e) => format!("{e:#}"),
+        };
+        tracing::Span::current().record("outcome", outcome);
+        (peer, result)
+    }
+    .instrument(span)
 }
 
 /// A torrent built from fetched metadata, and every peer the fetch heard of on the way: the
@@ -794,6 +790,47 @@ mod test {
         assert_eq!(torrent.raw_info, raw_info);
         assert_eq!(torrent.total_size, 12);
         assert_eq!(torrent.files.len(), 1);
+    }
+
+    /// A fetch that ends takes its peer connections with it, rather than leaving them to run
+    /// out PER_PEER_TIMEOUT against peers the swarm is about to dial, or after a cancel.
+    #[tokio::test]
+    async fn an_ended_fetch_hangs_up_on_its_peers() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let magnet = MagnetLink {
+            info_hash: InfoHash::from_bytes(&[4; 20]),
+            info_hash_v2: None,
+            display_name: None,
+            trackers: vec![],
+            web_seeds: vec![],
+            peers: vec![peer],
+            select_only: None,
+            feed: None,
+        };
+        let shutdown = CancellationToken::new();
+        let fetching = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                fetch(
+                    &magnet,
+                    Arc::new(test_identity()),
+                    shutdown,
+                    crate::dht::Dht::none(),
+                    crate::utp::none(),
+                    EventBus::new(),
+                )
+                .await
+            }
+        });
+        // a peer that takes the connection and never answers the handshake
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        shutdown.cancel();
+        assert!(fetching.await.unwrap().is_err());
+        let mut rest = vec![];
+        let hung_up = tokio::time::timeout(Duration::from_secs(5), accepted.read_to_end(&mut rest)).await;
+        assert!(hung_up.is_ok(), "the connection outlived the fetch");
     }
 
     /// More peers than MAX_CONCURRENT_FETCHES from one announce, every one before the last a
