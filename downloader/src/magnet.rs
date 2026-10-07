@@ -6,6 +6,7 @@
 
 use anyhow::{bail, ensure};
 use midwest_mainline::types::InfoHash;
+use std::net::SocketAddr;
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,47 @@ pub struct MagnetLink {
     pub trackers: Vec<String>,
     /// BEP 19 `ws=` web seeds; they join once the metadata has come from peers
     pub web_seeds: Vec<String>,
+    /// `x.pe=`: peers to try first, before any tracker or the DHT has answered
+    pub peers: Vec<SocketAddr>,
+    /// BEP 53 `so=`: the indices of the files to download; `None` for all of them
+    pub select_only: Option<Vec<usize>>,
+}
+
+impl MagnetLink {
+    /// The file selection `so=` asks for, for a torrent of `files` files: all of them without
+    /// `so=`, or when none of its indices exists.
+    pub fn selection(&self, files: usize) -> Vec<bool> {
+        let picked: Vec<bool> = (0..files)
+            .map(|i| self.select_only.as_ref().is_none_or(|only| only.contains(&i)))
+            .collect();
+        if picked.contains(&true) {
+            picked
+        } else {
+            vec![true; files]
+        }
+    }
+}
+
+/// BEP 53: comma-separated indices and inclusive ranges, `0,2,4,6-8`. Malformed parts are
+/// skipped; a range is capped so a hostile `0-4294967295` can't allocate the world.
+fn parse_select_only(value: &str) -> Vec<usize> {
+    const MAX_RANGE: usize = 1 << 20;
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        match part.split_once('-') {
+            Some((from, to)) => {
+                if let (Ok(from), Ok(to)) = (from.trim().parse::<usize>(), to.trim().parse::<usize>())
+                    && from <= to
+                {
+                    out.extend(from..=to.min(from + MAX_RANGE));
+                }
+            }
+            None => out.extend(part.trim().parse::<usize>()),
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// True if `s` looks like a magnet URI, so callers can accept either this or a file path.
@@ -32,6 +74,8 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     let mut display_name = None;
     let mut trackers = Vec::new();
     let mut web_seeds = Vec::new();
+    let mut peers = Vec::new();
+    let mut select_only: Option<Vec<usize>> = None;
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -45,6 +89,9 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
             "dn" if display_name.is_none() => display_name = Some(value.into_owned()),
             "tr" => trackers.push(value.into_owned()),
             "ws" => web_seeds.push(value.into_owned()),
+            // only address literals: a hostname here would have us resolve whatever the link says
+            "x.pe" => peers.extend(value.parse::<SocketAddr>()),
+            "so" => select_only.get_or_insert_default().extend(parse_select_only(&value)),
             _ => {}
         }
     }
@@ -58,6 +105,8 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
         display_name,
         trackers,
         web_seeds: crate::torrent::web_seed_urls(web_seeds.iter().map(|u| u.as_bytes())),
+        peers,
+        select_only,
     })
 }
 
@@ -129,6 +178,37 @@ fn decode_base32(s: &str) -> anyhow::Result<[u8; 20]> {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn select_only_and_peer_addresses() {
+        let hash = "f45add9d1a5185d8588df7dd6cd89993dd0174fa";
+        let magnet = parse_magnet(&format!(
+            "magnet:?xt=urn:btih:{hash}&so=0,2,4-6,x,9-7&x.pe=10.0.0.1:6881&x.pe=[::1]:7000&x.pe=host.test:1"
+        ))
+        .unwrap();
+        assert_eq!(magnet.select_only, Some(vec![0, 2, 4, 5, 6]));
+        assert_eq!(
+            magnet.peers,
+            [
+                "10.0.0.1:6881".parse::<SocketAddr>().unwrap(),
+                "[::1]:7000".parse().unwrap()
+            ]
+        );
+        assert_eq!(magnet.selection(4), [true, false, true, false]);
+        let none_exist = parse_magnet(&format!("magnet:?xt=urn:btih:{hash}&so=10")).unwrap();
+        assert_eq!(
+            none_exist.selection(2),
+            [true, true],
+            "nothing valid selected means everything"
+        );
+        let plain = parse_magnet(&format!("magnet:?xt=urn:btih:{hash}")).unwrap();
+        assert_eq!(plain.selection(2), [true, true]);
+        assert_eq!(
+            parse_select_only("0-4294967295").len(),
+            (1 << 20) + 1,
+            "ranges are capped"
+        );
+    }
+
     use super::*;
 
     const HEX: &str = "0123456789abcdef0123456789abcdef01234567";

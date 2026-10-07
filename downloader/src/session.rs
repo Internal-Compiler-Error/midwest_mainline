@@ -376,8 +376,8 @@ impl TorrentTask {
             piece_size: torrent.piece_size,
             files: torrent.files.len(),
         });
-        let _ = self.selected.send(selected);
-        let _ = self.sequential.send(sequential);
+        self.selected.send_replace(selected);
+        self.sequential.send_replace(sequential);
         self.uploaded_before = uploaded;
 
         let mut last_stats = None;
@@ -476,10 +476,10 @@ impl TorrentTask {
                     Some(Command::Pause) => pause_asked = Some(true),
                     Some(Command::Unpause) => pause_asked = Some(false),
                     Some(Command::SelectFiles(selected)) => {
-                        let _ = self.selected.send(selected);
+                        self.selected.send_replace(selected);
                     }
                     Some(Command::Sequential(on)) => {
-                        let _ = self.sequential.send(on);
+                        self.sequential.send_replace(on);
                     }
                     Some(Command::Recheck) => {}
                 },
@@ -665,11 +665,11 @@ impl TorrentTask {
                     Some(Command::Remove { delete_files }) => break Ok(Stop::Remove { delete_files }),
                     Some(Command::SelectFiles(selected)) => {
                         self.client.select_files(&torrent.info_hash, selected.clone());
-                        let _ = self.selected.send(selected);
+                        self.selected.send_replace(selected);
                     }
                     Some(Command::Sequential(on)) => {
                         self.client.set_sequential(&torrent.info_hash, on);
-                        let _ = self.sequential.send(on);
+                        self.sequential.send_replace(on);
                     }
                     Some(Command::Unpause) => {}
                     None => break Ok(Stop::Shutdown),
@@ -741,10 +741,10 @@ impl TorrentTask {
                     Some(Command::Recheck) => return Err(Stop::Recheck),
                     Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
                     Some(Command::SelectFiles(selected)) => {
-                        let _ = self.selected.send(selected);
+                        self.selected.send_replace(selected);
                     }
                     Some(Command::Sequential(on)) => {
-                        let _ = self.sequential.send(on);
+                        self.sequential.send_replace(on);
                     }
                     Some(Command::Unpause) => {}
                     None => return Err(Stop::Shutdown),
@@ -819,12 +819,12 @@ impl TorrentTask {
                     Some(Command::Recheck) => break Stop::Recheck,
                     Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
                     Some(Command::SelectFiles(selected)) => {
-                        let _ = self.selected.send(selected);
+                        self.selected.send_replace(selected);
                         // the paused resume file and the phase should say so too
                         break Stop::Pause;
                     }
                     Some(Command::Sequential(on)) => {
-                        let _ = self.sequential.send(on);
+                        self.sequential.send_replace(on);
                         break Stop::Pause;
                     }
                     Some(Command::Pause) => {}
@@ -1111,12 +1111,14 @@ impl Session {
         let dht = self.client.dht();
         let utp = self.client.utp();
         let bus = self.events.clone();
-        let info_hash = crate::magnet::parse_magnet(&source).ok().map(|m| m.info_hash);
+        let magnet = crate::magnet::parse_magnet(&source).ok();
+        let info_hash = magnet.as_ref().map(|m| m.info_hash);
         self.launch(source.clone(), info_hash, None, |cancel| async move {
             let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
             let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
+            let files = loaded.torrent.files.len();
             Ok(Resolved {
-                selected: vec![true; loaded.torrent.files.len()],
+                selected: magnet.map_or_else(|| vec![true; files], |m| m.selection(files)),
                 torrent: loaded.torrent,
                 root,
                 verified: nothing,
@@ -2151,6 +2153,37 @@ mod test {
         wait_for(&mut session, ids[0], |s| {
             matches!(s, Some(TorrentState::Downloading(_)))
         });
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What the resume file says about sequential mode (and the file selection) comes back
+    /// with the torrent. These go through `watch` senders that have no receiver yet at that
+    /// point, where a plain `send` silently drops the value.
+    #[test]
+    fn a_resumed_torrent_keeps_its_sequential_mode() {
+        let dir = scratch("sequential");
+        let torrent_file = write_torrent_file(&dir);
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), dir.join("downloads"));
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.set_sequential(id, true);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.sequential),
+        );
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        session.shutdown();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let ids = session.resume_all();
+        wait_for(
+            &mut session,
+            ids[0],
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.sequential),
+        );
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

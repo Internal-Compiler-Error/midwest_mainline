@@ -142,7 +142,8 @@ pub async fn fetch(
     // in one go, and if the first few happen to be dead, dropping the rest would leave us idle
     // until the *next* announce -- which is an interval (often 30 minutes) away, i.e. well past
     // any timeout here.
-    let mut pending: VecDeque<SocketAddr> = VecDeque::new();
+    // a magnet's own x.pe peers go first: they need no tracker or DHT to find
+    let mut pending: VecDeque<SocketAddr> = magnet.peers.iter().copied().filter(|p| tried.insert(*p)).collect();
     let mut in_flight = 0usize;
     let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
     let give_up = tokio::time::Instant::now() + OVERALL_TIMEOUT;
@@ -825,6 +826,8 @@ mod test {
             display_name: Some("hello".to_string()),
             trackers: vec![tracker_url],
             web_seeds: vec![],
+            peers: vec![],
+            select_only: None,
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
@@ -885,6 +888,8 @@ mod test {
             display_name: None,
             trackers: vec![tracker_url],
             web_seeds: vec![],
+            peers: vec![],
+            select_only: None,
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",

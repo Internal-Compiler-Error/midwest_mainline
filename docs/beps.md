@@ -30,6 +30,8 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 41 | UDP tracker extensions: we send an empty option list only | `announcer.rs` |
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
+| 53 | Magnet `so=` (select only): indices and ranges, applied when the metadata arrives; nothing valid selects all | `magnet.rs` (`MagnetLink::selection`), `session.rs` (`add`) |
+| magnet `x.pe` | Peer addresses in a magnet (address literals only), tried first by the metadata fetch | `magnet.rs`, `metadata.rs` |
 | MSE | Message stream encryption (not a BEP; the Vuze/libtorrent spec) | `mse.rs` |
 
 ## Next, in order
@@ -37,8 +39,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 52 + 47 | BitTorrent v2 (SHA-256 Merkle trees, `piece layers`, `btmh` magnets) and padding files / file attributes | Hybrid v1+v2 torrents are increasingly common; without 47 we'd write pad files to disk. Big: per-file Merkle verification, hash requests (`hash request`/`hashes`/`hash reject` messages), v2 info hash in the handshake |
-| 53 | Magnet `so=` (select only) | Small: map to `select_files` once metadata is in |
-| magnet `x.pe` | Peer addresses in a magnet | Small: hand to the swarm like any discovered peer |
 | 21 | Partial seeds (`upload_only` in the extended handshake) | Tell peers we're done with what we selected; don't count partial seeds as seeds |
 | 54 | `lt_donthave` | Small; needed if pieces can be dropped (e.g. a file deselected and deleted) |
 | 24 + BEP 10 `yourip` | Our external address from trackers and peers | Today only the DHT tells us; feeds BEP 42 ids and port mapping checks |
