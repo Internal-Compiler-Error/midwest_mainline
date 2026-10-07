@@ -429,24 +429,24 @@ pub fn save_durably(
     Ok(data.verified)
 }
 
-/// `save_durably` on the blocking pool. Returns the bitfield the file holds afterwards:
-/// `persisted` still if the write failed, which is logged.
+/// `save_durably` on the blocking pool. Returns the bitfield the file holds afterwards, or
+/// `None` if the write failed, which is logged.
 async fn save_in_background(
     torrent: &Arc<Torrent>,
     path: &Path,
     data: ResumeData,
-    persisted: BitBox<u8, Msb0>,
-) -> BitBox<u8, Msb0> {
+    persisted: &BitSlice<u8, Msb0>,
+) -> Option<BitBox<u8, Msb0>> {
     let written = {
-        let (torrent, path, had) = (torrent.clone(), path.to_path_buf(), persisted.clone());
+        let (torrent, path, had) = (torrent.clone(), path.to_path_buf(), persisted.to_bitvec());
         tokio::task::spawn_blocking(move || save_durably(&torrent, &path, data, &had)).await
     };
     match written {
-        Ok(Ok(now)) => return now,
+        Ok(Ok(now)) => return Some(now),
         Ok(Err(e)) => tracing::warn!("couldn't write resume file {}: {e:#}", path.display()),
         Err(e) => tracing::warn!("writing resume file {} failed: {e}", path.display()),
     }
-    persisted
+    None
 }
 
 /// The file indices a selection leaves out, as the resume file stores them.
@@ -493,7 +493,9 @@ pub(crate) async fn save_paused(
     let mut data = inputs.snapshot(verified, 0).to_data(torrent, root);
     data.paused = true;
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
-    save_in_background(torrent, &path, data, inputs.persisted).await
+    save_in_background(torrent, &path, data, &inputs.persisted)
+        .await
+        .unwrap_or(inputs.persisted)
 }
 
 /// What a resume file holds that changes while the torrent runs.
@@ -538,12 +540,33 @@ async fn save_every(
         inputs.snapshot(&stats.verified, stats.uploaded)
     };
     let mut persisted = inputs.persisted.clone();
-    let mut last = snapshot(&stats, &inputs);
-    persisted = save_in_background(&torrent, &path, last.to_data(&torrent, &root), persisted).await;
+    // what the file holds, once this has written it: less than asked for when a write failed
+    // or its newest pieces couldn't be flushed, which a later round tries again
+    let mut last: Option<Saved> = None;
     let mut last_write = tokio::time::Instant::now();
-    // set while only the counters have changed since the last write
+    // set while only the counters have changed since the last write, or a write fell short
     let mut counters_due: Option<tokio::time::Instant> = None;
+    let mut now = snapshot(&stats, &inputs);
     loop {
+        let due = match &last {
+            None => true,
+            Some(last) => {
+                now.differs_beyond_counters(last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters)
+            }
+        };
+        if due {
+            if let Some(written) = save_in_background(&torrent, &path, now.to_data(&torrent, &root), &persisted).await {
+                persisted = written;
+                last = Some(Saved {
+                    verified: persisted.clone(),
+                    ..now.clone()
+                });
+            }
+            last_write = tokio::time::Instant::now();
+            counters_due = (last.as_ref() != Some(&now)).then(|| last_write + counters);
+        } else if last.as_ref().is_some_and(|last| now.uploaded != last.uploaded) {
+            counters_due = Some(last_write + counters);
+        }
         tokio::select! {
             changed = stats.changed() => if changed.is_err() { break },
             changed = inputs.selected.changed() => if changed.is_err() { break },
@@ -563,19 +586,13 @@ async fn save_every(
         inputs.selected.mark_unchanged();
         inputs.modes.mark_unchanged();
         inputs.feed.mark_unchanged();
-        let now = snapshot(&stats, &inputs);
-        if now.differs_beyond_counters(&last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters) {
-            persisted = save_in_background(&torrent, &path, now.to_data(&torrent, &root), persisted).await;
-            last = now;
-            last_write = tokio::time::Instant::now();
-            counters_due = None;
-        } else if now.uploaded != last.uploaded {
-            counters_due = Some(last_write + counters);
-        }
+        now = snapshot(&stats, &inputs);
     }
     let now = snapshot(&stats, &inputs);
-    if now != last {
-        persisted = save_in_background(&torrent, &path, now.to_data(&torrent, &root), persisted).await;
+    if last.as_ref() != Some(&now)
+        && let Some(written) = save_in_background(&torrent, &path, now.to_data(&torrent, &root), &persisted).await
+    {
+        persisted = written;
     }
     persisted
 }
@@ -1084,6 +1101,43 @@ mod test {
 
         shutdown.cancel();
         assert_eq!(saver.await.unwrap().count_ones(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A write that fails (the disk full, the directory not there) is tried again without
+    /// waiting for the torrent to change, which a paused or finished one never does.
+    #[tokio::test]
+    async fn a_failed_write_is_tried_again() {
+        let dir = scratch_dir("retry");
+        let torrent = Arc::new(test_torrent(&content(100), 16, &["udp://a.test:1"]));
+        let resume_dir = dir.join("resume");
+        // a file where the directory should be
+        std::fs::write(&resume_dir, b"").unwrap();
+        let (_tx, rx) = watch::channel(no_progress());
+        let (_selected_tx, selected) = watch::channel(vec![true]);
+        let (_modes_tx, modes) = watch::channel(Modes::default());
+        let shutdown = CancellationToken::new();
+        let saver = tokio::spawn(save_every(
+            torrent.clone(),
+            dir.clone(),
+            rx,
+            ResumeInputs {
+                selected,
+                modes,
+                uploaded_before: 0,
+                persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
+                feed: watch::channel(None).1,
+            },
+            resume_dir.clone(),
+            shutdown.clone(),
+            (Duration::from_millis(20), Duration::from_millis(100)),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::remove_file(&resume_dir).unwrap();
+        let path = resume_dir.join(ResumeData::file_name(&torrent.info_hash));
+        file_comes_to(&path, |_| true).await;
+        shutdown.cancel();
+        saver.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
