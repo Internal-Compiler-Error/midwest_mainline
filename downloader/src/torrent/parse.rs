@@ -22,6 +22,11 @@ use std::sync::{Arc, OnceLock};
 /// 16 MiB, and a whole piece is buffered in memory while it downloads.
 const MAX_PIECE_SIZE: u32 = 64 << 20;
 
+/// The most pieces a torrent may have, libtorrent's limit too. Per-piece state (bitfields,
+/// availability, priorities) is sized by it, and a v2 torrent has no piece hashes to bound it:
+/// one file's `length` can claim billions.
+const MAX_PIECES: u64 = 1 << 21;
+
 /// How deep a v2 `file tree` may nest; real ones are a handful of levels.
 const MAX_TREE_DEPTH: usize = 64;
 
@@ -447,6 +452,9 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         bail!("torrent is empty");
     }
     let num_pieces = total_size.div_ceil(piece_len);
+    if num_pieces > MAX_PIECES {
+        bail!("too many pieces: {num_pieces} of {piece_len} bytes");
+    }
     let pieces = match pieces {
         Some(pieces) if (pieces.len() / 20) as u64 != num_pieces => bail!(
             "{} piece hashes for {total_size} bytes in pieces of {piece_len}",
@@ -455,9 +463,6 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         Some(pieces) => pieces.as_chunks::<20>().0.to_vec(),
         None => vec![],
     };
-    if u32::try_from(num_pieces).is_err() {
-        bail!("too many pieces");
-    }
 
     let v2 = roots.map(|roots| V2 {
         info_hash: Sha256::digest(&raw_info).into(),

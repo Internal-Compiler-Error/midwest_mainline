@@ -791,3 +791,16 @@ fn mutated_torrents_never_panic() {
         }
     }
 }
+
+/// A v2-only torrent has no piece hashes to pay for its pieces with: one file's `length` in a
+/// few bytes of info dict can claim billions of them, and the bitfields and per-piece state
+/// sized by that count would take gigabytes.
+#[test]
+fn a_v2_torrent_claiming_billions_of_pieces_is_refused() {
+    let len = (1u64 << 31) * 16384;
+    let mut info = format!("d9:file treed1:xd0:d6:lengthi{len}e11:pieces root32:").into_bytes();
+    info.extend_from_slice(&[1; 32]);
+    info.extend_from_slice(b"eee12:meta versioni2e4:name1:x12:piece lengthi16384ee");
+    let err = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap_err();
+    assert!(format!("{err:#}").contains("too many pieces"), "{err:#}");
+}
