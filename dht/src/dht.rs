@@ -539,7 +539,14 @@ impl DhtSession {
                 .unwrap();
         }
 
-        join_set.join_all().await;
+        while let Some(done) = join_set.join_next().await {
+            // a task the runtime cancelled on its way down isn't news; a panic is
+            if let Err(e) = done
+                && e.is_panic()
+            {
+                std::panic::resume_unwind(e.into_panic());
+            }
+        }
     }
 
     /// Returns a cheap handle to the lookup client; cloning is a single refcount bump
