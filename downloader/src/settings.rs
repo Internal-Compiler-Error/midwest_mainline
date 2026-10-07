@@ -187,3 +187,26 @@ pub const DHT_RETRY: Duration = Duration::from_secs(5);
 
 /// BEP 11 (PEX): the spec recommends capping a single message at roughly 50 added peers.
 pub const PEX_MAX_ADDED_PEERS: usize = 50;
+
+/// BEP 19: Range requests in flight at once per web seed. A few keep a mirror busy across
+/// each request's round trip without looking like a download accelerator to it.
+pub const WEB_SEED_JOBS: usize = 4;
+
+/// A web seed's jobs together fetch about this much of its measured throughput, so a fast
+/// mirror gets long runs of pieces and a slow one doesn't sit on many.
+pub const WEB_SEED_RUN_TARGET: Duration = Duration::from_secs(4);
+
+/// Requests one web seed job keeps in flight when its run spans several files.
+pub const WEB_SEED_PIPELINE: usize = 4;
+
+/// The most one web seed request fetches; it's all held in memory until verified.
+pub const WEB_SEED_MAX_RUN: usize = 16 * 1024 * 1024;
+
+/// After a failed request, a web seed rests this long, doubling per consecutive failure up
+/// to WEB_SEED_BACKOFF_MAX.
+pub const WEB_SEED_BACKOFF: Duration = Duration::from_secs(2);
+pub const WEB_SEED_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
+
+pub const WEB_SEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// longest a web seed may go without sending a byte mid-response
+pub const WEB_SEED_READ_TIMEOUT: Duration = Duration::from_secs(30);

@@ -18,6 +18,7 @@ use crate::storage::TorrentStorage;
 use crate::stream::{DialHints, PeerStream};
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
+use crate::webseed::{self, Failure, WebJob, WebSeed};
 use crate::wire::{BitField, BtMessage, Piece, Request};
 use anyhow::Context;
 use bitvec::prelude::*;
@@ -214,6 +215,14 @@ pub(crate) enum SwarmEvent {
     /// `dialing`, it could never be retried -- an address a peer keeps re-gossiping over PEX
     /// needs to actually leave the set on failure.
     DialFailed(SocketAddr),
+    /// a web seed's job (see `start_web_job`) fetched a block
+    WebSeedBlock { seed: usize, job: u64, block: Piece },
+    /// a web seed's job ended; every block it delivered came before this
+    WebSeedDone {
+        seed: usize,
+        job: u64,
+        outcome: Result<(), Failure>,
+    },
 }
 
 /// One peer's share of an in-flight piece: where it is in requesting the blocks.
@@ -254,6 +263,21 @@ impl InFlight {
             claims,
             span: tracing::Span::none(),
         }
+    }
+
+    /// A claim on every block not in yet, all requested at once: a web seed's.
+    fn claim_rest(&mut self, source: SocketAddr) {
+        let cursor = self.received.len();
+        self.claims.insert(source, Claim { cursor, reverse: false });
+        self.span.record("racers", self.claims.len());
+    }
+
+    /// Torrent-relative bytes from the first block not in yet to the end of the last one.
+    fn missing_span(&self, piece_offset: u64) -> Option<(u64, u64)> {
+        let first = self.received.iter().position(Option::is_none)?;
+        let last = self.received.iter().rposition(Option::is_none)?;
+        let end = ((last + 1) * BLOCK_SIZE).min(self.buf.len());
+        Some((piece_offset + (first * BLOCK_SIZE) as u64, piece_offset + end as u64))
     }
 
     fn add_racer(&mut self, peer: SocketAddr) {
@@ -443,6 +467,9 @@ pub struct TorrentSwarm {
     hashing: BTreeSet<u32>,
     /// block requests sent to any peer this session, UCB's `t`
     total_picks: usize,
+    /// BEP 19, in `torrent.web_seeds` order; the index is how their jobs report back
+    web_seeds: Vec<WebSeed>,
+    next_web_job: u64,
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
@@ -524,6 +551,12 @@ impl TorrentSwarm {
         };
         let events_tx = events_tx_weak;
 
+        let web_seeds = torrent
+            .web_seeds
+            .iter()
+            .enumerate()
+            .map(|(i, url)| WebSeed::new(i, url.clone()))
+            .collect();
         let swarm = TorrentSwarm {
             peers: vec![],
             dialing: BTreeSet::new(),
@@ -551,6 +584,8 @@ impl TorrentSwarm {
             holdings: BTreeMap::new(),
             hashing: BTreeSet::new(),
             total_picks: 0,
+            web_seeds,
+            next_web_job: 0,
             stat,
             stat_snapshot_tx: stat_tx,
             peers_snapshot_tx: peers_tx,
@@ -646,6 +681,9 @@ impl TorrentSwarm {
             self.torrent.name,
             self.peers.len()
         );
+        for w in self.web_seeds.iter().filter(|w| w.stats.received > 0) {
+            info!("web seed {} delivered {} bytes", w.url, w.stats.received);
+        }
     }
 
     async fn process_event(&mut self, event: SwarmEvent) {
@@ -668,6 +706,8 @@ impl TorrentSwarm {
                 senders,
                 outcome,
             } => self.piece_done(piece, len, senders, outcome).await,
+            SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block).await,
+            SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome).await,
             SwarmEvent::DialFailed(addr) => {
                 self.bus.emit(Event::DialFailed {
                     info_hash: self.torrent.info_hash,
@@ -738,9 +778,30 @@ impl TorrentSwarm {
         self.prune_known();
         self.publish_stats();
         self.sample_peers();
+        let piece_size = self.torrent.piece_size;
+        let web_seeds = self
+            .web_seeds
+            .iter()
+            .filter(|w| w.gave_up.is_none())
+            .map(|w| PeerSnapshot {
+                addr: w.addr,
+                client: "web seed".to_string(),
+                progress: 1.0,
+                downloaded: w.stats.received as u64,
+                uploaded: 0,
+                download_bps: w.stats.rx_rate,
+                choked_us: false,
+                choked_them: true,
+                interested_us: false,
+                interested_them: true,
+                outstanding: w.outstanding_blocks(piece_size),
+                encrypted: w.url.starts_with("https:"),
+                utp: false,
+                web_seed: Some(w.url.clone()),
+            });
         let _ = self
             .peers_snapshot_tx
-            .send(self.peers.iter().map(Peer::snapshot).collect());
+            .send(self.peers.iter().map(Peer::snapshot).chain(web_seeds).collect());
     }
 
     /// Keeps `known` from growing without bound over a long seed: past `KNOWN_PEERS_MAX`, the
@@ -1134,7 +1195,12 @@ impl TorrentSwarm {
             return;
         }
         self.stat.downloaded += block.length as u64;
+        self.store_block(from, block).await;
+    }
 
+    /// A block someone (a peer or a web seed) owed us is in: it goes into its piece, and a
+    /// piece with every block in goes off to be checked.
+    async fn store_block(&mut self, from: SocketAddr, block: Piece) {
         let Some(in_flight) = self.in_flight.get_mut(&block.index) else {
             return;
         };
@@ -1159,7 +1225,9 @@ impl TorrentSwarm {
                 len: block.length,
                 why: "lost race",
             });
-            self.refill(idx).await;
+            if let Some(idx) = self.peer_index(from) {
+                self.refill(idx).await;
+            }
             return;
         }
         *slot = Some(from);
@@ -1243,7 +1311,15 @@ impl TorrentSwarm {
                     piece,
                     peers: senders.iter().copied().collect(),
                 });
-                if let [from] = senders.iter().copied().collect::<Vec<_>>()[..] {
+                if let [from] = senders.iter().copied().collect::<Vec<_>>()[..]
+                    && let Some(seed) = self.web_seed_index(from)
+                {
+                    warn!(
+                        "piece {piece} from web seed {} failed hash verification",
+                        self.web_seeds[seed].url
+                    );
+                    self.give_up_web_seed(seed, "sent a bad piece".to_string());
+                } else if let [from] = senders.iter().copied().collect::<Vec<_>>()[..] {
                     warn!("piece {piece} from {from} failed hash verification, banning the peer");
                     if let Some(idx) = self.peer_index(from) {
                         self.drop_peer(idx, "sent a bad piece");
@@ -1364,6 +1440,7 @@ impl TorrentSwarm {
         self.assign_pieces(None);
         if self.missing.is_empty() {
             self.race_the_last_pieces();
+            self.race_web_seeds();
         }
         for idx in (0..self.peers.len()).rev() {
             self.refill(idx).await;
@@ -1419,21 +1496,41 @@ impl TorrentSwarm {
         let has_room = |p: &Peer, backlog: &BTreeMap<SocketAddr, usize>| {
             p.requested.len() + backlog.get(&p.remote_addr).copied().unwrap_or(0) < p.request_window()
         };
-        let mut order: Vec<(usize, f64)> = self
+        let mut order: Vec<(Source, f64)> = self
             .peers
             .iter()
             .enumerate()
             .filter(|&(idx, p)| only.is_none_or(|o| o == idx) && self.eligible(p) && has_room(p, &backlog))
-            .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
+            .map(|(idx, p)| (Source::Peer(idx), p.stats.score(self.total_picks, rate_scale)))
             .collect();
+        if only.is_none() {
+            let now = Instant::now();
+            order.extend(
+                self.web_seeds
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| w.has_room(now))
+                    .map(|(i, w)| (Source::Web(i), w.stats.score(self.total_picks, rate_scale))),
+            );
+        }
         order.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         loop {
             let mut assigned = false;
-            for &(idx, _) in &order {
+            for &(source, _) in &order {
                 if in_flight_bytes >= MAX_INFLIGHT_BYTES {
                     return;
                 }
+                let idx = match source {
+                    Source::Peer(idx) => idx,
+                    Source::Web(seed) => {
+                        if let Some(bytes) = self.assign_web_run(seed, MAX_INFLIGHT_BYTES - in_flight_bytes) {
+                            in_flight_bytes += bytes;
+                            assigned = true;
+                        }
+                        continue;
+                    }
+                };
                 if !has_room(&self.peers[idx], &backlog) {
                     continue;
                 }
@@ -1502,7 +1599,11 @@ impl TorrentSwarm {
 
     /// The fastest rate in the swarm, what UCB scales rates by (see `PeerStatistics::ucb_terms`).
     fn rate_scale(&self) -> f64 {
-        self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max)
+        self.peers
+            .iter()
+            .map(|p| p.stats.rx_rate)
+            .chain(self.web_seeds.iter().map(|w| w.stats.rx_rate))
+            .fold(1.0, f64::max)
     }
 
     /// Seconds until `f` is done at the combined rate of everyone on it.
@@ -1510,8 +1611,10 @@ impl TorrentSwarm {
         let rate: f64 = f
             .claims
             .keys()
-            .filter_map(|addr| self.peer_index(*addr))
-            .map(|idx| self.peers[idx].stats.rx_rate)
+            .filter_map(|&addr| match self.peer_index(addr) {
+                Some(idx) => Some(self.peers[idx].stats.rx_rate),
+                None => self.web_seed_index(addr).map(|seed| self.web_seeds[seed].stats.rx_rate),
+            })
             .sum();
         (f.blocks_left() * BLOCK_SIZE) as f64 / rate.max(1.0)
     }
@@ -1677,8 +1780,258 @@ impl TorrentSwarm {
             .map(|(idx, _)| idx)
     }
 
-    /// `None` when the piece couldn't be read back: unverified, but through no fault of the
-    /// peer that sent it. Never panics, this runs on the swarm's own event loop.
+    fn web_seed_index(&self, addr: SocketAddr) -> Option<usize> {
+        self.web_seeds.iter().position(|w| w.addr == addr)
+    }
+
+    /// Where in `missing` a web seed's next run starts: the rarest piece, ties going to the
+    /// lowest so consecutive jobs read the files front to back; the lowest when sequential.
+    fn pick_piece_for_web(&self) -> Option<usize> {
+        let rank = |piece: u32| {
+            if self.sequential {
+                (0, piece)
+            } else {
+                (self.availability[piece as usize], piece)
+            }
+        };
+        (0..self.missing.len()).min_by_key(|&pos| rank(self.missing[pos]))
+    }
+
+    /// Gives web seed `seed` a run of consecutive missing pieces, as long as its rate earns
+    /// (see `WebSeed::run_bytes`) within `budget` bytes, and starts fetching it. Returns the
+    /// bytes it took on.
+    fn assign_web_run(&mut self, seed: usize, budget: usize) -> Option<usize> {
+        if !self.web_seeds[seed].has_room(Instant::now()) {
+            return None;
+        }
+        let first_pos = self.pick_piece_for_web()?;
+        let first = self.missing[first_pos];
+        let piece_size = self.torrent.piece_size as usize;
+        let max_pieces = (self.web_seeds[seed].run_bytes().min(budget) / piece_size).max(1);
+        // where each of the next pieces sits in `missing`, if it's there
+        let mut next = vec![None; max_pieces - 1];
+        for (pos, &piece) in self.missing.iter().enumerate() {
+            if piece > first && ((piece - first) as usize) < max_pieces {
+                next[(piece - first - 1) as usize] = Some(pos);
+            }
+        }
+        let limit = match self.settings.borrow().download_limit {
+            0 => usize::MAX,
+            limit => limit as usize,
+        };
+        let mut positions = vec![];
+        let mut bytes = 0;
+        for (i, pos) in std::iter::once(Some(first_pos)).chain(next).enumerate() {
+            let Some(pos) = pos else {
+                break;
+            };
+            let size = self
+                .torrent
+                .nth_piece_size(first + i as u32)
+                .expect("piece index in range");
+            if !self.limiter.take_download(size.min(limit)) {
+                break;
+            }
+            positions.push(pos);
+            bytes += size;
+        }
+        if positions.is_empty() {
+            return None;
+        }
+        let last = first + positions.len() as u32 - 1;
+        // highest first, so each swap_remove moves in an element that isn't one of ours
+        positions.sort_unstable_by(|a, b| b.cmp(a));
+        for pos in positions {
+            self.missing.swap_remove(pos);
+        }
+
+        let addr = self.web_seeds[seed].addr;
+        for piece in first..=last {
+            let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
+            let mut in_flight = InFlight::new(size, addr);
+            in_flight.claim_rest(addr);
+            in_flight.span = tracing::info_span!(
+                "piece",
+                info_hash = %self.torrent.info_hash,
+                piece,
+                size,
+                peer = %self.web_seeds[seed].host,
+                racers = 1,
+                outcome = tracing::field::Empty,
+            );
+            self.in_flight.insert(piece, in_flight);
+            self.holdings.entry(addr).or_default().insert(piece);
+        }
+        let start = first as u64 * piece_size as u64;
+        self.start_web_job(seed, start, start + bytes as u64);
+        tracing::debug!(
+            "requesting pieces {first}..={last} from web seed {}",
+            self.web_seeds[seed].url
+        );
+        Some(bytes)
+    }
+
+    /// Endgame for the web seeds: each with room joins the piece furthest from done that it
+    /// isn't on yet, fetching just the blocks not in.
+    fn race_web_seeds(&mut self) {
+        let now = Instant::now();
+        let racers = self.racers_per_piece();
+        let rate_scale = self.rate_scale();
+        let mut seeds: Vec<(usize, f64)> = self
+            .web_seeds
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (i, w.stats.score(self.total_picks, rate_scale)))
+            .collect();
+        seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (seed, _) in seeds {
+            while self.web_seeds[seed].has_room(now) {
+                let addr = self.web_seeds[seed].addr;
+                let Some((_, piece)) = self
+                    .in_flight
+                    .iter()
+                    .filter(|(_, f)| f.claims.len() < racers && !f.claims.contains_key(&addr))
+                    .map(|(&piece, f)| (self.eta(f), piece))
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                else {
+                    break;
+                };
+                let offset = piece as u64 * self.torrent.piece_size as u64;
+                let in_flight = self.in_flight.get_mut(&piece).expect("just looked up");
+                let Some((start, end)) = in_flight.missing_span(offset) else {
+                    break;
+                };
+                in_flight.claim_rest(addr);
+                tracing::debug!(parent: &in_flight.span, peer = %self.web_seeds[seed].host, "racer joined");
+                self.holdings.entry(addr).or_default().insert(piece);
+                self.start_web_job(seed, start, end);
+                tracing::debug!(
+                    "endgame: also fetching piece {piece} from web seed {}",
+                    self.web_seeds[seed].url
+                );
+            }
+        }
+    }
+
+    /// Fetches torrent bytes `start..end` from web seed `seed` on a task of its own, whose
+    /// blocks and ending come back as events.
+    fn start_web_job(&mut self, seed: usize, start: u64, end: u64) {
+        let piece_size = self.torrent.piece_size as u64;
+        let pieces = (start / piece_size) as u32..=((end - 1) / piece_size) as u32;
+        let blocks = (end - start).div_ceil(BLOCK_SIZE as u64) as usize;
+        self.total_picks += blocks;
+        let id = self.next_web_job;
+        self.next_web_job += 1;
+        let w = &mut self.web_seeds[seed];
+        if w.jobs.is_empty() {
+            w.stats.requests_started(Instant::now());
+        }
+        w.stats.picked_count += blocks;
+        let cancel = CancellationToken::new();
+        w.jobs.insert(
+            id,
+            WebJob {
+                pieces,
+                _cancel: cancel.clone().drop_guard(),
+            },
+        );
+        let job = webseed::Job {
+            torrent: self.torrent.clone(),
+            base: w.url.clone(),
+            host: w.host.clone(),
+            start,
+            end,
+            redirects: w.redirects.clone(),
+        };
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let blocks = events.clone();
+            let run = job.run(move |block| {
+                let events = blocks.upgrade();
+                async move {
+                    let Some(events) = events else {
+                        return false;
+                    };
+                    let event = SwarmEvent::WebSeedBlock { seed, job: id, block };
+                    events.send(event).await.is_ok()
+                }
+            });
+            let outcome = tokio::select! {
+                outcome = run => outcome,
+                () = cancel.cancelled() => return,
+            };
+            if let Some(events) = events.upgrade() {
+                let _ = events.send(SwarmEvent::WebSeedDone { seed, job: id, outcome }).await;
+            }
+        });
+    }
+
+    async fn web_block_arrived(&mut self, seed: usize, job: u64, block: Piece) {
+        let w = &mut self.web_seeds[seed];
+        w.stats.block_received(block.length as usize, Instant::now());
+        self.stat.downloaded += block.length as u64;
+        let addr = w.addr;
+        let ours = |piece: u32| self.in_flight.get(&piece).is_some_and(|f| f.claims.contains_key(&addr));
+        if ours(block.index) {
+            self.store_block(addr, block).await;
+            return;
+        }
+        // finished by a racer, or released after a hash failure
+        self.stat.wasted += block.length as u64;
+        self.bus.emit(Event::BlockWasted {
+            info_hash: self.torrent.info_hash,
+            addr,
+            len: block.length,
+            why: "lost race",
+        });
+        let rest_unwanted = self.web_seeds[seed]
+            .jobs
+            .get(&job)
+            .is_some_and(|j| (block.index..=*j.pieces.end()).all(|p| !ours(p)));
+        if rest_unwanted {
+            self.web_seeds[seed].jobs.remove(&job);
+            self.schedule().await;
+        }
+    }
+
+    async fn web_job_done(&mut self, seed: usize, job: u64, outcome: Result<(), Failure>) {
+        let Some(job) = self.web_seeds[seed].jobs.remove(&job) else {
+            return;
+        };
+        let w = &mut self.web_seeds[seed];
+        let addr = w.addr;
+        match &outcome {
+            Ok(()) => w.succeeded(),
+            Err(failure) => {
+                warn!("web seed {} failed: {failure}", w.url);
+                w.failed(failure, Instant::now());
+            }
+        }
+        // whatever it didn't deliver goes back up for grabs
+        for piece in job.pieces.clone() {
+            if self.in_flight.get(&piece).is_some_and(|f| f.claims.contains_key(&addr)) {
+                self.release_claim(piece, addr);
+            }
+        }
+        if let Some(why) = self.web_seeds[seed].gave_up.clone() {
+            self.give_up_web_seed(seed, why);
+        }
+        self.schedule().await;
+    }
+
+    /// Stops asking web seed `seed` for anything, and puts what it was fetching back up for
+    /// grabs.
+    fn give_up_web_seed(&mut self, seed: usize, why: String) {
+        let w = &mut self.web_seeds[seed];
+        info!("giving up on web seed {}: {why}", w.url);
+        w.gave_up = Some(why);
+        w.jobs.clear();
+        let addr = w.addr;
+        for piece in self.pieces_held_by(addr) {
+            self.release_claim(piece, addr);
+        }
+        self.holdings.remove(&addr);
+    }
 
     /// Takes ownership of a handshaken socket. Sends our side of the opening exchange (BEP 10
     /// extended handshake, then BitField/HaveAll/HaveNone, then Interested) before the peer
@@ -1952,6 +2305,13 @@ fn upload_slots(interested: usize) -> usize {
     MAX_UNCHOKED_PEERS.max(interested.isqrt() + 1)
 }
 
+/// Who a piece can be handed to.
+#[derive(Clone, Copy)]
+enum Source {
+    Peer(usize),
+    Web(usize),
+}
+
 /// See `prune_known`. A few thousand is a busy swarm's worth over days.
 const KNOWN_PEERS_MAX: usize = 20_000;
 
@@ -2026,6 +2386,15 @@ mod test {
         seeding: bool,
         settings: crate::config::Settings,
     ) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
+        swarm_with_web_seeds(name, seeding, settings, vec![])
+    }
+
+    fn swarm_with_web_seeds(
+        name: &str,
+        seeding: bool,
+        settings: crate::config::Settings,
+        web_seeds: Vec<String>,
+    ) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
         let bytes = content();
         let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
         let mut info = format!(
@@ -2043,6 +2412,7 @@ mod test {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("swarm.bin");
         torrent.files[0].1 = path.clone();
+        torrent.web_seeds = web_seeds;
         let file = std::fs::File::options()
             .read(true)
             .write(true)
@@ -2673,6 +3043,104 @@ mod test {
             matches!(refused, Ok(None) | Ok(Some(Err(_)))),
             "the banned peer should be refused without an opening exchange, got {refused:?}"
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A web seed serving `body` as `swarm.bin`, its URL ending in '/' so the torrent's name
+    /// is appended.
+    async fn web_seed(body: Vec<u8>) -> String {
+        crate::webseed::test::serve([("/files/swarm.bin".to_string(), body)].into()).await + "files/"
+    }
+
+    fn assert_file_is_content(path: &PathBuf) {
+        assert!(
+            std::fs::read(path).unwrap() == content(),
+            "the file on disk is the content"
+        );
+    }
+
+    #[tokio::test]
+    async fn downloads_from_a_web_seed_alone() {
+        let url = web_seed(content()).await;
+        let (swarm, handle, path) = swarm_with_web_seeds("webseed", false, Default::default(), vec![url.clone()]);
+        let mut stats = handle.stats();
+        let peers = handle.peers();
+        tokio::spawn(swarm.work_loop());
+
+        wait_until_complete(&mut stats).await;
+        assert_file_is_content(&path);
+        let done = stats.borrow().clone();
+        assert_eq!((done.downloaded, done.wasted), (TOTAL as u64, 0));
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut peers = peers;
+            loop {
+                let seen = peers.borrow_and_update().clone();
+                if let Some(seed) = seen.iter().find(|p| p.downloaded == TOTAL as u64) {
+                    assert_eq!(seed.web_seed.as_deref(), Some(url.as_str()));
+                    break;
+                }
+                peers.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the web seed shows up in the peer list");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Serves every request from `peer` with `content()` until the swarm hangs up or the test
+    /// stops polling.
+    async fn serve_everything(peer: &mut Framed<tokio::net::TcpStream, BtCodec>) {
+        while let Some(Ok(msg)) = peer.next().await {
+            if let BtMessage::Request(req) = msg
+                && peer.send(block(req)).await.is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// A web seed that accepts connections and then says nothing holds its pieces until its
+    /// timeouts, so in endgame a working one races it for them.
+    #[tokio::test]
+    async fn a_stalled_web_seeds_pieces_are_raced() {
+        let black_hole = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let stalled = format!("http://{}/", black_hole.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((socket, _)) = black_hole.accept().await {
+                held.push(socket);
+            }
+        });
+        let good = web_seed(content()).await;
+        let (swarm, handle, path) = swarm_with_web_seeds("stalled", false, Default::default(), vec![stalled, good]);
+        let mut stats = handle.stats();
+        tokio::spawn(swarm.work_loop());
+
+        wait_until_complete(&mut stats).await;
+        assert_file_is_content(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A web seed whose URL 404s is given up on, and a lying one is dropped at its first bad
+    /// piece; either way the peer finishes the download.
+    #[tokio::test]
+    async fn broken_web_seeds_are_given_up_and_peers_finish() {
+        let missing = web_seed(content()).await.replace("files/", "elsewhere/");
+        let liar = web_seed(vec![7; TOTAL]).await;
+        let (swarm, handle, path) = swarm_with_web_seeds("badseeds", false, Default::default(), vec![missing, liar]);
+        let mut stats = handle.stats();
+        tokio::spawn(swarm.work_loop());
+        // the seeds get the first picks, before a peer is even there
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
+        open_as_seeder(&mut seeder).await;
+        tokio::select! {
+            () = wait_until_complete(&mut stats) => {}
+            () = serve_everything(&mut seeder) => panic!("the swarm hung up on the peer"),
+        }
+        assert_file_is_content(&path);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

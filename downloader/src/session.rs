@@ -1450,7 +1450,7 @@ impl Entry {
                 let rates = self.peer_rates.entry(p.addr).or_insert_with(Rates::new);
                 rates.update(p.downloaded, p.uploaded);
                 PeerInfo {
-                    addr: p.addr.to_string(),
+                    addr: p.web_seed.clone().unwrap_or_else(|| p.addr.to_string()),
                     client: p.client.clone(),
                     progress: p.progress,
                     downloaded: p.downloaded,

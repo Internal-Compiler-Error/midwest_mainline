@@ -76,6 +76,14 @@ pub struct Torrent {
     /// torrent -- no DHT, no PEX. We don't implement DHT, but we do implement PEX, so this has
     /// to actually gate something.
     pub private: bool,
+
+    /// BEP 19 web seeds: HTTP(S) URLs serving the torrent's files, from `url-list` (or a
+    /// magnet's `ws=`)
+    pub web_seeds: Vec<String>,
+
+    /// Each file's path exactly as the info dict spells it, `name` first, before
+    /// `safe_path_component` touched it: what a web seed's URLs are built from
+    pub raw_paths: Vec<Vec<String>>,
 }
 
 impl Torrent {
@@ -198,6 +206,15 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         announce_tiers.push(vec![String::from_utf8(announce.to_vec())?]);
     }
 
+    let web_seeds = match torrent.remove(b"url-list".as_slice()) {
+        Some(BencodeItemView::ByteString(url)) => web_seed_urls([url]),
+        Some(BencodeItemView::List(urls)) => web_seed_urls(urls.iter().filter_map(|url| match url {
+            BencodeItemView::ByteString(url) => Some(*url),
+            _ => None,
+        })),
+        _ => vec![],
+    };
+
     let Some(BencodeItemView::ByteString(name)) = info.remove(b"name".as_slice()) else {
         bail!("name needs to be a string");
     };
@@ -229,8 +246,10 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         u64::try_from(length).map_err(|_| anyhow!("file length {length} is negative"))
     };
     let mut files = vec![];
+    let mut raw_paths = vec![];
     if let Some(BencodeItemView::Integer(length)) = info.remove(b"length".as_slice()) {
         files.push((file_len(length)?, root));
+        raw_paths.push(vec![name.clone()]);
     } else if let Some(BencodeItemView::List(file_lists)) = info.remove(b"files".as_slice()) {
         for entry in file_lists.iter() {
             let BencodeItemView::Dictionary(entries) = entry else {
@@ -246,14 +265,18 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
                 bail!("file path is empty");
             }
             let mut f = root.clone();
+            let mut raw = vec![name.clone()];
             for p in paths.iter() {
                 let BencodeItemView::ByteString(p) = p else {
                     bail!("file path segment needs to be a string");
                 };
-                f.push(safe_path_component(str::from_utf8(p)?)?);
+                let p = str::from_utf8(p)?;
+                f.push(safe_path_component(p)?);
+                raw.push(p.to_string());
             }
 
             files.push((file_len(*length)?, f));
+            raw_paths.push(raw);
         }
     }
     if files.is_empty() {
@@ -295,7 +318,26 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         info_hash: hash,
         raw_info,
         private,
+        web_seeds,
+        raw_paths,
     })
+}
+
+/// The usable web seeds among `urls`: valid UTF-8 http(s) URLs, each once. Torrent makers
+/// put all sorts in `url-list` (empty strings, ftp, file paths); anything else is skipped.
+pub(crate) fn web_seed_urls<'a>(urls: impl IntoIterator<Item = &'a [u8]>) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for url in urls {
+        let Ok(url) = str::from_utf8(url) else {
+            continue;
+        };
+        let url = url.trim();
+        let http = url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host());
+        if http && !out.iter().any(|seen| seen == url) {
+            out.push(url.to_string());
+        }
+    }
+    out
 }
 
 /// Computes the info hash of a torrent metadata file, and also returns the raw bencoded bytes
@@ -567,6 +609,33 @@ mod test {
         assert_eq!(torrent.nth_piece_size(0u32), Some(5));
         assert_eq!(torrent.nth_piece_size(3u32), Some(2));
         assert_eq!(torrent.nth_piece_size(4u32), None);
+    }
+
+    #[test]
+    fn parses_url_list_as_a_string_or_a_list() {
+        let with = |url_list: &str| {
+            let plain = single_file_torrent(15, 5);
+            let mut bytes = plain[..plain.len() - 1].to_vec();
+            bytes.extend_from_slice(b"8:url-list");
+            bytes.extend_from_slice(url_list.as_bytes());
+            bytes.push(b'e');
+            parse_torrent(&bytes).unwrap().web_seeds
+        };
+        assert_eq!(with("16:http://m.test/a/"), ["http://m.test/a/"]);
+        assert_eq!(
+            with("l16:http://m.test/a/0:13:ftp://m.test/18:https://n.test/b/c16:http://m.test/a/e"),
+            ["http://m.test/a/", "https://n.test/b/c"],
+            "empty, non-http and repeated entries are skipped"
+        );
+        assert!(parse_torrent(&single_file_torrent(15, 5)).unwrap().web_seeds.is_empty());
+    }
+
+    #[test]
+    fn keeps_raw_paths_for_web_seeds() {
+        let multi = parse_torrent(&multi_file_torrent_with_path(&[b"AC/DC", b"b c.txt"])).unwrap();
+        assert_eq!(multi.raw_paths[1], ["multi", "AC/DC", "b c.txt"]);
+        let single = parse_torrent(&single_file_torrent(15, 5)).unwrap();
+        assert_eq!(single.raw_paths, [["test.txt"]]);
     }
 
     #[test]

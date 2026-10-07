@@ -21,6 +21,7 @@ juicy_bencode =  { path = "../../juicy_bencode" }
 sha1 = "0.11.0"
 rand = "0.10.2"
 reqwest = "0.13.4"
+bytes = "1.12.1"
 url = "2.5.8"
 bendy = "0.6.1"
 anyhow = "1.0.104"

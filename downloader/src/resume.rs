@@ -46,6 +46,8 @@ pub struct ResumeData {
     pub uploaded: u64,
     /// pieces are fetched in order rather than rarest first
     pub sequential: bool,
+    /// BEP 19 web seeds; a magnet's `ws=` ones exist nowhere else
+    pub web_seeds: Vec<String>,
 }
 
 impl ResumeData {
@@ -61,6 +63,7 @@ impl ResumeData {
             sequential: false,
             skip: vec![],
             uploaded: 0,
+            web_seeds: torrent.web_seeds.clone(),
         }
     }
 
@@ -80,7 +83,9 @@ impl ResumeData {
     }
 
     pub fn to_torrent(&self) -> anyhow::Result<Torrent> {
-        parse_torrent(&build_torrent_file(&self.raw_info, &self.trackers))
+        let mut torrent = parse_torrent(&build_torrent_file(&self.raw_info, &self.trackers))?;
+        torrent.web_seeds = self.web_seeds.clone();
+        Ok(torrent)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -121,6 +126,14 @@ impl ResumeData {
         if self.uploaded > 0 {
             out.extend_from_slice(&bstr(b"uploaded"));
             out.extend_from_slice(format!("i{}e", self.uploaded).as_bytes());
+        }
+        if !self.web_seeds.is_empty() {
+            out.extend_from_slice(&bstr(b"url-list"));
+            out.push(b'l');
+            for url in &self.web_seeds {
+                out.extend_from_slice(&bstr(url.as_bytes()));
+            }
+            out.push(b'e');
         }
         out.extend_from_slice(&bstr(b"verified"));
         out.extend_from_slice(&bstr(self.verified.as_raw_slice()));
@@ -173,6 +186,14 @@ impl ResumeData {
             _ => vec![],
         };
 
+        let web_seeds = match dict.remove(b"url-list".as_slice()) {
+            Some(BencodeItemView::List(urls)) => crate::torrent::web_seed_urls(urls.iter().filter_map(|u| match u {
+                BencodeItemView::ByteString(u) => Some(*u),
+                _ => None,
+            })),
+            _ => vec![],
+        };
+
         let raw_info = raw_info_bytes(bytes)?;
 
         let torrent = parse_torrent(&build_torrent_file(&raw_info, &trackers))
@@ -200,6 +221,7 @@ impl ResumeData {
             skip,
             uploaded,
             sequential,
+            web_seeds,
         })
     }
 
@@ -624,6 +646,16 @@ mod test {
         assert_eq!(decoded.skip, vec![0, 2]);
         assert_eq!(decoded.selected(4), vec![false, true, false, true]);
         assert_eq!(decoded.uploaded, 123_456);
+
+        let mut seeded = torrent.clone();
+        seeded.web_seeds = vec!["https://m.test/pub/".to_string()];
+        let data = ResumeData::from_torrent(&seeded, Path::new("/downloads"), &verified);
+        let decoded = ResumeData::decode(&data.encode()).unwrap();
+        assert_eq!(
+            decoded.to_torrent().unwrap(),
+            seeded,
+            "a magnet's ws= seeds survive a restart"
+        );
     }
 
     #[test]

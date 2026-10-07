@@ -15,6 +15,8 @@ pub struct MagnetLink {
     /// this one is attacker-controlled and never hash-verified.
     pub display_name: Option<String>,
     pub trackers: Vec<String>,
+    /// BEP 19 `ws=` web seeds; they join once the metadata has come from peers
+    pub web_seeds: Vec<String>,
 }
 
 /// True if `s` looks like a magnet URI, so callers can accept either this or a file path.
@@ -29,6 +31,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     let mut info_hash = None;
     let mut display_name = None;
     let mut trackers = Vec::new();
+    let mut web_seeds = Vec::new();
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -41,6 +44,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
             }
             "dn" if display_name.is_none() => display_name = Some(value.into_owned()),
             "tr" => trackers.push(value.into_owned()),
+            "ws" => web_seeds.push(value.into_owned()),
             _ => {}
         }
     }
@@ -53,6 +57,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
         info_hash,
         display_name,
         trackers,
+        web_seeds: crate::torrent::web_seed_urls(web_seeds.iter().map(|u| u.as_bytes())),
     })
 }
 
@@ -183,6 +188,19 @@ mod test {
         // v2-only magnets name a btmh multihash, which this client can't use
         let v2 = "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e&tr=http://a.test/announce";
         assert!(parse_magnet(v2).is_err());
+    }
+
+    #[test]
+    fn parses_web_seeds() {
+        let uri = format!(
+            "magnet:?xt=urn:btih:{HEX}&ws=https%3A%2F%2Fmirror.test%2Fpub%2Ffile%20name.iso&ws=http://other.test/&ws=ftp://no.test/x"
+        );
+        let magnet = parse_magnet(&uri).unwrap();
+        assert_eq!(
+            magnet.web_seeds,
+            ["https://mirror.test/pub/file name.iso", "http://other.test/"],
+            "decoded, and only http(s)"
+        );
     }
 
     #[test]

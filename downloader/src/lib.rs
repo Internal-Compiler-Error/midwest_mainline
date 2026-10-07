@@ -23,6 +23,7 @@ pub mod telemetry;
 mod torrent;
 pub mod torrent_swarm;
 pub mod utp;
+mod webseed;
 mod wire;
 
 pub use announcer::TrackerState;

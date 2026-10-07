@@ -116,6 +116,8 @@ pub struct PeerSnapshot {
     pub outstanding: usize,
     pub encrypted: bool,
     pub utp: bool,
+    /// the URL, when this is a BEP 19 web seed rather than a peer (`addr` is then a stand-in)
+    pub web_seed: Option<String>,
 }
 
 /// A human-readable client name from a peer id. Azureus-style ids (`-XX1234-...`) name the
@@ -312,6 +314,7 @@ impl Peer {
             outstanding: self.requested.len(),
             encrypted: self.encrypted,
             utp: self.utp,
+            web_seed: None,
         }
     }
 

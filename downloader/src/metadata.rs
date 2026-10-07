@@ -223,7 +223,8 @@ pub async fn fetch(
         took_ms: started.elapsed().as_millis() as u64,
     });
     let torrent_file = build_torrent_file(&raw_info, &magnet.trackers);
-    let torrent = parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")?;
+    let mut torrent = parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")?;
+    torrent.web_seeds = magnet.web_seeds.clone();
     Ok(Fetched {
         torrent,
         peers: tried.into_iter().collect(),
@@ -823,6 +824,7 @@ mod test {
             info_hash,
             display_name: Some("hello".to_string()),
             trackers: vec![tracker_url],
+            web_seeds: vec![],
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
@@ -882,6 +884,7 @@ mod test {
             info_hash,
             display_name: None,
             trackers: vec![tracker_url],
+            web_seeds: vec![],
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
