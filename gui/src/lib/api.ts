@@ -1,5 +1,5 @@
 // The Tauri commands in src-tauri/src/main.rs, typed. Everything the UI knows about a
-// torrent comes through `torrents()`; everything it does goes through the other three.
+// torrent comes through `torrents()`; everything it does to one is one of the other commands.
 import { invoke } from '@tauri-apps/api/core'
 
 export type TorrentId = number

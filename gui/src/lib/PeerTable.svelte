@@ -11,9 +11,7 @@
   import { clock } from './clock.svelte'
   import Num from './Num.svelte'
 
-  let { peers: live, onpeer }: { peers: Peer[]; onpeer?: (addr: string) => void } = $props()
-
-  let peers = $derived(live)
+  let { peers, onpeer }: { peers: Peer[]; onpeer?: (addr: string) => void } = $props()
 
   type Column = {
     key: string
@@ -57,7 +55,7 @@
   $effect(() => {
     clock.tick
     const col = columns.find((c) => c.key === sortKey)
-    const current = untrack(() => live)
+    const current = untrack(() => peers)
     if (!col) {
       order = current.map((p) => p.addr)
       return
