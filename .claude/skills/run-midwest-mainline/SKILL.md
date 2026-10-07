@@ -62,6 +62,13 @@ more); the CLI logs a progress line every 5 s (`77.3%  2371/3068 pieces  down 31
 CLI resumes from its resume file when run again on the same source; `--seed` keeps it
 uploading after completion.
 
+**BEP 46 (updating torrents)** - `downloader publish <key-file> <.torrent | info hash> [--salt
+<text>]` points a throwaway key (made in the key file if missing) at a torrent and prints the
+`magnet:?xs=urn:btpk:...` that follows it; a second publish to another hash moves it on (seq + 1).
+Give the publisher and the follower separate data dirs and `listen_port`s in their
+`settings.json` (never 6881). A follower resumed from its `.resume` (`--seed`, so a complete one
+keeps running) polls 30 s after its DHT is up and logs "its BEP 46 key ... is at seq N now".
+
 **GUI** - launches the debug app, optionally adding a source at startup (the app takes one
 as its first argument), waits N seconds (default 45), screenshots the window, quits:
 

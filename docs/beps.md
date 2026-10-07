@@ -37,6 +37,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 43 | Read-only DHT nodes: a query with `ro=1` is answered but its sender stays out of the routing table; `DhtSession::with_read_only` makes us one (queries carry `ro=1`, nothing is answered, not even with a 204). `json_rpc_server` takes `DHT_READ_ONLY=1`; the downloader has no setting for it yet | `message.rs` (`Krpc::read_only`), `rpc_manager.rs`, `server.rs`, `routing_table.rs` |
 | 44 | DHT arbitrary data: `get`/`put` of immutable (SHA-1 of the value) and mutable items (ed25519 via `ed25519-dalek`, salt, seq, `cas`; errors 205/206/207/301/302), stored in SQLite (`item`) and served for 2 hours after the last put. `DhtClient::{get,put}_{immutable,mutable}` look up the k closest token holders (BEP 42 compliant first); json_rpc_server RPCs `put`/`get`. A put on the live DHT was stored by 7 nodes and read back by a fresh node | `dht/src/dht/item.rs`, `message/item_queries.rs`, `client.rs`, migration `2026-10-08-000003_item` |
 | 45 | Multiple-address operation: `DhtSession::on_own_address` runs another node on a socket bound to one of the host's addresses, with its own node id (kept per address across starts), routing table and BEP 42 address votes, in the same database and sharing the announced-peer store; tokens and answers stay per socket. Nothing in the downloader uses it yet (one node per family) | `dht/src/dht/scope.rs`, `DhtSession::on_own_address` |
+| 46 | Updating torrents via DHT mutable items: `xs=urn:btpk:<key>&s=<salt>` magnets, with or without an `xt` (used only while the DHT has no item); the item `{ih: <20 bytes>}` (32 taken as a v2 hash) at its highest valid seq decides the torrent. Followers poll hourly (5 min retries doubling after a miss; 30 s after a resume) and put the item again each time to keep it alive; a new seq naming another torrent adds that as an entry of its own (`TorrentUpdateFound` event), beside the old one or in `<name> (seq N)` when the name is taken, starting from the old files of the same path and size (copied, then checked); the old one is marked superseded and seeds on. Key, salt, seq and superseded are in the resume file (`btpk`). `downloader publish <key-file> <.torrent \| info hash> [--salt]` signs and puts (seq + 1, CAS). Details shows "via DHT key …, seq N". Live: put at 7 nodes, a fresh node resolved it 4 s after its DHT came up and fetched the Arch ISO; seq 2 was picked up 40 s after a restart. An update quit on before its metadata arrives is lost, like any magnet | `feed.rs`, `magnet.rs` (`parse_feed`), `session.rs` (`add_feed`, `TorrentTask::follow`, `add_update`, `place_update`), `resume.rs`, `main.rs` (`publish`), `dht/src/dht/client.rs` (`put_signed`) |
 | 47 | Padding files and attributes: `attr` (`p` padding, `x` executable, `h` hidden, `l` symlink + `symlink path`), BitComet `_____padding_file_` names; padding stays in the piece stream but is never on disk, written, requested from peers or web seeds (reads as zeros, its blocks start out "received"), wanted, or listed in the GUI | `torrent.rs` (`FileAttr`, `padding_in_piece`), `storage.rs`, `check.rs`, `webseed.rs`, `torrent_swarm.rs` (`InFlight::skip_padding`), `bt_client.rs` (symlinks, mode 755) |
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 51 | DHT `sample_infohashes`: answered from the store (20 random info hashes, refreshed every 15 min); a crawler walks the keyspace with it (fixed query rate, each host asked again only after its `interval`), keeping what it samples in `sampled_infohash`. Opt-in in `json_rpc_server`'s index mode (`DHT_CRAWL=<queries/s>`, RPC `sampled`); ~10k distinct info hashes in the first minute at 20 q/s | `dht/src/dht/crawler.rs`, `server.rs`, `client.rs` (`sample_infohashes`), `json_rpc_server` |
@@ -49,9 +50,14 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 
 ## Next, in order
 
-| BEP | What | Why / notes |
+Every BEP worth having has been started. What's left are gaps in implemented ones:
+
+| BEP | Gap | Notes |
 |---|---|---|
-| 46 | Updating torrents via BEP 44 mutable items | Builds on 44: a magnet with a public key, the torrent's info hash as the item; the downloader would poll for new seqs |
+| 52 | See row 52's "Not done" | |
+| 46 | An update found before its metadata arrives is lost if the app quits then: the old version is already marked superseded | Mark it superseded only once the new version resolves, or persist pending updates |
+| 46 | An update downloads every file; the old version's selection and sequential/super-seed modes aren't carried over | |
+| 43, 45 | No downloader setting for read-only DHT or one node per address | Library and `json_rpc_server` only |
 
 ## Not planned
 
