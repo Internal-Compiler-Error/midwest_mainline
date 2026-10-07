@@ -737,7 +737,12 @@ impl TorrentTask {
             source: self.source.clone(),
             error: error.clone(),
         });
-        let _ = self.phase.send(Phase::Failed { error });
+        let holds = match owned {
+            Owned::Nothing => None,
+            Owned::Torrent { torrent, .. } => Some(torrent.info_hash),
+            Owned::Unresolved => self.info_hash,
+        };
+        let _ = self.phase.send(Phase::Failed { error, holds });
         let retry_from = match owned {
             Owned::Nothing => None,
             Owned::Torrent { torrent, .. } => Some(self.resume_dir.join(ResumeData::file_name(&torrent.info_hash))),
@@ -1167,6 +1172,8 @@ enum Phase {
     },
     Failed {
         error: String,
+        /// the info hash it has to itself, if it got as far as knowing it and isn't a duplicate
+        holds: Option<InfoHash>,
     },
 }
 
@@ -1427,6 +1434,10 @@ impl Session {
     /// `root` (see `BtClient::add_torrent` for the layout under it). Returns immediately;
     /// watch [`Session::torrents`] for what happens next. Adding a torrent that's already in
     /// the session shows up as a failed entry, not a second copy.
+    ///
+    /// A magnet for a torrent whose entry has failed is taken as asking for it again: an
+    /// entry with a resume file is rechecked (downloading whatever went missing, in its own
+    /// root) and its id returned; one without is dropped, its files left alone, for the new one.
     pub fn add(&mut self, source: impl Into<String>, root: impl Into<PathBuf>) -> TorrentId {
         let source = source.into();
         let root = root.into();
@@ -1435,6 +1446,18 @@ impl Session {
         }
         let magnet = crate::magnet::parse_magnet(&source).ok();
         let info_hash = magnet.as_ref().map(|m| m.info_hash);
+        if let Some(info_hash) = info_hash
+            && let Some(failed) = self.failed_holder(info_hash)
+        {
+            if self.resume_dir.join(ResumeData::file_name(&info_hash)).exists() {
+                self.recheck(failed);
+                return failed;
+            }
+            if let Some(entry) = self.torrents.remove(&failed) {
+                self.claimed.leaving(failed);
+                let _ = entry.commands.send(Command::Act(Action::Shutdown));
+            }
+        }
         let loader = self.loader();
         self.launch(source.clone(), info_hash, None, |cancel| async move {
             let mut resolved = Resolved::new(loader.load(&source, cancel).await?, root);
@@ -1624,6 +1647,16 @@ impl Session {
         }
     }
 
+    /// The failed entry that has `info_hash` to itself, if one does.
+    fn failed_holder(&self, info_hash: InfoHash) -> Option<TorrentId> {
+        self.torrents
+            .iter()
+            .find_map(|(id, entry)| match &*entry.phase.borrow() {
+                Phase::Failed { holds, .. } if *holds == Some(info_hash) => Some(*id),
+                _ => None,
+            })
+    }
+
     fn command(&mut self, id: TorrentId, command: Command) {
         if let Some(entry) = self.torrents.get(&id) {
             let _ = entry.commands.send(command);
@@ -1769,14 +1802,16 @@ impl Drop for Session {
 impl Entry {
     /// Known up front for a magnet or a resume file, and for anything else once it's running.
     fn info_hash(&self) -> Option<InfoHash> {
-        self.info_hash
-            .or_else(|| self.phase.borrow().torrent().map(|t| t.info_hash))
+        self.info_hash.or_else(|| match &*self.phase.borrow() {
+            Phase::Failed { holds, .. } => *holds,
+            phase => phase.torrent().map(|t| t.info_hash),
+        })
     }
 
     fn state(&mut self) -> TorrentState {
         let phase = self.phase.borrow_and_update().clone();
         match phase {
-            Phase::Failed { error } => TorrentState::Failed {
+            Phase::Failed { error, .. } => TorrentState::Failed {
                 source: self.source.clone(),
                 error,
             },
@@ -2557,6 +2592,47 @@ mod test {
         session.unpause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         assert_eq!(std::fs::metadata(root.join("session.bin")).unwrap().len(), 40);
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Adding the magnet of a torrent that failed asks for it again rather than adding a
+    /// second failed entry: one with a resume file is rechecked, one without makes way.
+    #[test]
+    fn a_magnet_for_a_failed_torrent_tries_it_again() {
+        let dir = scratch("readd-failed");
+        let torrent_file = write_torrent_file(&dir);
+        let torrent = crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap();
+        let magnet = format!("magnet:?xt=urn:btih:{}", torrent.info_hash);
+        let root = dir.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let failed = |session: &mut Session, id| {
+            wait_for(session, id, |s| matches!(s, Some(TorrentState::Failed { .. })));
+        };
+
+        // no resume file: can't even lay its files down under a root that is a file
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let first = session.add(torrent_file.display().to_string(), &blocked);
+        failed(&mut session, first);
+        let second = session.add(&magnet, &root);
+        assert_ne!(second, first);
+        wait_for(&mut session, first, |s| s.is_none());
+        wait_for(&mut session, second, |s| {
+            matches!(s, Some(TorrentState::Resolving { .. }))
+        });
+        session.remove(second, false);
+
+        // with one, its data deleted
+        let data = ResumeData::from_torrent(&torrent, &root, &bitvec![u8, Msb0; 1; 3]);
+        let path = dir.join("resume").join(ResumeData::file_name(&torrent.info_hash));
+        data.write(&path).unwrap();
+        let third = session.resume(&path);
+        failed(&mut session, third);
+        assert_eq!(session.add(&magnet, &root), third);
+        wait_for(&mut session, third, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        assert_eq!(session.torrents().len(), 1);
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
