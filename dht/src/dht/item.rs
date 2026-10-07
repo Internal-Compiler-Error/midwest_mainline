@@ -16,6 +16,7 @@ use crate::message::error::KrpcError;
 use crate::message::find_node_get_peers_response::{Item, ItemSignature};
 use crate::message::item_queries::{PutQuery, Signed};
 use crate::message::parse_value;
+use crate::our_error::OurError;
 use crate::schema::item;
 use crate::types::NodeId;
 use crate::utils::unix_timestmap_ms;
@@ -107,7 +108,7 @@ impl SharedState {
     /// The item stored at `target` and put within ITEM_LIFETIME, unless it's mutable and no
     /// newer than `newer_than`
     pub(crate) fn stored_item(&self, target: &NodeId, newer_than: Option<i64>) -> Option<Item> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
+        let mut conn = self.conn.get().ok()?;
         let cutoff = unix_timestmap_ms() - ITEM_LIFETIME.as_millis() as i64;
         let (value, key, seq, sig, _): ItemRow = item::table
             .filter(item::target.eq(target.as_bytes()))
@@ -203,10 +204,9 @@ impl SharedState {
     }
 
     /// Deletes items not put again within ITEM_LIFETIME
-    pub(crate) fn expire_items(&self) -> Result<usize, diesel::result::Error> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
+    pub(crate) fn expire_items(&self) -> Result<usize, OurError> {
         let cutoff = unix_timestmap_ms() - ITEM_LIFETIME.as_millis() as i64;
-        diesel::delete(item::table.filter(item::last_put.lt(cutoff))).execute(&mut conn)
+        self.with_conn(|conn| diesel::delete(item::table.filter(item::last_put.lt(cutoff))).execute(conn))
     }
 }
 

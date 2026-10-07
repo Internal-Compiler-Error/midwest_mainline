@@ -869,8 +869,8 @@ mod bep51_tests {
     const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
     fn store(session: &DhtSession, info_hash: InfoHash) {
-        let mut conn = session.state.conn.get().unwrap();
-        server::DhtServer::add_peers_to_db(&info_hash, "10.0.0.1:6881".parse().unwrap(), false, &mut conn).unwrap();
+        let peer = "10.0.0.1:6881".parse().unwrap();
+        session.state.store_peer(&info_hash, peer, false).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -942,10 +942,9 @@ mod bep33_tests {
     const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
     fn store(session: &DhtSession, info_hash: InfoHash, ips: std::ops::Range<u8>, seed: bool) {
-        let mut conn = session.state.conn.get().unwrap();
         for i in ips {
             let addr = SocketAddr::from(([10, 0, 0, i], 6881));
-            server::DhtServer::add_peers_to_db(&info_hash, addr, seed, &mut conn).unwrap();
+            session.state.store_peer(&info_hash, addr, seed).unwrap();
         }
     }
 
@@ -994,9 +993,8 @@ mod bep33_tests {
     }
 
     fn store_in(state: &SharedState, info_hash: InfoHash, i: u8, seed: bool) {
-        let mut conn = state.conn.get().unwrap();
         let addr = SocketAddr::from(([10, 0, 0, i], 6881));
-        server::DhtServer::add_peers_to_db(&info_hash, addr, seed, &mut conn).unwrap();
+        state.store_peer(&info_hash, addr, seed).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }

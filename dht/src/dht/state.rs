@@ -5,17 +5,19 @@
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{SqliteConnection, prelude::*};
 use rand::RngExt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::dht::routing_table::RoutingTable;
 use crate::dht::rpc_manager::RpcManager;
 use crate::message::find_node_get_peers_response::{Samples, ScrapeFilters};
+use crate::our_error::{OurError, naur};
 use crate::schema::{peer, swarm};
 use crate::token_generator::TokenGenerator;
 use crate::types::{Family, InfoHash, NodeId};
 use crate::utils::unix_timestmap_ms;
+use tracing::warn;
 
 // TODO: make these configurable some day
 /// How long to wait for a node to answer. Nodes that answer at all do so within a second
@@ -56,12 +58,15 @@ fn lifetime_cutoff() -> i64 {
     unix_timestmap_ms() - PEER_LIFETIME.as_millis() as i64
 }
 
-fn parse_addr(ip: &str, port: i32) -> SocketAddr {
-    assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
-    let ip: IpAddr = ip
-        .parse()
-        .unwrap_or_else(|_| panic!("invalid ip string representation got into the database: {}", ip));
-    SocketAddr::new(ip, port as u16)
+/// A peer's address as the `peer` table keeps it; `None` for a row that isn't one
+fn parse_addr(ip: &str, port: i32) -> Option<SocketAddr> {
+    Some(SocketAddr::new(ip.parse().ok()?, port.try_into().ok()?))
+}
+
+/// What a read of the store that failed comes to: nothing, and a line in the log
+fn or_nothing<T: Default>(read: Result<T, impl std::fmt::Display>) -> T {
+    read.inspect_err(|e| warn!("couldn't read the store: {e}"))
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -112,6 +117,18 @@ impl SharedState {
         }
     }
 
+    /// Runs `f` on a connection of the pool
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut SqliteConnection) -> Result<T, diesel::result::Error>,
+    ) -> Result<T, OurError> {
+        let mut conn = self
+            .conn
+            .get()
+            .map_err(|e| naur!("could not check out a db connection: {e}"))?;
+        Ok(f(&mut conn)?)
+    }
+
     /// Peers of `family` for `info_hash` that were announced *to us* within
     /// [`PEER_LIFETIME`], freshest first, capped so a get_peers response fits BEP 32's 1024
     /// bytes. A get_peers answer only carries the family it was asked over (BEP 32).
@@ -121,8 +138,6 @@ impl SharedState {
 
     /// `swarm_peers`, and with `noseed` (BEP 33), the ones that aren't seeds first
     pub(crate) fn swarm_peers_preferring(&self, info_hash: &InfoHash, family: Family, noseed: bool) -> Vec<SocketAddr> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-
         let query = peer::table
             .filter(peer::swarm.eq(&info_hash.0))
             .filter(peer::last_announced.ge(lifetime_cutoff()))
@@ -137,24 +152,22 @@ impl SharedState {
             Family::V4 => query.filter(peer::ip_addr.not_like("%:%")).limit(50),
             Family::V6 => query.filter(peer::ip_addr.like("%:%")).limit(25),
         };
-        query
-            .load::<(String, i32)>(&mut conn)
-            .unwrap()
+        or_nothing(self.with_conn(|conn| query.load::<(String, i32)>(conn)))
             .into_iter()
-            .map(|(ip, port)| parse_addr(&ip, port))
+            .filter_map(|(ip, port)| parse_addr(&ip, port))
             .collect()
     }
 
     /// BEP 33: bloom filters of the seeds' and the other peers' addresses announced to us for
     /// `info_hash` within [`PEER_LIFETIME`], both families; `None` if there are none
     pub(crate) fn scrape_filters(&self, info_hash: &InfoHash) -> Option<ScrapeFilters> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-        let peers = peer::table
-            .filter(peer::swarm.eq(&info_hash.0))
-            .filter(peer::last_announced.ge(lifetime_cutoff()))
-            .select((peer::ip_addr, peer::seed))
-            .load::<(String, bool)>(&mut conn)
-            .unwrap_or_default();
+        let peers = or_nothing(self.with_conn(|conn| {
+            peer::table
+                .filter(peer::swarm.eq(&info_hash.0))
+                .filter(peer::last_announced.ge(lifetime_cutoff()))
+                .select((peer::ip_addr, peer::seed))
+                .load::<(String, bool)>(conn)
+        }));
         if peers.is_empty() {
             return None;
         }
@@ -172,35 +185,60 @@ impl SharedState {
     /// Every peer ever announced to us for `info_hash` that the store still holds, stale or
     /// not, most recently announced first.
     pub(crate) fn stored_peers(&self, info_hash: &InfoHash) -> Vec<StoredPeer> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-
-        peer::table
-            .filter(peer::swarm.eq(&info_hash.0))
-            .order(peer::last_announced.desc())
-            .select((peer::ip_addr, peer::port, peer::first_announced, peer::last_announced))
-            .load::<(String, i32, i64, i64)>(&mut conn)
-            .unwrap()
-            .into_iter()
-            .map(|(ip, port, first_announced, last_announced)| StoredPeer {
-                addr: parse_addr(&ip, port),
-                first_announced,
-                last_announced,
+        let rows = or_nothing(self.with_conn(|conn| {
+            peer::table
+                .filter(peer::swarm.eq(&info_hash.0))
+                .order(peer::last_announced.desc())
+                .select((peer::ip_addr, peer::port, peer::first_announced, peer::last_announced))
+                .load::<(String, i32, i64, i64)>(conn)
+        }));
+        rows.into_iter()
+            .filter_map(|(ip, port, first_announced, last_announced)| {
+                Some(StoredPeer {
+                    addr: parse_addr(&ip, port)?,
+                    first_announced,
+                    last_announced,
+                })
             })
             .collect()
     }
 
     /// Info hashes the store holds at least one peer for.
     pub(crate) fn stored_swarms(&self) -> Vec<InfoHash> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-
-        peer::table
-            .select(peer::swarm)
-            .distinct()
-            .load::<Vec<u8>>(&mut conn)
-            .unwrap()
+        or_nothing(self.with_conn(|conn| peer::table.select(peer::swarm).distinct().load::<Vec<u8>>(conn)))
             .iter()
             .filter_map(|bytes| InfoHash::try_from_bytes(bytes))
             .collect()
+    }
+
+    /// Records that `addr` announced itself for `info_hash`, a seed or not (BEP 33). Announcing
+    /// again keeps when it was first seen.
+    pub(crate) fn store_peer(&self, info_hash: &InfoHash, addr: SocketAddr, seed: bool) -> Result<(), OurError> {
+        let info_hash = info_hash.as_bytes();
+        let now = unix_timestmap_ms();
+        self.with_conn(|conn| {
+            conn.transaction(|conn| {
+                // the peer table references the swarm, so make sure it exists first
+                diesel::insert_into(swarm::table)
+                    .values(swarm::info_hash.eq(info_hash))
+                    .on_conflict_do_nothing()
+                    .execute(conn)?;
+                diesel::insert_into(peer::table)
+                    .values((
+                        peer::ip_addr.eq(addr.ip().to_string()),
+                        peer::port.eq(i32::from(addr.port())),
+                        peer::swarm.eq(info_hash),
+                        peer::first_announced.eq(now),
+                        peer::last_announced.eq(now),
+                        peer::seed.eq(seed),
+                    ))
+                    .on_conflict((peer::ip_addr, peer::port, peer::swarm))
+                    .do_update()
+                    .set((peer::last_announced.eq(now), peer::seed.eq(seed)))
+                    .execute(conn)?;
+                Ok(())
+            })
+        })
     }
 
     /// BEP 51: up to [`MAX_SAMPLES`] info hashes from the store at random, refreshed every
@@ -216,37 +254,35 @@ impl SharedState {
                 ..samples.clone()
             };
         }
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-        let num: i64 = swarm::table.count().get_result(&mut conn).unwrap_or_default();
-        let samples = swarm::table
-            .select(swarm::info_hash)
-            .order(diesel::dsl::sql::<diesel::sql_types::Integer>("random()"))
-            .limit(MAX_SAMPLES)
-            .load::<Vec<u8>>(&mut conn)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|bytes| InfoHash::try_from_bytes(bytes))
-            .collect();
+        let (num, hashes) = or_nothing(self.with_conn(|conn| {
+            let num: i64 = swarm::table.count().get_result(conn)?;
+            let hashes = swarm::table
+                .select(swarm::info_hash)
+                .order(diesel::dsl::sql::<diesel::sql_types::Integer>("random()"))
+                .limit(MAX_SAMPLES)
+                .load::<Vec<u8>>(conn)?;
+            Ok((num, hashes))
+        }));
         let samples = Samples {
             interval: SAMPLE_INTERVAL.as_secs() as u32,
             num: num as u64,
-            samples,
+            samples: hashes.iter().filter_map(|h| InfoHash::try_from_bytes(h)).collect(),
         };
         *cached = Some((Instant::now(), samples.clone()));
         samples
     }
 
     /// Deletes peers announced longer than [`PEER_LIFETIME`] ago, and swarms left with none.
-    pub(crate) fn expire_peers(&self) -> Result<(), diesel::result::Error> {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-
-        conn.transaction(|conn| {
-            diesel::delete(peer::table.filter(peer::last_announced.lt(lifetime_cutoff()))).execute(conn)?;
-            diesel::delete(swarm::table.filter(diesel::dsl::not(diesel::dsl::exists(
-                peer::table.filter(peer::swarm.eq(swarm::info_hash)),
-            ))))
-            .execute(conn)?;
-            Ok(())
+    pub(crate) fn expire_peers(&self) -> Result<(), OurError> {
+        self.with_conn(|conn| {
+            conn.transaction(|conn| {
+                diesel::delete(peer::table.filter(peer::last_announced.lt(lifetime_cutoff()))).execute(conn)?;
+                diesel::delete(swarm::table.filter(diesel::dsl::not(diesel::dsl::exists(
+                    peer::table.filter(peer::swarm.eq(swarm::info_hash)),
+                ))))
+                .execute(conn)?;
+                Ok(())
+            })
         })
     }
 }
@@ -318,6 +354,28 @@ mod tests {
         let mut conn = state.conn.get().unwrap();
         let swarms: i64 = swarm::table.count().get_result(&mut conn).unwrap();
         assert_eq!(swarms, 1, "a swarm with no peers left goes too");
+    }
+
+    #[tokio::test]
+    async fn announcing_again_keeps_when_the_peer_was_first_seen() {
+        let state = state().await;
+        let info_hash = InfoHash([3; 20]);
+        let addr = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 6881));
+
+        state.store_peer(&info_hash, addr, false).unwrap();
+        let mut conn = state.conn.get().unwrap();
+        diesel::update(peer::table)
+            .set((peer::first_announced.eq(1), peer::last_announced.eq(1)))
+            .execute(&mut conn)
+            .unwrap();
+        drop(conn);
+        state.store_peer(&info_hash, addr, true).unwrap();
+
+        let [stored] = state.stored_peers(&info_hash)[..] else {
+            panic!("one peer")
+        };
+        assert_eq!(stored.first_announced, 1);
+        assert!(stored.last_announced > 1);
     }
 
     #[tokio::test]

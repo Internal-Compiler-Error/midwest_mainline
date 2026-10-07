@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::dht::client::DhtClient;
 use crate::dht::routing_table::sybil_group;
 use crate::dht::state::SharedState;
+use crate::our_error::OurError;
 use crate::schema::sampled_infohash;
 use crate::types::{InfoHash, NodeId, NodeInfo};
 use crate::utils::unix_timestmap_ms;
@@ -177,38 +178,36 @@ fn next_node(
 
 impl SharedState {
     /// Keeps sampled info hashes; returns how many weren't known before
-    pub(crate) fn record_samples(&self, samples: &[InfoHash]) -> Result<usize, diesel::result::Error> {
+    pub(crate) fn record_samples(&self, samples: &[InfoHash]) -> Result<usize, OurError> {
         use crate::schema::sampled_infohash::dsl::*;
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
         let now = unix_timestmap_ms();
-        conn.transaction(|conn| {
-            let mut new = 0;
-            for hash in samples {
-                let inserted = diesel::insert_into(sampled_infohash)
-                    .values((
-                        info_hash.eq(hash.as_bytes()),
-                        first_sampled.eq(now),
-                        last_sampled.eq(now),
-                    ))
-                    .on_conflict_do_nothing()
-                    .execute(conn)?;
-                if inserted == 0 {
-                    diesel::update(sampled_infohash.filter(info_hash.eq(hash.as_bytes())))
-                        .set((last_sampled.eq(now), times_sampled.eq(times_sampled + 1)))
+        self.with_conn(|conn| {
+            conn.transaction(|conn| {
+                let mut new = 0;
+                for hash in samples {
+                    let inserted = diesel::insert_into(sampled_infohash)
+                        .values((
+                            info_hash.eq(hash.as_bytes()),
+                            first_sampled.eq(now),
+                            last_sampled.eq(now),
+                        ))
+                        .on_conflict_do_nothing()
                         .execute(conn)?;
+                    if inserted == 0 {
+                        diesel::update(sampled_infohash.filter(info_hash.eq(hash.as_bytes())))
+                            .set((last_sampled.eq(now), times_sampled.eq(times_sampled + 1)))
+                            .execute(conn)?;
+                    }
+                    new += inserted;
                 }
-                new += inserted;
-            }
-            Ok(new)
+                Ok(new)
+            })
         })
     }
 
     /// How many distinct info hashes crawling has turned up
     pub(crate) fn sampled_count(&self) -> usize {
-        let mut conn = self.conn.get().expect("failed to get one connection from pool");
-        sampled_infohash::table
-            .count()
-            .get_result::<i64>(&mut conn)
+        self.with_conn(|conn| sampled_infohash::table.count().get_result::<i64>(conn))
             .unwrap_or_default() as usize
     }
 }
