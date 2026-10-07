@@ -464,8 +464,9 @@ impl TorrentTask {
             }
         }
         let mut resolve = std::pin::pin!(resolve(self.controls.cancel.clone()));
-        // a pause asked for while still resolving applies once resolved
-        let mut pause_asked = false;
+        // a pause or unpause asked for while still resolving applies once resolved, over what the
+        // resume file says
+        let mut pause_asked = None;
         // a switch flipped while resolving wins over what the resume file says
         let (mut sequential_asked, mut super_seed_asked) = (None, None);
         let resolved = loop {
@@ -485,8 +486,8 @@ impl TorrentTask {
                         return;
                     }
                     Command::Act(Action::Remove { .. } | Action::Shutdown) => return,
-                    Command::Act(Action::Pause) => pause_asked = true,
-                    Command::Act(Action::Unpause) => pause_asked = false,
+                    Command::Act(Action::Pause) => pause_asked = Some(true),
+                    Command::Act(Action::Unpause) => pause_asked = Some(false),
                     Command::Set(Switch::Sequential(on)) => sequential_asked = Some(on),
                     Command::Set(Switch::SuperSeed(on)) => super_seed_asked = Some(on),
                     // the files aren't known yet, and there's nothing on disk to check
@@ -495,7 +496,7 @@ impl TorrentTask {
             }
         };
         let mut resolved = resolved.map(|mut resolved| {
-            resolved.paused |= pause_asked;
+            resolved.paused = pause_asked.unwrap_or(resolved.paused);
             resolved.modes.sequential = sequential_asked.unwrap_or(resolved.modes.sequential);
             resolved.modes.super_seed = super_seed_asked.unwrap_or(resolved.modes.super_seed);
             resolved
@@ -2448,6 +2449,29 @@ mod test {
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
         session.unpause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An unpause that comes while a paused torrent's resume file is being read starts it.
+    #[test]
+    fn unpause_while_resolving_wins_over_the_resume_file() {
+        let dir = scratch("unpause-resolving");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        session.shutdown();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let ids = session.resume_all();
+        session.unpause(ids[0]);
+        wait_for(&mut session, ids[0], |s| {
+            matches!(s, Some(TorrentState::Downloading(_)))
+        });
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
