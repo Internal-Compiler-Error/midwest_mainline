@@ -796,7 +796,10 @@ impl TorrentTask {
                 Err(action) => return Ok((action, None)),
             },
         };
-        if *resumed {
+        // one paused before it ever ran has no files to pick up: they're laid down like a new
+        // torrent's, provided its root is there (and not on a drive that isn't mounted)
+        let nothing_to_pick_up = verified.not_any() && root.is_dir();
+        if *resumed && !nothing_to_pick_up {
             self.client
                 .add_torrent_resumed((**torrent).clone(), root, verified.clone())?;
         } else {
@@ -2494,6 +2497,35 @@ mod test {
         set_mode(0o700);
         session.shutdown();
         assert!(list_resume_files(&resume_dir)[0].paused, "the pause was lost");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A torrent paused before it ever ran has a resume file but no files; after a restart it
+    /// still starts when unpaused. Its root has to be there, though: one on a drive that isn't
+    /// mounted stays failed rather than being laid down on the wrong disk.
+    #[test]
+    fn a_torrent_paused_before_it_ran_starts_after_a_restart() {
+        let dir = scratch("paused-unstarted");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        let torrent = crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap();
+        let mut data = ResumeData::from_torrent(&torrent, &root, &bitvec![u8, Msb0; 0; 3]);
+        data.paused = true;
+        let path = dir.join("resume").join(ResumeData::file_name(&torrent.info_hash));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        data.write(&path).unwrap();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.resume(&path);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        session.unpause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Failed { .. })));
+
+        std::fs::create_dir_all(&root).unwrap();
+        session.unpause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        assert_eq!(std::fs::metadata(root.join("session.bin")).unwrap().len(), 40);
+        session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
