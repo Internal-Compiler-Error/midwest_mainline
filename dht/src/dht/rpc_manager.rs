@@ -27,7 +27,7 @@ use crate::{
     utils::{db_put, unix_timestmap_ms},
 };
 
-use super::{TxnIdGenerator, external_ip::ExternalIp, misc_key, routing_table::update_last_sent};
+use super::{TxnIdGenerator, external_ip::ExternalIp, routing_table::update_last_sent, scope::Scope};
 
 /// A message and who sent it
 pub type Inbound = (Krpc, SocketAddr);
@@ -52,6 +52,8 @@ pub struct RpcManager {
     inbound_subscribers: Arc<Mutex<Vec<mpsc::Sender<Inbound>>>>,
     db: Pool<ConnectionManager<SqliteConnection>>,
     external_ip: Arc<ExternalIp>,
+    /// where in the database the node behind this socket keeps its own things
+    scope: Scope,
 }
 
 pub trait Routable {
@@ -94,7 +96,18 @@ impl RpcManager {
             db,
             txn_id_generator,
             external_ip: Arc::new(ExternalIp::new(external_ip)),
+            scope: Scope::primary(family),
         }
+    }
+
+    /// The broker of a node in `scope` rather than its family's (BEP 45)
+    pub(crate) fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
     }
 
     pub fn family(&self) -> Family {
@@ -215,7 +228,7 @@ impl RpcManager {
         };
         info!("other nodes see us at {agreed}; the node id follows it at the next start");
         let db = self.db.clone();
-        let key = misc_key(super::OBSERVED_IP_KEY, self.family);
+        let key = self.scope.key(super::OBSERVED_IP_KEY);
         tokio::task::spawn_blocking(move || {
             let mut conn = match db.get() {
                 Ok(conn) => conn,
@@ -277,7 +290,7 @@ impl RpcManager {
             .get()
             .map_err(|e| naur!("could not check out a db connection: {e}"))?;
         // it's a double update but that's issue for another day
-        update_last_sent(&response_node_id, self.family, sent_time, &mut conn);
+        update_last_sent(&response_node_id, self.scope.table, sent_time, &mut conn);
         Ok(response)
     }
 

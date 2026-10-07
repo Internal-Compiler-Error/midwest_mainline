@@ -73,7 +73,8 @@ pub(crate) fn purge_shared_ips(conn: &mut SqliteConnection) -> Result<usize, die
         let Some(group) = ip.parse::<IpAddr>().ok().and_then(|ip| sybil_group(&ip)) else {
             continue;
         };
-        if !groups.insert(group) {
+        // per table: nodes of another address's table (BEP 45) don't compete
+        if !groups.insert((fam, group)) {
             doomed.push((node_id, fam));
         }
     }
@@ -121,6 +122,8 @@ pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
 pub struct RoutingTable {
     id: NodeId,
     family: Family,
+    /// the `node` rows that are this table's: its family's, or with BEP 45, its address's
+    scope_table: i32,
     table: Pool<ConnectionManager<SqliteConnection>>,
     rpc_manager: RpcManager,
     /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
@@ -133,11 +136,12 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// The table holds the nodes of the broker's address family.
+    /// The table holds the nodes of the broker's address family, in the broker's scope.
     pub fn new(id: NodeId, rpc_manager: RpcManager, table: Pool<ConnectionManager<SqliteConnection>>) -> RoutingTable {
         RoutingTable {
             id,
             family: rpc_manager.family(),
+            scope_table: rpc_manager.scope().table,
             table,
             rpc_manager,
             bucket_capacity: 1024, // TODO: make this configurable in the future
@@ -201,7 +205,7 @@ impl RoutingTable {
 
         let nodes = node
             .select(NodeNoMetaInfo::as_select())
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(bucket.eq(i))
             // order by Kadamlia XOR distance
@@ -264,7 +268,7 @@ impl RoutingTable {
         use crate::schema::node::dsl::*;
         let mut conn = self.table.get().unwrap();
         let target_id = target.0.to_vec();
-        node.filter(family.eq(self.family.db()))
+        node.filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(id.eq(target_id))
             .select(NodeNoMetaInfo::as_select())
@@ -362,7 +366,7 @@ impl RoutingTable {
             return false;
         };
         let mut conn = self.conn();
-        node.filter(family.eq(self.family.db()))
+        node.filter(family.eq(self.scope_table))
             .filter(ip_group.eq(group.to_string()))
             .filter(removed.eq(false))
             .count()
@@ -373,7 +377,7 @@ impl RoutingTable {
     fn least_recent_noncompliant(&self, i: i32) -> Option<NodeId> {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
-        node.filter(family.eq(self.family.db()))
+        node.filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(bucket.eq(i))
             .filter(bep42.eq(false))
@@ -389,7 +393,7 @@ impl RoutingTable {
     pub fn bep42_compliance(&self) -> (usize, usize) {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
-        let alive = node.filter(family.eq(self.family.db())).filter(removed.eq(false));
+        let alive = node.filter(family.eq(self.scope_table)).filter(removed.eq(false));
         let good: i64 = alive
             .filter(bep42.eq(true))
             .count()
@@ -407,7 +411,7 @@ impl RoutingTable {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
         let count: i64 = node
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .count()
             .get_result(&mut conn)
@@ -420,7 +424,7 @@ impl RoutingTable {
         use crate::schema::node::dsl::*;
         let mut conn = self.conn();
         let count: i64 = node
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(bucket.eq(i))
             .count()
@@ -438,7 +442,7 @@ impl RoutingTable {
             unix_timestmap_ms() - fifteenth_mins_ms
         }
 
-        node.filter(family.eq(self.family.db()))
+        node.filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(bucket.eq(i))
             .filter(failed_requests.ge(3)) // TODO: make this configurable
@@ -455,7 +459,7 @@ impl RoutingTable {
 
         {
             let mut conn = self.conn();
-            update_last_sent(&target.id(), self.family, unix_timestmap_ms(), &mut conn);
+            update_last_sent(&target.id(), self.scope_table, unix_timestmap_ms(), &mut conn);
         }
 
         let response = self.rpc_manager.query(ping_msg, target, REQ_TIMEOUT).await;
@@ -488,7 +492,7 @@ impl RoutingTable {
             let mut conn = self.conn();
             let _ = diesel::delete(
                 node::table
-                    .filter(node::family.eq(self.family.db()))
+                    .filter(node::family.eq(self.scope_table))
                     .filter(node::removed.eq(true)),
             )
             .execute(&mut conn)
@@ -506,7 +510,7 @@ impl RoutingTable {
         let now = unix_timestmap_ms();
         let idd = nodee.0.to_vec();
         let _ = diesel::update(node)
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(id.eq(idd))
             .set((last_contacted.eq(now), failed_requests.eq(0)))
             .execute(conn)
@@ -521,7 +525,7 @@ impl RoutingTable {
         let idd = nodee.0.to_vec();
         let mut conn = self.conn();
         let _ = diesel::update(node)
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(id.eq(idd))
             .set(failed_requests.eq(failed_requests + 1))
             .execute(&mut conn)
@@ -539,7 +543,7 @@ impl RoutingTable {
 
         let idd = nodee.0.to_vec();
         let _ = diesel::update(node)
-            .filter(family.eq(self.family.db()))
+            .filter(family.eq(self.scope_table))
             .filter(id.eq(idd))
             .set(removed.eq(true))
             .execute(conn)
@@ -554,7 +558,7 @@ impl RoutingTable {
         let _ = insert_into(node)
             .values(crate::models::NodeRow {
                 id: nodee.id().0.to_vec(),
-                family: self.family.db(),
+                family: self.scope_table,
                 bucket: index,
                 last_contacted: unix_timestmap_ms(),
                 ip_addr: ip.to_string(),
@@ -570,13 +574,13 @@ impl RoutingTable {
     }
 }
 
-pub fn update_last_sent(nodee: &NodeId, fam: Family, sent_timestamp: i64, conn: &mut SqliteConnection) {
+pub fn update_last_sent(nodee: &NodeId, table: i32, sent_timestamp: i64, conn: &mut SqliteConnection) {
     use crate::schema::node::dsl::*;
 
     let idd = nodee.0.to_vec();
     let _ = diesel::update(node)
         .set(last_sent.eq(sent_timestamp))
-        .filter(family.eq(fam.db()))
+        .filter(family.eq(table))
         .filter(id.eq(idd))
         .execute(conn)
         .inspect_err(|e| error!("{e}"));
