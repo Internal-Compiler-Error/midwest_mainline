@@ -18,7 +18,7 @@
   }
   const LANES: Lane[] = [
     { title: 'Metadata', names: ['metadata', 'metadata.peer'], rows: 8, weight: 1.1 },
-    { title: 'Trackers', names: ['tracker.announce'], rows: 6, weight: 1.1 },
+    { title: 'Trackers', names: ['tracker.announce', 'tracker.scrape'], rows: 6, weight: 1.1 },
     { title: 'DHT', names: ['dht.lookup'], rows: 3, weight: 1.1 },
     { title: 'Dials', names: ['dial'], rows: 48, weight: 2.4 },
     { title: 'Peers', names: ['peer'], rows: 64, weight: 3.2 },
@@ -83,6 +83,8 @@
       case 'dial':
         if (open) return '#a3a3a3'
         return field(span, 'error') ? '#64748b' : '#22c55e'
+      case 'tracker.scrape':
+        return field(span, 'error') ? '#f87171' : '#5eead4'
       case 'tracker.announce':
         return field(span, 'error') ? '#ef4444' : '#14b8a6'
       case 'dht.lookup':

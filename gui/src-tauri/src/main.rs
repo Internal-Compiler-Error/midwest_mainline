@@ -89,6 +89,9 @@ struct TrackerDto {
     error: Option<String>,
     peers: usize,
     next_announce_secs: Option<u64>,
+    seeders: Option<u32>,
+    leechers: Option<u32>,
+    downloaded: Option<u32>,
 }
 
 impl From<TrackerInfo> for TrackerDto {
@@ -104,6 +107,9 @@ impl From<TrackerInfo> for TrackerDto {
             error,
             peers: t.peers,
             next_announce_secs: t.next_announce_secs,
+            seeders: t.seeders,
+            leechers: t.leechers,
+            downloaded: t.downloaded,
         }
     }
 }

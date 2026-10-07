@@ -40,6 +40,37 @@ pub struct TrackerStatus {
     /// peers the last successful announce returned
     pub peers: usize,
     pub next_announce: Option<Instant>,
+    /// the swarm's size as the tracker counts it, from its announce replies or a scrape
+    pub swarm: SwarmCounts,
+}
+
+/// A tracker's count of a torrent's swarm (BEP 3 announce fields, BEP 48 / BEP 15 scrape).
+/// Each is `None` until the tracker has said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwarmCounts {
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    /// how many times the torrent has been downloaded to completion
+    pub downloaded: Option<u32>,
+}
+
+impl SwarmCounts {
+    /// `newer`'s counts, falling back to these where it says nothing.
+    fn updated(self, newer: SwarmCounts) -> SwarmCounts {
+        SwarmCounts {
+            seeders: newer.seeders.or(self.seeders),
+            leechers: newer.leechers.or(self.leechers),
+            downloaded: newer.downloaded.or(self.downloaded),
+        }
+    }
+}
+
+/// What a successful announce brings back.
+#[derive(Debug, PartialEq, Eq)]
+struct Announced {
+    peers: Vec<SocketAddr>,
+    interval: Duration,
+    counts: SwarmCounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +138,7 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
             state: TrackerState::Pending,
             peers: 0,
             next_announce: None,
+            swarm: SwarmCounts::default(),
         });
         rows.len() - 1
     };
@@ -363,6 +395,7 @@ struct Tracker {
     board: (TrackerBoard, usize),
     /// consecutive failed announces, for the retry backoff
     failures: u32,
+    last_scrape: Option<Instant>,
     bus: EventBus,
 }
 
@@ -382,6 +415,7 @@ impl Tracker {
             shutdown: shared.shutdown.clone(),
             board,
             failures: 0,
+            last_scrape: None,
             bus: shared.bus.clone(),
         }
     }
@@ -424,6 +458,43 @@ impl Tracker {
         }
     }
 
+    /// Whether to scrape after an announce: the announce didn't say how many have completed
+    /// the torrent (or anything about the swarm), and the last scrape is a while ago.
+    fn wants_scrape(&self) -> bool {
+        let (board, slot) = &self.board;
+        let swarm = board.borrow().get(*slot).map(|row| row.swarm).unwrap_or_default();
+        let missing = swarm.downloaded.is_none() || swarm.seeders.is_none();
+        missing && self.last_scrape.is_none_or(|at| at.elapsed() >= SCRAPE_INTERVAL)
+    }
+
+    fn record_scrape(&mut self, scraped: anyhow::Result<SwarmCounts>) {
+        self.last_scrape = Some(Instant::now());
+        match scraped {
+            Ok(counts) => {
+                debug!("Tracker [{}] scrape: {counts:?}", self.url);
+                tracing::Span::current().record("seeders", counts.seeders.unwrap_or(0));
+                let (board, slot) = &self.board;
+                report(board, *slot, |row| row.swarm = row.swarm.updated(counts));
+            }
+            Err(e) => {
+                tracing::Span::current().record("error", format!("{e:#}"));
+                debug!("Tracker [{}] scrape: {e:#}", self.url);
+            }
+        }
+    }
+
+    fn scrape_span(&self) -> tracing::Span {
+        let mut url = self.url.clone();
+        url.set_query(None);
+        tracing::info_span!(
+            "tracker.scrape",
+            info_hash = %self.info_hash,
+            url = %url,
+            seeders = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    }
+
     /// One announce, for the traces. The URL leaves out its query, where private trackers keep
     /// the user's passkey.
     fn announce_span(&self, event: AnnounceEvent) -> tracing::Span {
@@ -436,26 +507,42 @@ impl Tracker {
             event = ?event,
             peers = tracing::field::Empty,
             interval_secs = tracing::field::Empty,
+            seeders = tracing::field::Empty,
+            leechers = tracing::field::Empty,
             error = tracing::field::Empty,
         )
     }
 
     /// Books an announce's outcome: the schedule or backoff, the board row, the event bus, and
     /// the peers to the swarm.
-    async fn settle(&mut self, event: AnnounceEvent, announced: anyhow::Result<(Vec<SocketAddr>, Duration)>) {
+    async fn settle(&mut self, event: AnnounceEvent, announced: anyhow::Result<Announced>) {
         let (board, slot) = &self.board;
         let span = tracing::Span::current();
         match &announced {
-            Ok((peers, interval)) => {
+            Ok(Announced {
+                peers,
+                interval,
+                counts,
+            }) => {
                 span.record("peers", peers.len());
                 span.record("interval_secs", interval.as_secs());
+                if let Some(n) = counts.seeders {
+                    span.record("seeders", n);
+                }
+                if let Some(n) = counts.leechers {
+                    span.record("leechers", n);
+                }
             }
             Err(e) => {
                 span.record("error", format!("{e:#}"));
             }
         }
         match announced {
-            Ok((peers, interval)) => {
+            Ok(Announced {
+                peers,
+                interval,
+                counts,
+            }) => {
                 self.sent_started = true;
                 self.sent_completed |= event == AnnounceEvent::Completed;
                 self.failures = 0;
@@ -470,6 +557,7 @@ impl Tracker {
                     row.state = TrackerState::Working;
                     row.peers = count;
                     row.next_announce = Some(next);
+                    row.swarm = row.swarm.updated(counts);
                 });
                 self.bus.emit(BusEvent::Announced {
                     info_hash: self.info_hash,
@@ -509,6 +597,52 @@ impl Tracker {
 /// Peers asked of a tracker per announce. Left out, some trackers (Ubuntu's among them) hand
 /// out a single peer; 200 is what libtorrent asks for, and peers are cheap to have on hand.
 const NUMWANT: u32 = 200;
+
+/// The least time between scrapes of one tracker for one torrent; they only run when an
+/// announce left the swarm's counts unsaid, and the completed count changes slowly.
+const SCRAPE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// BEP 48: the scrape URL is the announce URL with its last path segment's leading
+/// `announce` swapped for `scrape`, and the info hash in the query. A tracker whose announce
+/// URL doesn't end that way has no scrape.
+fn http_scrape_url(announce: &Url, info_hash: &InfoHash) -> Option<Url> {
+    let mut url = announce.clone();
+    let last = url.path_segments()?.next_back()?.to_string();
+    let rest = last.strip_prefix("announce")?;
+    url.path_segments_mut().ok()?.pop().push(&format!("scrape{rest}"));
+    let hash = percent_encode(&info_hash.0);
+    let query = match url.query() {
+        Some(q) if !q.is_empty() => format!("{q}&info_hash={hash}"),
+        _ => format!("info_hash={hash}"),
+    };
+    url.set_query(Some(&query));
+    Some(url)
+}
+
+/// BEP 48 scrape response: `files` maps each 20-byte info hash to its counts.
+fn parse_http_scrape(body: &[u8], info_hash: &InfoHash) -> anyhow::Result<SwarmCounts> {
+    let Ok((_, mut dict)) = juicy_bencode::parse_bencode_dict(body) else {
+        bail!("scrape response is invalid bencode: {}", preview(body));
+    };
+    if let Some(BencodeItemView::ByteString(reason)) = dict.remove(b"failure reason".as_slice()) {
+        bail!("tracker: {}", preview(reason));
+    }
+    let Some(BencodeItemView::Dictionary(mut files)) = dict.remove(b"files".as_slice()) else {
+        bail!("scrape response has no files");
+    };
+    let Some(BencodeItemView::Dictionary(mut ours)) = files.remove(info_hash.0.as_slice()) else {
+        bail!("scrape response doesn't mention this torrent");
+    };
+    let mut count = |key: &[u8]| match ours.remove(key) {
+        Some(BencodeItemView::Integer(n)) => u32::try_from(n).ok(),
+        _ => None,
+    };
+    Ok(SwarmCounts {
+        seeders: count(b"complete"),
+        leechers: count(b"incomplete"),
+        downloaded: count(b"downloaded"),
+    })
+}
 
 /// One shared client, so announces reuse connections; the timeout covers the whole request.
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
@@ -590,6 +724,7 @@ struct HttpResponse {
     peers: Vec<SocketAddr>,
     interval: Duration,
     warning: Option<String>,
+    counts: SwarmCounts,
 }
 
 /// Parses an HTTP tracker's announce response; a `failure reason` is the error.
@@ -615,6 +750,12 @@ fn parse_http_response(body: &[u8]) -> anyhow::Result<HttpResponse> {
         }
     };
     let min_interval = integer(dict.remove(b"min interval".as_slice()));
+    let count = |item| integer(item).and_then(|n| u32::try_from(n).ok());
+    let counts = SwarmCounts {
+        seeders: count(dict.remove(b"complete".as_slice())),
+        leechers: count(dict.remove(b"incomplete".as_slice())),
+        downloaded: count(dict.remove(b"downloaded".as_slice())),
+    };
 
     let mut peers = vec![];
     match dict.remove(b"peers".as_slice()) {
@@ -661,6 +802,7 @@ fn parse_http_response(body: &[u8]) -> anyhow::Result<HttpResponse> {
         peers,
         interval: announce_interval(interval, min_interval),
         warning,
+        counts,
     })
 }
 
@@ -678,7 +820,7 @@ impl HttpAnnouncer {
 
     /// Performs a single announce, returning the peers and the interval until the next one.
     #[tracing::instrument(skip(self))]
-    async fn announce(&self, event: AnnounceEvent) -> anyhow::Result<(Vec<SocketAddr>, Duration)> {
+    async fn announce(&self, event: AnnounceEvent) -> anyhow::Result<Announced> {
         let tracker = &self.tracker;
         let url = http_announce_url(
             &tracker.url,
@@ -709,7 +851,25 @@ impl HttpAnnouncer {
         if let Some(warning) = &response.warning {
             warn!("Tracker [{}] warns: {warning}", tracker.url);
         }
-        Ok((response.peers, response.interval))
+        Ok(Announced {
+            peers: response.peers,
+            interval: response.interval,
+            counts: response.counts,
+        })
+    }
+
+    /// BEP 48: the tracker's count of the swarm, from its scrape URL.
+    async fn scrape(&self) -> anyhow::Result<SwarmCounts> {
+        let tracker = &self.tracker;
+        let url = http_scrape_url(&tracker.url, &tracker.info_hash).context("the tracker has no scrape URL")?;
+        let response = HTTP_CLIENT
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .context("sending the scrape")?;
+        let body = read_capped(response, TRACKER_RESPONSE_MAX).await?;
+        parse_http_scrape(&body, &tracker.info_hash)
     }
 
     async fn ev_loop(mut self) {
@@ -722,6 +882,14 @@ impl HttpAnnouncer {
                 _ = shutdown.cancelled() => break,
             };
             self.tracker.settle(event, announced).instrument(span).await;
+            if self.tracker.failures == 0 && self.tracker.wants_scrape() {
+                let span = self.tracker.scrape_span();
+                let scraped = tokio::select! {
+                    scraped = self.scrape().instrument(span.clone()) => scraped,
+                    _ = shutdown.cancelled() => break,
+                };
+                span.in_scope(|| self.tracker.record_scrape(scraped));
+            }
         }
         // BEP 3: send a courtesy event=stopped on graceful shutdown so the tracker drops us
         // immediately instead of waiting out the interval; best-effort, since we're on our
@@ -736,7 +904,6 @@ impl HttpAnnouncer {
 enum Action {
     Connect = 0,
     Announce = 1,
-    #[allow(dead_code)]
     Scrape = 2,
     Error = 3,
 }
@@ -828,7 +995,7 @@ async fn udp_connect(socket: &UdpSocket, attempts: u32) -> anyhow::Result<(i64, 
 /// a 4-byte-IP peer entry, with nothing like BEP 7's "peers"/"peers6" split; common tracker
 /// software returns 18-byte (16 IP + 2 port) entries when the announce arrived over IPv6, so
 /// `is_v6` is which family we reached the tracker over, not anything in the response.
-fn parse_udp_announce(reply: &[u8], is_v6: bool) -> anyhow::Result<(Vec<SocketAddr>, Duration)> {
+fn parse_udp_announce(reply: &[u8], is_v6: bool) -> anyhow::Result<Announced> {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, Default, KnownLayout, Unaligned)]
     #[repr(C)]
     struct AnnounceResponseHeader {
@@ -861,7 +1028,16 @@ fn parse_udp_announce(reply: &[u8], is_v6: bool) -> anyhow::Result<(Vec<SocketAd
             }
         })
         .collect();
-    Ok((peers, announce_interval(header.interval.get().into(), None)))
+    let count = |n: I32| u32::try_from(n.get()).ok();
+    Ok(Announced {
+        peers,
+        interval: announce_interval(header.interval.get().into(), None),
+        counts: SwarmCounts {
+            seeders: count(header.seeders),
+            leechers: count(header.leechers),
+            downloaded: None,
+        },
+    })
 }
 
 struct UdpAnnouncer {
@@ -942,7 +1118,7 @@ impl UdpAnnouncer {
 
     /// Performs a single announce, returning the peers and the interval until the next one.
     #[tracing::instrument(skip(self))]
-    async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<(Vec<SocketAddr>, Duration)> {
+    async fn announce(&mut self, event: AnnounceEvent) -> anyhow::Result<Announced> {
         if self.socket.is_none() {
             self.socket = Some(self.open().await?);
         }
@@ -1002,12 +1178,72 @@ impl UdpAnnouncer {
             announce.connection_id = connection_id.into();
             let wait = udp_retransmit_wait(n);
             if let Some(reply) = udp_exchange(socket, announce.as_bytes(), transaction_id, wait).await? {
-                let (peers, interval) = parse_udp_announce(&reply, is_v6)?;
-                debug!("Tracker [{}] announce returned {peers:?}", self.tracker.url);
-                return Ok((peers, interval));
+                let announced = parse_udp_announce(&reply, is_v6)?;
+                debug!("Tracker [{}] announce returned {:?}", self.tracker.url, announced.peers);
+                return Ok(announced);
             }
         }
         bail!("tracker didn't answer the announce after {UDP_TRACKER_ATTEMPTS} tries")
+    }
+
+    /// BEP 15 scrape: seeders, completed downloads and leechers for our info hash, over the
+    /// connection the announce left open.
+    async fn scrape(&mut self) -> anyhow::Result<SwarmCounts> {
+        let socket = self.socket.as_ref().context("not connected to the tracker")?;
+
+        #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+        #[repr(C)]
+        struct Scrape {
+            connection_id: I64,
+            action: I32,
+            transaction_id: I32,
+            info_hash: [u8; 20],
+        }
+
+        #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+        #[repr(C)]
+        struct ScrapeResponse {
+            action: I32,
+            transaction_id: I32,
+            seeders: I32,
+            completed: I32,
+            leechers: I32,
+        }
+
+        let transaction_id = rand::rng().random::<i32>();
+        let mut scrape = Scrape {
+            connection_id: 0.into(),
+            action: (Action::Scrape as i32).into(),
+            transaction_id: transaction_id.into(),
+            info_hash: self.tracker.info_hash.0,
+        };
+        for n in 0..UDP_TRACKER_ATTEMPTS {
+            let connection_id = match self.connection {
+                Some((id, at)) if at.elapsed() < UDP_CONNECTION_ID_TTL => id,
+                _ => {
+                    let connection = udp_connect(socket, UDP_TRACKER_ATTEMPTS).await?;
+                    self.connection = Some(connection);
+                    connection.0
+                }
+            };
+            scrape.connection_id = connection_id.into();
+            if let Some(reply) = udp_exchange(socket, scrape.as_bytes(), transaction_id, udp_retransmit_wait(n)).await?
+            {
+                let Ok((response, _)) = ScrapeResponse::ref_from_prefix(&reply) else {
+                    bail!("scrape response is too short");
+                };
+                if i32::from(response.action) != Action::Scrape as i32 {
+                    bail!("tracker answered scrape with action {}", i32::from(response.action));
+                }
+                let count = |n: I32| u32::try_from(n.get()).ok();
+                return Ok(SwarmCounts {
+                    seeders: count(response.seeders),
+                    leechers: count(response.leechers),
+                    downloaded: count(response.completed),
+                });
+            }
+        }
+        bail!("tracker didn't answer the scrape after {UDP_TRACKER_ATTEMPTS} tries")
     }
 
     async fn ev_loop(mut self) {
@@ -1024,6 +1260,14 @@ impl UdpAnnouncer {
                 self.connection = None;
             }
             self.tracker.settle(event, announced).instrument(span).await;
+            if self.tracker.failures == 0 && self.tracker.wants_scrape() {
+                let span = self.tracker.scrape_span();
+                let scraped = tokio::select! {
+                    scraped = self.scrape().instrument(span.clone()) => scraped,
+                    _ = shutdown.cancelled() => break,
+                };
+                span.in_scope(|| self.tracker.record_scrape(scraped));
+            }
         }
         // BEP 15: send a courtesy event=stopped on graceful shutdown so the tracker drops us
         // immediately instead of waiting out the interval; best-effort
@@ -1115,7 +1359,7 @@ mod test {
         body.extend_from_slice(b"6:peers618:");
         body.extend_from_slice(&[0; 15]);
         body.extend_from_slice(&[1, 0x1a, 0xe2]);
-        body.extend_from_slice(b"15:warning message2:hie");
+        body.extend_from_slice(b"15:warning message2:hi8:completei513e10:incompletei30ee");
         let response = parse_http_response(&body).unwrap();
         assert_eq!(
             response,
@@ -1123,6 +1367,11 @@ mod test {
                 peers: vec!["10.0.0.1:6881".parse().unwrap(), "[::1]:6882".parse().unwrap()],
                 interval: Duration::from_secs(900),
                 warning: Some("hi".into()),
+                counts: SwarmCounts {
+                    seeders: Some(513),
+                    leechers: Some(30),
+                    downloaded: None,
+                },
             }
         );
 
@@ -1132,18 +1381,51 @@ mod test {
     }
 
     #[test]
+    fn scrape_urls_and_responses() {
+        let hash = InfoHash([0x41; 20]);
+        let url = |s: &str| http_scrape_url(&Url::parse(s).unwrap(), &hash).map(|u| u.to_string());
+        assert_eq!(
+            url("https://torrent.ubuntu.com/announce").as_deref(),
+            Some("https://torrent.ubuntu.com/scrape?info_hash=AAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(
+            url("http://t.test/x/announce.php?passkey=k").as_deref(),
+            Some("http://t.test/x/scrape.php?passkey=k&info_hash=AAAAAAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(url("http://t.test/a"), None, "BEP 48: no 'announce' segment, no scrape");
+
+        let mut body = b"d5:filesd20:".to_vec();
+        body.extend_from_slice(&hash.0);
+        body.extend_from_slice(b"d8:completei5e10:downloadedi50e10:incompletei7eeee");
+        assert_eq!(
+            parse_http_scrape(&body, &hash).unwrap(),
+            SwarmCounts {
+                seeders: Some(5),
+                leechers: Some(7),
+                downloaded: Some(50),
+            }
+        );
+        assert!(parse_http_scrape(&body, &InfoHash([0; 20])).is_err(), "not our torrent");
+        assert!(parse_http_scrape(b"d14:failure reason4:nopee", &hash).is_err());
+    }
+
+    #[test]
     fn udp_announce_response_parsing() {
         let header = |action: i32, interval: i32| {
-            [action, 7, interval, 0, 0]
+            [action, 7, interval, 4, 12]
                 .iter()
                 .flat_map(|n| n.to_be_bytes())
                 .collect::<Vec<u8>>()
         };
         let mut reply = header(1, -30);
         reply.extend_from_slice(&[10, 0, 0, 1, 0x1a, 0xe1]);
-        let (peers, interval) = parse_udp_announce(&reply, false).unwrap();
-        assert_eq!(peers, ["10.0.0.1:6881".parse::<SocketAddr>().unwrap()]);
-        assert_eq!(interval, ANNOUNCE_INTERVAL_MIN);
+        let announced = parse_udp_announce(&reply, false).unwrap();
+        assert_eq!(announced.peers, ["10.0.0.1:6881".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(announced.interval, ANNOUNCE_INTERVAL_MIN);
+        assert_eq!(
+            (announced.counts.leechers, announced.counts.seeders),
+            (Some(4), Some(12))
+        );
         assert!(parse_udp_announce(&reply, true).is_err(), "6 bytes is no IPv6 peer");
         assert!(parse_udp_announce(&header(2, 60), false).is_err());
         assert!(parse_udp_announce(&reply[..10], false).is_err());
@@ -1309,9 +1591,9 @@ mod test {
         });
         let (events, _rx) = mpsc::channel(1);
         let mut announcer = UdpAnnouncer::new(url, &announcing(&events), (Arc::new(watch::channel(vec![]).0), 0));
-        let (peers, interval) = announcer.announce(AnnounceEvent::Started).await.unwrap();
-        assert_eq!(peers, ["10.0.0.1:6881".parse::<SocketAddr>().unwrap()]);
-        assert_eq!(interval, ANNOUNCE_INTERVAL_MIN);
+        let announced = announcer.announce(AnnounceEvent::Started).await.unwrap();
+        assert_eq!(announced.peers, ["10.0.0.1:6881".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(announced.interval, ANNOUNCE_INTERVAL_MIN);
         served.await.unwrap();
     }
 

@@ -35,6 +35,11 @@ export interface Tracker {
   error: string | null
   peers: number
   next_announce_secs: number | null
+  /** the swarm as this tracker counts it, null where it hasn't said */
+  seeders: number | null
+  leechers: number | null
+  /** times the torrent has been downloaded to completion */
+  downloaded: number | null
 }
 
 export interface TorrentFile {

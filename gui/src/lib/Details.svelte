@@ -25,6 +25,17 @@
     onpeer?: (addr: string) => void
   } = $props()
 
+  /** the biggest swarm any tracker reports; trackers see overlapping slices of it */
+  let swarm = $derived.by(() => {
+    if (!('trackers' in torrent)) return null
+    const counted = torrent.trackers.filter((t) => t.seeders !== null)
+    if (counted.length === 0) return null
+    const max = (pick: (t: (typeof counted)[number]) => number | null) =>
+      Math.max(...counted.map((t) => pick(t) ?? 0))
+    const downloaded = counted.some((t) => t.downloaded !== null) ? max((t) => t.downloaded) : null
+    return { seeders: max((t) => t.seeders), leechers: max((t) => t.leechers), downloaded }
+  })
+
   function toggleFile(index: number, checked: boolean) {
     if (torrent.kind !== 'downloading' && torrent.kind !== 'paused' && torrent.kind !== 'queued') return
     const selected = torrent.files.map((f) => f.selected)
@@ -75,6 +86,13 @@
       <dd class="tabular-nums"><Num value={torrent.left} format={humanBytesLike} /></dd>
       <dt class="font-medium">Total size</dt>
       <dd class="tabular-nums">{humanBytes(torrent.total_size)}</dd>
+      {#if swarm}
+        <dt class="font-medium">Swarm</dt>
+        <dd class="tabular-nums" title="the largest count any tracker reports">
+          <Num value={swarm.seeders} /> seeds · <Num value={swarm.leechers} /> leechers{#if swarm.downloaded !== null}
+            · <Num value={swarm.downloaded} /> downloads{/if}
+        </dd>
+      {/if}
     </dl>
 
     <div class="flex items-center gap-2">
@@ -117,6 +135,10 @@
                   title={trackerStatus(tracker)}>{trackerStatus(tracker)}</Table.Cell
                 >
                 <Table.Cell class="w-24 whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
+                <Table.Cell class="w-48 whitespace-nowrap text-muted-foreground tabular-nums" title="the swarm as this tracker counts it">
+                  {#if tracker.seeders !== null}{tracker.seeders} seeds · {tracker.leechers ?? '?'} leechers{/if}
+                  {#if tracker.downloaded !== null}· {tracker.downloaded} done{/if}
+                </Table.Cell>
                 <Table.Cell class="w-36 whitespace-nowrap text-muted-foreground tabular-nums">
                   {tracker.next_announce_secs === null ? '' : `next in ${Math.floor(tracker.next_announce_secs / 60)}m ${tracker.next_announce_secs % 60}s`}
                 </Table.Cell>

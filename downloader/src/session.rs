@@ -98,6 +98,11 @@ pub struct TrackerInfo {
     /// peers the last announce returned
     pub peers: usize,
     pub next_announce_secs: Option<u64>,
+    /// the swarm's size as this tracker counts it; `None` where it hasn't said
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    /// times the torrent has been downloaded to completion
+    pub downloaded: Option<u32>,
 }
 
 impl Progress {
@@ -1510,6 +1515,9 @@ fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
         next_announce_secs: status
             .next_announce
             .map(|at| at.saturating_duration_since(tokio::time::Instant::now()).as_secs()),
+        seeders: status.swarm.seeders,
+        leechers: status.swarm.leechers,
+        downloaded: status.swarm.downloaded,
     }
 }
 

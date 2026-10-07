@@ -20,12 +20,13 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 11 | PEX | `peer.rs`, `torrent_swarm.rs` (`run_pex_round`; random sample of 50 per round) |
 | 12 | Multitracker (`announce-list`) | `torrent.rs`, `announcer.rs` |
 | 14 | Local service discovery | `lsd.rs` |
-| 15 | UDP trackers (connect + announce; retransmits, connection-id expiry) | `announcer.rs` |
+| 15 | UDP trackers (connect, announce, scrape; retransmits, connection-id expiry) | `announcer.rs` |
 | 20 | Peer id convention (`-DL0100-` + random) | `defs.rs` (`random_peer_id`) |
 | 23 | Compact peer lists | `announcer.rs` |
 | 27 | Private torrents (no DHT/PEX/LSD for them) | `torrent.rs`, `torrent_swarm.rs`, `announcer.rs` |
 | 29 | uTP (via `librqbit-utp`; happy-eyeballs with TCP) | `utp.rs`, `stream.rs` |
 | 41 | UDP tracker extensions: we send an empty option list only | `announcer.rs` |
+| 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
 | MSE | Message stream encryption (not a BEP; the Vuze/libtorrent spec) | `mse.rs` |
 
@@ -41,7 +42,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 52 + 47 | BitTorrent v2 (SHA-256 Merkle trees, `piece layers`, `btmh` magnets) and padding files / file attributes | Hybrid v1+v2 torrents are increasingly common; without 47 we'd write pad files to disk. Big: per-file Merkle verification, hash requests (`hash request`/`hashes`/`hash reject` messages), v2 info hash in the handshake |
-| 48 + 15 scrape | Tracker scrape (seeds/leechers/completed) | Swarm size in the UI; cheap. The UDP `Scrape` action is only an enum value today |
 | 53 | Magnet `so=` (select only) | Small: map to `select_files` once metadata is in |
 | magnet `x.pe` | Peer addresses in a magnet | Small: hand to the swarm like any discovered peer |
 | 21 | Partial seeds (`upload_only` in the extended handshake) | Tell peers we're done with what we selected; don't count partial seeds as seeds |
