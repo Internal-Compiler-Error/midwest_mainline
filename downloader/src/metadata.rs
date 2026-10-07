@@ -851,6 +851,7 @@ mod test {
             web_seeds: vec![],
             peers: vec![],
             select_only: None,
+            feed: None,
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",
@@ -914,6 +915,7 @@ mod test {
             web_seeds: vec![],
             peers: vec![],
             select_only: None,
+            feed: None,
         };
         let identity = Arc::new(Identity {
             peer_id: *b"-TEST01-000000000000",

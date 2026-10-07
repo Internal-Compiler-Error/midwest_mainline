@@ -116,6 +116,15 @@ pub enum Event {
         info_hash: InfoHash,
         deleted_files: bool,
     },
+    /// BEP 46: the DHT key the torrent follows names a newer version at `seq`, which is added
+    /// as a torrent of its own; this one keeps seeding
+    TorrentUpdateFound {
+        #[serde(serialize_with = "hex")]
+        info_hash: InfoHash,
+        #[serde(serialize_with = "hex")]
+        update: InfoHash,
+        seq: i64,
+    },
 
     // -- peers
     PeersDiscovered {

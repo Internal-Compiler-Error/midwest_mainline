@@ -6,6 +6,7 @@ mod defs;
 pub mod dht;
 pub mod events;
 pub mod external;
+pub mod feed;
 mod layers;
 mod limiter;
 pub mod logs;

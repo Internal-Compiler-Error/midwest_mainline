@@ -4,6 +4,7 @@
 //! display name, and the tracker list. A magnet with no trackers is fine: the DHT finds its
 //! peers.
 
+use crate::feed::FeedKey;
 use anyhow::{bail, ensure};
 use midwest_mainline::types::InfoHash;
 use std::net::SocketAddr;
@@ -27,6 +28,9 @@ pub struct MagnetLink {
     pub peers: Vec<SocketAddr>,
     /// BEP 53 `so=`: the indices of the files to download; `None` for all of them
     pub select_only: Option<Vec<usize>>,
+    /// BEP 46 `xs=urn:btpk:` (and `s=`): the key whose DHT item names the torrent's newest
+    /// version; see `parse_feed` for a magnet that has only this
+    pub feed: Option<FeedKey>,
 }
 
 impl MagnetLink {
@@ -71,9 +75,43 @@ pub fn is_magnet_uri(s: &str) -> bool {
     s.trim_start().to_ascii_lowercase().starts_with("magnet:")
 }
 
-pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
+/// BEP 46: the key a magnet's `xs=urn:btpk:<64 hex>` names, with its `s=<hex>` salt, if it
+/// names one. Such a magnet needn't name a torrent itself, which `parse_magnet` requires.
+pub fn parse_feed(uri: &str) -> anyhow::Result<Option<FeedKey>> {
     let url = Url::parse(uri.trim())?;
     ensure!(url.scheme().eq_ignore_ascii_case("magnet"), "not a magnet URI");
+    let mut public = None;
+    let mut salt = vec![];
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "xs" => {
+                if let Some(rest) = strip_prefix_ignore_ascii_case(&value, "urn:btpk:")
+                    && public.is_none()
+                {
+                    ensure!(
+                        rest.len() == 64,
+                        "btpk public key must be 64 hex digits, got {}",
+                        rest.len()
+                    );
+                    public = Some(decode_hex::<32>(rest)?);
+                }
+            }
+            "s" => {
+                salt = crate::feed::unhex(&value)?;
+                ensure!(
+                    salt.len() <= midwest_mainline::dht::item::MAX_SALT,
+                    "a BEP 46 salt is at most 64 bytes"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(public.map(|public| FeedKey { public, salt }))
+}
+
+pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
+    let feed = parse_feed(uri)?;
+    let url = Url::parse(uri.trim())?;
 
     let mut info_hash = None;
     let mut info_hash_v2 = None;
@@ -108,7 +146,10 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     }
 
     let Some(info_hash) = info_hash.or(info_hash_v2.map(|v2| InfoHash::from_bytes(&v2[..20]))) else {
-        bail!("magnet URI has no `xt=urn:btih:` or `xt=urn:btmh:` info hash");
+        bail!(match feed {
+            Some(_) => "a BEP 46 magnet with no `xt` has to be resolved through the DHT first",
+            None => "magnet URI has no `xt=urn:btih:` or `xt=urn:btmh:` info hash",
+        });
     };
 
     Ok(MagnetLink {
@@ -119,7 +160,28 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
         web_seeds: crate::torrent::web_seed_urls(web_seeds.iter().map(|u| u.as_bytes())),
         peers,
         select_only,
+        feed,
     })
+}
+
+/// `uri` naming `version` in place of whatever `xt` it had, the rest kept as written
+pub fn with_version(uri: &str, version: &crate::feed::Version) -> String {
+    let uri = uri.trim();
+    let (head, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let is_topic = |part: &&str| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        key == "xt"
+            && (strip_prefix_ignore_ascii_case(value, "urn:btih:").is_some()
+                || strip_prefix_ignore_ascii_case(value, "urn:btmh:").is_some())
+    };
+    let mut parts = vec![format!("xt={}", version.exact_topic())];
+    parts.extend(
+        query
+            .split('&')
+            .filter(|part| !part.is_empty() && !is_topic(part))
+            .map(str::to_string),
+    );
+    format!("{head}?{}", parts.join("&"))
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -151,7 +213,7 @@ fn parse_multihash(raw: &str) -> anyhow::Result<[u8; 32]> {
     decode_hex(digest)
 }
 
-fn decode_hex<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
+pub(crate) fn decode_hex<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
     let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         let hi = hex_val(s.as_bytes()[i * 2])?;
@@ -335,6 +397,57 @@ mod test {
             ["https://mirror.test/pub/file name.iso", "http://other.test/"],
             "decoded, and only http(s)"
         );
+    }
+
+    #[test]
+    fn parses_bep_46_keys() {
+        let key = "8543d3e6115f0f98c944077a4493dcd543e49c739fd998550a1f614ab36ed63e";
+        let feed = parse_feed(&format!("magnet:?xs=urn:btpk:{key}&s=6e")).unwrap().unwrap();
+        assert_eq!(crate::feed::hex(&feed.public), key);
+        assert_eq!(feed.salt, b"n");
+        let unsalted = parse_feed(&format!("magnet:?xs=urn:BTPK:{}", key.to_uppercase()))
+            .unwrap()
+            .unwrap();
+        assert_eq!((unsalted.public, unsalted.salt.len()), (feed.public, 0));
+        assert_eq!(parse_feed(&format!("magnet:?xt=urn:btih:{HEX}")).unwrap(), None);
+
+        let only_key = format!("magnet:?xs=urn:btpk:{key}&dn=x&tr=udp%3A%2F%2Ft.test%3A1&so=1");
+        let err = parse_magnet(&only_key).unwrap_err();
+        assert!(err.to_string().contains("resolved through the DHT"), "{err}");
+        let both = parse_magnet(&format!("magnet:?xt=urn:btih:{HEX}&xs=urn:btpk:{key}")).unwrap();
+        assert_eq!(both.info_hash.0, expected_bytes());
+        assert_eq!(both.feed, Some(unsalted));
+
+        assert!(
+            parse_feed(&format!("magnet:?xs=urn:btpk:{}", &key[2..])).is_err(),
+            "short"
+        );
+        assert!(
+            parse_feed(&format!("magnet:?xs=urn:btpk:{key}&s=abc")).is_err(),
+            "odd salt"
+        );
+        assert!(
+            parse_feed(&format!("magnet:?xs=urn:btpk:{key}&s={}", "00".repeat(65))).is_err(),
+            "long salt"
+        );
+
+        // what a resolved key names goes in as the xt; everything else stays
+        let version = crate::feed::Version::v1(InfoHash(expected_bytes()));
+        let resolved = parse_magnet(&with_version(&only_key, &version)).unwrap();
+        assert_eq!(resolved.info_hash.0, expected_bytes());
+        assert_eq!(resolved.display_name.as_deref(), Some("x"));
+        assert_eq!(resolved.trackers, ["udp://t.test:1"]);
+        assert_eq!(resolved.select_only, Some(vec![1]));
+        assert_eq!(resolved.feed, Some(feed_of(&only_key)));
+        let stale = format!("magnet:?xt=urn:btih:{}&xs=urn:btpk:{key}", "00".repeat(20));
+        assert_eq!(
+            with_version(&stale, &version),
+            format!("magnet:?xt=urn:btih:{HEX}&xs=urn:btpk:{key}")
+        );
+    }
+
+    fn feed_of(uri: &str) -> FeedKey {
+        parse_feed(uri).unwrap().unwrap()
     }
 
     #[test]

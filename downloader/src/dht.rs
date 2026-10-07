@@ -82,6 +82,21 @@ impl DhtHandle {
     }
 }
 
+#[cfg(test)]
+impl DhtHandle {
+    /// A handle on one IPv4 node, for tests that run their own
+    pub(crate) fn of(session: Arc<DhtSession>) -> Self {
+        DhtHandle {
+            client: session.handle(),
+            client6: None,
+            udp_port: session.local_addr().port(),
+            udp_port6: None,
+            session,
+            session6: None,
+        }
+    }
+}
+
 pub type DhtWatch = watch::Receiver<Option<DhtHandle>>;
 
 /// Owns the running node; dropping it stops the node.

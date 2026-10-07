@@ -12,6 +12,7 @@
 //! and hash-verified, so the file is always a subset of what's on disk -- provided the target
 //! files are still the size they were, which `BtClient::add_torrent_resumed` checks.
 
+use crate::feed::{Feed, FeedKey};
 use crate::metadata::build_torrent_file_with;
 use crate::torrent::{Torrent, parse_torrent, swarm_info_hash};
 use crate::torrent_swarm::TorrentSwarmStats;
@@ -51,6 +52,8 @@ pub struct ResumeData {
     pub web_seeds: Vec<String>,
     /// BEP 52 piece layers (a bencoded dict), which the info dict doesn't hold
     pub piece_layers: Option<Vec<u8>>,
+    /// BEP 46: the DHT key the torrent updates through, and where in its history it is
+    pub feed: Option<Feed>,
 }
 
 /// The per-torrent switches the user flips, which live in the resume file.
@@ -76,6 +79,7 @@ impl ResumeData {
             uploaded: 0,
             web_seeds: torrent.web_seeds.clone(),
             piece_layers: torrent.piece_layers_bencoded(),
+            feed: None,
         }
     }
 
@@ -113,6 +117,25 @@ impl ResumeData {
 
         // keys in ascending order, as bencode requires
         let mut out = vec![b'd'];
+        if let Some(feed) = &self.feed {
+            out.extend_from_slice(&bstr(b"btpk"));
+            out.push(b'd');
+            out.extend_from_slice(&bstr(b"k"));
+            out.extend_from_slice(&bstr(&feed.key.public));
+            if !feed.key.salt.is_empty() {
+                out.extend_from_slice(&bstr(b"s"));
+                out.extend_from_slice(&bstr(&feed.key.salt));
+            }
+            if let Some(seq) = feed.seq {
+                out.extend_from_slice(&bstr(b"seq"));
+                out.extend_from_slice(format!("i{seq}e").as_bytes());
+            }
+            if let Some(seq) = feed.superseded {
+                out.extend_from_slice(&bstr(b"superseded"));
+                out.extend_from_slice(format!("i{seq}e").as_bytes());
+            }
+            out.push(b'e');
+        }
         out.extend_from_slice(&bstr(b"info"));
         out.extend_from_slice(&self.raw_info);
         if self.paused {
@@ -219,6 +242,12 @@ impl ResumeData {
             _ => vec![],
         };
 
+        let feed = match dict.remove(b"btpk".as_slice()) {
+            Some(BencodeItemView::Dictionary(feed)) => Some(decode_feed(&feed)?),
+            Some(_) => bail!("'btpk' must be a dict"),
+            None => None,
+        };
+
         let raw_info = raw_dict(bytes, b"info")?.context("missing 'info' dict")?;
         let piece_layers = raw_dict(bytes, b"piece layers")?;
 
@@ -250,6 +279,7 @@ impl ResumeData {
             super_seed,
             web_seeds,
             piece_layers,
+            feed,
         })
     }
 
@@ -268,6 +298,28 @@ impl ResumeData {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::decode(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
+}
+
+fn decode_feed(dict: &std::collections::BTreeMap<&[u8], BencodeItemView>) -> anyhow::Result<Feed> {
+    let Some(BencodeItemView::ByteString(public)) = dict.get(b"k".as_slice()) else {
+        bail!("'btpk' has no key");
+    };
+    let salt = match dict.get(b"s".as_slice()) {
+        Some(BencodeItemView::ByteString(salt)) => salt.to_vec(),
+        _ => vec![],
+    };
+    let int = |key: &[u8]| match dict.get(key) {
+        Some(BencodeItemView::Integer(n)) => Some(*n),
+        _ => None,
+    };
+    Ok(Feed {
+        key: FeedKey {
+            public: (*public).try_into().context("'btpk' key must be 32 bytes")?,
+            salt,
+        },
+        seq: int(b"seq"),
+        superseded: int(b"superseded"),
+    })
 }
 
 /// Replaces `path` with `bytes` by way of `tmp`, so that a crash leaves either the old file or
@@ -383,12 +435,13 @@ struct Saved {
     skip: Vec<u32>,
     modes: Modes,
     uploaded: u64,
+    feed: Option<Feed>,
 }
 
 impl Saved {
     /// Worth a write straight away, rather than only with the next round of counters.
     fn differs_beyond_counters(&self, other: &Saved) -> bool {
-        (&self.verified, &self.skip, self.modes) != (&other.verified, &other.skip, other.modes)
+        (&self.verified, &self.skip, self.modes, &self.feed) != (&other.verified, &other.skip, other.modes, &other.feed)
     }
 }
 
@@ -406,17 +459,20 @@ async fn save_every(
         mut modes,
         uploaded_before,
         mut persisted,
+        mut feed,
     } = inputs;
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
     let snapshot = |stats: &watch::Receiver<TorrentSwarmStats>,
                     selected: &watch::Receiver<Vec<bool>>,
-                    modes: &watch::Receiver<Modes>| {
+                    modes: &watch::Receiver<Modes>,
+                    feed: &watch::Receiver<Option<Feed>>| {
         let stats = stats.borrow();
         Saved {
             verified: stats.verified.clone(),
             skip: skipped(&selected.borrow()),
             modes: *modes.borrow(),
             uploaded: uploaded_before + stats.uploaded,
+            feed: feed.borrow().clone(),
         }
     };
     let save = async |saved: &Saved, persisted: &mut BitBox<u8, Msb0>| {
@@ -425,6 +481,7 @@ async fn save_every(
         data.sequential = saved.modes.sequential;
         data.super_seed = saved.modes.super_seed;
         data.uploaded = saved.uploaded;
+        data.feed = saved.feed.clone();
         let written = {
             let (torrent, path, had) = (torrent.clone(), path.clone(), persisted.clone());
             tokio::task::spawn_blocking(move || save_durably(&torrent, &path, data, &had)).await
@@ -436,7 +493,7 @@ async fn save_every(
         }
     };
 
-    let mut last = snapshot(&stats, &selected, &modes);
+    let mut last = snapshot(&stats, &selected, &modes, &feed);
     save(&last, &mut persisted).await;
     let mut last_write = tokio::time::Instant::now();
     // set while only the counters have changed since the last write
@@ -446,6 +503,8 @@ async fn save_every(
             changed = stats.changed() => if changed.is_err() { break },
             changed = selected.changed() => if changed.is_err() { break },
             changed = modes.changed() => if changed.is_err() { break },
+            // a feed nobody can change any more is just one that stays put
+            Ok(()) = feed.changed() => {}
             _ = tokio::time::sleep_until(counters_due.unwrap_or_else(tokio::time::Instant::now)),
                 if counters_due.is_some() => {}
             _ = shutdown.cancelled() => break,
@@ -458,7 +517,8 @@ async fn save_every(
         stats.mark_unchanged();
         selected.mark_unchanged();
         modes.mark_unchanged();
-        let now = snapshot(&stats, &selected, &modes);
+        feed.mark_unchanged();
+        let now = snapshot(&stats, &selected, &modes, &feed);
         if now.differs_beyond_counters(&last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters) {
             save(&now, &mut persisted).await;
             last = now;
@@ -468,7 +528,7 @@ async fn save_every(
             counters_due = Some(last_write + counters);
         }
     }
-    let now = snapshot(&stats, &selected, &modes);
+    let now = snapshot(&stats, &selected, &modes, &feed);
     if now != last {
         save(&now, &mut persisted).await;
     }
@@ -484,6 +544,8 @@ pub struct ResumeInputs {
     /// pieces already claimed by the resume file on disk, so known to be on disk themselves;
     /// anything verified beyond these gets its data flushed before the file claims it
     pub persisted: BitBox<u8, Msb0>,
+    /// BEP 46, see `ResumeData::feed`
+    pub feed: watch::Receiver<Option<Feed>>,
 }
 
 /// What a front end needs to list a resume file without loading the whole thing into a client.
@@ -681,6 +743,33 @@ mod test {
         assert_eq!(decoded.skip, vec![0, 2]);
         assert_eq!(decoded.selected(4), vec![false, true, false, true]);
         assert_eq!(decoded.uploaded, 123_456);
+
+        let following = ResumeData {
+            feed: Some(Feed {
+                key: FeedKey {
+                    public: [9; 32],
+                    salt: b"salt".to_vec(),
+                },
+                seq: Some(41),
+                superseded: Some(42),
+            }),
+            ..skipping.clone()
+        };
+        assert_eq!(ResumeData::decode(&following.encode()).unwrap(), following);
+        let unsalted = ResumeData {
+            feed: Some(Feed {
+                key: FeedKey {
+                    public: [9; 32],
+                    salt: vec![],
+                },
+                seq: None,
+                superseded: None,
+            }),
+            ..skipping.clone()
+        };
+        let encoded = unsalted.encode();
+        assert!(midwest_mainline::dht::item::is_canonical_bencode(&encoded));
+        assert_eq!(ResumeData::decode(&encoded).unwrap(), unsalted);
 
         let mut seeded = torrent.clone();
         seeded.web_seeds = vec!["https://m.test/pub/".to_string()];
@@ -894,6 +983,7 @@ mod test {
                 modes: modes_rx,
                 uploaded_before: 1000,
                 persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
+                feed: watch::channel(None).1,
             },
             dir.clone(),
             shutdown.clone(),
@@ -980,6 +1070,7 @@ mod test {
                 modes: modes_rx,
                 uploaded_before: 0,
                 persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
+                feed: watch::channel(None).1,
             },
             dir.join("nested"),
             shutdown.clone(),

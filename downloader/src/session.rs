@@ -12,6 +12,7 @@ use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::Dht;
 use crate::events::{Event, EventBus, Events, info_hash_hex};
+use crate::feed::{Feed, FeedKey, Found};
 use crate::peer::PeerSnapshot;
 use crate::portmap::MappingState;
 use crate::resume::{
@@ -92,6 +93,8 @@ pub struct Progress {
     pub super_seed: bool,
     /// the trackers and the DHT; empty while paused
     pub trackers: Vec<TrackerInfo>,
+    /// BEP 46: the DHT key it updates through, if it does
+    pub feed: Option<Feed>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +181,12 @@ struct Resolved {
     /// bytes uploaded in earlier sessions
     uploaded: u64,
     modes: Modes,
+    /// BEP 46: the key it follows
+    feed: Option<Feed>,
+    /// hash the files before starting (an update that reuses its predecessor's)
+    check_first: bool,
+    /// it has been away a while (resumed), so its key is polled soon rather than in an hour
+    poll_soon: bool,
 }
 
 /// The task that owns one torrent for its whole life in the session: resolves the source,
@@ -212,6 +221,18 @@ struct TorrentTask {
     uploaded_before: u64,
     /// the bitfield the resume file on disk holds, see `ResumeInputs::persisted`
     persisted: BitBox<u8, Msb0>,
+    /// BEP 46, read by the resume saver and the session's entry
+    feed: watch::Sender<Option<Feed>>,
+    /// where a followed key's newer version goes, for the session to add
+    updates: mpsc::UnboundedSender<FeedUpdate>,
+}
+
+/// A newer version of a torrent that follows a DHT key (BEP 46), for the session to add.
+struct FeedUpdate {
+    previous: Arc<Torrent>,
+    root: PathBuf,
+    key: FeedKey,
+    found: Found,
 }
 
 type Claimed = Arc<std::sync::Mutex<HashSet<InfoHash>>>;
@@ -304,7 +325,7 @@ impl TorrentTask {
             resolved
         });
 
-        let mut recheck_first = false;
+        let mut recheck_first = resolved.as_ref().is_ok_and(|r| r.check_first);
         loop {
             let (error, owned) = match resolved {
                 Err(e) => (format!("{e:#}"), Owned::Unresolved),
@@ -357,6 +378,9 @@ impl TorrentTask {
                 sequential: data.sequential,
                 super_seed: data.super_seed,
             },
+            feed: data.feed,
+            check_first: false,
+            poll_soon: true,
         })
     }
 
@@ -373,8 +397,13 @@ impl TorrentTask {
             selected,
             uploaded,
             modes,
+            feed,
+            check_first: _,
+            poll_soon,
         } = resolved;
         let torrent = Arc::new(torrent);
+        self.feed.send_replace(feed);
+        let _follower = self.follow(&torrent, &root, poll_soon);
         self.persisted = match resumed {
             true => verified.clone(),
             false => bitvec![u8, Msb0; 0; verified.len()].into_boxed_bitslice(),
@@ -636,6 +665,7 @@ impl TorrentTask {
                 modes: self.modes.subscribe(),
                 uploaded_before: self.uploaded_before,
                 persisted: self.persisted.clone(),
+                feed: self.feed.subscribe(),
             },
             self.resume_dir.clone(),
             stop_saving.clone(),
@@ -781,6 +811,57 @@ impl TorrentTask {
         }
     }
 
+    /// Polls the key the torrent follows (BEP 46), if it follows one, until it names a newer
+    /// version, which goes to the session to add; this torrent is marked superseded then and
+    /// only seeds. Stops when the returned guard is dropped.
+    fn follow(&self, torrent: &Arc<Torrent>, root: &Path, soon: bool) -> Option<tokio_util::sync::DropGuard> {
+        let feed = self.feed.borrow().clone().filter(|f| f.superseded.is_none())?;
+        let stop = CancellationToken::new();
+        let (dht, feed_tx, updates, bus) = (
+            self.client.dht(),
+            self.feed.clone(),
+            self.updates.clone(),
+            self.bus.clone(),
+        );
+        let (torrent, root) = (torrent.clone(), root.to_path_buf());
+        let follow = async move {
+            let set = {
+                let feed_tx = feed_tx.clone();
+                move |feed| {
+                    feed_tx.send_replace(Some(feed));
+                }
+            };
+            let schedule = crate::feed::Schedule::standard(!soon);
+            let found = crate::feed::follow(dht, feed_tx.subscribe(), set, torrent.info_hash, schedule).await?;
+            tracing::info!(
+                "{}: its BEP 46 key {} is at seq {} now, naming {}; adding that",
+                torrent.name,
+                feed.key.public_hex(),
+                found.seq,
+                found.version.info_hash
+            );
+            bus.emit(Event::TorrentUpdateFound {
+                info_hash: torrent.info_hash,
+                update: found.version.info_hash,
+                seq: found.seq,
+            });
+            feed_tx.send_modify(|feed| {
+                if let Some(feed) = feed {
+                    feed.superseded = Some(found.seq);
+                }
+            });
+            let _ = updates.send(FeedUpdate {
+                previous: torrent,
+                root,
+                key: feed.key,
+                found,
+            });
+            Some(())
+        };
+        tokio::spawn(stop.clone().run_until_cancelled_owned(follow));
+        Some(stop.drop_guard())
+    }
+
     /// Complete, with a ratio limit set, and uploaded that many times its size over its life.
     fn seeded_enough(&self, torrent: &Torrent, stats: &TorrentSwarmStats) -> bool {
         let limit = self.settings.borrow().seed_ratio_limit;
@@ -831,6 +912,8 @@ impl TorrentTask {
         data.sequential = modes.sequential;
         data.super_seed = modes.super_seed;
         data.uploaded = self.uploaded_before;
+        data.feed = self.feed.borrow().clone();
+        let mut feed = self.feed.subscribe();
         let written = {
             let (torrent, persisted) = (torrent.clone(), self.persisted.clone());
             let path = self.resume_dir.join(ResumeData::file_name(&torrent.info_hash));
@@ -864,6 +947,8 @@ impl TorrentTask {
                     Some(Command::Pause) => {}
                     None => break Stop::Shutdown,
                 },
+                // the key moved on while paused: the resume file should say so
+                Ok(()) = feed.changed() => break Stop::Pause,
             }
         };
         Ok((stop, Some(stats)))
@@ -950,6 +1035,7 @@ struct Entry {
     rates: Rates,
     /// per-peer rate samples, dropped for peers that went away
     peer_rates: HashMap<std::net::SocketAddr, Rates>,
+    feed: watch::Receiver<Option<Feed>>,
 }
 
 pub struct Session {
@@ -978,6 +1064,8 @@ pub struct Session {
     settings: watch::Sender<Settings>,
     /// the exclusive lock on `<data dir>/lock`, held until shutdown
     lock: Option<File>,
+    /// newer versions of torrents that follow a DHT key, added by `torrents`
+    updates: (mpsc::UnboundedSender<FeedUpdate>, mpsc::UnboundedReceiver<FeedUpdate>),
 }
 
 /// `Session::new`'s error when another session, in this process or another (the GUI and the
@@ -1106,6 +1194,7 @@ impl Session {
             data_dir: config.data_dir,
             settings: settings_tx,
             lock,
+            updates: mpsc::unbounded_channel(),
         })
     }
 
@@ -1133,6 +1222,25 @@ impl Session {
         Ok(())
     }
 
+    /// BEP 46: points `signing`'s DHT item under `salt` at `version`, so whoever follows the
+    /// key moves on to it. Waits for the DHT node (up to `wait`), so it blocks; not to be called
+    /// on an async runtime.
+    pub fn publish_update(
+        &self,
+        signing: &midwest_mainline::dht::item::SigningKey,
+        salt: &[u8],
+        version: &crate::feed::Version,
+        wait: Duration,
+    ) -> anyhow::Result<crate::feed::Published> {
+        let dht = self.client.dht();
+        self.handle.block_on(async {
+            let clients = tokio::time::timeout(wait, crate::feed::clients(dht))
+                .await
+                .map_err(|_| anyhow::anyhow!("the DHT node wasn't up after {}s", wait.as_secs()))??;
+            crate::feed::publish(&clients, signing, salt, version).await
+        })
+    }
+
     /// Where this session writes resume files.
     pub fn resume_dir(&self) -> &Path {
         &self.resume_dir
@@ -1149,6 +1257,9 @@ impl Session {
         let dht = self.client.dht();
         let utp = self.client.utp();
         let bus = self.events.clone();
+        if let Ok(Some(key)) = crate::magnet::parse_feed(&source) {
+            return self.add_feed(source, key, root);
+        }
         let magnet = crate::magnet::parse_magnet(&source).ok();
         let info_hash = magnet.as_ref().map(|m| m.info_hash);
         self.launch(source.clone(), info_hash, None, |cancel| async move {
@@ -1165,8 +1276,108 @@ impl Session {
                 peers: loaded.peers,
                 uploaded: 0,
                 modes: Modes::default(),
+                feed: None,
+                check_first: false,
+                poll_soon: false,
             })
         })
+    }
+
+    /// `add` for a BEP 46 magnet: the torrent is whatever the key's DHT item names (or the
+    /// magnet's own `xt` while the DHT has nothing), and it follows the key from then on.
+    fn add_feed(&mut self, source: String, key: FeedKey, root: PathBuf) -> TorrentId {
+        let identity = self.identity.clone();
+        let dht = self.client.dht();
+        let utp = self.client.utp();
+        let bus = self.events.clone();
+        let fallback = crate::magnet::parse_magnet(&source).ok().map(|m| crate::feed::Version {
+            info_hash: m.info_hash,
+            info_hash_v2: m.info_hash_v2,
+        });
+        // the key decides which torrent this is, so nothing is claimed before it has
+        self.launch(source.clone(), None, None, move |cancel| async move {
+            let (found, version) = crate::feed::resolve(dht.clone(), &key, fallback, cancel.clone()).await?;
+            let magnet_uri = crate::magnet::with_version(&source, &version);
+            let magnet = crate::magnet::parse_magnet(&magnet_uri)?;
+            let loaded = load_source(&magnet_uri, identity, cancel, dht, utp, bus).await?;
+            let files = loaded.torrent.files.len();
+            Ok(Resolved {
+                selected: magnet.selection(files),
+                verified: bitvec![u8, Msb0; 0; loaded.torrent.num_pieces()].into_boxed_bitslice(),
+                torrent: loaded.torrent,
+                root,
+                resumed: false,
+                paused: false,
+                peers: loaded.peers,
+                uploaded: 0,
+                modes: Modes::default(),
+                feed: Some(Feed {
+                    key,
+                    seq: found.map(|f| f.seq),
+                    superseded: None,
+                }),
+                check_first: false,
+                poll_soon: false,
+            })
+        })
+    }
+
+    /// Adds the newer version a followed key named, next to its predecessor (in a directory of
+    /// its own if the names clash), starting from whichever of the predecessor's files it
+    /// shares. Nothing happens if the session has it already.
+    fn add_update(&mut self, update: FeedUpdate) -> Option<TorrentId> {
+        let FeedUpdate {
+            previous,
+            root,
+            key,
+            found,
+        } = update;
+        let info_hash = found.version.info_hash;
+        if self.torrents.values().any(|e| e.info_hash() == Some(info_hash)) {
+            tracing::info!("{info_hash}, the BEP 46 update of {}, is here already", previous.name);
+            return None;
+        }
+        let source = crate::feed::magnet_uri(
+            &key,
+            Some(&found.version),
+            Some(&previous.name),
+            &previous.all_trackers(),
+        );
+        let identity = self.identity.clone();
+        let dht = self.client.dht();
+        let utp = self.client.utp();
+        let bus = self.events.clone();
+        let feed = Feed {
+            key,
+            seq: Some(found.seq),
+            superseded: None,
+        };
+        Some(
+            self.launch(source.clone(), Some(info_hash), None, move |cancel| async move {
+                let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
+                let torrent = loaded.torrent;
+                let seq = found.seq;
+                let (torrent, root, reused) = tokio::task::spawn_blocking(move || {
+                    let (root, reused) = place_update(&previous, &root, &torrent, seq)?;
+                    anyhow::Ok((torrent, root, reused))
+                })
+                .await??;
+                Ok(Resolved {
+                    selected: vec![true; torrent.files.len()],
+                    verified: bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice(),
+                    torrent,
+                    root,
+                    resumed: reused,
+                    paused: false,
+                    peers: loaded.peers,
+                    uploaded: 0,
+                    modes: Modes::default(),
+                    feed: Some(feed),
+                    check_first: reused,
+                    poll_soon: false,
+                })
+            }),
+        )
     }
 
     /// Picks a download back up from a resume file (see `ResumeData`), in the root it was
@@ -1200,6 +1411,9 @@ impl Session {
                         sequential: data.sequential,
                         super_seed: data.super_seed,
                     },
+                    feed: data.feed,
+                    check_first: false,
+                    poll_soon: true,
                 })
             },
         )
@@ -1303,6 +1517,7 @@ impl Session {
             started: Instant::now(),
         });
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let feed = watch::channel(None).0;
         self.torrents.insert(
             id,
             Entry {
@@ -1312,6 +1527,7 @@ impl Session {
                 commands: commands_tx,
                 rates: Rates::new(),
                 peer_rates: HashMap::new(),
+                feed: feed.subscribe(),
             },
         );
 
@@ -1332,6 +1548,8 @@ impl Session {
             settings: self.settings.subscribe(),
             uploaded_before: 0,
             persisted: BitBox::default(),
+            feed,
+            updates: self.updates.0.clone(),
         };
         // a session that runs for weeks sees many torrents come and go
         self.tasks.retain(|task| !task.is_finished());
@@ -1358,7 +1576,12 @@ impl Session {
     }
 
     /// The current state of every torrent, ready to render. Cheap enough to call every frame.
+    ///
+    /// Also where the newer versions that followed DHT keys found (BEP 46) join the session.
     pub fn torrents(&mut self) -> Vec<(TorrentId, TorrentState)> {
+        while let Ok(update) = self.updates.1.try_recv() {
+            self.add_update(update);
+        }
         self.torrents
             .iter_mut()
             .map(|(id, entry)| (*id, entry.state()))
@@ -1455,6 +1678,7 @@ impl Entry {
                 progress.uploaded += uploaded_before;
                 progress.peers = self.peers(&peers.borrow());
                 progress.trackers = trackers.borrow().iter().map(tracker_info).collect();
+                progress.feed = self.feed.borrow().clone();
                 TorrentState::Downloading(progress)
             }
             Phase::Paused {
@@ -1484,6 +1708,7 @@ impl Entry {
                     &self.rates,
                 );
                 progress.uploaded += uploaded_before;
+                progress.feed = self.feed.borrow().clone();
                 if queued {
                     TorrentState::Queued(progress)
                 } else {
@@ -1566,7 +1791,71 @@ fn progress(
         sequential: modes.sequential,
         super_seed: modes.super_seed,
         trackers: vec![],
+        feed: None,
     }
+}
+
+/// Where a BEP 46 update of `previous` (whose files are under `root`) goes: `root` too, unless
+/// that already holds something by its name (its predecessor's files, most likely, which the
+/// update would write its own pieces over while they seed). Then a directory of its own
+/// beside them, `<name> (seq
+/// N)`. The predecessor's files the update has too, same path and size, are copied over
+/// (a clone on APFS and the like) and the rest laid down empty, for a check to sort out what
+/// is still good; returns whether any were.
+fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) -> std::io::Result<(PathBuf, bool)> {
+    let top = torrent.top_level();
+    let mut new_root = root.to_path_buf();
+    let mut attempt = 1;
+    while new_root.join(&top).exists() {
+        let suffix = if attempt == 1 {
+            format!("(seq {seq})")
+        } else {
+            format!("(seq {seq}, {attempt})")
+        };
+        new_root = root.join(format!("{} {suffix}", top.display()));
+        attempt += 1;
+    }
+
+    let real = |t: &Torrent| -> HashMap<PathBuf, u64> {
+        t.files
+            .iter()
+            .zip(&t.attrs)
+            .filter(|(_, attr)| !attr.virtual_file())
+            .map(|((size, path), _)| (path.clone(), *size))
+            .collect()
+    };
+    let before = real(previous);
+    let wanted = real(torrent);
+    let mut reused = false;
+    for (path, size) in &wanted {
+        let from = root.join(path);
+        if before.get(path) == Some(size) && std::fs::metadata(&from).is_ok_and(|m| m.len() == *size) {
+            let to = new_root.join(path);
+            if let Some(dir) = to.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::copy(&from, &to)?;
+            reused = true;
+        }
+    }
+    if reused {
+        for (path, size) in &wanted {
+            let to = new_root.join(path);
+            if !to.exists() {
+                if let Some(dir) = to.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::File::create(&to)?.set_len(*size)?;
+            }
+        }
+        tracing::info!(
+            "{}: starting from the files it shares with {}, in {}",
+            torrent.name,
+            previous.name,
+            new_root.display()
+        );
+    }
+    Ok((new_root, reused))
 }
 
 fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
@@ -1753,6 +2042,7 @@ mod test {
             sequential: false,
             super_seed: false,
             trackers: vec![],
+            feed: None,
         };
         // a zero-piece torrent must not divide by zero
         assert_eq!(p.fraction(), 0.0);
@@ -2250,24 +2540,153 @@ mod test {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Adding a torrent over the data it describes (as its creator does to seed it) keeps
-    /// that data and finds every piece, rather than starting over on an emptied file.
+    /// The DHT key a torrent follows (BEP 46) is in its resume file, and still is after a
+    /// restart, a pause, and a shutdown; Progress shows it.
     #[test]
-    fn adding_a_torrent_over_its_data_seeds_it() {
-        let dir = scratch("over-data");
+    fn a_followed_key_survives_a_restart() {
+        let dir = scratch("feed");
         let torrent_file = write_torrent_file(&dir);
-        let downloads = dir.join("downloads");
-        std::fs::create_dir_all(&downloads).unwrap();
-        std::fs::write(downloads.join("session.bin"), [7u8; 40]).unwrap();
         let mut session = Session::new(test_config(&dir)).unwrap();
-        let id = session.add(torrent_file.display().to_string(), downloads.clone());
+        let id = session.add(torrent_file.display().to_string(), dir.join("downloads"));
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.shutdown();
+
+        let path = list_resume_files(&dir.join("resume"))[0].path.clone();
+        let feed = Feed {
+            key: FeedKey {
+                public: [4; 32],
+                salt: b"x".to_vec(),
+            },
+            seq: Some(7),
+            superseded: None,
+        };
+        let mut data = ResumeData::read(&path).unwrap();
+        data.feed = Some(feed.clone());
+        data.write(&path).unwrap();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.resume_all()[0];
         wait_for(
             &mut session,
             id,
-            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.completed && p.verified_pieces == 3),
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.feed.as_ref() == Some(&feed)),
         );
-        assert_eq!(std::fs::read(downloads.join("session.bin")).unwrap(), [7u8; 40]);
+        session.pause(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.feed.as_ref() == Some(&feed)),
+        );
         session.shutdown();
+        assert_eq!(ResumeData::read(&path).unwrap().feed, Some(feed));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_only_magnet_needs_the_dht() {
+        let dir = scratch("feed-no-dht");
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(
+            format!("magnet:?xs=urn:btpk:{}", "ab".repeat(32)),
+            dir.join("downloads"),
+        );
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Failed { error, .. }) if error.contains("needs the DHT")),
+        );
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A newer version a key names joins the session as an entry of its own, once
+    #[test]
+    fn an_update_is_added_unless_already_there() {
+        let dir = scratch("update");
+        let torrent_file = write_torrent_file(&dir);
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), dir.join("downloads"));
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        let previous = Arc::new(crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap());
+        let signing = midwest_mainline::dht::item::SigningKey::from_bytes(&[1; 32]);
+        let update = |info_hash: InfoHash| {
+            let version = crate::feed::Version::v1(info_hash);
+            let value = crate::feed::item_value(&version);
+            FeedUpdate {
+                previous: previous.clone(),
+                root: dir.join("downloads"),
+                key: FeedKey::of(&signing, b""),
+                found: Found {
+                    seq: 2,
+                    version,
+                    item: midwest_mainline::dht::item::MutableItem {
+                        key: signing.verifying_key().to_bytes(),
+                        salt: vec![],
+                        seq: 2,
+                        sig: midwest_mainline::dht::item::sign(&signing, b"", 2, &value),
+                        value,
+                    },
+                },
+            }
+        };
+        session.updates.0.send(update(previous.info_hash)).unwrap();
+        assert_eq!(session.torrents().len(), 1, "the session has that one already");
+
+        session.updates.0.send(update(InfoHash([5; 20]))).unwrap();
+        let torrents = session.torrents();
+        assert_eq!(torrents.len(), 2);
+        let (_, added) = &torrents[1];
+        let source = match added {
+            TorrentState::Resolving { source, .. } | TorrentState::Failed { source, .. } => source,
+            other => panic!("{other:?}"),
+        };
+        assert!(source.contains(&format!("xt=urn:btih:{}", "05".repeat(20))), "{source}");
+        assert!(source.contains("xs=urn:btpk:"), "{source}");
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An update whose name is taken goes beside it, starting from the files it shares
+    #[test]
+    fn an_update_starts_from_its_predecessors_files() {
+        use crate::torrent::fixtures;
+        let dir = scratch("place-update");
+        let torrent = |files: &[(&[&str], Vec<u8>)]| {
+            let info = fixtures::info("pkg", &fixtures::sorted(files), 16384, false);
+            crate::parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap()
+        };
+        let old = torrent(&[(&["same"], vec![1; 10]), (&["gone"], vec![2; 5])]);
+        let new = torrent(&[(&["same"], vec![1; 10]), (&["added"], vec![3; 7])]);
+        for (size, path) in &old.files {
+            std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(path), vec![9; *size as usize]).unwrap();
+        }
+
+        let (root, reused) = place_update(&old, &dir, &new, 2).unwrap();
+        assert!(reused);
+        assert_eq!(root, dir.join("pkg (seq 2)"));
+        assert_eq!(
+            std::fs::read(root.join("pkg/same")).unwrap(),
+            [9; 10],
+            "copied as it was"
+        );
+        assert_eq!(std::fs::metadata(root.join("pkg/added")).unwrap().len(), 7);
+        assert!(!root.join("pkg/gone").exists());
+        assert_eq!(
+            std::fs::read(dir.join("pkg/same")).unwrap(),
+            [9; 10],
+            "the old one untouched"
+        );
+
+        let (again, _) = place_update(&old, &dir, &new, 2).unwrap();
+        assert_eq!(again, dir.join("pkg (seq 2, 2)"), "never on top of anything");
+
+        let unrelated = crate::parse_torrent(&crate::metadata::build_torrent_file(
+            &fixtures::info("other", &[(&["f"], vec![1; 3])], 16384, false),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(place_update(&old, &dir, &unrelated, 3).unwrap(), (dir.clone(), false));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
