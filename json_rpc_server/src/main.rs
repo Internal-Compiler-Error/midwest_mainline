@@ -212,6 +212,12 @@ fn set_up_tracing() {
         .init();
 }
 
+/// Where the JSON-RPC listens: `RPC_ADDR`, else loopback, as what it offers (puts, lookups on
+/// demand, the store's whole contents) is for the machine's own use
+fn rpc_addr(configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| "127.0.0.1:3000".to_string())
+}
+
 #[derive(Clone)]
 struct AppState {
     pub dht: Arc<DhtSession>,
@@ -226,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
     set_up_tracing();
 
     let dht_port: u16 = env::var("DHT_PORT").map_or(Ok(44444), |p| p.parse())?;
-    let rpc_addr = env::var("RPC_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let rpc_addr = rpc_addr(env::var("RPC_ADDR").ok());
     let database_url = env::var("DATABASE_URL").map_err(|_| anyhow!("DATABASE_URL is not set"))?;
     let dht_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], dht_port))).await?;
     // DHT_RETENTION=forever keeps every announced peer, making this node a long-term index
@@ -319,6 +325,12 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rpc_listens_on_loopback_unless_told_otherwise() {
+        assert_eq!(rpc_addr(None), "127.0.0.1:3000");
+        assert_eq!(rpc_addr(Some("0.0.0.0:3001".to_string())), "0.0.0.0:3001");
+    }
 
     #[test]
     fn a_result_and_an_error_are_json_rpc_2s_shapes() {
