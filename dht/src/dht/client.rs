@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::dht::bep42;
 use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
@@ -74,7 +75,7 @@ struct Heard {
 pub struct GetPeersResult {
     /// every peer contact found for the info hash
     pub peers: Vec<SocketAddr>,
-    /// nodes that issued us a token and will accept an announce_peer from us
+    /// the closest nodes that issued us a token and will accept an announce_peer from us
     pub announce_candidates: Vec<(NodeInfo, Token)>,
 }
 
@@ -186,6 +187,7 @@ impl DhtClient {
         // nodes that answered usefully, closest first; the lookup is done when nothing
         // unqueried is closer than the LOOKUP_K-th of these
         let mut answered: Vec<NodeInfo> = vec![];
+        let mut noncompliant = 0;
         let mut in_flight = FuturesUnordered::new();
         // queries still within SLOW_REPLY; the slower ones stay in flight but free their slot
         let mut prompt: Vec<NodeInfo> = vec![];
@@ -232,7 +234,11 @@ impl DhtClient {
                     if done {
                         break;
                     }
-                    if useful {
+                    // BEP 42: a node whose id doesn't match its address has no say in when the
+                    // lookup is done; it can still refer us to others
+                    if useful && !bep42::compliant(&node.id(), node.end_point().ip()) {
+                        noncompliant += 1;
+                    } else if useful {
                         let at = answered.partition_point(|a| by_distance(a, &node).is_lt());
                         answered.insert(at, node);
                     }
@@ -257,6 +263,11 @@ impl DhtClient {
                 Err(_) => self.state.routing_table.mark_failed(&node.id()),
             }
         }
+        debug!(
+            "lookup of {target:?} done: {} queried, {} answered with BEP 42 ids, {noncompliant} without",
+            queried.len(),
+            answered.len()
+        );
         answered
     }
 
@@ -346,6 +357,15 @@ impl DhtClient {
 
         peers.sort_unstable();
         peers.dedup();
+        // announces go where lookups look: the k closest that gave us a token, BEP 42 compliant
+        // ones first (BEP 42 would have nothing stored on the others)
+        announce_candidates.sort_by_cached_key(|(node, _)| {
+            (
+                !bep42::compliant(&node.id(), node.end_point().ip()),
+                node.id().dist(&NodeId(info_hash.0)),
+            )
+        });
+        announce_candidates.truncate(LOOKUP_K);
 
         Ok(GetPeersResult {
             peers,

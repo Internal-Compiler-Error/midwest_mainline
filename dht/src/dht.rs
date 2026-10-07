@@ -20,6 +20,7 @@
 //! database (the routing tables are kept apart by family, the announced peers are shared),
 //! and pairs them with [`DhtSession::pair_with`] so each can seed and answer for the other.
 
+pub mod bep42;
 pub mod client;
 mod external_ip;
 pub mod routing_table;
@@ -49,7 +50,7 @@ use futures::stream::FuturesUnordered;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use routing_table::RoutingTable;
 use rpc_manager::RpcManager;
 use std::{
@@ -123,55 +124,13 @@ define_sql_function! {
     fn xor(x: sql_types::Binary, y: sql_types::Binary) -> sql_types::Binary;
 }
 
-/// A BEP 42 node id: the top 21 bits are the CRC32C of the masked IP (so the id is verifiably
-/// tied to the IP and hard to choose freely), the rest is random except the last byte, which
-/// repeats the random `rand` mixed into the CRC input.
-fn bep42_id(masked_ip: &mut [u8], rand: u8) -> NodeId {
-    let mut rng = rand::rng();
-    let r = rand & 0x07;
-    let mut id = [0u8; 20];
-
-    masked_ip[0] |= r << 5;
-    let crc = crc32c::crc32c(masked_ip);
-
-    id[0] = (crc >> 24) as u8;
-    id[1] = (crc >> 16) as u8;
-    id[2] = (((crc >> 8) & 0xf8) as u8) | (rng.random::<u8>() & 0x7);
-
-    rng.fill_bytes(&mut id[3..19]);
-
-    id[19] = rand;
-
-    NodeId(id)
-}
-
-/// A BEP 42 node id for our external IPv4 address
-fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
-    let mut ip = external_ip.octets();
-    for (ip, mask) in ip.iter_mut().zip([0x03, 0x0f, 0x3f, 0xff]) {
-        *ip &= mask;
-    }
-    bep42_id(&mut ip, rand)
-}
-
-/// A BEP 42 node id for our external IPv6 address: the CRC covers its first 64 bits, under
-/// IPv6's own mask
-fn random_idv6(external_ip: &Ipv6Addr, rand: u8) -> NodeId {
-    let mut ip: [u8; 8] = external_ip.octets()[..8].try_into().unwrap();
-    for (ip, mask) in ip.iter_mut().zip([0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff]) {
-        *ip &= mask;
-    }
-    bep42_id(&mut ip, rand)
-}
-
 /// The node id for `public_ip`: BEP 42's when the address is known; an IPv6 node that doesn't
 /// know its address yet gets a random one (an IPv4 one gets 0.0.0.0's, as it always has).
 fn mint_id(public_ip: IpAddr) -> NodeId {
     let rand = rand::rng().random::<u8>();
     match public_ip {
-        IpAddr::V4(ip) => random_idv4(&ip, rand),
         IpAddr::V6(ip) if ip.is_unspecified() => NodeId(rand::rng().random()),
-        IpAddr::V6(ip) => random_idv6(&ip, rand),
+        ip => bep42::mint(ip, rand),
     }
 }
 
@@ -278,6 +237,9 @@ impl DhtSession {
             Ok(0) => {}
             Ok(n) => info!("dropped {n} routing table nodes sharing an address with another"),
             Err(e) => warn!("couldn't apply one node per address to the routing table: {e}"),
+        }
+        if let Err(e) = routing_table::fill_bep42(&mut conn) {
+            warn!("couldn't work out the routing table's BEP 42 compliance: {e}");
         }
         let observed = known_external_ip(&mut conn, family)?;
         let external_addr = external_addr.filter(|ip| {
@@ -386,11 +348,11 @@ impl DhtSession {
         info!("bootstrap routers answered in {:?}", started.elapsed());
         client.find_node(client.our_id()).await;
 
+        let (compliant, nodes) = self.bep42_compliance();
         info!(
-            "{} DHT bootstrapped in {:?}, routing table has {} nodes",
+            "{} DHT bootstrapped in {:?}, routing table has {nodes} nodes, {compliant} with BEP 42 ids",
             self.family(),
             started.elapsed(),
-            self.node_count()
         );
 
         Ok(())
@@ -399,6 +361,11 @@ impl DhtSession {
     /// Nodes in this family's routing table
     pub fn node_count(&self) -> usize {
         self.routing_table.node_count()
+    }
+
+    /// Nodes in this family's routing table whose ids are BEP 42 compliant, and all of them
+    pub fn bep42_compliance(&self) -> (usize, usize) {
+        self.routing_table.bep42_compliance()
     }
 
     pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
@@ -588,54 +555,15 @@ mod tests {
 
 #[cfg(test)]
 mod recompute_tests {
-    use super::{OBSERVED_IP_KEY, known_external_ip, misc_key, random_idv4, random_idv6, resume_identity};
+    use super::{OBSERVED_IP_KEY, known_external_ip, misc_key, resume_identity};
+    use crate::dht::bep42::compliant as bep42_valid;
     use crate::dht::routing_table::bucket_index;
     use crate::schema::node::dsl as node_dsl;
     use crate::test_support::memory_pool;
     use crate::types::{Family, NodeId};
     use crate::utils::{base64_enc, db_put};
     use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    /// BEP 42's check: the top 21 bits are the CRC32C of the masked address with the id's
-    /// last byte's low 3 bits mixed in
-    fn bep42_valid(id: &NodeId, ip: IpAddr) -> bool {
-        let mut masked = match ip {
-            IpAddr::V4(ip) => ip
-                .octets()
-                .iter()
-                .zip([0x03, 0x0f, 0x3f, 0xff])
-                .map(|(b, m)| b & m)
-                .collect(),
-            IpAddr::V6(ip) => ip.octets()[..8]
-                .iter()
-                .zip([0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff])
-                .map(|(b, m)| b & m)
-                .collect::<Vec<u8>>(),
-        };
-        masked[0] |= (id.0[19] & 0x07) << 5;
-        let crc = crc32c::crc32c(&masked);
-        id.0[0] == (crc >> 24) as u8 && id.0[1] == (crc >> 16) as u8 && (id.0[2] & 0xf8) == ((crc >> 8) as u8 & 0xf8)
-    }
-
-    #[test]
-    fn node_ids_follow_bep_42_for_both_families() {
-        // BEP 42's own test vector: 124.31.75.21 with rand 1 starts 5f bf bf
-        let id = random_idv4(&Ipv4Addr::new(124, 31, 75, 21), 1);
-        assert_eq!(&id.0[..2], &[0x5f, 0xbf]);
-        assert_eq!(id.0[2] & 0xf8, 0xb8);
-        assert_eq!(id.0[19], 1);
-
-        let v6: Ipv6Addr = "2001:470:1:2::5".parse().unwrap();
-        for rand in [0u8, 7, 86, 255] {
-            let id = random_idv6(&v6, rand);
-            assert!(bep42_valid(&id, v6.into()));
-            assert_eq!(id.0[19], rand);
-        }
-        // the same /64 makes the same prefix; the interface id doesn't count
-        let other: Ipv6Addr = "2001:470:1:2:ffff::9".parse().unwrap();
-        assert!(bep42_valid(&random_idv6(&v6, 86), other.into()));
-    }
+    use std::net::{IpAddr, Ipv6Addr};
 
     #[test]
     fn identity_change_recomputes_buckets() {
@@ -659,6 +587,7 @@ mod recompute_tests {
                 port: 6881,
                 failed_requests: 0,
                 removed: false,
+                bep42: None,
             })
             .execute(&mut *conn)
             .unwrap();

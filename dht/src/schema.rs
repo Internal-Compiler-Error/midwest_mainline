@@ -20,6 +20,7 @@ diesel::table! {
         removed -> Bool,
         last_sent -> Nullable<BigInt>,
         added -> BigInt,
+        bep42 -> Nullable<Bool>,
     }
 }
 

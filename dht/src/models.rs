@@ -31,6 +31,7 @@ pub struct NodeRow {
     pub port: i32,
     pub failed_requests: i32,
     pub removed: bool,
+    pub bep42: Option<bool>,
 }
 
 #[derive(Queryable, Selectable)]

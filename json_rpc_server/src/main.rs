@@ -73,6 +73,9 @@ async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) 
         "node_counts" => serde_json::json!({
             "v4": s.dht.node_count(),
             "v6": s.dht6.as_ref().map(|d| d.node_count()),
+            // nodes with BEP 42 compliant ids, of each family
+            "bep42_v4": s.dht.bep42_compliance().0,
+            "bep42_v6": s.dht6.as_ref().map(|d| d.bep42_compliance().0),
         }),
         "stored_swarms" => {
             let swarms: Vec<String> = s.dht.stored_swarms().iter().map(|h| hex::encode(h.0)).collect();

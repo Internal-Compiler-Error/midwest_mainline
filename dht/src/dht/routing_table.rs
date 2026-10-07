@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info};
 
+use crate::dht::bep42::compliant;
 use crate::dht::xor;
 use crate::message::Krpc;
 use crate::message::ping_query::PingQuery;
@@ -80,6 +81,23 @@ pub(crate) fn purge_shared_ips(conn: &mut SqliteConnection) -> Result<usize, die
         purged += diesel::delete(node.filter(id.eq(node_id)).filter(family.eq(fam))).execute(conn)?;
     }
     Ok(purged)
+}
+
+/// Works out BEP 42 compliance for rows saved before it was recorded.
+pub(crate) fn fill_bep42(conn: &mut SqliteConnection) -> Result<usize, diesel::result::Error> {
+    use crate::schema::node::dsl::*;
+    let rows: Vec<(Vec<u8>, i32, String)> = node.filter(bep42.is_null()).select((id, family, ip_addr)).load(conn)?;
+    conn.transaction(|conn| {
+        for (node_id, fam, ip) in &rows {
+            let (Some(nid), Ok(ip)) = (NodeId::try_from_bytes(node_id), ip.parse::<IpAddr>()) else {
+                continue;
+            };
+            diesel::update(node.filter(id.eq(node_id)).filter(family.eq(fam)))
+                .set(bep42.eq(compliant(&nid, ip)))
+                .execute(conn)?;
+        }
+        Ok(rows.len())
+    })
 }
 
 /// Which of the 160 buckets `target` falls into, relative to `our_id`.
@@ -304,6 +322,18 @@ impl RoutingTable {
             return;
         }
 
+        // BEP 42: a compliant node takes the place of a non-compliant one, the one heard from
+        // least recently
+        if compliant(&new_node_id, addr.ip())
+            && let Some(victim) = self.least_recent_noncompliant(bucket_idx)
+        {
+            debug!("Bucket {bucket_idx} full, {new_node_id:?} replaces a non-BEP 42 node");
+            let mut conn = self.conn();
+            self.mark_as_dead(&victim, &mut conn);
+            self.put_to_bucket(NodeInfo::new(new_node_id, addr), &mut conn);
+            return;
+        }
+
         info!("Bucket {bucket_idx} full, refreshing all buckets to evict");
         let this = self.clone();
         let work = async move {
@@ -341,6 +371,35 @@ impl RoutingTable {
             .count()
             .get_result::<i64>(&mut conn)
             .is_ok_and(|n| n > 0)
+    }
+
+    fn least_recent_noncompliant(&self, i: i32) -> Option<NodeId> {
+        use crate::schema::node::dsl::*;
+        let mut conn = self.conn();
+        node.filter(family.eq(self.family.db()))
+            .filter(removed.eq(false))
+            .filter(bucket.eq(i))
+            .filter(bep42.eq(false))
+            .order(last_contacted.asc())
+            .select(id)
+            .first::<Vec<u8>>(&mut conn)
+            .ok()
+            .and_then(|raw| NodeId::try_from_bytes(&raw))
+    }
+
+    /// How many nodes in the table have BEP 42 compliant ids (LAN ones count as compliant),
+    /// and how many nodes there are
+    pub fn bep42_compliance(&self) -> (usize, usize) {
+        use crate::schema::node::dsl::*;
+        let mut conn = self.conn();
+        let alive = node.filter(family.eq(self.family.db())).filter(removed.eq(false));
+        let good: i64 = alive
+            .filter(bep42.eq(true))
+            .count()
+            .get_result(&mut conn)
+            .unwrap_or_default();
+        let all: i64 = alive.count().get_result(&mut conn).unwrap_or_default();
+        (good as usize, all as usize)
     }
 
     fn conn(&self) -> PooledConnection<ConnectionManager<SqliteConnection>> {
@@ -440,6 +499,8 @@ impl RoutingTable {
         }
 
         join_all((0..160).map(|i| async move { self.refresh_bucket(i).await })).await;
+        let (good, all) = self.bep42_compliance();
+        info!("{} routing table: {all} nodes, {good} with BEP 42 ids", self.family);
     }
 
     // TODO: use AsRef or Into to make it take in anything that can turn into an ID
@@ -504,6 +565,7 @@ impl RoutingTable {
                 port: nodee.end_point().port() as i32,
                 failed_requests: 0,
                 removed: false,
+                bep42: Some(compliant(&nodee.id(), ip)),
             })
             .on_conflict_do_nothing()
             .execute(conn)
@@ -546,6 +608,7 @@ mod tests {
             port: 6881,
             failed_requests: 0,
             removed: false,
+            bep42: None,
         };
         let rows = [
             row(1, Family::V4, "35.167.186.212", 10),
@@ -701,6 +764,85 @@ mod tests {
             .first(&mut conn)
             .unwrap();
         assert_eq!(failed, 0, "hearing from the node resets the counter");
+    }
+
+    #[tokio::test]
+    async fn a_compliant_node_takes_a_full_buckets_place_from_a_non_compliant_one() {
+        use crate::schema::node::dsl::*;
+
+        let mut table = test_routing_table(NodeId([0x00; 20])).await;
+        table.bucket_capacity = 2;
+        // all in bucket 159 (top bit set), at public addresses, ids made up so not compliant
+        let older = NodeId([0xFF; 20]);
+        let newer = NodeId([0xFE; 20]);
+        table.add(older, "1.1.1.1:6881".parse().unwrap());
+        table.add(newer, "2.2.2.2:6881".parse().unwrap());
+        let mut conn = table.conn();
+        diesel::update(node.filter(id.eq(older.0.to_vec())))
+            .set(last_contacted.eq(1))
+            .execute(&mut conn)
+            .unwrap();
+        drop(conn);
+        assert_eq!(table.bep42_compliance(), (0, 2));
+
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let good = (0..=255)
+            .map(|r| crate::dht::bep42::mint(ip, r))
+            .find(|n| n.0[0] & 0x80 != 0)
+            .unwrap();
+        table.add(good, SocketAddr::new(ip, 6881));
+        assert!(table.contains(&good));
+        assert!(
+            !table.contains(&older),
+            "the least recently heard from non-compliant node goes"
+        );
+        assert!(table.contains(&newer));
+        assert_eq!(table.bep42_compliance(), (1, 2));
+
+        // a non-compliant newcomer doesn't get in that way
+        table.add(NodeId([0xFD; 20]), "3.3.3.3:6881".parse().unwrap());
+        assert!(!table.contains(&NodeId([0xFD; 20])));
+    }
+
+    #[test]
+    fn compliance_of_old_rows_is_worked_out() {
+        let pool = memory_pool();
+        let mut conn = pool.get().unwrap();
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let good = crate::dht::bep42::mint(ip, 3);
+        for (node_id, addr) in [
+            (good, "9.9.9.9"),
+            (NodeId([1; 20]), "8.8.8.8"),
+            (NodeId([2; 20]), "10.0.0.1"),
+        ] {
+            diesel::insert_into(crate::schema::node::table)
+                .values(crate::models::NodeRow {
+                    id: node_id.0.to_vec(),
+                    family: 4,
+                    bucket: 0,
+                    last_contacted: 0,
+                    ip_addr: addr.to_string(),
+                    ip_group: None,
+                    port: 6881,
+                    failed_requests: 0,
+                    removed: false,
+                    bep42: None,
+                })
+                .execute(&mut *conn)
+                .unwrap();
+        }
+        assert_eq!(fill_bep42(&mut conn).unwrap(), 3);
+        let mut flags: Vec<(u8, Option<bool>)> = crate::schema::node::table
+            .select((crate::schema::node::id, crate::schema::node::bep42))
+            .load::<(Vec<u8>, Option<bool>)>(&mut *conn)
+            .unwrap()
+            .into_iter()
+            .map(|(i, b)| (i[0], b))
+            .collect();
+        flags.sort();
+        let mut expected = vec![(good.0[0], Some(true)), (1, Some(false)), (2, Some(true))];
+        expected.sort();
+        assert_eq!(flags, expected, "the LAN node is exempt");
     }
 
     #[tokio::test]
