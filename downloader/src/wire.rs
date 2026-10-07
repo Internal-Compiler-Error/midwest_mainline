@@ -750,6 +750,9 @@ pub(crate) async fn shake_hands<S: AsyncRead + AsyncWrite + Unpin>(
         peer.shutdown().await?;
         return Err(io::Error::other("handshake hash info didn't match"));
     }
+    if upgraded {
+        tracing::debug!("the peer upgraded the connection to the v2 hash");
+    }
 
     Ok(handshake)
 }
