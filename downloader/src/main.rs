@@ -172,6 +172,7 @@ fn report_until_done(session: &mut Session, id: TorrentId, seed: bool, interrupt
             return 1;
         };
         let due = last_report.elapsed() >= REPORT_EVERY;
+        let paused = matches!(state, TorrentState::Paused(_));
         match state {
             TorrentState::Failed { error, .. } => {
                 tracing::error!("{error}");
@@ -188,6 +189,11 @@ fn report_until_done(session: &mut Session, id: TorrentId, seed: bool, interrupt
                 }
                 if p.completed && !seed {
                     tracing::info!("{} is complete in {}", p.name, p.root);
+                    return 0;
+                }
+                // the session stops a complete torrent once it has seeded to the ratio limit
+                if p.completed && paused {
+                    tracing::info!("{} has seeded to the ratio limit", p.name);
                     return 0;
                 }
                 if due {
@@ -333,6 +339,62 @@ mod test {
         ] {
             assert!(parse(wrong).is_err(), "{wrong:?}");
         }
+    }
+
+    /// A session in a scratch directory holding a complete 3-piece torrent with a resume file
+    /// that says `uploaded` bytes went out and `paused`; returns the resume file's path.
+    fn complete_torrent(name: &str, uploaded: u64, paused: bool, ratio_limit: f64) -> (Session, PathBuf, PathBuf) {
+        use bitvec::prelude::*;
+        use sha1::Digest;
+        let dir = std::env::temp_dir().join(format!("downloader-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        let content = [7u8; 40];
+        std::fs::write(root.join("cli.bin"), content).unwrap();
+        let mut info = b"d6:lengthi40e4:name7:cli.bin12:piece lengthi16e6:pieces60:".to_vec();
+        info.extend(content.chunks(16).flat_map(|c| sha1::Sha1::digest(c).to_vec()));
+        info.push(b'e');
+        let torrent = parse_torrent(&[&b"d4:info"[..], &info, b"e"].concat()).unwrap();
+        let mut data = ResumeData::from_torrent(&torrent, &root, &bitvec![u8, Msb0; 1; 3]);
+        (data.uploaded, data.paused) = (uploaded, paused);
+        let path = dir.join("resume").join(ResumeData::file_name(&torrent.info_hash));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        data.write(&path).unwrap();
+        let session = Session::new(SessionConfig {
+            peer_id: *b"-DL0100-cli-test....",
+            data_dir: dir.clone(),
+            settings: Settings {
+                listen_port: 0,
+                dht: false,
+                port_mapping: false,
+                seed_ratio_limit: ratio_limit,
+                ..Settings::default()
+            },
+        })
+        .unwrap();
+        (session, path, dir)
+    }
+
+    /// `report_until_done` on a thread that's interrupted after a while, so a hang fails.
+    fn report_within(session: &mut Session, id: TorrentId, seed: bool) -> i32 {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let alarm = interrupted.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            alarm.store(true, Ordering::SeqCst);
+        });
+        report_until_done(session, id, seed, &interrupted)
+    }
+
+    /// `--seed` seeds until the ratio limit, which stops the torrent; that's the end of it.
+    #[test]
+    fn seeding_ends_at_the_ratio_limit() {
+        let (mut session, path, dir) = complete_torrent("ratio", 80, false, 1.5);
+        let id = session.resume(&path);
+        assert_eq!(report_within(&mut session, id, true), 0);
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
