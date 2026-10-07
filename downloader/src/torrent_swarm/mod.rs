@@ -195,6 +195,8 @@ pub(crate) struct Shared {
     pub settings: SettingsWatch,
     pub limiter: Arc<RateLimiter>,
     pub external: ExternalAddress,
+    /// the client's: its announcers say goodbye when this goes, not only when the swarm does
+    pub shutdown: CancellationToken,
 }
 
 /// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
@@ -378,6 +380,7 @@ impl TorrentSwarm {
             settings,
             limiter,
             external,
+            shutdown,
         } = shared;
         assert_eq!(
             verified.len(),
@@ -395,7 +398,7 @@ impl TorrentSwarm {
         let (inbox, incoming) = mpsc::channel(SWARM_INBOX);
         let (peers_tx, peers_rx) = watch::channel(vec![]);
         let events_tx_weak = events_tx.downgrade();
-        let announcers = CancellationToken::new();
+        let announcers = shutdown.child_token();
         let trackers = spawn_announcers(Announcing {
             trackers: torrent.all_trackers(),
             private: torrent.private,
@@ -719,6 +722,58 @@ impl TorrentSwarm {
 mod test {
     use super::test_support::*;
     use super::*;
+
+    /// The client shutting down has the swarm's trackers told event=stopped (BEP 3) at once:
+    /// the swarm itself may take longer to go than the client waits for.
+    #[tokio::test]
+    async fn client_shutdown_says_goodbye_to_the_trackers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let tracker = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (requests, mut requested) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0; 4096];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let _ = requests.send(String::from_utf8_lossy(&request[..n]).into_owned());
+                let body = b"d8:intervali1800e5:peers0:e";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+
+        let mut torrent = single_file_torrent();
+        torrent.announce_tiers = vec![vec![tracker]];
+        let dir = std::env::temp_dir().join(format!("downloader-swarm-goodbye-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        torrent.files[0].path = dir.join("swarm.bin");
+        let file = std::fs::File::create(&torrent.files[0].path).unwrap();
+        file.set_len(TOTAL as u64).unwrap();
+        let torrent = Arc::new(torrent);
+        let storage = Arc::new(TorrentStorage::new(torrent.clone(), vec![Some(file)]));
+        let shared = shared(crate::bt_client::default_settings());
+        let client = shared.shutdown.clone();
+        let (swarm, handle) =
+            TorrentSwarm::new(torrent, storage, bitvec![u8, Msb0; 0; 3].into_boxed_bitslice(), shared);
+        tokio::spawn(swarm.work_loop());
+
+        async fn announced(requested: &mut tokio::sync::mpsc::UnboundedReceiver<String>, event: &str) {
+            while !requested.recv().await.unwrap().contains(&format!("&event={event} ")) {}
+        }
+        tokio::time::timeout(Duration::from_secs(5), announced(&mut requested, "started"))
+            .await
+            .unwrap();
+        client.cancel();
+        tokio::time::timeout(Duration::from_secs(5), announced(&mut requested, "stopped"))
+            .await
+            .expect("no event=stopped while the swarm lives on");
+        drop(handle);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The bus hears a peer arrive and leave, with the reason.
     #[tokio::test]

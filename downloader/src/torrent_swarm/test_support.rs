@@ -118,6 +118,7 @@ pub(super) fn shared(settings: crate::config::SettingsWatch) -> Shared {
         settings: settings.clone(),
         limiter: Arc::new(RateLimiter::new(settings)),
         external: ExternalAddress::default(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     }
 }
 

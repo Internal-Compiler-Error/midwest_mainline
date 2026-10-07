@@ -309,6 +309,7 @@ impl BtClient {
             settings: self.settings.clone(),
             limiter: self.limiter.clone(),
             external: self.external.clone(),
+            shutdown: self.shutdown.clone(),
         };
         let handle = TorrentSwarm::spawn(torrent.clone(), storage, verified, shared);
         // BEP 52: a hybrid's peers may come knocking with its v2 hash, truncated
