@@ -16,7 +16,7 @@ pub(super) use bitvec::prelude::*;
 pub(super) use futures::SinkExt;
 pub(super) use futures::StreamExt;
 pub(super) use sha1::{Digest, Sha1};
-pub(super) use std::collections::BTreeSet;
+pub(super) use std::collections::{BTreeMap, BTreeSet};
 pub(super) use std::net::{Ipv4Addr, SocketAddrV4};
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
@@ -61,17 +61,7 @@ pub(super) fn swarm_with_web_seeds(
     settings: crate::config::Settings,
     web_seeds: Vec<String>,
 ) -> (TorrentSwarm, TorrentSwarmHandle, PathBuf) {
-    let bytes = content();
-    let pieces: Vec<u8> = bytes.chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
-    let mut info = format!(
-        "d6:lengthi{TOTAL}e4:name9:swarm.bin12:piece lengthi{PIECE}e6:pieces{}:",
-        pieces.len()
-    )
-    .into_bytes();
-    info.extend_from_slice(&pieces);
-    info.push(b'e');
-    let mut torrent = parse_torrent(&build_torrent_file(&info, &["wss://unused.test/announce".to_string()])).unwrap();
-
+    let mut torrent = single_file_torrent();
     let dir = std::env::temp_dir().join(format!("downloader-swarm-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -87,31 +77,48 @@ pub(super) fn swarm_with_web_seeds(
         .unwrap();
     file.set_len(TOTAL as u64).unwrap();
     if seeding {
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&path, content()).unwrap();
     }
 
     let torrent = Arc::new(torrent);
     let storage = Arc::new(TorrentStorage::new(torrent.clone(), vec![Some(file)]));
-    let id = Arc::new(Identity {
-        peer_id: *b"-DL0100-swarm-test..",
-        serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
-        dht: false,
-        encryption: crate::config::Encryption::Prefer,
-    });
     let verified = bitvec![u8, Msb0; seeding as u8; 3].into_boxed_bitslice();
-    let (settings_tx, settings_rx) = watch::channel(settings);
+    let (settings_tx, settings) = watch::channel(settings);
     std::mem::forget(settings_tx);
-    let shared = Shared {
+    let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared(settings));
+    (swarm, handle, path)
+}
+
+/// `content()` as a single-file torrent of 3 pieces, with a tracker URL whose scheme no
+/// announcer handles.
+pub(super) fn single_file_torrent() -> crate::torrent::Torrent {
+    let pieces: Vec<u8> = content().chunks(PIECE).flat_map(|c| Sha1::digest(c).to_vec()).collect();
+    let mut info = format!(
+        "d6:lengthi{TOTAL}e4:name9:swarm.bin12:piece lengthi{PIECE}e6:pieces{}:",
+        pieces.len()
+    )
+    .into_bytes();
+    info.extend_from_slice(&pieces);
+    info.push(b'e');
+    parse_torrent(&build_torrent_file(&info, &["wss://unused.test/announce".to_string()])).unwrap()
+}
+
+/// The client-wide services, as a client without DHT or uTP has them.
+pub(super) fn shared(settings: crate::config::SettingsWatch) -> Shared {
+    Shared {
         events: EventBus::new(),
-        id,
+        id: Arc::new(Identity {
+            peer_id: *b"-DL0100-swarm-test..",
+            serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            dht: false,
+            encryption: crate::config::Encryption::Prefer,
+        }),
         dht: crate::dht::Dht::none(),
         utp: crate::utp::none(),
-        settings: settings_rx.clone(),
-        limiter: Arc::new(RateLimiter::new(settings_rx)),
+        settings: settings.clone(),
+        limiter: Arc::new(RateLimiter::new(settings)),
         external: ExternalAddress::default(),
-    };
-    let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
-    (swarm, handle, path)
+    }
 }
 
 /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket

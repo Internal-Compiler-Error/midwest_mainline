@@ -42,7 +42,7 @@ mod test_support;
 mod upload;
 mod web_seeds;
 
-use in_flight::InFlight;
+use in_flight::InFlightPieces;
 use known::KnownPeer;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,12 +230,11 @@ pub(crate) enum SwarmEvent {
     /// A completed piece was hashed and, if it was good, written (see `piece_assembled`).
     PieceDone {
         piece: u32,
-        len: usize,
         senders: BTreeSet<SocketAddr>,
         /// whether it matched its hash, or why it couldn't be written
         outcome: Result<bool, String>,
     },
-    /// A dial spawned by `connect_to_discovered_peers` failed. Without this the address would
+    /// A dial spawned by `connect_to_peers` failed. Without this the address would
     /// sit in `dialing` forever, and since dedup against re-discovering the same address checks
     /// `dialing`, it could never be retried -- an address a peer keeps re-gossiping over PEX
     /// needs to actually leave the set on failure.
@@ -322,12 +321,9 @@ pub struct TorrentSwarm {
     super_seed: bool,
     /// BEP 16: how many peers each piece has been revealed to
     super_seed_offers: Vec<u32>,
-    in_flight: BTreeMap<u32, InFlight>,
+    in_flight: InFlightPieces,
     /// our public address by the votes of peers (`yourip`) and trackers
     external: ExternalAddress,
-    /// per peer, the in-flight pieces it holds a claim on: the inverse of `InFlight::claims`,
-    /// so a peer's pieces are found without scanning everything in flight (once per block)
-    holdings: BTreeMap<SocketAddr, BTreeSet<u32>>,
     /// complete pieces off being hashed and written (see `piece_assembled`)
     hashing: BTreeSet<u32>,
     /// block requests sent to any peer this session, UCB's `t`
@@ -462,8 +458,7 @@ impl TorrentSwarm {
             sequential: false,
             super_seed: false,
             super_seed_offers: vec![0; pieces],
-            in_flight: BTreeMap::new(),
-            holdings: BTreeMap::new(),
+            in_flight: InFlightPieces::default(),
             external,
             hashing: BTreeSet::new(),
             total_picks: 0,
@@ -586,10 +581,9 @@ impl TorrentSwarm {
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block),
             SwarmEvent::PieceDone {
                 piece,
-                len,
                 senders,
                 outcome,
-            } => self.piece_done(piece, len, senders, outcome),
+            } => self.piece_done(piece, senders, outcome),
             SwarmEvent::HashesRead { to, reply } => self.hashes_read(to, reply),
             SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block),
             SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome),
@@ -618,9 +612,7 @@ impl TorrentSwarm {
             .wanted
             .iter_ones()
             .filter(|&p| {
-                !self.stat.verified[p]
-                    && !self.in_flight.contains_key(&(p as u32))
-                    && !self.hashing.contains(&(p as u32))
+                !self.stat.verified[p] && !self.in_flight.contains(p as u32) && !self.hashing.contains(&(p as u32))
             })
             .map(|p| p as u32)
             .collect();
@@ -701,13 +693,6 @@ impl TorrentSwarm {
         self.known.entry(addr).or_default().ban(Instant::now());
     }
 
-    fn pieces_held_by(&self, addr: SocketAddr) -> Vec<u32> {
-        self.holdings
-            .get(&addr)
-            .map(|held| held.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
     fn peer_index(&self, addr: SocketAddr) -> Option<usize> {
         self.peers.binary_search_by_key(&addr, |p| p.remote_addr).ok()
     }
@@ -733,10 +718,9 @@ impl TorrentSwarm {
             .entry(peer.remote_addr)
             .or_default()
             .disconnected(&peer.stats, Instant::now());
-        for piece in self.pieces_held_by(peer.remote_addr) {
+        for piece in self.in_flight.held_by(peer.remote_addr) {
             self.release_claim(piece, peer.remote_addr);
         }
-        self.holdings.remove(&peer.remote_addr);
         self.layers.give_up(peer.remote_addr);
         info!("{} disconnected, {} peers left", peer.remote_addr, self.peers.len());
     }
@@ -749,17 +733,7 @@ impl TorrentSwarm {
         if let Some(idx) = self.peer_index(peer) {
             self.peers[idx].forget_piece(piece);
         }
-        let Some(in_flight) = self.in_flight.get_mut(&piece) else {
-            return;
-        };
-        in_flight.claims.remove(&peer);
-        if let Some(held) = self.holdings.get_mut(&peer) {
-            held.remove(&piece);
-        }
-        tracing::debug!(parent: &in_flight.span, %peer, "claim released");
-        if in_flight.claims.is_empty() {
-            in_flight.span.record("outcome", "released");
-            self.in_flight.remove(&piece);
+        if self.in_flight.release(piece, peer).is_some() {
             self.missing.push(piece);
         }
     }
@@ -851,22 +825,8 @@ mod test {
         }
         let torrent = Arc::new(torrent);
         let storage = Arc::new(TorrentStorage::new(torrent.clone(), handles));
-        let id = Arc::new(Identity {
-            peer_id: *b"-DL0100-swarm-test..",
-            serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
-            dht: false,
-            encryption: crate::config::Encryption::Prefer,
-        });
-        let shared = Shared {
-            events: EventBus::new(),
-            id,
-            dht: crate::dht::Dht::none(),
-            utp: crate::utp::none(),
-            settings: crate::bt_client::default_settings(),
-            limiter: Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
-            external: ExternalAddress::default(),
-        };
         let verified = bitvec![u8, Msb0; 0; 3].into_boxed_bitslice();
+        let shared = shared(crate::bt_client::default_settings());
         let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         let stats = handle.stats();
         tokio::spawn(swarm.work_loop());

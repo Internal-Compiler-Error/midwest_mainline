@@ -1,76 +1,101 @@
-//! A piece being downloaded: its buffer, which blocks are in and from whom, and how far each
-//! claimant has got in requesting the rest.
+//! The pieces being downloaded: each one's buffer, which blocks are in and from whom, and how
+//! far each claimant (a peer or a web seed) has got in requesting the rest.
 
 use crate::settings::BLOCK_SIZE;
 use crate::torrent::Torrent;
-use crate::wire::Request;
+use crate::wire::{Piece, Request};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::net::SocketAddr;
 
-/// One peer's share of an in-flight piece: where it is in requesting the blocks.
-pub(super) struct Claim {
+/// One claimant's share of an in-flight piece: where it is in requesting the blocks.
+struct Claim {
     /// index of the next block to request
-    pub(super) cursor: usize,
+    cursor: usize,
     /// walk the piece from the end: the second peer racing for a piece goes the other way,
     /// so the two meet in the middle and the bytes fetched twice are roughly halved
-    pub(super) reverse: bool,
+    reverse: bool,
 }
 
 /// Who "delivered" a block of padding (BEP 47): nobody, it's zeros from the start.
-pub(super) const PADDING: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+const PADDING: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
 
 /// A piece we're in the middle of downloading. Normally one peer holds it; in endgame
 /// (see `schedule`) several race for it, and each block records who delivered it so a
 /// failed hash can still convict a lone sender.
 pub(super) struct InFlight {
     pub(super) buf: Vec<u8>,
-    /// per block, the peer it arrived from
-    pub(super) received: Vec<Option<SocketAddr>>,
-    pub(super) claims: BTreeMap<SocketAddr, Claim>,
+    /// per block, the claimant it arrived from
+    received: Vec<Option<SocketAddr>>,
+    claims: BTreeMap<SocketAddr, Claim>,
     /// from assignment to verification, for the traces
     pub(super) span: tracing::Span,
 }
 
-impl InFlight {
-    pub(super) fn new(size: usize, peer: SocketAddr) -> Self {
-        let blocks = size.div_ceil(BLOCK_SIZE);
-        let mut claims = BTreeMap::new();
-        claims.insert(
-            peer,
-            Claim {
-                cursor: 0,
-                reverse: false,
-            },
-        );
-        Self {
-            buf: vec![0u8; size],
-            received: vec![None; blocks],
-            claims,
-            span: tracing::Span::none(),
-        }
-    }
+/// What became of a block handed to `InFlight::store`.
+#[derive(Debug, PartialEq)]
+pub(super) enum Stored {
+    /// it's in; this many blocks are still to come
+    Added { blocks_left: usize },
+    /// someone else's copy came first
+    Duplicate,
+    /// it covers padding, which is in from the start (a web seed's run doesn't skip it)
+    Padding,
+    /// it doesn't fit a block of the piece
+    Malformed,
+}
 
-    /// Marks the blocks that are nothing but padding as in already: the buffer starts out
+impl InFlight {
+    /// `piece`, claimed by `claimant` to request front to back; `shown_as` names the claimant in
+    /// the traces. Blocks that are nothing but padding are in already: the buffer starts out
     /// zeroed, so there's nothing to request.
-    pub(super) fn skip_padding(&mut self, torrent: &Torrent, piece: u32) {
+    pub(super) fn new(torrent: &Torrent, piece: u32, claimant: SocketAddr, shown_as: impl Display) -> Self {
+        let size = torrent.nth_piece_size(piece).expect("piece index in range");
+        let mut received = vec![None; size.div_ceil(BLOCK_SIZE)];
         for pad in torrent.padding_in_piece(piece) {
             let first = pad.start.div_ceil(BLOCK_SIZE);
-            let end = if pad.end == self.buf.len() {
-                self.received.len()
+            let end = if pad.end == size {
+                received.len()
             } else {
                 pad.end / BLOCK_SIZE
             };
-            for block in first..end {
-                self.received[block] = Some(PADDING);
+            // a stretch of padding inside a single block has first > end, and covers nothing
+            for slot in received.iter_mut().take(end).skip(first) {
+                *slot = Some(PADDING);
             }
+        }
+        Self {
+            buf: vec![0u8; size],
+            received,
+            claims: BTreeMap::from([(
+                claimant,
+                Claim {
+                    cursor: 0,
+                    reverse: false,
+                },
+            )]),
+            span: tracing::info_span!(
+                "piece",
+                info_hash = %torrent.info_hash,
+                piece,
+                size,
+                peer = %shown_as,
+                racers = 1,
+                outcome = tracing::field::Empty,
+            ),
         }
     }
 
-    /// A claim on every block not in yet, all requested at once: a web seed's.
-    pub(super) fn claim_rest(&mut self, source: SocketAddr) {
-        let cursor = self.received.len();
-        self.claims.insert(source, Claim { cursor, reverse: false });
-        self.span.record("racers", self.claims.len());
+    pub(super) fn racers(&self) -> usize {
+        self.claims.len()
+    }
+
+    pub(super) fn claimed_by(&self, claimant: SocketAddr) -> bool {
+        self.claims.contains_key(&claimant)
+    }
+
+    pub(super) fn claimants(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.claims.keys().copied()
     }
 
     /// Torrent-relative bytes from the first block not in yet to the end of the last one.
@@ -81,15 +106,7 @@ impl InFlight {
         Some((piece_offset + (first * BLOCK_SIZE) as u64, piece_offset + end as u64))
     }
 
-    pub(super) fn add_racer(&mut self, peer: SocketAddr) {
-        let reverse = self.claims.len() % 2 == 1;
-        let cursor = if reverse { self.received.len() - 1 } else { 0 };
-        self.claims.insert(peer, Claim { cursor, reverse });
-        self.span.record("racers", self.claims.len());
-        tracing::debug!(parent: &self.span, %peer, "racer joined");
-    }
-
-    pub(super) fn request(&self, piece: u32, block: usize) -> Request {
+    fn request(&self, piece: u32, block: usize) -> Request {
         let begin = block * BLOCK_SIZE;
         Request {
             index: piece,
@@ -98,10 +115,10 @@ impl InFlight {
         }
     }
 
-    /// The next block `peer` should ask for: the first one past its cursor that hasn't
+    /// The next block `claimant` should ask for: the first one past its cursor that hasn't
     /// arrived from anyone yet.
-    pub(super) fn next_request(&mut self, piece: u32, peer: SocketAddr) -> Option<Request> {
-        let claim = self.claims.get_mut(&peer)?;
+    fn next_request(&mut self, piece: u32, claimant: SocketAddr) -> Option<Request> {
+        let claim = self.claims.get_mut(&claimant)?;
         loop {
             let block = claim.cursor;
             if block >= self.received.len() {
@@ -118,9 +135,9 @@ impl InFlight {
         }
     }
 
-    /// Blocks `peer` has still to request
-    pub(super) fn unrequested_blocks(&self, peer: SocketAddr) -> usize {
-        let Some(claim) = self.claims.get(&peer) else {
+    /// Blocks `claimant` has still to request.
+    pub(super) fn unrequested_blocks(&self, claimant: SocketAddr) -> usize {
+        let Some(claim) = self.claims.get(&claimant) else {
             return 0;
         };
         if claim.cursor >= self.received.len() {
@@ -138,6 +155,27 @@ impl InFlight {
         self.received.iter().filter(|r| r.is_none()).count()
     }
 
+    /// Puts a block from `from` in its place. Its length is the sender's word, so it's checked
+    /// before anything is copied.
+    pub(super) fn store(&mut self, from: SocketAddr, block: &Piece) -> Stored {
+        let begin = block.begin as usize;
+        let end = begin + block.data.len();
+        if block.data.len() != block.length as usize || end > self.buf.len() || !begin.is_multiple_of(BLOCK_SIZE) {
+            return Stored::Malformed;
+        }
+        let slot = &mut self.received[begin / BLOCK_SIZE];
+        match *slot {
+            Some(PADDING) => return Stored::Padding,
+            Some(_) => return Stored::Duplicate,
+            None => *slot = Some(from),
+        }
+        self.buf[begin..end].copy_from_slice(&block.data);
+        Stored::Added {
+            blocks_left: self.blocks_left(),
+        }
+    }
+
+    /// Everyone who delivered a block of it.
     pub(super) fn senders(&self) -> BTreeSet<SocketAddr> {
         self.received
             .iter()
@@ -145,5 +183,231 @@ impl InFlight {
             .copied()
             .filter(|&a| a != PADDING)
             .collect()
+    }
+}
+
+/// Every in-flight piece, and per claimant the pieces it has a claim on (the inverse of each
+/// piece's claims, so a peer's pieces are found without scanning everything in flight, once
+/// per block). Claims change only through here, which keeps the two in step.
+#[derive(Default)]
+pub(super) struct InFlightPieces {
+    pieces: BTreeMap<u32, InFlight>,
+    holdings: BTreeMap<SocketAddr, BTreeSet<u32>>,
+}
+
+impl InFlightPieces {
+    pub(super) fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub(super) fn contains(&self, piece: u32) -> bool {
+        self.pieces.contains_key(&piece)
+    }
+
+    pub(super) fn get(&self, piece: u32) -> Option<&InFlight> {
+        self.pieces.get(&piece)
+    }
+
+    pub(super) fn get_mut(&mut self, piece: u32) -> Option<&mut InFlight> {
+        self.pieces.get_mut(&piece)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (u32, &InFlight)> {
+        self.pieces.iter().map(|(&piece, f)| (piece, f))
+    }
+
+    /// The bytes of every piece in flight.
+    pub(super) fn bytes(&self) -> usize {
+        self.pieces.values().map(|f| f.buf.len()).sum()
+    }
+
+    pub(super) fn start(&mut self, piece: u32, in_flight: InFlight) {
+        for claimant in in_flight.claimants() {
+            self.holdings.entry(claimant).or_default().insert(piece);
+        }
+        self.pieces.insert(piece, in_flight);
+    }
+
+    /// An endgame racer joins `piece`, walking it the other way from the last one to join.
+    pub(super) fn add_racer(&mut self, piece: u32, racer: SocketAddr) {
+        let f = self.pieces.get_mut(&piece).expect("racing a piece in flight");
+        let reverse = f.claims.len() % 2 == 1;
+        let cursor = if reverse { f.received.len() - 1 } else { 0 };
+        f.claims.insert(racer, Claim { cursor, reverse });
+        f.span.record("racers", f.claims.len());
+        tracing::debug!(parent: &f.span, peer = %racer, "racer joined");
+        self.holdings.entry(racer).or_default().insert(piece);
+    }
+
+    /// A claim on every block of `piece` not in yet, all requested at once: a web seed's.
+    pub(super) fn claim_rest(&mut self, piece: u32, claimant: SocketAddr) {
+        let f = self.pieces.get_mut(&piece).expect("claiming a piece in flight");
+        let cursor = f.received.len();
+        f.claims.insert(claimant, Claim { cursor, reverse: false });
+        f.span.record("racers", f.claims.len());
+        self.holdings.entry(claimant).or_default().insert(piece);
+    }
+
+    pub(super) fn holds(&self, claimant: SocketAddr, piece: u32) -> bool {
+        self.holdings.get(&claimant).is_some_and(|held| held.contains(&piece))
+    }
+
+    pub(super) fn held_by(&self, claimant: SocketAddr) -> Vec<u32> {
+        self.holdings
+            .get(&claimant)
+            .map(|held| held.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Blocks `claimant` has still to request, across its pieces.
+    pub(super) fn backlog(&self, claimant: SocketAddr) -> usize {
+        self.holdings
+            .get(&claimant)
+            .into_iter()
+            .flatten()
+            .map(|piece| self.pieces[piece].unrequested_blocks(claimant))
+            .sum()
+    }
+
+    /// The next block `claimant` should ask for, from the first of its pieces that has one.
+    pub(super) fn next_request(&mut self, claimant: SocketAddr) -> Option<Request> {
+        let held = self.holdings.get(&claimant)?;
+        held.iter()
+            .find_map(|&piece| self.pieces.get_mut(&piece)?.next_request(piece, claimant))
+    }
+
+    /// Takes `claimant` off `piece`. A piece left with no claimant isn't in flight any more,
+    /// and is returned.
+    pub(super) fn release(&mut self, piece: u32, claimant: SocketAddr) -> Option<InFlight> {
+        if let Some(held) = self.holdings.get_mut(&claimant) {
+            held.remove(&piece);
+            if held.is_empty() {
+                self.holdings.remove(&claimant);
+            }
+        }
+        let f = self.pieces.get_mut(&piece)?;
+        f.claims.remove(&claimant);
+        tracing::debug!(parent: &f.span, peer = %claimant, "claim released");
+        if !f.claims.is_empty() {
+            return None;
+        }
+        f.span.record("outcome", "released");
+        self.pieces.remove(&piece)
+    }
+
+    /// `piece` is complete: it leaves, and so do its claims.
+    pub(super) fn finish(&mut self, piece: u32) -> Option<InFlight> {
+        let f = self.pieces.remove(&piece)?;
+        for claimant in f.claimants() {
+            if let Some(held) = self.holdings.get_mut(&claimant) {
+                held.remove(&piece);
+                if held.is_empty() {
+                    self.holdings.remove(&claimant);
+                }
+            }
+        }
+        Some(f)
+    }
+
+    /// Everything in flight, which is in flight no more.
+    pub(super) fn take_all(&mut self) -> BTreeMap<u32, InFlight> {
+        self.holdings.clear();
+        std::mem::take(&mut self.pieces)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::super::test_support::{PIECE, single_file_torrent};
+    use super::*;
+
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], 6881))
+    }
+
+    fn block(piece: u32, begin: usize, len: usize) -> Piece {
+        Piece {
+            index: piece,
+            begin: begin as u32,
+            length: len as u32,
+            data: vec![7; len].into(),
+        }
+    }
+
+    #[test]
+    fn racers_walk_a_piece_from_opposite_ends_and_skip_what_is_in() {
+        let torrent = single_file_torrent();
+        let mut pieces = InFlightPieces::default();
+        pieces.start(0, InFlight::new(&torrent, 0, addr(1), addr(1)));
+        pieces.add_racer(0, addr(2));
+        let begins = |pieces: &mut InFlightPieces, who| {
+            std::iter::from_fn(|| pieces.next_request(who))
+                .map(|r| r.begin as usize)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pieces.get(0).unwrap().unrequested_blocks(addr(2)), 3);
+        assert_eq!(begins(&mut pieces, addr(2)), [2 * BLOCK_SIZE, BLOCK_SIZE, 0]);
+
+        let f = pieces.get_mut(0).unwrap();
+        assert_eq!(
+            f.store(addr(2), &block(0, 2 * BLOCK_SIZE, PIECE - 2 * BLOCK_SIZE)),
+            Stored::Added { blocks_left: 2 }
+        );
+        assert_eq!(
+            begins(&mut pieces, addr(1)),
+            [0, BLOCK_SIZE],
+            "the block already in isn't asked for"
+        );
+        assert_eq!(pieces.backlog(addr(1)), 0);
+    }
+
+    #[test]
+    fn a_block_is_stored_once_and_only_where_it_fits() {
+        let torrent = single_file_torrent();
+        let mut f = InFlight::new(&torrent, 0, addr(1), "test");
+        assert_eq!(
+            f.store(addr(1), &block(0, 1, BLOCK_SIZE)),
+            Stored::Malformed,
+            "not on a block boundary"
+        );
+        assert_eq!(
+            f.store(addr(1), &block(0, 2 * BLOCK_SIZE, BLOCK_SIZE)),
+            Stored::Malformed,
+            "past the end"
+        );
+        let mut short = block(0, 0, BLOCK_SIZE);
+        short.length += 1;
+        assert_eq!(f.store(addr(1), &short), Stored::Malformed, "length and data disagree");
+
+        assert_eq!(
+            f.store(addr(1), &block(0, 0, BLOCK_SIZE)),
+            Stored::Added { blocks_left: 2 }
+        );
+        assert_eq!(f.store(addr(2), &block(0, 0, BLOCK_SIZE)), Stored::Duplicate);
+        assert_eq!(f.senders(), BTreeSet::from([addr(1)]));
+    }
+
+    #[test]
+    fn claims_and_holdings_stay_in_step() {
+        let torrent = single_file_torrent();
+        let mut pieces = InFlightPieces::default();
+        pieces.start(0, InFlight::new(&torrent, 0, addr(1), addr(1)));
+        pieces.start(1, InFlight::new(&torrent, 1, addr(1), addr(1)));
+        pieces.add_racer(1, addr(2));
+        assert_eq!(pieces.held_by(addr(1)), [0, 1]);
+        assert!(pieces.holds(addr(2), 1));
+
+        assert!(pieces.release(1, addr(1)).is_none(), "addr(2) still races for it");
+        assert_eq!(pieces.held_by(addr(1)), [0]);
+        assert!(
+            pieces.release(1, addr(2)).is_some(),
+            "the last claimant leaving abandons it"
+        );
+        assert!(!pieces.contains(1));
+        assert!(pieces.held_by(addr(2)).is_empty());
+
+        assert!(pieces.finish(0).is_some());
+        assert!(pieces.held_by(addr(1)).is_empty());
+        assert_eq!(pieces.len(), 0);
     }
 }

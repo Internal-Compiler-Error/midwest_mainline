@@ -2,7 +2,6 @@
 //! what a bad hash or a failed write means. Also BEP 52 piece layers fetched for a magnet.
 
 use crate::events::Event;
-use crate::settings::BLOCK_SIZE;
 use crate::wire::{BtMessage, Piece, Request};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -11,7 +10,7 @@ use tracing::{info, warn};
 
 use super::{
     SwarmEvent, TorrentSwarm,
-    in_flight::{InFlight, PADDING},
+    in_flight::{InFlight, Stored},
 };
 
 impl TorrentSwarm {
@@ -44,84 +43,64 @@ impl TorrentSwarm {
         let from = peer.remote_addr;
         if peer.block_received(&block).is_none() {
             tracing::debug!("{from} sent a block we weren't waiting for, ignoring");
-            self.stat.wasted += block.length as u64;
-            self.bus.emit(Event::BlockWasted {
-                info_hash: self.torrent.info_hash,
-                addr: from,
-                len: block.length,
-                why: "unexpected",
-            });
+            self.wasted(from, block.length, "unexpected");
             return;
         }
         self.stat.downloaded += block.length as u64;
         self.store_block(from, block);
     }
 
+    /// Bytes that came in for nothing.
+    pub(super) fn wasted(&mut self, from: SocketAddr, len: u32, why: &'static str) {
+        self.stat.wasted += len as u64;
+        self.bus.emit(Event::BlockWasted {
+            info_hash: self.torrent.info_hash,
+            addr: from,
+            len,
+            why,
+        });
+    }
+
     /// A block someone (a peer or a web seed) owed us is in: it goes into its piece, and a
     /// piece with every block in goes off to be checked.
     pub(super) fn store_block(&mut self, from: SocketAddr, block: Piece) {
-        let Some(in_flight) = self.in_flight.get_mut(&block.index) else {
+        let piece = block.index;
+        let Some(in_flight) = self.in_flight.get_mut(piece) else {
             return;
         };
-        let begin = block.begin as usize;
-        let end = begin + block.data.len();
-        // the block length is remote-controlled; a mismatch must not panic via copy_from_slice
-        if block.data.len() != block.length as usize || end > in_flight.buf.len() || !begin.is_multiple_of(BLOCK_SIZE) {
-            warn!(
-                "{from} sent a malformed block for piece {}, giving up on it there",
-                block.index
-            );
-            self.release_claim(block.index, from);
-            return;
-        }
-        let slot = &mut in_flight.received[begin / BLOCK_SIZE];
-        if *slot == Some(PADDING) {
-            // a web seed's run covers padding too
-            return;
-        }
-        if slot.is_some() {
-            // a racer lost this block
-            self.stat.wasted += block.length as u64;
-            self.bus.emit(Event::BlockWasted {
-                info_hash: self.torrent.info_hash,
-                addr: from,
-                len: block.length,
-                why: "lost race",
-            });
-            if let Some(idx) = self.peer_index(from) {
-                self.refill(idx);
+        let raced = in_flight.racers() > 1;
+        match in_flight.store(from, &block) {
+            Stored::Padding => {}
+            Stored::Malformed => {
+                warn!("{from} sent a malformed block for piece {piece}, giving up on it there");
+                self.release_claim(piece, from);
             }
-            return;
-        }
-        *slot = Some(from);
-        in_flight.buf[begin..end].copy_from_slice(&block.data);
-        let raced = in_flight.claims.len() > 1;
-        let blocks_left = in_flight.blocks_left();
-        if raced && blocks_left > 0 {
-            self.cancel_duplicates(&block, from);
-        }
-        if blocks_left > 0 {
-            if let Some(idx) = self.peer_index(from) {
-                self.schedule_peer(idx);
+            Stored::Duplicate => {
+                self.wasted(from, block.length, "lost race");
+                if let Some(idx) = self.peer_index(from) {
+                    self.refill(idx);
+                }
             }
-            return;
-        }
-
-        let piece = block.index;
-        let in_flight = self.in_flight.remove(&piece).expect("checked above");
-        for addr in in_flight.claims.keys() {
-            if let Some(held) = self.holdings.get_mut(addr) {
-                held.remove(&piece);
+            Stored::Added { blocks_left: 0 } => {
+                let in_flight = self.in_flight.finish(piece).expect("stored into it");
+                self.cancel_losers(piece, &in_flight);
+                self.piece_assembled(piece, in_flight);
+            }
+            Stored::Added { .. } => {
+                if raced {
+                    self.cancel_duplicates(&block, from);
+                }
+                if let Some(idx) = self.peer_index(from) {
+                    self.schedule_peer(idx);
+                }
             }
         }
-        self.cancel_losers(piece, &in_flight);
-        self.piece_assembled(piece, in_flight);
     }
 
     /// Hashes the piece and writes it if it's good, on the blocking pool: neither belongs on
     /// this loop, where a slow disk would hold up every peer. The buffer is hashed before it's
     /// written, so nothing is read back. `piece_done` takes it from there.
-    pub(super) fn piece_assembled(&mut self, piece: u32, in_flight: InFlight) {
+    fn piece_assembled(&mut self, piece: u32, in_flight: InFlight) {
         self.hashing.insert(piece);
         let senders = in_flight.senders();
         let torrent = self.torrent.clone();
@@ -150,7 +129,6 @@ impl TorrentSwarm {
             if let Some(events) = events.upgrade() {
                 let _ = events.blocking_send(SwarmEvent::PieceDone {
                     piece,
-                    len: buf.len(),
                     senders,
                     outcome,
                 });
@@ -158,75 +136,25 @@ impl TorrentSwarm {
         });
     }
 
-    pub(super) fn piece_done(
-        &mut self,
-        piece: u32,
-        len: usize,
-        senders: BTreeSet<SocketAddr>,
-        outcome: Result<bool, String>,
-    ) {
+    pub(super) fn piece_done(&mut self, piece: u32, senders: BTreeSet<SocketAddr>, outcome: Result<bool, String>) {
         self.hashing.remove(&piece);
         match outcome {
-            Ok(true) => {}
-            Ok(false) => {
-                self.bus.emit(Event::PieceFailed {
-                    info_hash: self.torrent.info_hash,
-                    piece,
-                    peers: senders.iter().copied().collect(),
-                });
-                if let [from] = senders.iter().copied().collect::<Vec<_>>()[..]
-                    && let Some(seed) = self.web_seed_index(from)
-                {
-                    warn!(
-                        "piece {piece} from web seed {} failed hash verification",
-                        self.web_seeds[seed].url
-                    );
-                    self.give_up_web_seed(seed, "sent a bad piece".to_string());
-                } else if let [from] = senders.iter().copied().collect::<Vec<_>>()[..] {
-                    warn!("piece {piece} from {from} failed hash verification, banning the peer");
-                    if let Some(idx) = self.peer_index(from) {
-                        self.drop_peer(idx, "sent a bad piece");
-                    }
-                    self.ban(from);
-                } else {
-                    warn!("piece {piece} failed hash verification, and came from {senders:?}; will retry");
-                }
-                self.missing.push(piece);
-                self.schedule();
-                return;
-            }
-            Err(e) => {
-                // Retrying would download the same piece forever into a disk that can't take
-                // it, so the torrent stops here and says why; the resume data keeps what was
-                // verified so far.
-                warn!("couldn't write piece {piece}: {e}; stopping the download");
-                self.missing.push(piece);
-                if self.stat.storage_error.is_none() {
-                    self.stat.storage_error = Some(e);
-                    self.holdings.clear();
-                    for (piece, f) in std::mem::take(&mut self.in_flight) {
-                        for &addr in f.claims.keys() {
-                            if let Some(idx) = self.peer_index(addr) {
-                                self.peers[idx].forget_piece(piece);
-                            }
-                        }
-                        self.missing.push(piece);
-                    }
-                }
-                self.publish_stats();
-                return;
-            }
+            Ok(true) => self.piece_verified(piece, senders),
+            Ok(false) => self.piece_failed(piece, senders),
+            Err(e) => self.storage_failed(piece, e),
         }
+    }
 
+    fn piece_verified(&mut self, piece: u32, senders: BTreeSet<SocketAddr>) {
+        let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
         self.stat.verified.set(piece as usize, true);
         self.bus.emit(Event::PieceVerified {
             info_hash: self.torrent.info_hash,
             piece,
-            len,
-            peers: senders.iter().copied().collect(),
+            len: size,
+            peers: senders.into_iter().collect(),
         });
         info!("piece {piece} is completed");
-        let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
         self.stat.written += size;
         let was_complete = self.stat.completed;
         // what `refresh` would work out, without recounting the whole bitfield per piece
@@ -254,20 +182,67 @@ impl TorrentSwarm {
         self.schedule();
     }
 
+    /// A piece is downloaded whole from one sender unless it was raced, so a bad one usually
+    /// convicts its sender; a raced one can't tell who lied, and is just fetched again.
+    fn piece_failed(&mut self, piece: u32, senders: BTreeSet<SocketAddr>) {
+        self.bus.emit(Event::PieceFailed {
+            info_hash: self.torrent.info_hash,
+            piece,
+            peers: senders.iter().copied().collect(),
+        });
+        let lone = senders.first().filter(|_| senders.len() == 1).copied();
+        match lone.map(|from| (from, self.web_seed_index(from))) {
+            Some((_, Some(seed))) => {
+                warn!(
+                    "piece {piece} from web seed {} failed hash verification",
+                    self.web_seeds[seed].url
+                );
+                self.give_up_web_seed(seed, "sent a bad piece".to_string());
+            }
+            Some((from, None)) => {
+                warn!("piece {piece} from {from} failed hash verification, banning the peer");
+                if let Some(idx) = self.peer_index(from) {
+                    self.drop_peer(idx, "sent a bad piece");
+                }
+                self.ban(from);
+            }
+            None => warn!("piece {piece} failed hash verification, and came from {senders:?}; will retry"),
+        }
+        self.missing.push(piece);
+        self.schedule();
+    }
+
+    /// Retrying would download the same piece forever into a disk that can't take it, so the
+    /// torrent stops here and says why; the resume data keeps what was verified so far.
+    fn storage_failed(&mut self, piece: u32, e: String) {
+        warn!("couldn't write piece {piece}: {e}; stopping the download");
+        self.missing.push(piece);
+        if self.stat.storage_error.is_none() {
+            self.stat.storage_error = Some(e);
+            for (piece, f) in self.in_flight.take_all() {
+                for addr in f.claimants() {
+                    if let Some(idx) = self.peer_index(addr) {
+                        self.peers[idx].forget_piece(piece);
+                    }
+                }
+                self.missing.push(piece);
+            }
+        }
+        self.publish_stats();
+    }
+
     /// A block of a raced piece just arrived from `from`: any other racer that asked for the
     /// same block is told not to bother.
-    pub(super) fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
+    fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
         let req = Request {
             index: block.index,
             begin: block.begin,
             length: block.length,
         };
-        let racers: Vec<SocketAddr> = self.in_flight[&block.index]
-            .claims
-            .keys()
-            .copied()
-            .filter(|&addr| addr != from)
-            .collect();
+        let Some(in_flight) = self.in_flight.get(block.index) else {
+            return;
+        };
+        let racers: Vec<SocketAddr> = in_flight.claimants().filter(|&addr| addr != from).collect();
         for addr in racers {
             let Some(idx) = self.peer_index(addr) else {
                 continue;
@@ -281,8 +256,8 @@ impl TorrentSwarm {
 
     /// A raced piece just completed: every other claimant is told to stop sending the blocks
     /// it still owes. A peer whose socket fails here is dropped.
-    pub(super) fn cancel_losers(&mut self, piece: u32, in_flight: &InFlight) {
-        for &addr in in_flight.claims.keys() {
+    fn cancel_losers(&mut self, piece: u32, in_flight: &InFlight) {
+        for addr in in_flight.claimants() {
             let Some(idx) = self.peer_index(addr) else {
                 continue;
             };

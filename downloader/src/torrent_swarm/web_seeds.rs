@@ -1,7 +1,6 @@
 //! BEP 19 web seeds: runs of pieces scheduled next to the peers, fetched by jobs on tasks of
 //! their own, and their part in the endgame.
 
-use crate::events::Event;
 use crate::settings::BLOCK_SIZE;
 use crate::webseed::{self, Failure, WebJob};
 use crate::wire::Piece;
@@ -82,21 +81,9 @@ impl TorrentSwarm {
 
         let addr = self.web_seeds[seed].addr;
         for piece in first..=last {
-            let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
-            let mut in_flight = InFlight::new(size, addr);
-            in_flight.skip_padding(&self.torrent, piece);
-            in_flight.claim_rest(addr);
-            in_flight.span = tracing::info_span!(
-                "piece",
-                info_hash = %self.torrent.info_hash,
-                piece,
-                size,
-                peer = %self.web_seeds[seed].host,
-                racers = 1,
-                outcome = tracing::field::Empty,
-            );
-            self.in_flight.insert(piece, in_flight);
-            self.holdings.entry(addr).or_default().insert(piece);
+            let in_flight = InFlight::new(&self.torrent, piece, addr, &self.web_seeds[seed].host);
+            self.in_flight.start(piece, in_flight);
+            self.in_flight.claim_rest(piece, addr);
         }
         let start = first as u64 * piece_size as u64;
         self.start_web_job(seed, start, start + bytes as u64);
@@ -126,20 +113,19 @@ impl TorrentSwarm {
                 let Some((_, piece)) = self
                     .in_flight
                     .iter()
-                    .filter(|(_, f)| f.claims.len() < racers && !f.claims.contains_key(&addr))
-                    .map(|(&piece, f)| (self.eta(f), piece))
+                    .filter(|(_, f)| f.racers() < racers && !f.claimed_by(addr))
+                    .map(|(piece, f)| (self.eta(f), piece))
                     .max_by(|a, b| a.0.total_cmp(&b.0))
                 else {
                     break;
                 };
                 let offset = piece as u64 * self.torrent.piece_size as u64;
-                let in_flight = self.in_flight.get_mut(&piece).expect("just looked up");
+                let in_flight = self.in_flight.get(piece).expect("just looked up");
                 let Some((start, end)) = in_flight.missing_span(offset) else {
                     break;
                 };
-                in_flight.claim_rest(addr);
                 tracing::debug!(parent: &in_flight.span, peer = %self.web_seeds[seed].host, "racer joined");
-                self.holdings.entry(addr).or_default().insert(piece);
+                self.in_flight.claim_rest(piece, addr);
                 self.start_web_job(seed, start, end);
                 tracing::debug!(
                     "endgame: also fetching piece {piece} from web seed {}",
@@ -207,23 +193,16 @@ impl TorrentSwarm {
         w.stats.block_received(block.length as usize, Instant::now());
         self.stat.downloaded += block.length as u64;
         let addr = w.addr;
-        let ours = |piece: u32| self.in_flight.get(&piece).is_some_and(|f| f.claims.contains_key(&addr));
-        if ours(block.index) {
+        if self.in_flight.holds(addr, block.index) {
             self.store_block(addr, block);
             return;
         }
         // finished by a racer, or released after a hash failure
-        self.stat.wasted += block.length as u64;
-        self.bus.emit(Event::BlockWasted {
-            info_hash: self.torrent.info_hash,
-            addr,
-            len: block.length,
-            why: "lost race",
-        });
+        self.wasted(addr, block.length, "lost race");
         let rest_unwanted = self.web_seeds[seed]
             .jobs
             .get(&job)
-            .is_some_and(|j| (block.index..=*j.pieces.end()).all(|p| !ours(p)));
+            .is_some_and(|j| (block.index..=*j.pieces.end()).all(|p| !self.in_flight.holds(addr, p)));
         if rest_unwanted {
             self.web_seeds[seed].jobs.remove(&job);
             self.schedule();
@@ -245,7 +224,7 @@ impl TorrentSwarm {
         }
         // whatever it didn't deliver goes back up for grabs
         for piece in job.pieces.clone() {
-            if self.in_flight.get(&piece).is_some_and(|f| f.claims.contains_key(&addr)) {
+            if self.in_flight.holds(addr, piece) {
                 self.release_claim(piece, addr);
             }
         }
@@ -263,10 +242,9 @@ impl TorrentSwarm {
         w.gave_up = Some(why);
         w.jobs.clear();
         let addr = w.addr;
-        for piece in self.pieces_held_by(addr) {
+        for piece in self.in_flight.held_by(addr) {
             self.release_claim(piece, addr);
         }
-        self.holdings.remove(&addr);
     }
 }
 

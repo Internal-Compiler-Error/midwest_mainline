@@ -69,7 +69,7 @@ impl TorrentSwarm {
                     // will be asked of the peer until it unchokes, so its pieces go back
                     // on the pile now for others rather than after a stall timeout
                     let addr = peer.remote_addr;
-                    for piece in self.pieces_held_by(addr) {
+                    for piece in self.in_flight.held_by(addr) {
                         self.release_claim(piece, addr);
                     }
                     self.schedule();
@@ -162,7 +162,7 @@ impl TorrentSwarm {
                 if peer.drop_have(piece) {
                     self.availability[piece as usize] -= 1;
                     let addr = peer.remote_addr;
-                    if self.holdings.get(&addr).is_some_and(|held| held.contains(&piece)) {
+                    if self.in_flight.holds(addr, piece) {
                         self.release_claim(piece, addr);
                         self.schedule();
                     }
