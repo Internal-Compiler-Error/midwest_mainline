@@ -3,9 +3,10 @@
   // chart is an ECharts option derived from the store; ECharts animates the changes.
   import { Button } from '$lib/components/ui/button'
   import { humanBytes, timeOfDay } from './format'
-  import { echart, base, type Option } from './echart'
+  import { base, type Option } from './echart'
   import type { Insights, PeerRecord } from './bus.svelte'
   import type { Kind, Stamped } from './events'
+  import Panel from './Panel.svelte'
 
   let { insights }: { insights: Insights } = $props()
   let filter = $state<Kind | null>(null)
@@ -13,6 +14,28 @@
 
   const perSecond = (bytes: number) => `${humanBytes(bytes)}/s`
   const short = (addr: string) => addr.replace(/^\[?([^\]]+)\]?:(\d+)$/, '$1:$2')
+
+  /** A count per label as horizontal bars, the biggest at the top. */
+  function countBars(counts: Map<string, number>, color?: string): Option {
+    const entries = [...counts.entries()].sort((a, b) => a[1] - b[1])
+    return base({
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      xAxis: { type: 'value', splitNumber: 3 },
+      yAxis: { type: 'category', data: entries.map((e) => e[0]) },
+      series: [
+        {
+          type: 'bar',
+          barMaxWidth: 16,
+          data: entries.map((e) => e[1]),
+          itemStyle: color ? { color } : undefined,
+          label: { show: true, position: 'right', fontSize: 9 },
+        },
+      ],
+    })
+  }
+
+  const area = (name: string, data: number[][]) =>
+    ({ name, type: 'line', smooth: true, showSymbol: false, areaStyle: { opacity: 0.25 }, data }) as const
 
   let connected = $derived([...insights.peers.values()].filter((p) => p.left_at === null))
   let byRate = $derived([...connected].sort((a, b) => b.rx_bps - a.rx_bps))
@@ -25,24 +48,7 @@
       legend: { top: 0, right: 0, icon: 'circle' },
       xAxis: { type: 'time', axisLabel: { formatter: '{HH}:{mm}:{ss}' }, splitLine: { show: false } },
       yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
-      series: [
-        {
-          name: 'down',
-          type: 'line',
-          smooth: true,
-          showSymbol: false,
-          areaStyle: { opacity: 0.25 },
-          data: insights.rates.map((p, i) => [t[i], p.down]),
-        },
-        {
-          name: 'up',
-          type: 'line',
-          smooth: true,
-          showSymbol: false,
-          areaStyle: { opacity: 0.25 },
-          data: insights.rates.map((p, i) => [t[i], p.up]),
-        },
-      ],
+      series: [area('down', insights.rates.map((p, i) => [t[i], p.down])), area('up', insights.rates.map((p, i) => [t[i], p.up]))],
     })
   })
 
@@ -128,15 +134,7 @@
   })
 
   // -- how peers were found, and who they turned out to be
-  let discovery = $derived.by((): Option => {
-    const entries = [...insights.discovery.entries()].sort((a, b) => a[1] - b[1])
-    return base({
-      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-      xAxis: { type: 'value', splitNumber: 3 },
-      yAxis: { type: 'category', data: entries.map((e) => e[0]) },
-      series: [{ type: 'bar', barMaxWidth: 16, data: entries.map((e) => e[1]), label: { show: true, position: 'right', fontSize: 9 } }],
-    })
-  })
+  let discovery = $derived(countBars(insights.discovery))
 
   let clients = $derived.by((): Option => {
     const entries = [...insights.clients.entries()].sort((a, b) => b[1] - a[1])
@@ -193,15 +191,7 @@
     })
   })
 
-  let goodbyes = $derived.by((): Option => {
-    const entries = [...insights.disconnects.entries()].sort((a, b) => a[1] - b[1])
-    return base({
-      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-      xAxis: { type: 'value', splitNumber: 3 },
-      yAxis: { type: 'category', data: entries.map((e) => e[0]) },
-      series: [{ type: 'bar', barMaxWidth: 16, data: entries.map((e) => e[1]), itemStyle: { color: '#f59e0b' }, label: { show: true, position: 'right', fontSize: 9 } }],
-    })
-  })
+  let goodbyes = $derived(countBars(insights.disconnects, '#f59e0b'))
 
   // -- the piece map: one cell per piece (or per few pieces for a big torrent), coloured by
   // when it arrived
@@ -282,71 +272,44 @@
   </div>
 
   <div class="grid grid-cols-2 gap-3 xl:grid-cols-3">
-    <section class="rounded-md border p-2 xl:col-span-2">
-      <h3 class="font-medium">Throughput</h3>
-      <div class="h-52" use:echart={throughput}></div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Peers by rate <span class="font-normal text-muted-foreground">(purple: encrypted)</span></h3>
-      <div class="h-52" use:echart={race}></div>
-    </section>
+    <Panel class="xl:col-span-2" title="Throughput" chart={throughput} />
+    <Panel title="Peers by rate" note="(purple: encrypted)" chart={race} />
 
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">UCB: the last pick per peer</h3>
-      <div class="h-52" use:echart={ucb}></div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Recent picks <span class="font-normal text-muted-foreground">exploit vs explore</span></h3>
-      <div class="h-52" use:echart={scatter}></div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Fastest peers, last minute</h3>
-      <div class="h-52" use:echart={history}></div>
-    </section>
+    <Panel title="UCB: the last pick per peer" chart={ucb} />
+    <Panel title="Recent picks" note="exploit vs explore" chart={scatter} />
+    <Panel title="Fastest peers, last minute" chart={history} />
 
-    <section class="rounded-md border p-2 xl:col-span-2">
-      <div class="flex items-center gap-2">
-        <h3 class="font-medium">Piece map</h3>
-        {#if pieceMaps.length > 1}
-          <select class="rounded border bg-background px-1 text-xs" bind:value={pieceTorrent}>
-            {#each pieceMaps as m (m.info_hash)}<option value={m.info_hash}>{m.name}</option>{/each}
-          </select>
-        {:else if shownPieces}
-          <span class="text-muted-foreground">{shownPieces.name}</span>
-        {/if}
-        {#if shownPieces}
-          <span class="ml-auto text-muted-foreground tabular-nums">
-            {shownPieces.arrived} arrived this session · {shownPieces.failed} failed · {shownPieces.total} pieces
-          </span>
-        {/if}
-      </div>
-      <div class="h-44" use:echart={pieceMap}></div>
+    <Panel class="xl:col-span-2" chart={pieceMap} height="h-44">
+      {#snippet header()}
+        <div class="flex items-center gap-2">
+          <h3 class="font-medium">Piece map</h3>
+          {#if pieceMaps.length > 1}
+            <select class="rounded border bg-background px-1 text-xs" aria-label="torrent" bind:value={pieceTorrent}>
+              {#each pieceMaps as m (m.info_hash)}<option value={m.info_hash}>{m.name}</option>{/each}
+            </select>
+          {:else if shownPieces}
+            <span class="text-muted-foreground">{shownPieces.name}</span>
+          {/if}
+          {#if shownPieces}
+            <span class="ml-auto text-muted-foreground tabular-nums">
+              {shownPieces.arrived} arrived this session · {shownPieces.failed} failed · {shownPieces.total} pieces
+            </span>
+          {/if}
+        </div>
+      {/snippet}
       <div class="flex gap-3 text-muted-foreground">
         <span><i class="inline-block size-2 rounded-sm bg-slate-500"></i> had at start</span>
         <span><i class="inline-block size-2 rounded-sm bg-cyan-400"></i> early <i class="inline-block size-2 rounded-sm bg-purple-500"></i> late</span>
         <span><i class="inline-block size-2 rounded-sm bg-red-500"></i> failed a hash check</span>
       </div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Peers found, by source</h3>
-      <div class="h-44" use:echart={discovery}></div>
-    </section>
+    </Panel>
+    <Panel title="Peers found, by source" chart={discovery} height="h-44" />
 
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Clients</h3>
-      <div class="h-44" use:echart={clients}></div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Transport <span class="font-normal text-muted-foreground">(outer ring: who called whom)</span></h3>
-      <div class="h-44" use:echart={transport}></div>
-    </section>
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Why peers left</h3>
-      <div class="h-44" use:echart={goodbyes}></div>
-    </section>
+    <Panel title="Clients" chart={clients} height="h-44" />
+    <Panel title="Transport" note="(outer ring: who called whom)" chart={transport} height="h-44" />
+    <Panel title="Why peers left" chart={goodbyes} height="h-44" />
 
-    <section class="rounded-md border p-2">
-      <h3 class="font-medium">Announces</h3>
+    <Panel title="Announces">
       <ul class="mt-1 max-h-44 overflow-auto font-mono text-[11px] leading-4">
         {#each [...insights.announces].reverse() as a (a.at + a.url)}
           <li class="truncate" class:text-destructive={!a.ok}>
@@ -356,9 +319,8 @@
           <li class="text-muted-foreground">nothing yet</li>
         {/each}
       </ul>
-    </section>
-    <section class="rounded-md border p-2 xl:col-span-2">
-      <h3 class="font-medium">Lifecycle</h3>
+    </Panel>
+    <Panel class="xl:col-span-2" title="Lifecycle">
       <ul class="mt-1 max-h-44 overflow-auto font-mono text-[11px] leading-4">
         {#each [...insights.lifecycle].reverse() as e (e.seq)}
           <li class="truncate">{timeOfDay(e.at_ms)} <b>{e.kind}</b> {describe(e)}</li>
@@ -366,23 +328,30 @@
           <li class="text-muted-foreground">nothing yet</li>
         {/each}
       </ul>
-    </section>
+    </Panel>
 
-    <section class="col-span-2 rounded-md border p-2 xl:col-span-3">
-      <div class="flex flex-wrap items-center gap-1">
-        <h3 class="mr-2 font-medium">Feed</h3>
-        <Button variant={filter === null ? 'secondary' : 'ghost'} size="xs" onclick={() => (filter = null)}>all</Button>
-        {#each kinds as [kind, n] (kind)}
-          <Button variant={filter === kind ? 'secondary' : 'ghost'} size="xs" onclick={() => (filter = filter === kind ? null : kind)}>
-            {kind} <span class="text-muted-foreground">{n}</span>
-          </Button>
-        {/each}
-      </div>
+    <Panel class="col-span-2 xl:col-span-3">
+      {#snippet header()}
+        <div class="flex flex-wrap items-center gap-1">
+          <h3 class="mr-2 font-medium">Feed</h3>
+          <Button variant={filter === null ? 'secondary' : 'ghost'} size="xs" aria-pressed={filter === null} onclick={() => (filter = null)}>all</Button>
+          {#each kinds as [kind, n] (kind)}
+            <Button
+              variant={filter === kind ? 'secondary' : 'ghost'}
+              size="xs"
+              aria-pressed={filter === kind}
+              onclick={() => (filter = filter === kind ? null : kind)}
+            >
+              {kind} <span class="text-muted-foreground">{n}</span>
+            </Button>
+          {/each}
+        </div>
+      {/snippet}
       <ul class="mt-1 max-h-56 overflow-auto font-mono text-[11px] leading-4 select-text">
         {#each shownFeed as e (e.seq + '-' + e.at_ms)}
           <li class="truncate"><span class="text-muted-foreground">{timeOfDay(e.at_ms)}</span> <b>{e.kind}</b> {describe(e)}</li>
         {/each}
       </ul>
-    </section>
+    </Panel>
   </div>
 </div>
