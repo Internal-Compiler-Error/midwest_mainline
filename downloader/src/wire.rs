@@ -631,6 +631,45 @@ impl Handshake {
     pub fn supports_dht(&self) -> bool {
         self.extensions[7] & 0x01 != 0
     }
+
+    /// BEP 52: bit 0x10 of reserved byte 7 says the peer supports v2 torrents.
+    pub fn supports_v2(&self) -> bool {
+        self.extensions[7] & 0x10 != 0
+    }
+}
+
+/// What a handshake of ours says about BEP 52, which depends on the torrent it's for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum V2Support {
+    /// a v1 torrent, or a magnet with nothing but a v1 hash
+    #[default]
+    None,
+    /// a v2-only torrent: its swarm goes by the v2 hash, and every peer in it speaks v2
+    Only,
+    /// a hybrid, handshaken under its v1 hash: the remote may answer with this, the truncated
+    /// v2 hash, to upgrade the connection to v2
+    Hybrid(InfoHash),
+}
+
+impl V2Support {
+    /// Whether the connection `theirs` opened, or answered, can carry v2 messages (hash
+    /// requests): for a hybrid, the remote said it supports v2 or went by the v2 hash.
+    pub fn v2_peer(self, theirs: &Handshake) -> bool {
+        match self {
+            V2Support::None => false,
+            V2Support::Only => true,
+            V2Support::Hybrid(v2) => theirs.supports_v2() || theirs.info_hash == v2,
+        }
+    }
+
+    /// The hash to answer an inbound handshake for this torrent with: a hybrid's v1 hash is
+    /// upgraded to the v2 one when the remote supports v2, as BEP 52 lets the answering side do.
+    pub fn answer(self, theirs: &Handshake) -> InfoHash {
+        match self {
+            V2Support::Hybrid(v2) if theirs.supports_v2() => v2,
+            _ => theirs.info_hash,
+        }
+    }
 }
 
 /// Sends our half of the handshake. Used both when we dial out (before reading the remote's
@@ -640,10 +679,14 @@ pub(crate) async fn send_handshake<S: AsyncWrite + Unpin>(
     peer: &mut S,
     info_hash: &InfoHash,
     local_id: &Identity,
+    v2: V2Support,
 ) -> io::Result<()> {
     let mut extensions = [0u8; 8];
     extensions[5] |= 0x10; // BEP 10: we support the extension protocol
     extensions[7] |= 0x04; // BEP 6: we support the fast extension
+    if v2 != V2Support::None {
+        extensions[7] |= 0x10; // BEP 52: we support v2 torrents
+    }
     if local_id.dht {
         extensions[7] |= 0x01; // BEP 5: we'll send our DHT port
     }
@@ -693,11 +736,13 @@ pub(crate) async fn shake_hands<S: AsyncRead + AsyncWrite + Unpin>(
     peer: &mut S,
     info_hash: &InfoHash,
     local_id: &Identity,
+    v2: V2Support,
 ) -> io::Result<Handshake> {
-    send_handshake(peer, info_hash, local_id).await?;
+    send_handshake(peer, info_hash, local_id, v2).await?;
     let handshake = read_handshake(peer).await?;
 
-    if &handshake.info_hash != info_hash {
+    let upgraded = matches!(v2, V2Support::Hybrid(v2) if handshake.info_hash == v2);
+    if &handshake.info_hash != info_hash && !upgraded {
         warn!(
             "handshake info hash didn't match, expected {:?}, got {:?}",
             info_hash, handshake.info_hash,
@@ -773,13 +818,13 @@ mod test {
             assert_eq!(handshake.info_hash, info_hash);
             assert_eq!(handshake.peer_id, dialer_id);
             assert!(handshake.supports_dht());
-            send_handshake(&mut sock, &info_hash, &identity(acceptor_id, false))
+            send_handshake(&mut sock, &info_hash, &identity(acceptor_id, false), V2Support::None)
                 .await
                 .unwrap();
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let handshake = shake_hands(&mut client, &info_hash, &identity(dialer_id, true))
+        let handshake = shake_hands(&mut client, &info_hash, &identity(dialer_id, true), V2Support::None)
             .await
             .unwrap();
         assert_eq!(handshake.peer_id, acceptor_id);
@@ -787,6 +832,57 @@ mod test {
         assert!(handshake.supports_extensions() && handshake.supports_fast_extension());
 
         server.await.unwrap();
+    }
+
+    /// BEP 52's upgrade: a hybrid dialled under its v1 hash with the v2 bit set is answered
+    /// with its v2 hash, which the dialler takes; without the bit it stays v1, and any other
+    /// hash is still refused.
+    #[tokio::test]
+    async fn a_hybrid_connection_upgrades_to_v2() {
+        let (v1, v2) = (InfoHash::from_bytes(&[1; 20]), InfoHash::from_bytes(&[2; 20]));
+        let hybrid = V2Support::Hybrid(v2);
+        let identity = Identity {
+            peer_id: [9; 20],
+            serving: "127.0.0.1:0".parse().unwrap(),
+            dht: false,
+            encryption: crate::config::Encryption::Disabled,
+        };
+        // the acceptor's view, as `bt_client::welcome` has it, and what the dialler ends up with
+        async fn open(
+            dialler: V2Support,
+            acceptor: V2Support,
+            answer: Option<InfoHash>,
+            identity: &Identity,
+        ) -> (Handshake, io::Result<Handshake>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let id = identity.clone();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let theirs = read_handshake(&mut sock).await.unwrap();
+                let answer = answer.unwrap_or_else(|| acceptor.answer(&theirs));
+                send_handshake(&mut sock, &answer, &id, acceptor).await.unwrap();
+                theirs
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let ours = shake_hands(&mut client, &InfoHash::from_bytes(&[1; 20]), identity, dialler).await;
+            (server.await.unwrap(), ours)
+        }
+
+        let (theirs, ours) = open(hybrid, hybrid, None, &identity).await;
+        assert!(theirs.supports_v2() && hybrid.v2_peer(&theirs));
+        let ours = ours.expect("the v2 hash is a valid answer");
+        assert_eq!(ours.info_hash, v2, "upgraded");
+        assert!(ours.supports_v2() && hybrid.v2_peer(&ours));
+
+        let (theirs, ours) = open(V2Support::None, hybrid, None, &identity).await;
+        assert!(!theirs.supports_v2() && !hybrid.v2_peer(&theirs));
+        assert_eq!(ours.unwrap().info_hash, v1, "a v1 peer isn't upgraded");
+
+        let (_, ours) = open(V2Support::None, hybrid, Some(v2), &identity).await;
+        assert!(ours.is_err(), "only a hybrid's dialler takes the v2 hash");
+        let (_, ours) = open(hybrid, hybrid, Some(InfoHash::from_bytes(&[3; 20])), &identity).await;
+        assert!(ours.is_err());
     }
 
     fn round_trip(msg: BtMessage) -> BtMessage {

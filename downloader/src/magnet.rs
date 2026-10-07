@@ -5,6 +5,7 @@
 //! peers.
 
 use crate::feed::FeedKey;
+use crate::wire::V2Support;
 use anyhow::{bail, ensure};
 use midwest_mainline::types::InfoHash;
 use std::net::SocketAddr;
@@ -44,6 +45,21 @@ impl MagnetLink {
             picked
         } else {
             vec![true; files]
+        }
+    }
+
+    /// A hybrid's truncated v2 hash, when the magnet has both a btih and a btmh.
+    pub fn hybrid_v2_hash(&self) -> Option<InfoHash> {
+        let v2 = InfoHash::from_bytes(&self.info_hash_v2?[..20]);
+        (v2 != self.info_hash).then_some(v2)
+    }
+
+    /// What the metadata fetch's handshakes say about BEP 52.
+    pub(crate) fn v2_support(&self) -> V2Support {
+        match (self.info_hash_v2, self.hybrid_v2_hash()) {
+            (_, Some(v2)) => V2Support::Hybrid(v2),
+            (Some(_), None) => V2Support::Only,
+            (None, _) => V2Support::None,
         }
     }
 }

@@ -7,7 +7,7 @@
 use crate::config::Encryption;
 use crate::defs::Identity;
 use crate::mse;
-use crate::wire::{HANDSHAKE_STR, Handshake, read_handshake, read_handshake_body, shake_hands};
+use crate::wire::{HANDSHAKE_STR, Handshake, V2Support, read_handshake, read_handshake_body, shake_hands};
 use librqbit_utp::{UtpSocketUdp, UtpStream};
 use midwest_mainline::types::InfoHash;
 use std::io::{self, ErrorKind};
@@ -94,10 +94,12 @@ impl Transport {
 /// Encryption follows `our_id.encryption`; with `Prefer`, a peer that doesn't take the
 /// encrypted opening is dialled again in plaintext over the same transport, since the first
 /// connection is spent once what we sent on it wasn't a handshake, and a peer remembered as
-/// having refused it before is dialled in plaintext from the start.
+/// having refused it before is dialled in plaintext from the start. `v2` is what the handshake
+/// says about BEP 52; a hybrid's peer may answer with its v2 hash instead of `info_hash`.
 pub(crate) async fn connect(
     addr: SocketAddr,
     info_hash: &InfoHash,
+    v2: V2Support,
     our_id: &Identity,
     utp: Option<&Arc<UtpSocketUdp>>,
     hints: DialHints,
@@ -129,7 +131,7 @@ pub(crate) async fn connect(
             }
         },
     };
-    let handshake = shake_hands(&mut stream, info_hash, our_id).await?;
+    let handshake = shake_hands(&mut stream, info_hash, our_id, v2).await?;
     Ok((stream, handshake))
 }
 
@@ -294,7 +296,9 @@ mod test {
                 match accept(PeerStream::Tcp(tcp), policy, || vec![hash]).await {
                     Ok((mut stream, handshake)) => {
                         assert_eq!(handshake.info_hash, hash);
-                        send_handshake(&mut stream, &hash, &identity(2, policy)).await.unwrap();
+                        send_handshake(&mut stream, &hash, &identity(2, policy), V2Support::None)
+                            .await
+                            .unwrap();
                         outcomes.push(stream.is_encrypted());
                     }
                     Err(_) => outcomes.push(false),
@@ -312,6 +316,7 @@ mod test {
         let (stream, handshake) = connect(
             addr,
             &hash,
+            V2Support::None,
             &identity(1, Encryption::Prefer),
             None,
             DialHints::default(),
@@ -332,6 +337,7 @@ mod test {
         let (stream, _) = connect(
             addr,
             &hash,
+            V2Support::None,
             &identity(1, Encryption::Prefer),
             None,
             DialHints::default(),
@@ -354,6 +360,7 @@ mod test {
             connect(
                 addr,
                 &hash,
+                V2Support::None,
                 &identity(1, Encryption::Disabled),
                 None,
                 DialHints::default()
@@ -368,6 +375,7 @@ mod test {
             connect(
                 addr,
                 &hash,
+                V2Support::None,
                 &identity(1, Encryption::Require),
                 None,
                 DialHints::default()
@@ -391,7 +399,7 @@ mod test {
                 .await
                 .unwrap();
             let other = InfoHash::from_bytes(&[10; 20]);
-            send_handshake(&mut stream, &other, &identity(2, Encryption::Prefer))
+            send_handshake(&mut stream, &other, &identity(2, Encryption::Prefer), V2Support::None)
                 .await
                 .unwrap();
             tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
@@ -402,6 +410,7 @@ mod test {
             connect(
                 addr,
                 &hash,
+                V2Support::None,
                 &identity(1, Encryption::Prefer),
                 None,
                 DialHints::default()
@@ -425,12 +434,21 @@ mod test {
                 let stream = server.accept().await.unwrap();
                 let (mut stream, handshake) = accept(PeerStream::Utp(stream), policy, || vec![hash]).await.unwrap();
                 assert_eq!(handshake.info_hash, hash);
-                send_handshake(&mut stream, &hash, &identity(2, policy)).await.unwrap();
+                send_handshake(&mut stream, &hash, &identity(2, policy), V2Support::None)
+                    .await
+                    .unwrap();
                 (stream.is_utp(), stream.is_encrypted())
             });
-            let (stream, _) = connect(addr, &hash, &identity(1, policy), Some(&client), DialHints::default())
-                .await
-                .unwrap();
+            let (stream, _) = connect(
+                addr,
+                &hash,
+                V2Support::None,
+                &identity(1, policy),
+                Some(&client),
+                DialHints::default(),
+            )
+            .await
+            .unwrap();
             let expected = (true, policy == Encryption::Prefer);
             assert_eq!((stream.is_utp(), stream.is_encrypted()), expected);
             assert_eq!(acceptor.await.unwrap(), expected);
@@ -501,7 +519,7 @@ mod test {
             let (mut stream, _) = accept(PeerStream::Utp(stream), Encryption::Prefer, || vec![hash])
                 .await
                 .unwrap();
-            send_handshake(&mut stream, &hash, &identity(2, Encryption::Prefer))
+            send_handshake(&mut stream, &hash, &identity(2, Encryption::Prefer), V2Support::None)
                 .await
                 .unwrap();
             stream.is_encrypted()
@@ -511,9 +529,16 @@ mod test {
             plaintext: true,
             ..Default::default()
         };
-        let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Prefer), Some(&client), hints)
-            .await
-            .unwrap();
+        let (stream, _) = connect(
+            addr,
+            &hash,
+            V2Support::None,
+            &identity(1, Encryption::Prefer),
+            Some(&client),
+            hints,
+        )
+        .await
+        .unwrap();
         assert!(stream.is_utp() && !stream.is_encrypted());
         assert!(!acceptor.await.unwrap());
         drop(tcp);
@@ -530,6 +555,7 @@ mod test {
         let (stream, _) = connect(
             addr,
             &hash,
+            V2Support::None,
             &identity(1, Encryption::Disabled),
             Some(&client),
             DialHints::default(),
@@ -555,9 +581,16 @@ mod test {
             ..Default::default()
         };
         let started = tokio::time::Instant::now();
-        let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Disabled), Some(&client), hints)
-            .await
-            .unwrap();
+        let (stream, _) = connect(
+            addr,
+            &hash,
+            V2Support::None,
+            &identity(1, Encryption::Disabled),
+            Some(&client),
+            hints,
+        )
+        .await
+        .unwrap();
         let took = started.elapsed();
         assert!(!stream.is_utp());
         assert!(

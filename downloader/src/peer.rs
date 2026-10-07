@@ -140,6 +140,8 @@ pub(crate) struct Peer {
     pub remote_supports_fast: bool,
     /// the connection is MSE-obfuscated; shown to the user, decides nothing
     pub encrypted: bool,
+    /// BEP 52: it can take hash requests (a v2 torrent's peer, or a hybrid's that supports v2)
+    pub v2: bool,
     /// same for running over uTP
     pub utp: bool,
     /// the message id the remote wants us to use for ut_metadata messages, learned from
@@ -324,6 +326,7 @@ impl Peer {
             remote_addr,
             remote_supports_fast,
             encrypted,
+            v2: false,
             utp,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,

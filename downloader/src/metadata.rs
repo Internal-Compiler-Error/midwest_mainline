@@ -23,7 +23,7 @@ use crate::stream::DialHints;
 use crate::torrent::{Torrent, parse_torrent};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use crate::utp::UtpWatch;
-use crate::wire::{BtCodec, BtMessage, Extended};
+use crate::wire::{BtCodec, BtMessage, Extended, V2Support};
 use anyhow::{Context, bail, ensure};
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
@@ -138,7 +138,7 @@ pub async fn fetch(
         bus: bus.clone(),
         // trackers' word on our address before there's a client to tell; it isn't kept
         external: Default::default(),
-        v2: None,
+        v2: magnet.hybrid_v2_hash(),
     });
 
     let started = tokio::time::Instant::now();
@@ -161,6 +161,7 @@ pub async fn fetch(
             let Some(peer) = pending.pop_front() else { break };
             in_flight += 1;
             let info_hash = magnet.info_hash;
+            let v2 = magnet.v2_support();
             let identity = identity.clone();
             let result_tx = result_tx.clone();
             let utp = utp.borrow().clone();
@@ -168,7 +169,7 @@ pub async fn fetch(
             tokio::spawn(
                 async move {
                     let result =
-                        tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity, utp))
+                        tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, v2, identity, utp))
                             .await
                             .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
                     let outcome = match &result {
@@ -256,12 +257,14 @@ pub struct Fetched {
 async fn fetch_from_peer(
     addr: SocketAddr,
     info_hash: InfoHash,
+    v2: V2Support,
     identity: Arc<Identity>,
     utp: Option<Arc<UtpSocketUdp>>,
 ) -> anyhow::Result<Vec<u8>> {
-    let (stream, handshake) = crate::stream::connect(addr, &info_hash, &identity, utp.as_ref(), DialHints::default())
-        .await
-        .with_context(|| format!("connect to {addr}"))?;
+    let (stream, handshake) =
+        crate::stream::connect(addr, &info_hash, v2, &identity, utp.as_ref(), DialHints::default())
+            .await
+            .with_context(|| format!("connect to {addr}"))?;
     ensure!(
         handshake.supports_extensions(),
         "{addr} doesn't support the extension protocol, so it can't serve metadata"
@@ -597,7 +600,7 @@ mod test {
         let server = tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let their_handshake = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &their_handshake.info_hash, &test_identity())
+            send_handshake(&mut tcp, &their_handshake.info_hash, &test_identity(), V2Support::None)
                 .await
                 .unwrap();
 
@@ -656,7 +659,7 @@ mod test {
             }
         });
 
-        let fetched = fetch_from_peer(addr, info_hash, Arc::new(test_identity()), None)
+        let fetched = fetch_from_peer(addr, info_hash, V2Support::None, Arc::new(test_identity()), None)
             .await
             .unwrap();
         assert_eq!(fetched, raw_info, "fetched metadata must match byte-for-byte");
@@ -685,7 +688,9 @@ mod test {
         tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
             let hs = read_handshake(&mut tcp).await.unwrap();
-            send_handshake(&mut tcp, &hs.info_hash, &test_identity()).await.unwrap();
+            send_handshake(&mut tcp, &hs.info_hash, &test_identity(), V2Support::None)
+                .await
+                .unwrap();
 
             let (reader, writer) = tcp.into_split();
             let mut reader = FramedRead::new(reader, BtDecoder);
@@ -714,7 +719,7 @@ mod test {
             }
         });
 
-        let err = fetch_from_peer(addr, real_hash, Arc::new(test_identity()), None)
+        let err = fetch_from_peer(addr, real_hash, V2Support::None, Arc::new(test_identity()), None)
             .await
             .unwrap_err();
         assert!(
@@ -738,7 +743,10 @@ mod test {
                 let served = raw_info.clone();
                 tokio::spawn(async move {
                     let Ok(hs) = read_handshake(&mut tcp).await else { return };
-                    if send_handshake(&mut tcp, &hs.info_hash, &test_identity()).await.is_err() {
+                    if send_handshake(&mut tcp, &hs.info_hash, &test_identity(), V2Support::None)
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
 

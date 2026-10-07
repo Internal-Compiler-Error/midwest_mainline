@@ -22,7 +22,7 @@ use crate::stream::{DialHints, PeerStream};
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
 use crate::webseed::{self, Failure, WebJob, WebSeed};
-use crate::wire::{BitField, BtMessage, Piece, Request};
+use crate::wire::{BitField, BtMessage, Piece, Request, V2Support};
 use anyhow::Context;
 use bitvec::prelude::*;
 use rand::RngExt;
@@ -122,6 +122,8 @@ pub struct TorrentSwarmHandle {
     stats: watch::Receiver<TorrentSwarmStats>,
     peers: watch::Receiver<Vec<PeerSnapshot>>,
     trackers: watch::Receiver<Vec<TrackerStatus>>,
+    /// what handshakes for this torrent say about BEP 52, for the inbound listener's answer
+    pub(crate) v2: V2Support,
 }
 
 impl TorrentSwarmHandle {
@@ -196,6 +198,8 @@ pub(crate) struct ConnectedPeer {
     pub remote_supports_extensions: bool,
     pub remote_supports_fast: bool,
     pub remote_supports_dht: bool,
+    /// BEP 52: the connection can carry hash requests (see `V2Support::v2_peer`)
+    pub remote_supports_v2: bool,
     pub peer_id: [u8; 20],
 }
 
@@ -610,6 +614,7 @@ impl TorrentSwarm {
             stats: stat_rx,
             peers: peers_rx,
             trackers,
+            v2: torrent.v2_support(),
         };
         let events_tx = events_tx_weak;
 
@@ -2369,6 +2374,7 @@ impl TorrentSwarm {
         );
         peer.stats = known.stats.clone();
         peer.dialed = connected.dialed;
+        peer.v2 = connected.remote_supports_v2;
         let opening = async {
             if connected.remote_supports_extensions {
                 peer.send_extended_handshake(
@@ -2737,7 +2743,14 @@ async fn dial(
 ) -> anyhow::Result<ConnectedPeer> {
     let (stream, handshake) = tokio::time::timeout(
         crate::settings::HANDSHAKE_TIMEOUT,
-        crate::stream::connect(addr, &torrent.info_hash, our_id, utp.as_ref(), hints),
+        crate::stream::connect(
+            addr,
+            &torrent.info_hash,
+            torrent.v2_support(),
+            our_id,
+            utp.as_ref(),
+            hints,
+        ),
     )
     .await
     .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
@@ -2754,6 +2767,7 @@ async fn dial(
         remote_supports_extensions: handshake.supports_extensions(),
         remote_supports_fast: handshake.supports_fast_extension(),
         remote_supports_dht: handshake.supports_dht(),
+        remote_supports_v2: torrent.v2_support().v2_peer(&handshake),
         peer_id: handshake.peer_id,
     })
 }
@@ -3006,6 +3020,7 @@ mod test {
                 remote_supports_extensions: false,
                 remote_supports_fast: fast,
                 remote_supports_dht: false,
+                remote_supports_v2: false,
                 peer_id: *b"-TS0001-fake-peer-id",
             })
             .await;

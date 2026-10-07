@@ -531,7 +531,9 @@ async fn welcome(
         return;
     };
 
-    if let Err(e) = crate::wire::send_handshake(&mut stream, &handshake.info_hash, &id).await {
+    // BEP 52: a hybrid's peer that supports v2 gets the v2 hash back, upgrading the connection
+    let answer = handle.v2.answer(&handshake);
+    if let Err(e) = crate::wire::send_handshake(&mut stream, &answer, &id, handle.v2).await {
         tracing::debug!("failed to reply to handshake from {remote_addr}: {e}");
         return;
     }
@@ -544,6 +546,7 @@ async fn welcome(
             remote_supports_extensions: handshake.supports_extensions(),
             remote_supports_fast: handshake.supports_fast_extension(),
             remote_supports_dht: handshake.supports_dht(),
+            remote_supports_v2: handle.v2.v2_peer(&handshake),
             peer_id: handshake.peer_id,
         })
         .await;

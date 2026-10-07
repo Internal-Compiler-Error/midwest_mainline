@@ -1,4 +1,5 @@
 use crate::merkle::{self, Hash};
+use crate::wire::V2Support;
 use anyhow::{anyhow, bail};
 use bendy::decoding::Object;
 use bitvec::prelude::*;
@@ -208,16 +209,26 @@ impl Torrent {
         Some(InfoHash::from_bytes(&v2.info_hash[..20]))
     }
 
-    /// Validates that a piece matches its expected hash. A v2-only piece whose file's piece
-    /// layer isn't known yet can't be checked, and fails.
-    pub fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
-        if !self.v2_only() {
-            return *Sha1::digest(data) == self.pieces[piece as usize];
+    /// What our handshakes for this torrent say about BEP 52.
+    pub(crate) fn v2_support(&self) -> V2Support {
+        match (&self.v2, self.hybrid_v2_hash()) {
+            (_, Some(v2)) => V2Support::Hybrid(v2),
+            (Some(_), None) => V2Support::Only,
+            (None, _) => V2Support::None,
         }
-        let Some((expected, len, leaves)) = self.v2_piece_hash(piece) else {
+    }
+
+    /// Validates that a piece matches its expected hashes: a hybrid's must match both its SHA-1
+    /// hash and, once its file's piece layer is known, its Merkle hash. A v2-only piece whose
+    /// file's piece layer isn't known yet can't be checked, and fails.
+    pub fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
+        if !self.v2_only() && *Sha1::digest(data) != self.pieces[piece as usize] {
             return false;
-        };
-        data.len() >= len && merkle::data_root(&data[..len], leaves) == expected
+        }
+        match self.v2_piece_hash(piece) {
+            Some((expected, len, leaves)) => data.len() >= len && merkle::data_root(&data[..len], leaves) == expected,
+            None => !self.v2_only(),
+        }
     }
 
     /// Whether `valid_piece` can tell for `piece`: always, but for a v2-only torrent from a
@@ -1595,6 +1606,39 @@ mod test {
         assert_eq!(t.hybrid_v2_hash().unwrap().as_bytes(), &v2.info_hash[..20]);
         let stream = stream(&files);
         assert!(t.valid_piece(1, &stream[P..2 * P]), "checked by SHA-1");
+    }
+
+    /// The halves of a hybrid must agree on every piece: here the v1 hashes describe one `d`
+    /// and the file tree another, so `d`'s second piece passes neither way.
+    #[test]
+    fn a_hybrid_piece_must_match_both_hashes() {
+        let files = files();
+        let mut other = files.clone();
+        other[2].1[40_000] ^= 1;
+        let v1 = fixtures::info("hy", &files, P, true);
+        let v2 = fixtures::info("hy", &other, P, true);
+        let pieces = |info: &[u8]| info.windows(8).position(|w| w == b"6:pieces").unwrap();
+        let mut info = v2[..pieces(&v2)].to_vec();
+        info.extend_from_slice(&v1[pieces(&v1)..]);
+        let layers = fixtures::piece_layers(&other, P);
+        let t = parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).unwrap();
+        assert!(t.v2.is_some() && !t.v2_only());
+
+        let (ours, theirs) = (stream(&files), stream(&other));
+        let piece = |data: &[u8], i: usize| data[i * P..((i + 1) * P).min(data.len())].to_vec();
+        for i in [0, 1, 2, 4] {
+            assert!(t.valid_piece(i as u32, &piece(&ours, i)), "piece {i}");
+        }
+        assert!(
+            !t.valid_piece(3, &piece(&ours, 3)),
+            "SHA-1 agrees, the Merkle tree doesn't"
+        );
+        assert!(!t.valid_piece(3, &piece(&theirs, 3)), "the other way round");
+
+        // without the piece layers (as from a magnet), only SHA-1 can tell
+        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+        assert!(bare.valid_piece(3, &piece(&ours, 3)));
+        assert!(!bare.valid_piece(3, &piece(&theirs, 3)));
     }
 
     #[test]
