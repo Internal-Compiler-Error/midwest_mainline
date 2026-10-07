@@ -1034,6 +1034,8 @@ pub struct PeerStatistics {
 
     /// Deliveries within the last RATE_WINDOW, oldest first
     arrivals: VecDeque<(Instant, usize)>,
+    /// the bytes of `arrivals`
+    arrived: usize,
 
     /// When the current run of outstanding requests began
     busy_since: Option<Instant>,
@@ -1053,6 +1055,7 @@ impl PeerStatistics {
     pub fn requests_started(&mut self, now: Instant) {
         self.busy_since = Some(now);
         self.arrivals.clear();
+        self.arrived = 0;
     }
 
     /// A requested block arrived. The throughput sample is bytes delivered over the window
@@ -1062,18 +1065,17 @@ impl PeerStatistics {
     pub fn block_received(&mut self, length: usize, now: Instant) {
         self.received += length;
         self.arrivals.push_back((now, length));
-        while self
-            .arrivals
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > RATE_WINDOW)
+        self.arrived += length;
+        while let Some(&(at, len)) = self.arrivals.front()
+            && now.duration_since(at) > RATE_WINDOW
         {
             self.arrivals.pop_front();
+            self.arrived -= len;
         }
         let window_start = self.busy_since.map_or(now, |since| since.max(now - RATE_WINDOW));
         let span = now.duration_since(window_start).as_secs_f64();
         if span > 0.0 {
-            let bytes: usize = self.arrivals.iter().map(|(_, len)| len).sum();
-            self.rx_rate = bytes as f64 / span;
+            self.rx_rate = self.arrived as f64 / span;
         }
     }
 
