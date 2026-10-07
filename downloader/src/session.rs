@@ -328,6 +328,8 @@ impl Controls {
 /// puts the torrent in the client and takes it out again on pause, unpause, remove, and
 /// shutdown, and keeps the resume file current in between.
 struct TorrentTask {
+    /// its entry's
+    id: TorrentId,
     client: BtClient,
     bus: EventBus,
     /// what the user gave, for naming a torrent that failed before it was known
@@ -371,7 +373,26 @@ struct FeedUpdate {
     modes: Modes,
 }
 
-type Claimed = Arc<std::sync::Mutex<HashSet<InfoHash>>>;
+type Claimed = Arc<Claims>;
+
+/// Who has which info hash to themselves, see `Claim`.
+#[derive(Default)]
+struct Claims {
+    /// the entry holding each, and whether it has been removed and is only cleaning up
+    held: std::sync::Mutex<HashMap<InfoHash, (TorrentId, bool)>>,
+    released: Notify,
+}
+
+impl Claims {
+    /// The entry is gone from the session; one that wants its torrent waits for it to finish.
+    fn leaving(&self, id: TorrentId) {
+        for (holder, leaving) in self.held.lock().unwrap().values_mut() {
+            if *holder == id {
+                *leaving = true;
+            }
+        }
+    }
+}
 
 /// An info hash one entry has to itself: a second entry for the same torrent fails rather
 /// than sharing (or truncating) its files and resume file. Let go when the entry's task ends.
@@ -381,17 +402,35 @@ struct Claim {
 }
 
 impl Claim {
-    fn take(claimed: &Claimed, info_hash: InfoHash) -> Option<Self> {
-        claimed.lock().unwrap().insert(info_hash).then(|| Self {
-            claimed: claimed.clone(),
-            info_hash,
-        })
+    /// `None` if another entry holds it; one that was removed is waited out, so its files and
+    /// resume file are dealt with before this entry touches them.
+    async fn take(claimed: &Claimed, id: TorrentId, info_hash: InfoHash) -> Option<Self> {
+        use std::collections::hash_map::Entry;
+        loop {
+            // registered before looking, so a release between the look and the wait isn't missed
+            let released = claimed.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            match claimed.held.lock().unwrap().entry(info_hash) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert((id, false));
+                    return Some(Self {
+                        claimed: claimed.clone(),
+                        info_hash,
+                    });
+                }
+                Entry::Occupied(held) if !held.get().1 => return None,
+                Entry::Occupied(_) => {}
+            }
+            released.await;
+        }
     }
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.claimed.lock().unwrap().remove(&self.info_hash);
+        self.claimed.held.lock().unwrap().remove(&self.info_hash);
+        self.claimed.released.notify_waiters();
     }
 }
 
@@ -416,7 +455,7 @@ impl TorrentTask {
         // a magnet or resume file names its torrent up front, so a duplicate fails at once
         let mut claim = None;
         if let Some(info_hash) = self.info_hash {
-            claim = Claim::take(&self.claimed, info_hash);
+            claim = Claim::take(&self.claimed, self.id, info_hash).await;
             if claim.is_none() {
                 self.info_hash = None;
                 self.fail("this torrent is already added".to_string(), &Owned::Nothing)
@@ -468,7 +507,7 @@ impl TorrentTask {
                 Err(e) => (format!("{e:#}"), Owned::Unresolved),
                 Ok(resolved) => {
                     if claim.is_none() {
-                        claim = Claim::take(&self.claimed, resolved.torrent.info_hash);
+                        claim = Claim::take(&self.claimed, self.id, resolved.torrent.info_hash).await;
                     }
                     if claim.is_none() {
                         self.info_hash = None;
@@ -1529,6 +1568,7 @@ impl Session {
     /// Unknown ids are ignored.
     pub fn remove(&mut self, id: TorrentId, delete_files: bool) {
         if let Some(entry) = self.torrents.remove(&id) {
+            self.claimed.leaving(id);
             let _ = entry.commands.send(Command::Act(Action::Remove { delete_files }));
         }
     }
@@ -1573,6 +1613,7 @@ impl Session {
         );
 
         let task = TorrentTask {
+            id,
             client: self.client.clone(),
             bus: self.events.clone(),
             source,
@@ -2476,6 +2517,36 @@ mod test {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Removing a torrent and adding it straight back (to download it afresh, say) gets a new
+    /// entry once the old one has cleaned up, not "already added".
+    #[test]
+    fn a_removed_torrent_can_be_added_again_at_once() {
+        let dir = scratch("readd");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.remove(id, true);
+        let again = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, again, |s| {
+            matches!(s, Some(TorrentState::Downloading(_) | TorrentState::Failed { .. }))
+        });
+        let Some((_, state)) = session.torrents().into_iter().find(|(i, _)| *i == again) else {
+            panic!()
+        };
+        assert!(matches!(state, TorrentState::Downloading(_)), "{state:?}");
+        // a duplicate of one that stays is still refused
+        let dup = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, dup, |s| matches!(s, Some(TorrentState::Failed { .. })));
+        session.remove(dup, false);
+        let third = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, third, |s| matches!(s, Some(TorrentState::Failed { .. })));
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
