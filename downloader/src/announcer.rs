@@ -466,6 +466,8 @@ struct Tracker {
     board: (TrackerBoard, usize),
     /// consecutive failed announces, for the retry backoff
     failures: u32,
+    /// what the last successful announce said about the swarm, before any scrape filled in
+    announced_counts: SwarmCounts,
     last_scrape: Option<Instant>,
     bus: EventBus,
     external: crate::external::ExternalAddress,
@@ -487,6 +489,7 @@ impl Tracker {
             shutdown: shared.shutdown.clone(),
             board,
             failures: 0,
+            announced_counts: SwarmCounts::default(),
             last_scrape: None,
             bus: shared.bus.clone(),
             external: shared.external.clone(),
@@ -531,13 +534,12 @@ impl Tracker {
         }
     }
 
-    /// Whether to scrape after an announce: the announce didn't say how many have completed
-    /// the torrent (or anything about the swarm), and the last scrape is a while ago.
+    /// Whether to scrape after an announce: it succeeded but didn't say how many have
+    /// completed the torrent (or anything about the swarm), and the last scrape is a while ago.
     fn wants_scrape(&self) -> bool {
-        let (board, slot) = &self.board;
-        let swarm = board.borrow().get(*slot).map(|row| row.swarm).unwrap_or_default();
+        let swarm = self.announced_counts;
         let missing = swarm.downloaded.is_none() || swarm.seeders.is_none();
-        missing && self.last_scrape.is_none_or(|at| at.elapsed() >= SCRAPE_INTERVAL)
+        self.failures == 0 && missing && self.last_scrape.is_none_or(|at| at.elapsed() >= SCRAPE_INTERVAL)
     }
 
     fn record_scrape(&mut self, scraped: anyhow::Result<SwarmCounts>) {
@@ -619,6 +621,7 @@ impl Tracker {
                 self.sent_started = true;
                 self.sent_completed |= event == AnnounceEvent::Completed;
                 self.failures = 0;
+                self.announced_counts = counts;
                 self.next_ready = Instant::now() + interval;
                 let (count, next) = (peers.len(), self.next_ready);
                 info!(
@@ -969,7 +972,7 @@ impl HttpAnnouncer {
                 _ = shutdown.cancelled() => break,
             };
             self.tracker.settle(event, announced).instrument(span).await;
-            if self.tracker.failures == 0 && self.tracker.wants_scrape() {
+            if self.tracker.wants_scrape() {
                 let span = self.tracker.scrape_span();
                 let scraped = tokio::select! {
                     scraped = self.scrape().instrument(span.clone()) => scraped,
@@ -1347,7 +1350,7 @@ impl UdpAnnouncer {
                 self.connection = None;
             }
             self.tracker.settle(event, announced).instrument(span).await;
-            if self.tracker.failures == 0 && self.tracker.wants_scrape() {
+            if self.tracker.wants_scrape() {
                 let span = self.tracker.scrape_span();
                 let scraped = tokio::select! {
                     scraped = self.scrape().instrument(span.clone()) => scraped,
@@ -1716,6 +1719,45 @@ mod test {
             .collect();
         assert_eq!(found, expected);
         shutdown.cancel();
+    }
+
+    /// A tracker whose announces never say how many have completed (every UDP tracker) is
+    /// scraped again every SCRAPE_INTERVAL, not just once: the count a scrape filled in must not
+    /// pass for the announce having said it.
+    #[tokio::test]
+    async fn scrapes_again_while_announces_leave_counts_out() {
+        let (events, _rx) = mpsc::channel(8);
+        let row = TrackerStatus {
+            url: "udp://t.test:1".into(),
+            state: TrackerState::Pending,
+            peers: 0,
+            next_announce: None,
+            swarm: SwarmCounts::default(),
+        };
+        let board = Arc::new(watch::channel(vec![row]).0);
+        let mut tracker = Tracker::new(Url::parse("udp://t.test:1").unwrap(), &announcing(&events), (board, 0));
+        let announced = || Announced {
+            peers: vec![],
+            interval: Duration::from_secs(1800),
+            counts: SwarmCounts {
+                seeders: Some(3),
+                leechers: Some(4),
+                downloaded: None,
+            },
+        };
+        tracker.settle(AnnounceEvent::Started, Ok(announced())).await;
+        assert!(tracker.wants_scrape());
+        tracker.record_scrape(Ok(SwarmCounts {
+            seeders: Some(3),
+            leechers: Some(4),
+            downloaded: Some(50),
+        }));
+        assert!(!tracker.wants_scrape(), "just scraped");
+        tracker.last_scrape = Instant::now().checked_sub(SCRAPE_INTERVAL);
+        tracker.settle(AnnounceEvent::Regular, Ok(announced())).await;
+        assert!(tracker.wants_scrape(), "the completed count would go stale");
+        tracker.settle(AnnounceEvent::Regular, Err(anyhow!("down"))).await;
+        assert!(!tracker.wants_scrape(), "not while the tracker fails");
     }
 
     /// Connect, then announce with the connection ID the tracker handed out.
