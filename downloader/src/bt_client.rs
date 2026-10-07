@@ -210,14 +210,20 @@ impl BtClient {
     /// Stops serving `info_hash`: its swarm ends, and every connection to its peers closes.
     /// The files and any resume data are left where they are. Returns whether it was there.
     pub fn remove_torrent(&self, info_hash: &InfoHash) -> bool {
-        self.swarms.lock().unwrap().remove(info_hash).is_some()
+        let mut swarms = self.swarms.lock().unwrap();
+        let Some(removed) = swarms.remove(info_hash) else {
+            return false;
+        };
+        // a hybrid is also there under its v2 hash
+        swarms.retain(|_, handle| !handle.same_swarm(&removed));
+        true
     }
 
     /// Starts `torrent` from scratch under `root`: target files are created (or truncated)
     /// and sized. A single-file torrent becomes `root/<name>`, a multi-file one
     /// `root/<name>/...`, the way every mainstream client lays a download out.
     pub fn add_torrent(&self, torrent: Torrent, root: &Path) -> anyhow::Result<()> {
-        let verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
+        let verified = bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice();
         self.add_torrent_with(torrent, root, verified, true)
     }
 
@@ -226,11 +232,11 @@ impl BtClient {
     /// files are opened in place and must already be their full size -- a missing or
     /// wrong-sized file is an error, since the bitfield can't be trusted against it.
     pub fn add_torrent_resumed(&self, torrent: Torrent, root: &Path, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
-        if verified.len() != torrent.pieces.len() {
+        if verified.len() != torrent.num_pieces() {
             bail!(
                 "resume bitfield covers {} pieces but the torrent has {}",
                 verified.len(),
-                torrent.pieces.len()
+                torrent.num_pieces()
             );
         }
         self.add_torrent_with(torrent, root, verified, false)
@@ -251,8 +257,15 @@ impl BtClient {
         }
 
         let mut files = vec![];
-        for (size, relative) in torrent.files.iter() {
+        for ((size, relative), attr) in torrent.files.iter().zip(&torrent.attrs) {
             let file = root.join(relative);
+            if attr.virtual_file() {
+                if let Some(target) = &attr.symlink {
+                    make_symlink(&torrent, root, relative, target);
+                }
+                files.push(None);
+                continue;
+            }
             fs::create_dir_all(file.parent().unwrap())?;
             let f = File::options()
                 .read(true)
@@ -262,8 +275,11 @@ impl BtClient {
                 .open(&file)
                 .with_context(|| format!("opening {}", file.display()))?;
             if fresh {
-                // `TorrentStorage::new` derives per-file offsets from on-disk lengths
                 f.set_len(*size)?;
+                if attr.executable {
+                    use std::os::unix::fs::PermissionsExt;
+                    f.set_permissions(fs::Permissions::from_mode(0o755))?;
+                }
             } else {
                 let on_disk = f.metadata()?.len();
                 if on_disk != *size {
@@ -273,7 +289,7 @@ impl BtClient {
                     );
                 }
             }
-            files.push(f);
+            files.push(Some(f));
         }
 
         let torrent = Arc::new(torrent);
@@ -290,6 +306,10 @@ impl BtClient {
             external: self.external.clone(),
         };
         let handle = TorrentSwarm::spawn(torrent.clone(), storage, verified, shared);
+        // BEP 52: a hybrid's peers may come knocking with its v2 hash, truncated
+        if let Some(v2) = torrent.hybrid_v2_hash() {
+            swarms.insert(v2, handle.clone());
+        }
         swarms.insert(torrent.info_hash, handle);
         self.lsd.announce();
         Ok(())
@@ -422,6 +442,37 @@ impl BtClient {
 }
 
 /// See `MAX_INBOUND_HANDSHAKES`.
+/// BEP 47: links `relative` (under `root`) to `target`, a path from the torrent's top level,
+/// with a relative link so the download can be moved. Best effort: an existing entry is left
+/// alone, and a failure only costs the link.
+fn make_symlink(torrent: &Torrent, root: &Path, relative: &Path, target: &Path) {
+    let depth = relative.components().count();
+    if depth < 2 {
+        return;
+    }
+    let mut link_target = std::path::PathBuf::new();
+    for _ in 0..depth - 2 {
+        link_target.push("..");
+    }
+    link_target.push(target);
+    let link = root.join(relative);
+    if link.symlink_metadata().is_ok() {
+        return;
+    }
+    let made = link
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| std::os::unix::fs::symlink(&link_target, &link));
+    if let Err(e) = made {
+        tracing::warn!(
+            "{}: couldn't link {} to {}: {e}",
+            torrent.name,
+            link.display(),
+            link_target.display()
+        );
+    }
+}
+
 static INBOUND_HANDSHAKES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_INBOUND_HANDSHAKES);
 
 /// Takes an inbound connection through its opening (see `stream::accept`), replies to the

@@ -9,32 +9,15 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct TorrentStorage {
     torrent: Arc<Torrent>,
-    files: Vec<File>,
-
-    /// for each file at `i`, offset[i] contains the offset of the file into the conceptual one
-    /// giant file
-    offsets: Vec<u64>,
+    /// one per entry of the torrent's files; `None` for padding and symlinks, which have no
+    /// bytes on disk: padding reads as zeros and is never written
+    files: Vec<Option<File>>,
 }
 
 impl TorrentStorage {
-    pub fn new(torrent: Arc<Torrent>, files: Vec<File>) -> TorrentStorage {
-        // prefix sum
-        let offsets = files
-            .iter()
-            .scan(0u64, |acc, file| {
-                let start = *acc;
-                // relies on each file already being sized to its expected length (see
-                // `BtClient::add_torrent`, which `set_len`s every file right after creating it)
-                *acc += file.metadata().unwrap().len();
-                Some(start)
-            })
-            .collect::<Vec<_>>();
-
-        TorrentStorage {
-            torrent,
-            files,
-            offsets,
-        }
+    pub fn new(torrent: Arc<Torrent>, files: Vec<Option<File>>) -> TorrentStorage {
+        debug_assert_eq!(files.len(), torrent.files.len());
+        TorrentStorage { torrent, files }
     }
 
     /// The byte range of `piece` in the conceptual single file all the torrent's files form.
@@ -51,7 +34,9 @@ impl TorrentStorage {
         let mut written = 0;
         for (file, range) in self.file_segments(self.piece_range(piece)?) {
             let size = (range.end - range.start) as usize;
-            file.write_all_at(&complete_piece[written..written + size], range.start)?;
+            if let Some(file) = file {
+                file.write_all_at(&complete_piece[written..written + size], range.start)?;
+            }
             written += size;
         }
 
@@ -81,7 +66,9 @@ impl TorrentStorage {
         let mut read = 0;
         for (file, interval) in self.file_segments(range) {
             let len = (interval.end - interval.start) as usize;
-            file.read_exact_at(&mut buf[read..read + len], interval.start)?;
+            if let Some(file) = file {
+                file.read_exact_at(&mut buf[read..read + len], interval.start)?;
+            }
             read += len;
         }
         Ok(buf.into_boxed_slice())
@@ -89,26 +76,18 @@ impl TorrentStorage {
 
     /// Maps a byte range of the conceptual single file onto the actual files it spans, with
     /// each file's part expressed as a range within that file.
-    fn file_segments(&self, range: Range<u64>) -> Vec<(&File, Range<u64>)> {
-        let first = self
-            .offsets
-            .partition_point(|&off| off <= range.start)
-            .saturating_sub(1);
-        let last = self.offsets.partition_point(|&off| off < range.end);
-
+    fn file_segments(&self, range: Range<u64>) -> Vec<(Option<&File>, Range<u64>)> {
         let mut ret = vec![];
-        for f in first..last {
-            let f_start = self.offsets[f];
-            let f_end = if f + 1 < self.offsets.len() {
-                self.offsets[f + 1]
-            } else {
-                self.torrent.total_size
-            };
-
+        for f in self.torrent.file_at(range.start)..self.files.len() {
+            let f_start = self.torrent.file_offset(f);
+            if f_start >= range.end {
+                break;
+            }
+            let f_end = f_start + self.torrent.files[f].0;
             let overlap_start = range.start.max(f_start);
             let overlap_end = range.end.min(f_end);
             if overlap_start < overlap_end {
-                ret.push((&self.files[f], overlap_start - f_start..overlap_end - f_start));
+                ret.push((self.files[f].as_ref(), overlap_start - f_start..overlap_end - f_start));
             }
         }
         ret
@@ -152,7 +131,7 @@ mod test {
             *path = dir.join(format!("f{i}.bin"));
             std::fs::write(&*path, &content[offset..offset + *size as usize]).unwrap();
             offset += *size as usize;
-            files.push(File::options().read(true).write(true).open(&*path).unwrap());
+            files.push(Some(File::options().read(true).write(true).open(&*path).unwrap()));
         }
         TorrentStorage::new(Arc::new(torrent), files)
     }
@@ -213,7 +192,7 @@ mod test {
                 .unwrap();
             // sparse, so this costs no disk space
             file.set_len(*size).unwrap();
-            files.push(file);
+            files.push(Some(file));
         }
         let last = dir.join("f2.bin");
         let storage = TorrentStorage::new(Arc::new(torrent), files);
@@ -223,6 +202,42 @@ mod test {
         storage.write_piece(1280, &piece).unwrap();
         assert_eq!(std::fs::read(&last).unwrap(), vec![2; MIB as usize]);
         assert_eq!(&*storage.read_block(1280, MIB as u32 - 1, 2).unwrap(), &[1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// BEP 47: `a` (10 bytes), 6 bytes of padding, `b` (10 bytes), 16-byte pieces. The
+    /// padding has no file: it reads as zeros and writes go nowhere.
+    #[test]
+    fn padding_is_zeros_and_never_written() {
+        let info = b"d5:filesld6:lengthi10e4:pathl1:aeed4:attr1:p6:lengthi6e4:pathl4:.pad1:6eed6:lengthi10e4:pathl1:beee4:name1:t12:piece lengthi16e6:pieces40:0123456789012345678901234567890123456789e";
+        let mut torrent = parse_torrent(&build_torrent_file(info, &[])).unwrap();
+        let dir = std::env::temp_dir().join(format!("downloader-storage-pad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = vec![];
+        for (i, (size, path)) in torrent.files.iter_mut().enumerate() {
+            *path = dir.join(format!("f{i}"));
+            if i == 1 {
+                files.push(None);
+                continue;
+            }
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&*path)
+                .unwrap();
+            file.set_len(*size).unwrap();
+            files.push(Some(file));
+        }
+        let storage = TorrentStorage::new(Arc::new(torrent), files);
+        storage.write_piece(0, &[7; 16]).unwrap();
+        storage.write_piece(1, &[9; 10]).unwrap();
+        assert_eq!(std::fs::read(dir.join("f0")).unwrap(), [7; 10]);
+        assert!(!dir.join("f1").exists());
+        assert_eq!(std::fs::read(dir.join("f2")).unwrap(), [9; 10]);
+        assert_eq!(&*storage.read_block(0, 8, 8).unwrap(), &[7, 7, 0, 0, 0, 0, 0, 0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

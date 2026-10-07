@@ -124,6 +124,8 @@ pub struct FileInfo {
     pub size: u64,
     /// whether the user wants it downloaded; see `Session::select_files`
     pub selected: bool,
+    /// BEP 47 padding: part of the piece stream, never on disk, nothing to show
+    pub pad: bool,
 }
 
 /// One connected peer, ready to render.
@@ -372,7 +374,7 @@ impl TorrentTask {
             info_hash: torrent.info_hash,
             name: torrent.name.clone(),
             size: torrent.total_size,
-            pieces: torrent.pieces.len(),
+            pieces: torrent.num_pieces(),
             piece_size: torrent.piece_size,
             files: torrent.files.len(),
         });
@@ -1118,7 +1120,7 @@ impl Session {
         let info_hash = magnet.as_ref().map(|m| m.info_hash);
         self.launch(source.clone(), info_hash, None, |cancel| async move {
             let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
-            let nothing = bitvec![u8, Msb0; 0; loaded.torrent.pieces.len()].into_boxed_bitslice();
+            let nothing = bitvec![u8, Msb0; 0; loaded.torrent.num_pieces()].into_boxed_bitslice();
             let files = loaded.torrent.files.len();
             Ok(Resolved {
                 selected: magnet.map_or_else(|| vec![true; files], |m| m.selection(files)),
@@ -1384,7 +1386,7 @@ impl Entry {
             Phase::Checking { torrent, checked } => TorrentState::Checking {
                 name: torrent.name.clone(),
                 checked_pieces: *checked.borrow(),
-                total_pieces: torrent.pieces.len(),
+                total_pieces: torrent.num_pieces(),
             },
             Phase::Downloading {
                 torrent,
@@ -1495,6 +1497,7 @@ fn progress(
                 path: p.display().to_string(),
                 size: *size,
                 selected: selected.get(i).copied().unwrap_or(true),
+                pad: torrent.attrs[i].pad,
             })
             .collect(),
         total_size: torrent.total_size,

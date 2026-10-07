@@ -32,6 +32,7 @@ use juicy_bencode::BencodeItemView;
 use librqbit_utp::UtpSocketUdp;
 use midwest_mainline::types::InfoHash;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -134,6 +135,7 @@ pub async fn fetch(
         bus: bus.clone(),
         // trackers' word on our address before there's a client to tell; it isn't kept
         external: Default::default(),
+        v2: None,
     });
 
     let started = tokio::time::Instant::now();
@@ -225,6 +227,12 @@ pub async fn fetch(
         bytes: raw_info.len(),
         took_ms: started.elapsed().as_millis() as u64,
     });
+    if let Some(v2) = magnet.info_hash_v2 {
+        ensure!(
+            Sha256::digest(&raw_info)[..] == v2,
+            "{from} served metadata that doesn't match the magnet's v2 info hash"
+        );
+    }
     let torrent_file = build_torrent_file(&raw_info, &magnet.trackers);
     let mut torrent = parse_torrent(&torrent_file).context("metadata fetched from peers didn't parse as a torrent")?;
     torrent.web_seeds = magnet.web_seeds.clone();
@@ -344,9 +352,9 @@ async fn fetch_from_peer(
 
     // The whole reason this is safe to accept from an untrusted peer: the bytes have to hash
     // to the info hash we asked for, otherwise they're someone else's (or fabricated) metadata.
-    let digest = Sha1::digest(&buffer);
+    // (a v2-only swarm goes by the truncated SHA-256 hash; `fetch` checks all of it)
     ensure!(
-        digest.as_slice() == info_hash.0,
+        Sha1::digest(&buffer).as_slice() == info_hash.0 || Sha256::digest(&buffer)[..20] == info_hash.0,
         "{addr} served metadata that doesn't match the requested info hash"
     );
 
@@ -416,6 +424,11 @@ fn parse_data_message(payload: &[u8]) -> anyhow::Result<UtMetadata<'_>> {
 /// is necessarily the same one we just verified against. Keys are emitted in ascending order
 /// ("announce" < "announce-list" < "info") as bencode requires.
 pub(crate) fn build_torrent_file(raw_info: &[u8], trackers: &[String]) -> Vec<u8> {
+    build_torrent_file_with(raw_info, trackers, None)
+}
+
+/// `build_torrent_file`, with a BEP 52 `piece layers` dict (bencoded) next to the info dict.
+pub(crate) fn build_torrent_file_with(raw_info: &[u8], trackers: &[String], piece_layers: Option<&[u8]>) -> Vec<u8> {
     fn bencode_str(bytes: &[u8]) -> Vec<u8> {
         let mut out = format!("{}:", bytes.len()).into_bytes();
         out.extend_from_slice(bytes);
@@ -441,6 +454,10 @@ pub(crate) fn build_torrent_file(raw_info: &[u8], trackers: &[String]) -> Vec<u8
 
     out.extend_from_slice(&bencode_str(b"info"));
     out.extend_from_slice(raw_info);
+    if let Some(layers) = piece_layers {
+        out.extend_from_slice(&bencode_str(b"piece layers"));
+        out.extend_from_slice(layers);
+    }
     out.push(b'e');
     out
 }
@@ -825,6 +842,7 @@ mod test {
 
         let magnet = MagnetLink {
             info_hash,
+            info_hash_v2: None,
             display_name: Some("hello".to_string()),
             trackers: vec![tracker_url],
             web_seeds: vec![],
@@ -887,6 +905,7 @@ mod test {
         let tracker_url = spawn_http_tracker_with(peers).await;
         let magnet = MagnetLink {
             info_hash,
+            info_hash_v2: None,
             display_name: None,
             trackers: vec![tracker_url],
             web_seeds: vec![],

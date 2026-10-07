@@ -12,14 +12,13 @@
 //! and hash-verified, so the file is always a subset of what's on disk -- provided the target
 //! files are still the size they were, which `BtClient::add_torrent_resumed` checks.
 
-use crate::metadata::build_torrent_file;
-use crate::torrent::{Torrent, parse_torrent};
+use crate::metadata::build_torrent_file_with;
+use crate::torrent::{Torrent, parse_torrent, swarm_info_hash};
 use crate::torrent_swarm::TorrentSwarmStats;
 use anyhow::{Context, bail};
 use bitvec::prelude::*;
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 use midwest_mainline::types::InfoHash;
-use sha1::{Digest, Sha1};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +47,8 @@ pub struct ResumeData {
     pub sequential: bool,
     /// BEP 19 web seeds; a magnet's `ws=` ones exist nowhere else
     pub web_seeds: Vec<String>,
+    /// BEP 52 piece layers (a bencoded dict), which the info dict doesn't hold
+    pub piece_layers: Option<Vec<u8>>,
 }
 
 impl ResumeData {
@@ -64,6 +65,7 @@ impl ResumeData {
             skip: vec![],
             uploaded: 0,
             web_seeds: torrent.web_seeds.clone(),
+            piece_layers: torrent.piece_layers_bencoded(),
         }
     }
 
@@ -73,7 +75,7 @@ impl ResumeData {
     }
 
     pub fn info_hash(&self) -> InfoHash {
-        InfoHash::from_bytes(Sha1::digest(&self.raw_info).as_slice())
+        swarm_info_hash(&self.raw_info)
     }
 
     /// The file name a resume file for this torrent is written under.
@@ -83,9 +85,13 @@ impl ResumeData {
     }
 
     pub fn to_torrent(&self) -> anyhow::Result<Torrent> {
-        let mut torrent = parse_torrent(&build_torrent_file(&self.raw_info, &self.trackers))?;
+        let mut torrent = parse_torrent(&self.torrent_file())?;
         torrent.web_seeds = self.web_seeds.clone();
         Ok(torrent)
+    }
+
+    fn torrent_file(&self) -> Vec<u8> {
+        build_torrent_file_with(&self.raw_info, &self.trackers, self.piece_layers.as_deref())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -102,6 +108,10 @@ impl ResumeData {
         if self.paused {
             out.extend_from_slice(&bstr(b"paused"));
             out.extend_from_slice(b"i1e");
+        }
+        if let Some(layers) = &self.piece_layers {
+            out.extend_from_slice(&bstr(b"piece layers"));
+            out.extend_from_slice(layers);
         }
         out.extend_from_slice(&bstr(b"root"));
         out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
@@ -194,11 +204,12 @@ impl ResumeData {
             _ => vec![],
         };
 
-        let raw_info = raw_info_bytes(bytes)?;
+        let raw_info = raw_dict(bytes, b"info")?.context("missing 'info' dict")?;
+        let piece_layers = raw_dict(bytes, b"piece layers")?;
 
-        let torrent = parse_torrent(&build_torrent_file(&raw_info, &trackers))
+        let torrent = parse_torrent(&build_torrent_file_with(&raw_info, &trackers, piece_layers.as_deref()))
             .context("resume file's info dict didn't parse as a torrent")?;
-        let pieces = torrent.pieces.len();
+        let pieces = torrent.num_pieces();
         if verified.len() != pieces.div_ceil(8) {
             bail!(
                 "verified bitfield is {} bytes, expected {} for {pieces} pieces",
@@ -222,6 +233,7 @@ impl ResumeData {
             uploaded,
             sequential,
             web_seeds,
+            piece_layers,
         })
     }
 
@@ -270,6 +282,9 @@ pub(crate) fn replace_file(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Re
 /// opened afresh, which is enough: a sync flushes the file, not just one descriptor's writes.
 pub fn sync_pieces(torrent: &Torrent, root: &Path, pieces: &BitSlice<u8, Msb0>) -> std::io::Result<()> {
     for (index, (_, relative)) in torrent.files.iter().enumerate() {
+        if torrent.attrs[index].virtual_file() {
+            continue;
+        }
         let range = torrent.pieces_of_file(index);
         if pieces[range.start as usize..range.end as usize].any() {
             std::fs::File::open(root.join(relative))?.sync_data()?;
@@ -529,24 +544,25 @@ pub fn scan_resume_files(dir: &Path) -> Vec<(PathBuf, anyhow::Result<ResumeSumma
         .collect()
 }
 
-/// The bencoded bytes of the top-level "info" value, verbatim, so the info hash recomputed
-/// from them is the one the file was written for. `parse_bencode_dict` only hands back a parsed
-/// view, so this walks the outer dict with bendy, which can return the raw span.
-fn raw_info_bytes(input: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// The bencoded bytes of the top-level dict `key` ("info", "piece layers"), verbatim, so the
+/// info hash recomputed from them is the one the file was written for. `parse_bencode_dict`
+/// only hands back a parsed view, so this walks the outer dict with bendy, which can return the
+/// raw span.
+fn raw_dict(input: &[u8], key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
     use bendy::decoding::{Decoder, Object};
     let mut decoder = Decoder::new(input);
     let Some(Object::Dict(mut dict)) = decoder.next_object().map_err(|e| anyhow::anyhow!("{e}"))? else {
         bail!("not a bencoded dict");
     };
-    while let Some((key, val)) = dict.next_pair().map_err(|e| anyhow::anyhow!("{e}"))? {
-        if key == b"info" {
-            let Object::Dict(info) = val else {
-                bail!("'info' must be a dict");
+    while let Some((k, val)) = dict.next_pair().map_err(|e| anyhow::anyhow!("{e}"))? {
+        if k == key {
+            let Object::Dict(value) = val else {
+                bail!("{:?} must be a dict", String::from_utf8_lossy(key));
             };
-            return Ok(info.into_raw().map_err(|e| anyhow::anyhow!("{e}"))?.to_vec());
+            return Ok(Some(value.into_raw().map_err(|e| anyhow::anyhow!("{e}"))?.to_vec()));
         }
     }
-    bail!("missing 'info' dict")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -554,6 +570,8 @@ mod test {
     use super::*;
     use crate::BtClient;
     use crate::defs::Identity;
+    use crate::metadata::build_torrent_file;
+    use sha1::{Digest, Sha1};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     fn bstr(bytes: &[u8]) -> Vec<u8> {
@@ -973,5 +991,38 @@ mod test {
         assert_eq!(persisted, ResumeData::read(&path).unwrap().verified);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A v2 torrent's piece layers aren't in the info dict, so the resume file keeps them --
+    /// including ones that arrived from peers -- and it goes by the truncated v2 hash.
+    #[test]
+    fn keeps_a_v2_torrents_piece_layers() {
+        use crate::torrent::fixtures::{self, sorted};
+        const P: usize = 16384;
+        let files = sorted(&[(&["big"][..], vec![5; 3 * P + 7]), (&["small"][..], vec![6; 10])]);
+        let info = fixtures::info("v2", &files, P, false);
+        let torrent = parse_torrent(&build_torrent_file(&info, &[])).unwrap();
+        assert_eq!(torrent.missing_layers(), [0]);
+        let verified = bitvec![u8, Msb0; 0; torrent.num_pieces()];
+
+        let without = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &verified);
+        assert_eq!(without.piece_layers, None);
+        assert_eq!(without.info_hash(), torrent.info_hash);
+        assert_eq!(
+            ResumeData::decode(&without.encode())
+                .unwrap()
+                .to_torrent()
+                .unwrap()
+                .missing_layers(),
+            [0]
+        );
+
+        assert!(torrent.set_layer(0, fixtures::layer(&files[0].1, P)));
+        let with = ResumeData::from_torrent(&torrent, Path::new("/downloads"), &verified);
+        let decoded = ResumeData::decode(&with.encode()).unwrap();
+        assert_eq!(decoded, with);
+        let rebuilt = decoded.to_torrent().unwrap();
+        assert!(rebuilt.missing_layers().is_empty());
+        assert_eq!(rebuilt.info_hash, torrent.info_hash);
     }
 }

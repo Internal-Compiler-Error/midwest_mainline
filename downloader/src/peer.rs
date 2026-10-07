@@ -587,6 +587,11 @@ impl Peer {
         .await
     }
 
+    /// Any message, for the swarm's own protocols (BEP 52 hashes).
+    pub(crate) async fn send_message(&mut self, msg: BtMessage) -> io::Result<()> {
+        self.send(msg).await
+    }
+
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
         self.send(BtMessage::KeepAlive(KeepAlive)).await
     }

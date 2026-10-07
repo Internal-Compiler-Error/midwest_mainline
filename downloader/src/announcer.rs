@@ -114,6 +114,9 @@ pub(crate) struct Announcing {
     pub bus: EventBus,
     /// where trackers' BEP 24 `external ip` goes
     pub external: crate::external::ExternalAddress,
+    /// BEP 52: a hybrid's truncated v2 hash, looked up and announced on the DHT too so
+    /// v2-only peers find us
+    pub v2: Option<InfoHash>,
 }
 
 /// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
@@ -129,6 +132,7 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
         shutdown,
         dht,
         bus,
+        v2,
         ..
     } = &args;
     let (board, statuses) = watch::channel(vec![]);
@@ -146,18 +150,19 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
     };
     // a watch whose sender is gone is a client with no DHT, now or ever; no row for it
     let dht_slot = dht.has_changed().is_ok().then(|| slot("DHT"));
+    let dht_v2_slot = v2.filter(|_| dht_slot.is_some()).map(|v2| (v2, slot("DHT (v2 hash)")));
     let usable: Vec<Url> = trackers.iter().filter_map(|t| Url::parse(t).ok()).collect();
     let slots: Vec<usize> = usable.iter().map(|url| slot(url.as_str())).collect();
     let _ = board.send(rows);
 
-    if let Some(dht_slot) = dht_slot {
+    for (hash, slot) in dht_slot.map(|slot| (*info_hash, slot)).into_iter().chain(dht_v2_slot) {
         tokio::spawn(dht_announcer(
-            *info_hash,
+            hash,
             identity.serving.port(),
             dht.clone(),
             events.clone(),
             shutdown.clone(),
-            (board.clone(), dht_slot),
+            (board.clone(), slot),
             bus.clone(),
         ));
     }
@@ -1593,6 +1598,7 @@ mod test {
             dht: crate::dht::Dht::none(),
             bus: EventBus::new(),
             external: Default::default(),
+            v2: None,
         }
     }
 
@@ -1655,6 +1661,7 @@ mod test {
             dht: crate::dht::Dht::none(),
             bus: EventBus::new(),
             external: Default::default(),
+            v2: None,
         });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(
@@ -1683,6 +1690,7 @@ mod test {
             dht: dht_rx,
             bus: EventBus::new(),
             external: Default::default(),
+            v2: None,
         });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);

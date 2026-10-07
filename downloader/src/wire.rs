@@ -281,6 +281,52 @@ impl Encode for Extended {
     }
 }
 
+/// BEP 52 `hash request` (id 21) and `hash reject` (id 23): which hashes of the tree under
+/// `root` -- `length` of them from layer `base` (0 is the leaves), starting at `index` -- and
+/// how many layers of uncle hashes above them to prove them with.
+#[derive(Debug, Clone, PartialEq, Eq, Copy, Hash, PartialOrd, Ord)]
+pub struct HashRequest {
+    pub root: [u8; 32],
+    pub base: u32,
+    pub index: u32,
+    pub length: u32,
+    pub proof_layers: u32,
+}
+
+impl HashRequest {
+    const LEN: usize = 32 + 16;
+
+    fn encode_as(&self, id: u8, extra: usize, buf: &mut [u8]) {
+        buf[..4].copy_from_slice(&((1 + Self::LEN + extra) as u32).to_be_bytes());
+        buf[4] = id;
+        buf[5..37].copy_from_slice(&self.root);
+        buf[37..53].copy_from_slice(&u32s_to_be_bytes!(
+            self.base,
+            self.index,
+            self.length,
+            self.proof_layers
+        ));
+    }
+
+    fn decode(buf: &[u8]) -> Self {
+        Self {
+            root: buf[..32].try_into().unwrap(),
+            base: be_u32(buf, 32),
+            index: be_u32(buf, 36),
+            length: be_u32(buf, 40),
+            proof_layers: be_u32(buf, 44),
+        }
+    }
+}
+
+/// BEP 52 `hashes` (id 22): the answer to a `HashRequest`, the requested hashes followed by
+/// the uncle hashes, bottom up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hashes {
+    pub request: HashRequest,
+    pub hashes: Box<[[u8; 32]]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BtMessage {
     KeepAlive(KeepAlive),
@@ -300,6 +346,9 @@ pub(crate) enum BtMessage {
     AllowedFast(AllowedFast),
     Extended(Extended),
     Port(Port),
+    HashRequest(HashRequest),
+    Hashes(Hashes),
+    HashReject(HashRequest),
     Unknown(u8, #[allow(unused)] Box<[u8]>),
 }
 
@@ -329,6 +378,8 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::AllowedFast(_) => 9,
             BtMessage::Extended(ext) => 6 + ext.payload.len(),
             BtMessage::Port(_) => 7,
+            BtMessage::HashRequest(_) | BtMessage::HashReject(_) => 5 + HashRequest::LEN,
+            BtMessage::Hashes(h) => 5 + HashRequest::LEN + h.hashes.len() * 32,
             BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
         };
 
@@ -354,6 +405,12 @@ impl Encoder<BtMessage> for BtEncoder {
             BtMessage::AllowedFast(allowed_fast) => allowed_fast.encode(buf),
             BtMessage::Extended(ext) => ext.encode(buf),
             BtMessage::Port(port) => port.encode(buf),
+            BtMessage::HashRequest(request) => request.encode_as(21, 0, buf),
+            BtMessage::HashReject(request) => request.encode_as(23, 0, buf),
+            BtMessage::Hashes(h) => {
+                h.request.encode_as(22, h.hashes.len() * 32, buf);
+                buf[5 + HashRequest::LEN..].copy_from_slice(h.hashes.as_flattened());
+            }
             BtMessage::Unknown(..) => panic!(),
         }
 
@@ -518,6 +575,24 @@ impl Decoder for BtDecoder {
                         ext_id,
                         payload: Box::from(payload),
                     })
+                }
+                21 => {
+                    exact(HashRequest::LEN)?;
+                    BtMessage::HashRequest(HashRequest::decode(buf))
+                }
+                22 => {
+                    let (hashes, rest) = buf.get(HashRequest::LEN..).unwrap_or_default().as_chunks::<32>();
+                    if buf.len() < HashRequest::LEN || !rest.is_empty() {
+                        return Err(invalid("hashes message isn't a request and whole hashes"));
+                    }
+                    BtMessage::Hashes(Hashes {
+                        request: HashRequest::decode(buf),
+                        hashes: hashes.into(),
+                    })
+                }
+                23 => {
+                    exact(HashRequest::LEN)?;
+                    BtMessage::HashReject(HashRequest::decode(buf))
                 }
                 t => BtMessage::Unknown(t, Box::from(buf)),
             }
@@ -970,5 +1045,36 @@ mod test {
             )
             .unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
+    }
+
+    #[test]
+    fn hash_messages_round_trip() {
+        let request = HashRequest {
+            root: [3; 32],
+            base: 2,
+            index: 512,
+            length: 4,
+            proof_layers: 5,
+        };
+        let hashes = Hashes {
+            request,
+            hashes: vec![[1; 32], [2; 32], [4; 32]].into(),
+        };
+        for msg in [
+            BtMessage::HashRequest(request),
+            BtMessage::HashReject(request),
+            BtMessage::Hashes(hashes),
+        ] {
+            let mut buf = BytesMut::new();
+            BtEncoder.encode(msg.clone(), &mut buf).unwrap();
+            assert_eq!(BtDecoder.decode(&mut buf).unwrap(), Some(msg));
+            assert!(buf.is_empty());
+        }
+        // a request short of its proof layers, and hashes that aren't whole
+        for frame in [&b"\x00\x00\x00\x30\x15"[..], b"\x00\x00\x00\x32\x16"] {
+            let mut src = BytesMut::from(frame);
+            src.resize(4 + u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize, 0);
+            assert!(BtDecoder.decode(&mut src).is_err(), "{frame:?}");
+        }
     }
 }

@@ -11,24 +11,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Which pieces under `root` hash correctly. A file that's missing or too short fails every
-/// piece touching it. `progress` gets the count of pieces checked so far, now and then.
+/// piece touching it; padding reads as the zeros it stands for. `progress` gets the count of
+/// pieces checked so far, now and then.
 pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usize)) -> BitBox<u8, Msb0> {
-    // opened once, read-only; `None` for a file that isn't there
-    let files: Vec<(u64, Option<File>)> = torrent
+    // opened once, read-only
+    let files: Vec<Slot> = torrent
         .files
         .iter()
-        .map(|(size, path)| (*size, File::open(root.join(path)).ok()))
+        .zip(&torrent.attrs)
+        .map(|((_, path), attr)| match attr {
+            attr if attr.pad => Slot::Zeros,
+            attr if attr.symlink.is_some() => Slot::Missing,
+            _ => File::open(root.join(path)).map_or(Slot::Missing, Slot::File),
+        })
         .collect();
-    let mut offsets = Vec::with_capacity(files.len());
-    let mut total = 0u64;
-    for (size, _) in &files {
-        offsets.push(total);
-        total += size;
-    }
 
     // every core hashes, each with its own buffer; the caller's thread only reports progress,
     // so `progress` needn't be thread-safe
-    let n = torrent.pieces.len();
+    let n = torrent.num_pieces();
     let checked = AtomicUsize::new(0);
     let good: Vec<bool> = std::thread::scope(|scope| {
         let work = scope.spawn(|| {
@@ -39,7 +39,7 @@ pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usiz
                     |buf, piece| {
                         let len = torrent.nth_piece_size(piece as u32).unwrap();
                         let start = piece as u64 * torrent.piece_size as u64;
-                        let ok = read_at(&files, &offsets, start, &mut buf[..len])
+                        let ok = read_at(torrent, &files, start, &mut buf[..len])
                             && torrent.valid_piece(piece as u32, &buf[..len]);
                         checked.fetch_add(1, Ordering::Relaxed);
                         ok
@@ -57,23 +57,33 @@ pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usiz
     good.into_iter().collect::<BitVec<u8, Msb0>>().into_boxed_bitslice()
 }
 
+enum Slot {
+    File(File),
+    Zeros,
+    Missing,
+}
+
 /// Fills `buf` from the torrent's files as one long stream starting at `start`; false if any
 /// of it is missing.
-fn read_at(files: &[(u64, Option<File>)], offsets: &[u64], start: u64, buf: &mut [u8]) -> bool {
+fn read_at(torrent: &Torrent, files: &[Slot], start: u64, buf: &mut [u8]) -> bool {
     let end = start + buf.len() as u64;
     let mut filled = 0usize;
-    for (i, (size, file)) in files.iter().enumerate() {
-        let file_start = offsets[i];
-        let file_end = file_start + size;
-        if file_end <= start || file_start >= end {
+    for (i, slot) in files.iter().enumerate().skip(torrent.file_at(start)) {
+        let file_start = torrent.file_offset(i);
+        if file_start >= end {
+            break;
+        }
+        let file_end = file_start + torrent.files[i].0;
+        if file_end <= start {
             continue;
         }
-        let Some(file) = file else { return false };
         let from = start.max(file_start);
         let to = end.min(file_end);
         let chunk = &mut buf[filled..filled + (to - from) as usize];
-        if file.read_exact_at(chunk, from - file_start).is_err() {
-            return false;
+        match slot {
+            Slot::File(file) if file.read_exact_at(chunk, from - file_start).is_ok() => {}
+            Slot::Zeros => chunk.fill(0),
+            _ => return false,
         }
         filled += chunk.len();
     }
@@ -129,5 +139,35 @@ mod test {
         let verified = check_files(&torrent, &dir, |_| {});
         assert_eq!(verified.iter().by_vals().collect::<Vec<_>>(), [true, false, false]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v2-only (Merkle trees, synthesised padding) and hybrid (SHA-1 over a stream with BEP 47
+    /// padding files that aren't on disk) both recheck.
+    #[test]
+    fn rechecks_v2_and_hybrid_torrents() {
+        use crate::torrent::fixtures::{self, sorted};
+        const P: usize = 16384;
+        let data = |len: usize, seed: usize| -> Vec<u8> { (0..len).map(|i| ((i * 5 + seed) % 241) as u8).collect() };
+        let files = sorted(&[(&["x"][..], data(20_000, 1)), (&["y"][..], data(40_000, 2))]);
+        for hybrid in [false, true] {
+            let torrent = parse_torrent(&fixtures::torrent_file("t", &files, P, hybrid)).unwrap();
+            assert_eq!(torrent.v2_only(), !hybrid);
+            let dir = scratch(if hybrid { "hybrid" } else { "v2" });
+            std::fs::create_dir_all(dir.join("t")).unwrap();
+            std::fs::write(dir.join("t/x"), &files[0].1).unwrap();
+            std::fs::write(dir.join("t/y"), &files[1].1).unwrap();
+            assert!(check_files(&torrent, &dir, |_| {}).all(), "hybrid {hybrid}");
+
+            // y's middle piece is wrong
+            let mut y = files[1].1.clone();
+            y[P + 5] ^= 1;
+            std::fs::write(dir.join("t/y"), &y).unwrap();
+            let verified = check_files(&torrent, &dir, |_| {});
+            assert_eq!(
+                verified.iter().by_vals().collect::<Vec<_>>(),
+                [true, true, true, false, true]
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

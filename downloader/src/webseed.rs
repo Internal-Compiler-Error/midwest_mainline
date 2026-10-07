@@ -209,10 +209,24 @@ impl Job {
             while pipeline.len() < WEB_SEED_PIPELINE
                 && let Some(range) = ranges.next()
             {
-                pipeline.push_back(self.fetch(range)?);
+                // BEP 47: padding is zeros, and not on the server
+                pipeline.push_back(if self.torrent.attrs[range.file].pad {
+                    Err(range.len)
+                } else {
+                    Ok(self.fetch(range)?)
+                });
             }
-            let Some(mut fetch) = pipeline.pop_front() else {
-                return Ok(());
+            let mut fetch = match pipeline.pop_front() {
+                None => return Ok(()),
+                Some(Ok(fetch)) => fetch,
+                Some(Err(zeros)) => {
+                    for block in blocks.feed(&vec![0; zeros as usize]) {
+                        if !deliver(block).await {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
             };
             let mut left = fetch.range.len;
             while left > 0 {
@@ -765,5 +779,39 @@ pub(crate) mod test {
         seed.succeeded();
         seed.failed(&Failure::Permanent("HTTP 404".into()), now);
         assert!(!seed.has_room(now + WEB_SEED_BACKOFF_MAX));
+    }
+
+    /// BEP 47: padding isn't asked of the server (it has no such file); it comes back as zeros.
+    #[tokio::test]
+    async fn padding_is_zeros_not_a_request() {
+        use crate::torrent::fixtures::{self, sorted};
+        const PIECE: usize = BLOCK_SIZE;
+        let files = sorted(&[(&["a"][..], vec![1; 5000]), (&["b"][..], vec![2; 3000])]);
+        let t = crate::torrent::parse_torrent(&fixtures::torrent_file("pad", &files, PIECE, true)).unwrap();
+        assert!(t.attrs[1].pad);
+        let base = serve(HashMap::from([
+            ("/seed/pad/a".to_string(), files[0].1.clone()),
+            ("/seed/pad/b".to_string(), files[1].1.clone()),
+        ]))
+        .await;
+        let job = Job {
+            torrent: Arc::new(t),
+            base: format!("{base}seed"),
+            host: "localhost".into(),
+            start: 0,
+            end: (PIECE + 3000) as u64,
+            redirects: Arc::default(),
+        };
+        let mut rebuilt = vec![];
+        job.run(|b| {
+            rebuilt.extend_from_slice(&b.data);
+            std::future::ready(true)
+        })
+        .await
+        .unwrap();
+        let mut expected = vec![1; 5000];
+        expected.resize(PIECE, 0);
+        expected.extend_from_slice(&[2; 3000]);
+        assert_eq!(rebuilt, expected);
     }
 }

@@ -4,7 +4,9 @@ use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
 use crate::external::ExternalAddress;
+use crate::layers::{self, LayerFetch, Received};
 use crate::limiter::RateLimiter;
+use crate::merkle::Hash;
 use crate::peer::{
     Holepunch, HolepunchError, Inbox, Incoming, LT_DONTHAVE_ID, PEX_UTP, Peer, PeerSnapshot, PeerStatistics,
     ProtocolViolation, UT_HOLEPUNCH_ID, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
@@ -130,6 +132,11 @@ impl TorrentSwarmHandle {
         self.stats.clone()
     }
 
+    /// Whether both handles are to one swarm (a hybrid is registered under two hashes).
+    pub(crate) fn same_swarm(&self, other: &TorrentSwarmHandle) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
     /// The connected peers as of the last housekeeping tick (once a second).
     pub fn peers(&self) -> watch::Receiver<Vec<PeerSnapshot>> {
         self.peers.clone()
@@ -236,6 +243,9 @@ struct Claim {
     reverse: bool,
 }
 
+/// Who "delivered" a block of padding (BEP 47): nobody, it's zeros from the start.
+const PADDING: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+
 /// A piece we're in the middle of downloading. Normally one peer holds it; in endgame
 /// (see `schedule`) several race for it, and each block records who delivered it so a
 /// failed hash can still convict a lone sender.
@@ -264,6 +274,22 @@ impl InFlight {
             received: vec![None; blocks],
             claims,
             span: tracing::Span::none(),
+        }
+    }
+
+    /// Marks the blocks that are nothing but padding as in already: the buffer starts out
+    /// zeroed, so there's nothing to request.
+    fn skip_padding(&mut self, torrent: &Torrent, piece: u32) {
+        for pad in torrent.padding_in_piece(piece) {
+            let first = pad.start.div_ceil(BLOCK_SIZE);
+            let end = if pad.end == self.buf.len() {
+                self.received.len()
+            } else {
+                pad.end / BLOCK_SIZE
+            };
+            for block in first..end {
+                self.received[block] = Some(PADDING);
+            }
         }
     }
 
@@ -340,7 +366,12 @@ impl InFlight {
     }
 
     fn senders(&self) -> BTreeSet<SocketAddr> {
-        self.received.iter().flatten().copied().collect()
+        self.received
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&a| a != PADDING)
+            .collect()
     }
 }
 
@@ -476,6 +507,11 @@ pub struct TorrentSwarm {
     hashing: BTreeSet<u32>,
     /// block requests sent to any peer this session, UCB's `t`
     total_picks: usize,
+    /// BEP 52: the piece layers a v2 torrent from a magnet still needs from peers; its pieces
+    /// can't be checked (so aren't picked) until their file's layer is in
+    layers: LayerFetch,
+    /// per file, the Merkle tree above its piece layer, built for the first hash request
+    hash_trees: BTreeMap<usize, Vec<Vec<Hash>>>,
     /// BEP 19, in `torrent.web_seeds` order; the index is how their jobs report back
     web_seeds: Vec<WebSeed>,
     next_web_job: u64,
@@ -520,12 +556,12 @@ impl TorrentSwarm {
         } = shared;
         assert_eq!(
             verified.len(),
-            torrent.pieces.len(),
+            torrent.num_pieces(),
             "verified bitfield must have one bit per piece"
         );
         let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
         let explore_slots = ((missing.len() as f64).sqrt().ceil() as usize).max(1);
-        let wanted = bitvec![u8, Msb0; 1; torrent.pieces.len()].into_boxed_bitslice();
+        let wanted = bitvec![u8, Msb0; 1; torrent.num_pieces()].into_boxed_bitslice();
         let stat = TorrentSwarmStats::for_verified(&torrent, verified, wanted);
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
@@ -544,6 +580,7 @@ impl TorrentSwarm {
             dht: dht.clone(),
             bus: bus.clone(),
             external: external.clone(),
+            v2: torrent.hybrid_v2_hash(),
         });
         bus.emit(Event::PiecesKnown {
             info_hash: torrent.info_hash,
@@ -574,7 +611,9 @@ impl TorrentSwarm {
             known: BTreeMap::new(),
             exploring: BTreeSet::new(),
             explore_slots,
-            availability: vec![0; torrent.pieces.len()],
+            availability: vec![0; torrent.num_pieces()],
+            layers: LayerFetch::new(&torrent),
+            hash_trees: BTreeMap::new(),
             inbox,
             incoming,
             next_conn: 0,
@@ -786,6 +825,7 @@ impl TorrentSwarm {
             self.release_claim(piece, peer);
         }
 
+        self.request_layers().await;
         self.schedule().await;
         self.send_held_uploads().await;
         self.prune_known();
@@ -815,6 +855,35 @@ impl TorrentSwarm {
         let _ = self
             .peers_snapshot_tx
             .send(self.peers.iter().map(Peer::snapshot).chain(web_seeds).collect());
+    }
+
+    /// BEP 52: asks peers for the piece layers we lack, each from a peer that has some of the
+    /// file's pieces (and so must be able to answer).
+    async fn request_layers(&mut self) {
+        if self.layers.is_empty() {
+            return;
+        }
+        let addrs: Vec<SocketAddr> = self.peers.iter().map(|p| p.remote_addr).collect();
+        let (torrent, peers) = (&self.torrent, &self.peers);
+        let has = |addr: SocketAddr, file: usize| {
+            peers
+                .binary_search_by_key(&addr, |p| p.remote_addr)
+                .is_ok_and(|i| torrent.pieces_of_file(file).any(|piece| peers[i].they_have(piece)))
+        };
+        let requests = self.layers.assign(torrent, &addrs, has, Instant::now());
+        for (addr, req) in requests {
+            if let Some(idx) = self.peer_index(addr)
+                && self.peers[idx].send_message(BtMessage::HashRequest(req)).await.is_err()
+            {
+                self.drop_peer(idx, "send failed");
+            }
+        }
+    }
+
+    /// Whether `piece` can be checked once it's in; only a v2 piece whose file's layer
+    /// hasn't arrived can't.
+    fn verifiable(&self, piece: u32) -> bool {
+        self.layers.is_empty() || self.torrent.can_verify(piece)
     }
 
     /// Keeps `known` from growing without bound over a long seed: past `KNOWN_PEERS_MAX`, the
@@ -917,6 +986,7 @@ impl TorrentSwarm {
             self.release_claim(piece, peer.remote_addr);
         }
         self.holdings.remove(&peer.remote_addr);
+        self.layers.give_up(peer.remote_addr);
         info!("{} disconnected, {} peers left", peer.remote_addr, self.peers.len());
     }
 
@@ -1142,6 +1212,34 @@ impl TorrentSwarm {
                     ext.ext_id
                 );
             }
+            BtMessage::HashRequest(req) => {
+                let reply = match layers::answer(&self.torrent, &mut self.hash_trees, &req) {
+                    Some(hashes) => BtMessage::Hashes(hashes),
+                    None => BtMessage::HashReject(req),
+                };
+                if self.peers[idx].send_message(reply).await.is_err() {
+                    self.drop_peer(idx, "send failed");
+                }
+            }
+            BtMessage::Hashes(hashes) => {
+                let addr = self.peers[idx].remote_addr;
+                match self.layers.received(&self.torrent, addr, &hashes) {
+                    Received::Partial => {}
+                    Received::Layer(file) => {
+                        info!("piece layer of {:?} in from {addr}", self.torrent.files[file].1);
+                        self.schedule().await;
+                    }
+                    Received::Bad => {
+                        warn!("{addr} sent piece hashes that don't add up, disconnecting");
+                        self.drop_peer(idx, "bad hashes");
+                        self.ban(addr);
+                    }
+                }
+            }
+            BtMessage::HashReject(_) => {
+                self.layers.give_up(self.peers[idx].remote_addr);
+                self.request_layers().await;
+            }
             other => unreachable!("Peer::apply handles everything else: {other:?}"),
         }
     }
@@ -1278,6 +1376,10 @@ impl TorrentSwarm {
             return;
         }
         let slot = &mut in_flight.received[begin / BLOCK_SIZE];
+        if *slot == Some(PADDING) {
+            // a web seed's run covers padding too
+            return;
+        }
         if slot.is_some() {
             // a racer lost this block
             self.stat.wasted += block.length as u64;
@@ -1614,6 +1716,7 @@ impl TorrentSwarm {
                 let addr = self.peers[idx].remote_addr;
                 self.emit_pick(idx, piece, rate_scale);
                 let mut in_flight = InFlight::new(size, addr);
+                in_flight.skip_padding(&self.torrent, piece);
                 in_flight.span = tracing::info_span!(
                     "piece",
                     info_hash = %self.torrent.info_hash,
@@ -1654,7 +1757,7 @@ impl TorrentSwarm {
         let mut best: Option<(usize, u32)> = None;
         for pos in (offset..n).chain(0..offset) {
             let piece = self.missing[pos];
-            if !peer.they_have(piece) {
+            if !peer.they_have(piece) || !self.verifiable(piece) {
                 continue;
             }
             let rank = if self.sequential {
@@ -1871,7 +1974,9 @@ impl TorrentSwarm {
                 (self.availability[piece as usize], piece)
             }
         };
-        (0..self.missing.len()).min_by_key(|&pos| rank(self.missing[pos]))
+        (0..self.missing.len())
+            .filter(|&pos| self.verifiable(self.missing[pos]))
+            .min_by_key(|&pos| rank(self.missing[pos]))
     }
 
     /// Gives web seed `seed` a run of consecutive missing pieces, as long as its rate earns
@@ -1888,7 +1993,7 @@ impl TorrentSwarm {
         // where each of the next pieces sits in `missing`, if it's there
         let mut next = vec![None; max_pieces - 1];
         for (pos, &piece) in self.missing.iter().enumerate() {
-            if piece > first && ((piece - first) as usize) < max_pieces {
+            if piece > first && ((piece - first) as usize) < max_pieces && self.verifiable(piece) {
                 next[(piece - first - 1) as usize] = Some(pos);
             }
         }
@@ -1926,6 +2031,7 @@ impl TorrentSwarm {
         for piece in first..=last {
             let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
             let mut in_flight = InFlight::new(size, addr);
+            in_flight.skip_padding(&self.torrent, piece);
             in_flight.claim_rest(addr);
             in_flight.span = tracing::info_span!(
                 "piece",
@@ -2146,7 +2252,7 @@ impl TorrentSwarm {
         let mut peer = Peer::new(
             connected.stream,
             remote_addr,
-            self.torrent.pieces.len(),
+            self.torrent.num_pieces(),
             connected.remote_supports_fast,
             connected.peer_id,
             self.next_conn,
@@ -2612,7 +2718,7 @@ mod test {
         }
 
         let torrent = Arc::new(torrent);
-        let storage = Arc::new(TorrentStorage::new(torrent.clone(), vec![file]));
+        let storage = Arc::new(TorrentStorage::new(torrent.clone(), vec![Some(file)]));
         let id = Arc::new(Identity {
             peer_id: *b"-DL0100-swarm-test..",
             serving: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
@@ -2899,7 +3005,7 @@ mod test {
                 .open(&path)
                 .unwrap();
             file.set_len(*size as u64).unwrap();
-            handles.push(file);
+            handles.push(Some(file));
         }
         let torrent = Arc::new(torrent);
         let storage = Arc::new(TorrentStorage::new(torrent.clone(), handles));

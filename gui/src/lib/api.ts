@@ -46,6 +46,8 @@ export interface TorrentFile {
   path: string
   size: number
   selected: boolean
+  /** BEP 47 padding: never on disk, not listed */
+  pad: boolean
 }
 
 export interface Peer {

@@ -11,7 +11,12 @@ use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MagnetLink {
+    /// what the swarm goes by: the `btih` hash, or for a v2-only magnet the `btmh` one
+    /// truncated (BEP 52)
     pub info_hash: InfoHash,
+    /// BEP 52 `xt=urn:btmh:1220<hex>`: the full SHA-256 info hash, which the metadata from
+    /// peers is checked against
+    pub info_hash_v2: Option<[u8; 32]>,
     /// the `dn` param -- a *hint* only. The real name comes from the metadata we fetch, since
     /// this one is attacker-controlled and never hash-verified.
     pub display_name: Option<String>,
@@ -71,6 +76,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     ensure!(url.scheme().eq_ignore_ascii_case("magnet"), "not a magnet URI");
 
     let mut info_hash = None;
+    let mut info_hash_v2 = None;
     let mut display_name = None;
     let mut trackers = Vec::new();
     let mut web_seeds = Vec::new();
@@ -79,11 +85,16 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
-            // there can be several `xt`s (e.g. a v1 btih alongside a v2 btmh); take the first
-            // btih we understand and ignore the rest
-            "xt" if info_hash.is_none() => {
-                if let Some(rest) = strip_prefix_ignore_ascii_case(&value, "urn:btih:") {
+            // a hybrid's magnet has both a v1 btih and a v2 btmh; the first of each counts
+            "xt" => {
+                if let Some(rest) = strip_prefix_ignore_ascii_case(&value, "urn:btih:")
+                    && info_hash.is_none()
+                {
                     info_hash = Some(parse_info_hash(rest)?);
+                } else if let Some(rest) = strip_prefix_ignore_ascii_case(&value, "urn:btmh:")
+                    && info_hash_v2.is_none()
+                {
+                    info_hash_v2 = Some(parse_multihash(rest)?);
                 }
             }
             "dn" if display_name.is_none() => display_name = Some(value.into_owned()),
@@ -96,12 +107,13 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
         }
     }
 
-    let Some(info_hash) = info_hash else {
-        bail!("magnet URI has no `xt=urn:btih:` info hash (v2-only `btmh` magnets aren't supported)");
+    let Some(info_hash) = info_hash.or(info_hash_v2.map(|v2| InfoHash::from_bytes(&v2[..20]))) else {
+        bail!("magnet URI has no `xt=urn:btih:` or `xt=urn:btmh:` info hash");
     };
 
     Ok(MagnetLink {
         info_hash,
+        info_hash_v2,
         display_name,
         trackers,
         web_seeds: crate::torrent::web_seed_urls(web_seeds.iter().map(|u| u.as_bytes())),
@@ -119,15 +131,28 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
 /// raw bytes.
 fn parse_info_hash(raw: &str) -> anyhow::Result<InfoHash> {
     let bytes = match raw.len() {
-        40 => decode_hex(raw)?,
+        40 => decode_hex::<20>(raw)?,
         32 => decode_base32(raw)?,
         n => bail!("info hash must be 40 hex or 32 base32 characters, got {n}"),
     };
     Ok(InfoHash::from_bytes(&bytes))
 }
 
-fn decode_hex(s: &str) -> anyhow::Result<[u8; 20]> {
-    let mut out = [0u8; 20];
+/// A btmh hash is a hex multihash; BEP 52 only has SHA-256 (code 0x12, 32 bytes long).
+fn parse_multihash(raw: &str) -> anyhow::Result<[u8; 32]> {
+    let Some(digest) = strip_prefix_ignore_ascii_case(raw, "1220") else {
+        bail!("btmh info hash must be a SHA-256 multihash (1220...)");
+    };
+    ensure!(
+        digest.len() == 64,
+        "btmh info hash must have 64 hex digits, got {}",
+        digest.len()
+    );
+    decode_hex(digest)
+}
+
+fn decode_hex<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
+    let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         let hi = hex_val(s.as_bytes()[i * 2])?;
         let lo = hex_val(s.as_bytes()[i * 2 + 1])?;
@@ -211,6 +236,38 @@ mod test {
 
     use super::*;
 
+    #[test]
+    fn parses_btmh_magnets() {
+        let v2 = "caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e";
+        let only = parse_magnet(&format!("magnet:?xt=urn:btmh:1220{v2}&dn=v2")).unwrap();
+        let full: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&v2[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        assert_eq!(only.info_hash_v2.unwrap().as_slice(), full);
+        assert_eq!(
+            only.info_hash.as_bytes(),
+            &full[..20],
+            "the swarm goes by the truncated hash"
+        );
+
+        let hybrid = parse_magnet(&format!(
+            "magnet:?xt=urn:btmh:1220{v2}&xt=urn:btih:631a31dd0a46257d5078c0dee4e66e26f73e42ac"
+        ))
+        .unwrap();
+        assert_eq!(hybrid.info_hash.as_bytes()[0], 0x63, "a hybrid goes by its v1 hash");
+        assert!(hybrid.info_hash_v2.is_some());
+
+        assert!(
+            parse_magnet(&format!("magnet:?xt=urn:btmh:1114{v2}")).is_err(),
+            "not sha2-256"
+        );
+        assert!(parse_magnet("magnet:?xt=urn:btmh:1220abcd").is_err(), "short");
+        assert!(
+            parse_magnet(&format!("magnet:?xt=urn:btmh:1220{}zz", &v2[2..])).is_err(),
+            "not hex"
+        );
+    }
+
     const HEX: &str = "0123456789abcdef0123456789abcdef01234567";
     /// same 20 bytes as HEX, base32-encoded (RFC 4648, padding stripped)
     const BASE32: &str = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
@@ -265,9 +322,6 @@ mod test {
     fn rejects_missing_or_malformed_info_hash() {
         assert!(parse_magnet("magnet:?dn=nothing&tr=http://a.test/announce").is_err());
         assert!(parse_magnet("magnet:?xt=urn:btih:xyz&tr=http://a.test/announce").is_err());
-        // v2-only magnets name a btmh multihash, which this client can't use
-        let v2 = "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e&tr=http://a.test/announce";
-        assert!(parse_magnet(v2).is_err());
     }
 
     #[test]

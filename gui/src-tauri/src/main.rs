@@ -119,6 +119,7 @@ struct FileDto {
     path: String,
     size: u64,
     selected: bool,
+    pad: bool,
 }
 
 impl From<FileInfo> for FileDto {
@@ -127,6 +128,7 @@ impl From<FileInfo> for FileDto {
             path: f.path,
             size: f.size,
             selected: f.selected,
+            pad: f.pad,
         }
     }
 }

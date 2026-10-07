@@ -36,6 +36,11 @@
     return { seeders: max((t) => t.seeders), leechers: max((t) => t.leechers), downloaded }
   })
 
+  /** each file worth listing with its index; padding is neither on disk nor selectable */
+  let shownFiles = $derived(
+    'files' in torrent ? torrent.files.map((f, i) => [f, i] as const).filter(([f]) => !f.pad) : [],
+  )
+
   function toggleFile(index: number, checked: boolean) {
     if (torrent.kind !== 'downloading' && torrent.kind !== 'paused' && torrent.kind !== 'queued') return
     const selected = torrent.files.map((f) => f.selected)
@@ -101,10 +106,10 @@
       <span class="text-muted-foreground">(pieces in order, for playing while it downloads)</span>
     </div>
 
-    <div class="font-medium">Files ({torrent.files.length})</div>
+    <div class="font-medium">Files ({shownFiles.length})</div>
     <div class="max-h-40 overflow-auto rounded-md border">
       <ul class="p-2">
-        {#each torrent.files as file, i (file.path)}
+        {#each shownFiles as [file, i] (file.path)}
           <li class="flex items-center gap-2">
             <Checkbox
               checked={file.selected}
