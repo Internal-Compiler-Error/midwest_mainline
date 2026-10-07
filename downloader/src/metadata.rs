@@ -71,6 +71,10 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// addresses are unreachable and each costs a `CONNECT_TIMEOUT` to find out.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
+/// The most peers a fetch keeps track of. It needs one that answers, and one tracker's answer
+/// alone may name hundreds of thousands.
+const MAX_PEERS: usize = 10_000;
+
 /// Resolves a magnet link into a full `Torrent` by fetching its metadata from peers.
 #[tracing::instrument(
     name = "metadata",
@@ -127,7 +131,8 @@ pub async fn fetch(
     // dozens at once, and if the first few are dead the rest are what's left to try until its
     // next announce, an interval (often 30 minutes) away. A magnet's own x.pe peers go first:
     // they need no tracker or DHT to find.
-    let mut pending: VecDeque<SocketAddr> = magnet.peers.iter().copied().filter(|p| tried.insert(*p)).collect();
+    let mut pending = VecDeque::new();
+    queue_new(magnet.peers.iter().copied(), &mut tried, &mut pending);
 
     let (from, raw_info) = loop {
         while fetches.len() < MAX_CONCURRENT_FETCHES
@@ -151,9 +156,7 @@ pub async fn fetch(
                 let SwarmEvent::PeersDiscovered(peers, _) = event else {
                     continue;
                 };
-                let before = pending.len();
-                pending.extend(peers.into_iter().filter(|peer| tried.insert(*peer)));
-                if pending.len() > before {
+                if queue_new(peers, &mut tried, &mut pending) {
                     idle_deadline = Instant::now() + IDLE_TIMEOUT;
                 }
             }
@@ -194,6 +197,25 @@ pub async fn fetch(
         torrent,
         peers: tried.into_iter().collect(),
     })
+}
+
+/// Queues the `peers` not heard of before, up to MAX_PEERS heard of in all; whether any were
+/// new.
+fn queue_new(
+    peers: impl IntoIterator<Item = SocketAddr>,
+    heard_of: &mut BTreeSet<SocketAddr>,
+    pending: &mut VecDeque<SocketAddr>,
+) -> bool {
+    let before = pending.len();
+    for peer in peers {
+        if heard_of.len() >= MAX_PEERS {
+            break;
+        }
+        if heard_of.insert(peer) {
+            pending.push_back(peer);
+        }
+    }
+    pending.len() > before
 }
 
 /// What the pre-metadata announces report: progress we can't know yet. BEP 3 wants the bytes
@@ -790,6 +812,19 @@ mod test {
         assert_eq!(torrent.raw_info, raw_info);
         assert_eq!(torrent.total_size, 12);
         assert_eq!(torrent.files.len(), 1);
+    }
+
+    /// However many peers the trackers and the DHT name, a fetch keeps MAX_PEERS of them.
+    #[test]
+    fn the_peers_a_fetch_keeps_are_capped() {
+        let (mut heard_of, mut pending) = (BTreeSet::new(), VecDeque::new());
+        let peer = |n: u32| SocketAddr::from((std::net::Ipv4Addr::from(n), 6881));
+        assert!(queue_new([peer(1), peer(1), peer(2)], &mut heard_of, &mut pending));
+        assert_eq!(pending, [peer(1), peer(2)]);
+        assert!(!queue_new([peer(2)], &mut heard_of, &mut pending), "nothing new");
+        assert!(queue_new((0..1_000_000).map(peer), &mut heard_of, &mut pending));
+        assert_eq!((heard_of.len(), pending.len()), (MAX_PEERS, MAX_PEERS));
+        assert!(!queue_new([peer(u32::MAX)], &mut heard_of, &mut pending));
     }
 
     /// A fetch that ends takes its peer connections with it, rather than leaving them to run
