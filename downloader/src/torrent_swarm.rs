@@ -30,7 +30,6 @@ use rand::seq::IndexedRandom;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -730,7 +729,7 @@ impl TorrentSwarm {
                         continue;
                     };
                     match msg {
-                        Some(Ok(msg)) => self.on_peer_message(idx, msg).await,
+                        Some(Ok(msg)) => self.on_peer_message(idx, msg),
                         Some(Err(e)) => {
                             info!("{} read failed ({e}), disconnecting", self.peers[idx].remote_addr);
                             self.drop_peer(idx, "read failed");
@@ -742,19 +741,19 @@ impl TorrentSwarm {
                     }
                 }
                 event = self.events_rx.recv() => match event {
-                    Some(event) => self.process_event(event).await,
+                    Some(event) => self.process_event(event),
                     // the last TorrentSwarmHandle is gone: this torrent is being dropped
                     None => break,
                 },
-                _ = housekeeping_ticker.tick() => self.housekeeping().await,
+                _ = housekeeping_ticker.tick() => self.housekeeping(),
                 _ = keepalive_ticker.tick() => {
-                    self.broadcast(|peer| Box::pin(peer.send_keepalive())).await;
+                    self.broadcast(Peer::send_keepalive);
                 }
                 _ = choking_ticker.tick() => {
                     choking_round += 1;
-                    self.run_choking_algorithm(choking_round).await;
+                    self.run_choking_algorithm(choking_round);
                 }
-                _ = pex_ticker.tick() => self.run_pex_round().await,
+                _ = pex_ticker.tick() => self.run_pex_round(),
             }
         }
         info!(
@@ -767,7 +766,7 @@ impl TorrentSwarm {
         }
     }
 
-    async fn process_event(&mut self, event: SwarmEvent) {
+    fn process_event(&mut self, event: SwarmEvent) {
         match event {
             SwarmEvent::PeersDiscovered(peers, source) => {
                 self.bus.emit(Event::PeersDiscovered {
@@ -777,20 +776,20 @@ impl TorrentSwarm {
                 });
                 self.connect_to_discovered_peers(peers)
             }
-            SwarmEvent::FilesSelected(selected) => self.select_files(&selected).await,
+            SwarmEvent::FilesSelected(selected) => self.select_files(&selected),
             SwarmEvent::Sequential(on) => self.sequential = on,
-            SwarmEvent::SuperSeed(on) => self.set_super_seed(on).await,
-            SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
-            SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
+            SwarmEvent::SuperSeed(on) => self.set_super_seed(on),
+            SwarmEvent::PeerConnected(connected) => self.add_peer(connected),
+            SwarmEvent::BlockRead { to, block } => self.send_block(to, block),
             SwarmEvent::PieceDone {
                 piece,
                 len,
                 senders,
                 outcome,
-            } => self.piece_done(piece, len, senders, outcome).await,
-            SwarmEvent::HashesRead { to, reply } => self.hashes_read(to, reply).await,
-            SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block).await,
-            SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome).await,
+            } => self.piece_done(piece, len, senders, outcome),
+            SwarmEvent::HashesRead { to, reply } => self.hashes_read(to, reply),
+            SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block),
+            SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome),
             SwarmEvent::DialFailed(addr) => {
                 self.bus.emit(Event::DialFailed {
                     info_hash: self.torrent.info_hash,
@@ -801,7 +800,7 @@ impl TorrentSwarm {
                     .entry(canonical(addr))
                     .or_default()
                     .dial_failed(Instant::now());
-                self.try_holepunch(canonical(addr)).await;
+                self.try_holepunch(canonical(addr));
             }
         }
     }
@@ -809,7 +808,7 @@ impl TorrentSwarm {
     /// Wants only the pieces of the selected files from now on. Pieces that stopped being
     /// wanted leave the pile, and ones in flight are allowed to finish; newly wanted pieces
     /// join the pile. Completion and `left` follow the new selection.
-    async fn select_files(&mut self, selected: &[bool]) {
+    fn select_files(&mut self, selected: &[bool]) {
         self.stat.wanted = self.torrent.wanted_pieces(selected);
         self.missing = self
             .stat
@@ -824,12 +823,12 @@ impl TorrentSwarm {
             .collect();
         self.stat.refresh(&self.torrent);
         self.publish_stats();
-        self.schedule().await;
+        self.schedule();
     }
 
     /// Once a second: time out stalled requests, drop silent peers, keep the request pipeline
     /// full, and publish progress.
-    async fn housekeeping(&mut self) {
+    fn housekeeping(&mut self) {
         let mut stalled = Vec::new();
         let mut silent = Vec::new();
         for (idx, peer) in self.peers.iter().enumerate() {
@@ -857,9 +856,9 @@ impl TorrentSwarm {
             self.release_claim(piece, peer);
         }
 
-        self.request_layers().await;
-        self.schedule().await;
-        self.send_held_uploads().await;
+        self.request_layers();
+        self.schedule();
+        self.send_held_uploads();
         self.prune_known();
         self.publish_stats();
         self.sample_peers();
@@ -892,7 +891,7 @@ impl TorrentSwarm {
     /// BEP 52: asks peers for the piece layers we lack, each from a peer that has some of the
     /// file's pieces (and so must be able to answer) and speaks v2 (a hybrid's v1-only peers
     /// don't know hash requests).
-    async fn request_layers(&mut self) {
+    fn request_layers(&mut self) {
         if self.layers.is_empty() {
             return;
         }
@@ -906,7 +905,7 @@ impl TorrentSwarm {
         let requests = self.layers.assign(torrent, &addrs, has, Instant::now());
         for (addr, req) in requests {
             if let Some(idx) = self.peer_index(addr)
-                && self.peers[idx].send_message(BtMessage::HashRequest(req)).await.is_err()
+                && self.peers[idx].send(BtMessage::HashRequest(req)).is_err()
             {
                 self.drop_peer(idx, "send failed");
             }
@@ -940,7 +939,7 @@ impl TorrentSwarm {
 
     /// Sends blocks the upload limit held back, as far as it allows now. A block for a peer
     /// that has since gone is dropped.
-    async fn send_held_uploads(&mut self) {
+    fn send_held_uploads(&mut self) {
         while let Some((to, block)) = self.held_uploads.pop_front() {
             let Some(idx) = self.peer_index(to) else {
                 continue;
@@ -950,7 +949,7 @@ impl TorrentSwarm {
                 break;
             }
             self.stat.uploaded += block.length as u64;
-            if self.peers[idx].send_block(block).await.is_err() {
+            if self.peers[idx].send_block(block).is_err() {
                 self.drop_peer(idx, "send failed");
             }
         }
@@ -1046,14 +1045,11 @@ impl TorrentSwarm {
         }
     }
 
-    /// Sends the same message to every peer, dropping any the write fails for.
-    async fn broadcast<F>(&mut self, mut send: F)
-    where
-        F: for<'p> FnMut(&'p mut Peer) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'p>>,
-    {
+    /// Sends to every peer, dropping any the send fails for.
+    fn broadcast(&mut self, mut send: impl FnMut(&mut Peer) -> io::Result<()>) {
         let mut dead = Vec::new();
         for (idx, peer) in self.peers.iter_mut().enumerate() {
-            if send(peer).await.is_err() {
+            if send(peer).is_err() {
                 dead.push(idx);
             }
         }
@@ -1062,7 +1058,7 @@ impl TorrentSwarm {
         }
     }
 
-    async fn on_peer_message(&mut self, idx: usize, msg: BtMessage) {
+    fn on_peer_message(&mut self, idx: usize, msg: BtMessage) {
         let peer = &mut self.peers[idx];
         let choked = matches!(msg, BtMessage::Choke(_));
         let choked_us_before = peer.choked_us;
@@ -1113,7 +1109,7 @@ impl TorrentSwarm {
                 }
                 if let Some(piece) = new_piece {
                     self.availability[piece as usize] += 1;
-                    self.schedule_peer(idx).await;
+                    self.schedule_peer(idx);
                 } else if choked {
                     // BEP 3: a choke discards our outstanding requests, and nothing more
                     // will be asked of the peer until it unchokes, so its pieces go back
@@ -1122,15 +1118,15 @@ impl TorrentSwarm {
                     for piece in self.pieces_held_by(addr) {
                         self.release_claim(piece, addr);
                     }
-                    self.schedule().await;
+                    self.schedule();
                 } else if became_interested {
-                    self.unchoke_if_slot_free(idx).await;
+                    self.unchoke_if_slot_free(idx);
                 } else if replaces_bitfield || peer.choked_us != choked_us_before {
                     // an unchoke or a bitfield may have made pieces requestable
-                    self.schedule().await;
+                    self.schedule();
                 }
                 if new_piece.is_some() || replaces_bitfield {
-                    self.reveal_where_spread().await;
+                    self.reveal_where_spread();
                 }
                 return;
             }
@@ -1160,8 +1156,8 @@ impl TorrentSwarm {
                     });
                 }
             }
-            BtMessage::Request(request) => self.serve_request(idx, request).await,
-            BtMessage::Piece(piece) => self.block_arrived(idx, piece).await,
+            BtMessage::Request(request) => self.serve_request(idx, request),
+            BtMessage::Piece(piece) => self.block_arrived(idx, piece),
             BtMessage::RejectRequest(reject) => {
                 // BEP 6: the peer is declining a request we made; the piece it belonged to
                 // goes back on the pile rather than idling out BLOCK_REQUEST_TIMEOUT
@@ -1178,7 +1174,7 @@ impl TorrentSwarm {
                     );
                     let addr = peer.remote_addr;
                     self.release_claim(req.index, addr);
-                    self.schedule().await;
+                    self.schedule();
                 }
             }
             BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::UtMetadata) => {
@@ -1194,13 +1190,13 @@ impl TorrentSwarm {
                 let end = (start + METADATA_PIECE_SIZE).min(self.torrent.raw_info.len());
                 let total_size = self.torrent.metadata_size();
                 let data = &self.torrent.raw_info[start..end];
-                if peer.send_metadata_piece(piece, total_size, data).await.is_err() {
+                if peer.send_metadata_piece(piece, total_size, data).is_err() {
                     self.drop_peer(idx, "send failed");
                 }
             }
             BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::UtHolepunch) => {
                 if let Some(msg) = Holepunch::decode(&ext.payload) {
-                    self.on_holepunch(idx, msg).await;
+                    self.on_holepunch(idx, msg);
                 }
             }
             BtMessage::Extended(ext) if Extension::from_id(ext.ext_id) == Some(Extension::LtDonthave) => {
@@ -1214,7 +1210,7 @@ impl TorrentSwarm {
                     let addr = peer.remote_addr;
                     if self.holdings.get(&addr).is_some_and(|held| held.contains(&piece)) {
                         self.release_claim(piece, addr);
-                        self.schedule().await;
+                        self.schedule();
                     }
                 }
             }
@@ -1261,7 +1257,7 @@ impl TorrentSwarm {
                         None => BtMessage::HashReject(req),
                     },
                 };
-                if self.peers[idx].send_message(reply).await.is_err() {
+                if self.peers[idx].send(reply).is_err() {
                     self.drop_peer(idx, "send failed");
                 }
             }
@@ -1271,7 +1267,7 @@ impl TorrentSwarm {
                     Received::Partial => {}
                     Received::Layer(file) => {
                         info!("piece layer of {:?} in from {addr}", self.torrent.files[file].1);
-                        self.schedule().await;
+                        self.schedule();
                     }
                     Received::Bad => {
                         warn!("{addr} sent piece hashes that don't add up, disconnecting");
@@ -1282,7 +1278,7 @@ impl TorrentSwarm {
             }
             BtMessage::HashReject(_) => {
                 self.layers.give_up(self.peers[idx].remote_addr);
-                self.request_layers().await;
+                self.request_layers();
             }
             other => unreachable!("Peer::apply handles everything else: {other:?}"),
         }
@@ -1291,10 +1287,10 @@ impl TorrentSwarm {
     /// BEP 3: a choked peer isn't entitled to any data, full stop. BEP 6 turns "ignore it"
     /// into "must say so": once Fast Extension is negotiated a declined request needs an
     /// explicit RejectRequest, which `send_reject` no-ops on its own if it isn't.
-    async fn serve_request(&mut self, idx: usize, request: Request) {
+    fn serve_request(&mut self, idx: usize, request: Request) {
         let peer = &mut self.peers[idx];
         if peer.choked_them {
-            if peer.send_reject(request).await.is_err() {
+            if peer.send_reject(request).is_err() {
                 self.drop_peer(idx, "send failed");
             }
             return;
@@ -1310,7 +1306,7 @@ impl TorrentSwarm {
                 .is_none_or(|view| view.offered.contains(&request.index));
         let sane = request.length > 0 && request.length <= MAX_SERVED_BLOCK;
         if !verified || !sane || peer.uploads.len() >= MAX_QUEUED_UPLOADS {
-            if peer.send_reject(request).await.is_err() {
+            if peer.send_reject(request).is_err() {
                 self.drop_peer(idx, "send failed");
             }
             return;
@@ -1371,16 +1367,16 @@ impl TorrentSwarm {
         });
     }
 
-    async fn hashes_read(&mut self, to: SocketAddr, reply: BtMessage) {
+    fn hashes_read(&mut self, to: SocketAddr, reply: BtMessage) {
         self.hash_reads -= 1;
         if let Some(idx) = self.peer_index(to)
-            && self.peers[idx].send_message(reply).await.is_err()
+            && self.peers[idx].send(reply).is_err()
         {
             self.drop_peer(idx, "send failed");
         }
     }
 
-    async fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
+    fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
         let Some(idx) = self.peer_index(to) else {
             return;
         };
@@ -1404,24 +1400,21 @@ impl TorrentSwarm {
                     return;
                 }
                 self.stat.uploaded += block.length as u64;
-                peer.send_block(block).await
+                peer.send_block(block)
             }
-            Ok(block) => {
-                peer.send_reject(Request {
-                    index: block.index,
-                    begin: block.begin,
-                    length: block.length,
-                })
-                .await
-            }
-            Err(request) => peer.send_reject(request).await,
+            Ok(block) => peer.send_reject(Request {
+                index: block.index,
+                begin: block.begin,
+                length: block.length,
+            }),
+            Err(request) => peer.send_reject(request),
         };
         if sent.is_err() {
             self.drop_peer(idx, "send failed");
         }
     }
 
-    async fn block_arrived(&mut self, idx: usize, block: Piece) {
+    fn block_arrived(&mut self, idx: usize, block: Piece) {
         let peer = &mut self.peers[idx];
         let from = peer.remote_addr;
         if peer.block_received(&block).is_none() {
@@ -1436,12 +1429,12 @@ impl TorrentSwarm {
             return;
         }
         self.stat.downloaded += block.length as u64;
-        self.store_block(from, block).await;
+        self.store_block(from, block);
     }
 
     /// A block someone (a peer or a web seed) owed us is in: it goes into its piece, and a
     /// piece with every block in goes off to be checked.
-    async fn store_block(&mut self, from: SocketAddr, block: Piece) {
+    fn store_block(&mut self, from: SocketAddr, block: Piece) {
         let Some(in_flight) = self.in_flight.get_mut(&block.index) else {
             return;
         };
@@ -1471,7 +1464,7 @@ impl TorrentSwarm {
                 why: "lost race",
             });
             if let Some(idx) = self.peer_index(from) {
-                self.refill(idx).await;
+                self.refill(idx);
             }
             return;
         }
@@ -1480,11 +1473,11 @@ impl TorrentSwarm {
         let raced = in_flight.claims.len() > 1;
         let blocks_left = in_flight.blocks_left();
         if raced && blocks_left > 0 {
-            self.cancel_duplicates(&block, from).await;
+            self.cancel_duplicates(&block, from);
         }
         if blocks_left > 0 {
             if let Some(idx) = self.peer_index(from) {
-                self.schedule_peer(idx).await;
+                self.schedule_peer(idx);
             }
             return;
         }
@@ -1496,7 +1489,7 @@ impl TorrentSwarm {
                 held.remove(&piece);
             }
         }
-        self.cancel_losers(piece, &in_flight).await;
+        self.cancel_losers(piece, &in_flight);
         self.piece_assembled(piece, in_flight);
     }
 
@@ -1540,13 +1533,7 @@ impl TorrentSwarm {
         });
     }
 
-    async fn piece_done(
-        &mut self,
-        piece: u32,
-        len: usize,
-        senders: BTreeSet<SocketAddr>,
-        outcome: Result<bool, String>,
-    ) {
+    fn piece_done(&mut self, piece: u32, len: usize, senders: BTreeSet<SocketAddr>, outcome: Result<bool, String>) {
         self.hashing.remove(&piece);
         match outcome {
             Ok(true) => {}
@@ -1574,7 +1561,7 @@ impl TorrentSwarm {
                     warn!("piece {piece} failed hash verification, and came from {senders:?}; will retry");
                 }
                 self.missing.push(piece);
-                self.schedule().await;
+                self.schedule();
                 return;
             }
             Err(e) => {
@@ -1625,21 +1612,20 @@ impl TorrentSwarm {
                     self.torrent.private,
                     self.id.serving.port(),
                 );
-                self.broadcast(move |peer| Box::pin(peer.send_extended_handshake(size, private, true, port)))
-                    .await;
+                self.broadcast(|peer| peer.send_extended_handshake(size, private, true, port));
             }
         }
         // announcers watch this to send a prompt event=completed rather than waiting for
         // their next periodic announce, which could be minutes away
         self.publish_stats();
 
-        self.broadcast(move |peer| Box::pin(peer.send_have(piece))).await;
-        self.schedule().await;
+        self.broadcast(|peer| peer.send_have(piece));
+        self.schedule();
     }
 
     /// A block of a raced piece just arrived from `from`: any other racer that asked for the
     /// same block is told not to bother.
-    async fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
+    fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
         let req = Request {
             index: block.index,
             begin: block.begin,
@@ -1656,7 +1642,7 @@ impl TorrentSwarm {
                 continue;
             };
             let peer = &mut self.peers[idx];
-            if peer.requested.remove(&req).is_some() && peer.send_cancel(req).await.is_err() {
+            if peer.requested.remove(&req).is_some() && peer.send_cancel(req).is_err() {
                 self.drop_peer(idx, "send failed");
             }
         }
@@ -1664,14 +1650,14 @@ impl TorrentSwarm {
 
     /// A raced piece just completed: every other claimant is told to stop sending the blocks
     /// it still owes. A peer whose socket fails here is dropped.
-    async fn cancel_losers(&mut self, piece: u32, in_flight: &InFlight) {
+    fn cancel_losers(&mut self, piece: u32, in_flight: &InFlight) {
         for &addr in in_flight.claims.keys() {
             let Some(idx) = self.peer_index(addr) else {
                 continue;
             };
             let peer = &mut self.peers[idx];
             for req in peer.forget_piece(piece) {
-                if peer.send_cancel(req).await.is_err() {
+                if peer.send_cancel(req).is_err() {
                     self.drop_peer(idx, "send failed");
                     break;
                 }
@@ -1687,7 +1673,7 @@ impl TorrentSwarm {
     /// whichever peer holds them, slow ones included. So peers with room also take the pieces
     /// furthest from done, up to ENDGAME_RACERS per piece, from the other end; each block
     /// that arrives is cancelled at the other racers (`cancel_duplicates`).
-    async fn schedule(&mut self) {
+    fn schedule(&mut self) {
         if self.stat.storage_error.is_some() {
             return;
         }
@@ -1698,19 +1684,19 @@ impl TorrentSwarm {
             self.race_web_seeds();
         }
         for idx in (0..self.peers.len()).rev() {
-            self.refill(idx).await;
+            self.refill(idx);
         }
     }
 
     /// `schedule` for one peer that just got room (a block arrived) or something new to offer
     /// (a Have): cheap enough to run per message, unlike a full pass.
-    async fn schedule_peer(&mut self, idx: usize) {
+    fn schedule_peer(&mut self, idx: usize) {
         if self.stat.storage_error.is_some() {
             return;
         }
         // usually the pieces it already holds have blocks left to ask for, and that's all
         let addr = self.peers[idx].remote_addr;
-        self.refill(idx).await;
+        self.refill(idx);
         let Some(idx) = self.peer_index(addr) else {
             return;
         };
@@ -1721,7 +1707,7 @@ impl TorrentSwarm {
             } else {
                 self.assign_pieces(Some(idx));
             }
-            self.refill(idx).await;
+            self.refill(idx);
         }
     }
 
@@ -1880,7 +1866,7 @@ impl TorrentSwarm {
         self.super_seed && self.stat.all_verified()
     }
 
-    async fn set_super_seed(&mut self, on: bool) {
+    fn set_super_seed(&mut self, on: bool) {
         self.super_seed = on;
         if on {
             // peers already connected have seen everything; it applies to newcomers
@@ -1897,7 +1883,7 @@ impl TorrentSwarm {
                 .filter(|p| !view.offered.contains(p) && !peer.they_have(*p))
                 .collect();
             for piece in hidden {
-                if peer.send_have(piece).await.is_err() {
+                if peer.send_have(piece).is_err() {
                     self.drop_peer(idx, "send failed");
                     break;
                 }
@@ -1907,7 +1893,7 @@ impl TorrentSwarm {
 
     /// BEP 16: shows a super-seeded peer one more piece it lacks: the least common, counting
     /// both who has it and who it was shown to, so one copy of each goes out before seconds.
-    async fn reveal_next_piece(&mut self, idx: usize) {
+    fn reveal_next_piece(&mut self, idx: usize) {
         let peer = &self.peers[idx];
         let Some(view) = &peer.super_seed else { return };
         let scatter = rand::random::<u32>();
@@ -1927,7 +1913,7 @@ impl TorrentSwarm {
         view.offered.insert(piece);
         view.current = Some((piece, others, Instant::now()));
         self.super_seed_offers[piece as usize] += 1;
-        if peer.send_have(piece).await.is_err() {
+        if peer.send_have(piece).is_err() {
             self.drop_peer(idx, "send failed");
         }
     }
@@ -1935,7 +1921,7 @@ impl TorrentSwarm {
     /// BEP 16: a peer gets its next piece once the one it was shown turns up at another peer,
     /// which means it passed it on. Alone in the swarm, or holding its piece for a while with
     /// no taker, it gets the next one anyway rather than waiting forever.
-    async fn reveal_where_spread(&mut self) {
+    fn reveal_where_spread(&mut self) {
         if !self.peers.iter().any(|p| p.super_seed.is_some()) {
             return;
         }
@@ -1956,7 +1942,7 @@ impl TorrentSwarm {
             .collect();
         for addr in ready {
             if let Some(idx) = self.peer_index(addr) {
-                self.reveal_next_piece(idx).await;
+                self.reveal_next_piece(idx);
             }
         }
     }
@@ -2028,7 +2014,7 @@ impl TorrentSwarm {
 
     /// Tops the peer's outstanding requests up to its window from the pieces assigned to it.
     /// The peer is dropped if a send fails, so callers must not hold an index past this.
-    async fn refill(&mut self, idx: usize) {
+    fn refill(&mut self, idx: usize) {
         let peer = &mut self.peers[idx];
         if !peer.ready() {
             return;
@@ -2049,7 +2035,7 @@ impl TorrentSwarm {
                     continue 'pieces;
                 };
                 self.total_picks += 1;
-                if peer.request_block(req).await.is_err() {
+                if peer.request_block(req).is_err() {
                     failed = true;
                     break 'pieces;
                 }
@@ -2315,14 +2301,14 @@ impl TorrentSwarm {
         });
     }
 
-    async fn web_block_arrived(&mut self, seed: usize, job: u64, block: Piece) {
+    fn web_block_arrived(&mut self, seed: usize, job: u64, block: Piece) {
         let w = &mut self.web_seeds[seed];
         w.stats.block_received(block.length as usize, Instant::now());
         self.stat.downloaded += block.length as u64;
         let addr = w.addr;
         let ours = |piece: u32| self.in_flight.get(&piece).is_some_and(|f| f.claims.contains_key(&addr));
         if ours(block.index) {
-            self.store_block(addr, block).await;
+            self.store_block(addr, block);
             return;
         }
         // finished by a racer, or released after a hash failure
@@ -2339,11 +2325,11 @@ impl TorrentSwarm {
             .is_some_and(|j| (block.index..=*j.pieces.end()).all(|p| !ours(p)));
         if rest_unwanted {
             self.web_seeds[seed].jobs.remove(&job);
-            self.schedule().await;
+            self.schedule();
         }
     }
 
-    async fn web_job_done(&mut self, seed: usize, job: u64, outcome: Result<(), Failure>) {
+    fn web_job_done(&mut self, seed: usize, job: u64, outcome: Result<(), Failure>) {
         let Some(job) = self.web_seeds[seed].jobs.remove(&job) else {
             return;
         };
@@ -2365,7 +2351,7 @@ impl TorrentSwarm {
         if let Some(why) = self.web_seeds[seed].gave_up.clone() {
             self.give_up_web_seed(seed, why);
         }
-        self.schedule().await;
+        self.schedule();
     }
 
     /// Stops asking web seed `seed` for anything, and puts what it was fetching back up for
@@ -2385,7 +2371,7 @@ impl TorrentSwarm {
     /// Takes ownership of a handshaken socket. Sends our side of the opening exchange (BEP 10
     /// extended handshake, then BitField/HaveAll/HaveNone, then Interested) before the peer
     /// joins `peers`, so nothing else can be written to it first.
-    async fn add_peer(&mut self, connected: ConnectedPeer) {
+    fn add_peer(&mut self, connected: ConnectedPeer) {
         let remote_addr = canonical(connected.remote_addr);
         self.dialing.remove(&remote_addr);
         if self.peer_index(remote_addr).is_some() {
@@ -2413,7 +2399,6 @@ impl TorrentSwarm {
             known.plaintext_only = !connected.stream.is_encrypted();
         }
 
-        let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port_for(&remote_addr));
         self.next_conn += 1;
         let mut peer = Peer::new(
             connected.stream,
@@ -2427,45 +2412,12 @@ impl TorrentSwarm {
         peer.stats = known.stats.clone();
         peer.dialed = connected.dialed;
         peer.v2 = connected.remote_supports_v2;
-        let opening = async {
-            if connected.remote_supports_extensions {
-                peer.send_extended_handshake(
-                    self.torrent.metadata_size(),
-                    self.torrent.private,
-                    self.partial_seed(),
-                    self.id.serving.port(),
-                )
-                .await?;
-            }
-            // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
-            // place of a BitField for the "everything"/"nothing" cases
-            if self.super_seeding() {
-                peer.super_seed = Some(Default::default());
-                if peer.remote_supports_fast {
-                    peer.send_have_none().await?;
-                } else {
-                    let has = vec![0u8; self.torrent.num_pieces().div_ceil(8)].into_boxed_slice();
-                    peer.send_bitfield(BitField { has }).await?;
-                }
-            } else if peer.remote_supports_fast && self.stat.all_verified() {
-                peer.send_have_all().await?;
-            } else if peer.remote_supports_fast && self.stat.verified_cnt() == 0 {
-                peer.send_have_none().await?;
-            } else {
-                let has = Box::from(self.stat.verified.clone().as_raw_slice());
-                peer.send_bitfield(BitField { has }).await?;
-            }
-            // BEP 5: a peer that has a DHT node too gets told where ours listens
-            if connected.remote_supports_dht
-                && let Some(port) = dht_port
-            {
-                peer.send_port(port).await?;
-            }
-            // BEP 3: connections start choked; whether to unchoke is the choking algorithm's
-            // call, not an automatic grant on connect
-            peer.show_interest().await
-        };
-        if let Err(e) = opening.await {
+        let opened = self.open(
+            &mut peer,
+            connected.remote_supports_extensions,
+            connected.remote_supports_dht,
+        );
+        if let Err(e) = opened {
             info!("{remote_addr} went away during the opening exchange ({e})");
             self.known
                 .entry(remote_addr)
@@ -2497,7 +2449,45 @@ impl TorrentSwarm {
         });
         let insert_at = self.peers.partition_point(|p| p.remote_addr < remote_addr);
         self.peers.insert(insert_at, peer);
-        self.reveal_next_piece(insert_at).await;
+        self.reveal_next_piece(insert_at);
+    }
+
+    /// Our side of the opening exchange, in the order BEP 10 and BEP 6 expect.
+    fn open(&self, peer: &mut Peer, extensions: bool, dht: bool) -> io::Result<()> {
+        if extensions {
+            peer.send_extended_handshake(
+                self.torrent.metadata_size(),
+                self.torrent.private,
+                self.partial_seed(),
+                self.id.serving.port(),
+            )?;
+        }
+        // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
+        // place of a BitField for the "everything"/"nothing" cases
+        if self.super_seeding() {
+            peer.super_seed = Some(Default::default());
+            if peer.remote_supports_fast {
+                peer.send_have_none()?;
+            } else {
+                let has = vec![0u8; self.torrent.num_pieces().div_ceil(8)].into_boxed_slice();
+                peer.send_bitfield(BitField { has })?;
+            }
+        } else if peer.remote_supports_fast && self.stat.all_verified() {
+            peer.send_have_all()?;
+        } else if peer.remote_supports_fast && self.stat.verified_cnt() == 0 {
+            peer.send_have_none()?;
+        } else {
+            let has = Box::from(self.stat.verified.as_raw_slice());
+            peer.send_bitfield(BitField { has })?;
+        }
+        // BEP 5: a peer that has a DHT node too gets told where ours listens
+        let dht_port = self.dht.borrow().as_ref().map(|d| d.udp_port_for(&peer.remote_addr));
+        if dht && let Some(port) = dht_port {
+            peer.send_port(port)?;
+        }
+        // BEP 3: connections start choked; whether to unchoke is the choking algorithm's
+        // call, not an automatic grant on connect
+        peer.show_interest()
     }
 
     /// Dials every address in `peers` we're not already connected to or dialing. Shared by
@@ -2587,7 +2577,7 @@ impl TorrentSwarm {
     /// BEP 55, as the initiator: a peer we couldn't dial may be behind a NAT that only lets in
     /// what it sent out to first. The peer that told us about it is connected to it, so it can
     /// tell both of us to connect at once (over uTP), which opens both NATs. Once per address.
-    async fn try_holepunch(&mut self, addr: SocketAddr) {
+    fn try_holepunch(&mut self, addr: SocketAddr) {
         let Some(known) = self.known.get_mut(&addr) else {
             return;
         };
@@ -2607,17 +2597,13 @@ impl TorrentSwarm {
             known.holepunched = true;
         }
         tracing::debug!("asking {relay} to introduce us to {addr} (holepunch)");
-        if self.peers[idx]
-            .send_holepunch(Holepunch::Rendezvous(addr))
-            .await
-            .is_err()
-        {
+        if self.peers[idx].send_holepunch(Holepunch::Rendezvous(addr)).is_err() {
             self.drop_peer(idx, "send failed");
         }
     }
 
     /// BEP 55: a holepunch message from the peer at `idx`.
-    async fn on_holepunch(&mut self, idx: usize, msg: Holepunch) {
+    fn on_holepunch(&mut self, idx: usize, msg: Holepunch) {
         let from = self.peers[idx].remote_addr;
         match msg {
             // we're the relay: introduce the two, or say why not
@@ -2638,8 +2624,8 @@ impl TorrentSwarm {
                         Some(t) => {
                             let initiator = self.peers[idx].reachable_addr();
                             tracing::debug!("introducing {from} and {target} (holepunch)");
-                            let to_target = self.peers[t].send_holepunch(Holepunch::Connect(initiator)).await;
-                            let to_initiator = self.peers[idx].send_holepunch(Holepunch::Connect(target)).await;
+                            let to_target = self.peers[t].send_holepunch(Holepunch::Connect(initiator));
+                            let to_initiator = self.peers[idx].send_holepunch(Holepunch::Connect(target));
                             if to_target.is_err() || to_initiator.is_err() {
                                 tracing::debug!("couldn't pass on a holepunch between {from} and {target}");
                             }
@@ -2648,7 +2634,7 @@ impl TorrentSwarm {
                     }
                 };
                 if let Some(error) = error {
-                    let _ = self.peers[idx].send_holepunch(Holepunch::Error(target, error)).await;
+                    let _ = self.peers[idx].send_holepunch(Holepunch::Error(target, error));
                 }
             }
             // a relay introduced us: dial now, over uTP, while the other side dials us
@@ -2673,7 +2659,7 @@ impl TorrentSwarm {
     /// chance to prove itself instead of the same top N being unchoked forever.
     /// A peer that just declared interest gets a free upload slot now rather than at the next
     /// choking round, up to 10 s away; the round still decides who keeps one.
-    async fn unchoke_if_slot_free(&mut self, idx: usize) {
+    fn unchoke_if_slot_free(&mut self, idx: usize) {
         let interested = self.peers.iter().filter(|p| p.interested_us).count();
         let unchoked = self.peers.iter().filter(|p| !p.choked_them).count();
         let peer = &mut self.peers[idx];
@@ -2686,12 +2672,12 @@ impl TorrentSwarm {
             choked: false,
             by_us: true,
         });
-        if peer.unchoke().await.is_err() {
+        if peer.unchoke().is_err() {
             self.drop_peer(idx, "send failed");
         }
     }
 
-    async fn run_choking_algorithm(&mut self, round: u64) {
+    fn run_choking_algorithm(&mut self, round: u64) {
         let mut interested: Vec<(SocketAddr, f64)> = self
             .peers
             .iter()
@@ -2721,33 +2707,30 @@ impl TorrentSwarm {
                 });
             }
         }
-        self.broadcast(move |peer| {
+        self.broadcast(|peer| {
             let should_unchoke = to_unchoke.contains(&peer.remote_addr);
-            Box::pin(async move {
-                if should_unchoke && peer.choked_them {
-                    peer.unchoke().await
-                } else if !should_unchoke && !peer.choked_them {
-                    peer.choke().await
-                } else {
-                    Ok(())
-                }
-            })
-        })
-        .await;
+            if should_unchoke && peer.choked_them {
+                peer.unchoke()
+            } else if !should_unchoke && !peer.choked_them {
+                peer.choke()
+            } else {
+                Ok(())
+            }
+        });
     }
 
     /// BEP 11 (PEX): tell each peer about every *other* peer we know of. No per-peer diffing
     /// against what we've told them before ("added"/"dropped" bookkeeping) -- we just resend
     /// the current full membership every round, which is redundant but simple and spec-legal
     /// (PEX is a discovery hint, not an authoritative membership feed).
-    async fn run_pex_round(&mut self) {
+    fn run_pex_round(&mut self) {
         // BEP 27: a private torrent's peers must come only from its trackers.
         if self.torrent.private {
             return;
         }
 
         let all: Vec<(SocketAddr, u8)> = self.peers.iter().map(|p| (p.remote_addr, p.pex_flags())).collect();
-        self.broadcast(move |peer| {
+        self.broadcast(|peer| {
             // BEP 11 recommends capping a single PEX message at roughly 50 added peers; a
             // fresh random sample each round, so over time every peer hears of the whole swarm
             let added: Vec<(SocketAddr, u8)> = all
@@ -2756,14 +2739,11 @@ impl TorrentSwarm {
                 .filter(|(a, _)| *a != peer.remote_addr)
                 .take(PEX_MAX_ADDED_PEERS)
                 .collect();
-            Box::pin(async move {
-                if added.is_empty() {
-                    return Ok(());
-                }
-                peer.send_pex(&added).await
-            })
-        })
-        .await;
+            if added.is_empty() {
+                return Ok(());
+            }
+            peer.send_pex(&added)
+        });
     }
 }
 
@@ -3191,7 +3171,7 @@ mod test {
                 .truncate(true)
                 .open(&path)
                 .unwrap();
-            file.set_len(*size as u64).unwrap();
+            file.set_len(*size).unwrap();
             handles.push(Some(file));
         }
         let torrent = Arc::new(torrent);

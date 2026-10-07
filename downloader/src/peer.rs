@@ -160,8 +160,8 @@ pub(crate) struct SuperSeedView {
 /// One connected peer, owned by its `TorrentSwarm`. The socket itself belongs to two tasks: a
 /// reader that forwards each message to the swarm's inbox, and a writer that drains this peer's
 /// outbox, batching whatever is queued into one flush. The swarm never waits on a socket, so a
-/// slow or stalled peer can't hold up the others; sends here only queue, and a peer that lets
-/// its queue fill up is disconnected.
+/// slow or stalled peer can't hold up the others; sends here only queue (they're plain
+/// functions, not async), and a peer that lets its queue fill up is disconnected.
 ///
 /// What lives here is per-connection state and the wire-level sends. Anything that needs the
 /// rest of the swarm (serving a `Request`, assembling a piece, dialing PEX peers) is in
@@ -551,13 +551,13 @@ impl Peer {
     }
 
     /// BEP 55; a silent no-op for a peer that never said it speaks holepunch.
-    pub async fn send_holepunch(&mut self, msg: Holepunch) -> io::Result<()> {
-        self.send_extended(Extension::UtHolepunch, msg.encode()).await
+    pub fn send_holepunch(&mut self, msg: Holepunch) -> io::Result<()> {
+        self.send_extended(Extension::UtHolepunch, msg.encode())
     }
 
     /// An extension message on the id the peer asked for it on; a silent no-op for a peer
     /// that never said it speaks `ext`, there's no id to send it on.
-    async fn send_extended(&mut self, ext: Extension, payload: Vec<u8>) -> io::Result<()> {
+    fn send_extended(&mut self, ext: Extension, payload: Vec<u8>) -> io::Result<()> {
         let Some(ext_id) = self.their_id(ext) else {
             return Ok(());
         };
@@ -565,7 +565,6 @@ impl Peer {
             ext_id,
             payload: payload.into_boxed_slice(),
         }))
-        .await
     }
 
     /// BEP 54: the peer no longer has `piece`. False if it never said it had it.
@@ -600,9 +599,9 @@ impl Peer {
         !self.requested.is_empty() && self.last_progress.elapsed() > limit
     }
 
-    /// Queues `msg` for the writer without waiting. Async only so callers read the same as a
-    /// socket write would; it completes at once.
-    async fn send(&mut self, msg: BtMessage) -> io::Result<()> {
+    /// Queues `msg` for the writer; the error is the queue being full or the writer gone,
+    /// either way the connection is beyond use. Every send here only queues, so none waits.
+    pub(crate) fn send(&mut self, msg: BtMessage) -> io::Result<()> {
         self.outbox.try_send(msg).map_err(|e| match e {
             TrySendError::Full(_) => {
                 io::Error::new(io::ErrorKind::WouldBlock, "send queue full, the peer isn't reading")
@@ -612,7 +611,7 @@ impl Peer {
     }
 
     /// BEP 10, sent once on connecting and again when `upload_only` (BEP 21) turns on.
-    pub async fn send_extended_handshake(
+    pub fn send_extended_handshake(
         &mut self,
         metadata_size: u32,
         private: bool,
@@ -630,64 +629,58 @@ impl Peer {
             ext_id: 0,
             payload: payload.into_boxed_slice(),
         }))
-        .await
     }
 
-    /// Any message, for the swarm's own protocols (BEP 52 hashes).
-    pub(crate) async fn send_message(&mut self, msg: BtMessage) -> io::Result<()> {
-        self.send(msg).await
+    pub fn send_keepalive(&mut self) -> io::Result<()> {
+        self.send(BtMessage::KeepAlive(KeepAlive))
     }
 
-    pub async fn send_keepalive(&mut self) -> io::Result<()> {
-        self.send(BtMessage::KeepAlive(KeepAlive)).await
-    }
-
-    pub async fn request_block(&mut self, req: Request) -> io::Result<()> {
+    pub fn request_block(&mut self, req: Request) -> io::Result<()> {
         self.stats.block_requested();
         if self.requested.is_empty() {
             self.last_progress = Instant::now();
             self.stats.requests_started(self.last_progress);
         }
         self.requested.insert(req, Instant::now());
-        self.send(BtMessage::Request(req)).await
+        self.send(BtMessage::Request(req))
     }
 
-    pub async fn unchoke(&mut self) -> io::Result<()> {
-        self.send(BtMessage::Unchoke(Unchoke)).await?;
+    pub fn unchoke(&mut self) -> io::Result<()> {
+        self.send(BtMessage::Unchoke(Unchoke))?;
         self.choked_them = false;
         Ok(())
     }
 
-    pub async fn choke(&mut self) -> io::Result<()> {
-        self.send(BtMessage::Choke(Choke)).await?;
+    pub fn choke(&mut self) -> io::Result<()> {
+        self.send(BtMessage::Choke(Choke))?;
         self.choked_them = true;
         Ok(())
     }
 
-    pub async fn show_interest(&mut self) -> io::Result<()> {
-        self.send(BtMessage::Interested(Interested)).await?;
+    pub fn show_interest(&mut self) -> io::Result<()> {
+        self.send(BtMessage::Interested(Interested))?;
         self.interested_them = true;
         Ok(())
     }
 
-    pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
-        self.send(BtMessage::BitField(bit_field)).await
+    pub fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
+        self.send(BtMessage::BitField(bit_field))
     }
 
     /// BEP 6: sent in place of `BitField` when we have every piece.
-    pub async fn send_have_all(&mut self) -> io::Result<()> {
-        self.send(BtMessage::HaveAll(HaveAll)).await
+    pub fn send_have_all(&mut self) -> io::Result<()> {
+        self.send(BtMessage::HaveAll(HaveAll))
     }
 
     /// BEP 6: sent in place of `BitField` when we have no pieces at all.
-    pub async fn send_have_none(&mut self) -> io::Result<()> {
-        self.send(BtMessage::HaveNone(HaveNone)).await
+    pub fn send_have_none(&mut self) -> io::Result<()> {
+        self.send(BtMessage::HaveNone(HaveNone))
     }
 
     /// BEP 3: `Have` isn't the piece's data and isn't subject to choking, so it goes out
     /// regardless of choke/interest state.
-    pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
-        self.send(BtMessage::Have(Have { checked: index })).await
+    pub fn send_have(&mut self, index: u32) -> io::Result<()> {
+        self.send(BtMessage::Have(Have { checked: index }))
     }
 
     /// Forgets every outstanding request for `piece`; the caller decides whether to tell the
@@ -701,23 +694,22 @@ impl Peer {
     }
 
     /// BEP 5: where our DHT node listens.
-    pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
-        self.send(BtMessage::Port(Port { port })).await
+    pub fn send_port(&mut self, port: u16) -> io::Result<()> {
+        self.send(BtMessage::Port(Port { port }))
     }
 
-    pub async fn send_cancel(&mut self, req: Request) -> io::Result<()> {
+    pub fn send_cancel(&mut self, req: Request) -> io::Result<()> {
         self.send(BtMessage::Cancel(Cancel {
             index: req.index,
             begin: req.begin,
             length: req.length,
         }))
-        .await
     }
 
     /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
     /// support: the classic protocol has no "I'm declining this" message, and a plain drop
     /// is exactly what such a peer already expects.
-    pub async fn send_reject(&mut self, req: Request) -> io::Result<()> {
+    pub fn send_reject(&mut self, req: Request) -> io::Result<()> {
         if !self.remote_supports_fast {
             return Ok(());
         }
@@ -726,25 +718,24 @@ impl Peer {
             begin: req.begin,
             length: req.length,
         }))
-        .await
     }
 
-    pub async fn send_block(&mut self, piece: Piece) -> io::Result<()> {
+    pub fn send_block(&mut self, piece: Piece) -> io::Result<()> {
         let length = piece.length as usize;
-        self.send(BtMessage::Piece(piece)).await?;
+        self.send(BtMessage::Piece(piece))?;
         self.stats.block_sent(length);
         Ok(())
     }
 
     /// BEP 9: reply to a ut_metadata request with one piece of the raw info dict.
-    pub async fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: &[u8]) -> io::Result<()> {
+    pub fn send_metadata_piece(&mut self, piece: u32, total_size: u32, data: &[u8]) -> io::Result<()> {
         let payload = build_ut_metadata_data_message(piece, total_size, data);
-        self.send_extended(Extension::UtMetadata, payload).await
+        self.send_extended(Extension::UtMetadata, payload)
     }
 
     /// BEP 11 (PEX)
-    pub async fn send_pex(&mut self, added: &[(SocketAddr, u8)]) -> io::Result<()> {
-        self.send_extended(Extension::UtPex, build_pex_message(added)).await
+    pub fn send_pex(&mut self, added: &[(SocketAddr, u8)]) -> io::Result<()> {
+        self.send_extended(Extension::UtPex, build_pex_message(added))
     }
 }
 
@@ -1416,8 +1407,8 @@ mod test {
             begin: 4,
             length: 4,
         };
-        peer.request_block(first).await.unwrap();
-        peer.request_block(second).await.unwrap();
+        peer.request_block(first).unwrap();
+        peer.request_block(second).unwrap();
         tokio::time::sleep(limit * 2).await;
         assert!(peer.stalled(limit), "two requests, no delivery");
 
