@@ -1,15 +1,21 @@
-use crate::settings::{BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, RATE_WINDOW, REQUEST_PIPELINE_TARGET};
+use crate::settings::{
+    BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW, REQUEST_PIPELINE_TARGET, WRITE_TIMEOUT,
+};
 use crate::stream::PeerStream;
 use crate::wire::{
     BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece, Port,
     RejectRequest, Request, Unchoke,
 };
-use futures::SinkExt;
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::AbortHandle;
 use tokio_util::codec::Framed;
 
 /// BEP 10: the message id we tell peers to use when sending *us* ut_metadata messages. Fixed,
@@ -18,10 +24,22 @@ pub(crate) const UT_METADATA_ID: u8 = 1;
 /// BEP 10: same idea as `UT_METADATA_ID`, but for BEP 11 (PEX) messages.
 pub(crate) const UT_PEX_ID: u8 = 2;
 
-/// One connected peer. Owned outright by its `TorrentSwarm`, which is the only thing that ever
-/// reads from or writes to the socket, so everything here is a plain field: no channels, no
-/// snapshots, no task of its own. The swarm's event loop polls every peer's socket and calls
-/// the `&mut self` methods below in between.
+/// What a peer's reader (or a failing writer) hands the swarm: the next message, `None` when the
+/// peer hung up, or the error that ended the connection. `conn` tells this connection apart from
+/// a later one to the same address, whose messages must not be mixed up with a dead one's.
+pub(crate) struct Incoming {
+    pub addr: SocketAddr,
+    pub conn: u64,
+    pub msg: Option<io::Result<BtMessage>>,
+}
+
+pub(crate) type Inbox = mpsc::Sender<Incoming>;
+
+/// One connected peer, owned by its `TorrentSwarm`. The socket itself belongs to two tasks: a
+/// reader that forwards each message to the swarm's inbox, and a writer that drains this peer's
+/// outbox, batching whatever is queued into one flush. The swarm never waits on a socket, so a
+/// slow or stalled peer can't hold up the others; sends here only queue, and a peer that lets
+/// its queue fill up is disconnected.
 ///
 /// What lives here is per-connection state and the wire-level sends. Anything that needs the
 /// rest of the swarm (serving a `Request`, assembling a piece, dialing PEX peers) is in
@@ -41,7 +59,10 @@ pub(crate) struct Peer {
     /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
     pub their_ut_pex_id: Option<u8>,
 
-    pub socket: Framed<PeerStream, BtCodec>,
+    /// identifies this connection in `Incoming`
+    pub conn: u64,
+    outbox: mpsc::Sender<BtMessage>,
+    io_tasks: [AbortHandle; 2],
 
     /// BEP 3 bitfield layout: `ceil(num_pieces / 8)` bytes, piece 0 is the high bit of byte 0
     they_have: Box<[u8]>,
@@ -172,22 +193,35 @@ pub fn client_name(peer_id: &[u8; 20]) -> String {
 pub(crate) struct ProtocolViolation(pub String);
 
 impl Peer {
+    /// Starts the connection's reader and writer tasks on the current runtime; the reader
+    /// delivers to `inbox` tagged with `conn`.
     pub fn new(
         stream: PeerStream,
         remote_addr: SocketAddr,
         num_pieces: usize,
         remote_supports_fast: bool,
         peer_id: [u8; 20],
+        conn: u64,
+        inbox: Inbox,
     ) -> Self {
+        let encrypted = stream.is_encrypted();
+        let utp = stream.is_utp();
+        // room for a whole block and then some, so a 16 KiB Piece doesn't grow the buffer
+        let (sink, source) = Framed::with_capacity(stream, BtCodec, 64 * 1024).split();
+        let (outbox, queued) = mpsc::channel(PEER_OUTBOX);
+        let writer = tokio::spawn(write_loop(sink, queued, remote_addr, conn, inbox.clone()));
+        let reader = tokio::spawn(read_loop(source, remote_addr, conn, inbox));
         Self {
             peer_id,
             remote_addr,
             remote_supports_fast,
-            encrypted: stream.is_encrypted(),
-            utp: stream.is_utp(),
+            encrypted,
+            utp,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
-            socket: Framed::new(stream, BtCodec),
+            conn,
+            outbox,
+            io_tasks: [reader.abort_handle(), writer.abort_handle()],
             they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
             num_pieces,
             // BEP 3: "At the start of the connection, both sides ... are choked."
@@ -346,10 +380,18 @@ impl Peer {
         !self.requested.is_empty() && self.last_progress.elapsed() > limit
     }
 
+    /// Queues `msg` for the writer without waiting. Async only so callers read the same as a
+    /// socket write would; it completes at once.
+    async fn send(&mut self, msg: BtMessage) -> io::Result<()> {
+        self.outbox.try_send(msg).map_err(|e| match e {
+            TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "send queue full, the peer isn't reading"),
+            TrySendError::Closed(_) => io::ErrorKind::BrokenPipe.into(),
+        })
+    }
+
     pub async fn send_extended_handshake(&mut self, metadata_size: u32, private: bool) -> io::Result<()> {
         let payload = build_extended_handshake(metadata_size, private);
-        self.socket
-            .send(BtMessage::Extended(Extended {
+        self.send(BtMessage::Extended(Extended {
                 ext_id: 0,
                 payload: payload.into_boxed_slice(),
             }))
@@ -357,7 +399,7 @@ impl Peer {
     }
 
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::KeepAlive(KeepAlive)).await
+        self.send(BtMessage::KeepAlive(KeepAlive)).await
     }
 
     pub async fn request_block(&mut self, req: Request) -> io::Result<()> {
@@ -367,45 +409,45 @@ impl Peer {
             self.stats.requests_started(self.last_progress);
         }
         self.requested.insert(req, Instant::now());
-        self.socket.send(BtMessage::Request(req)).await
+        self.send(BtMessage::Request(req)).await
     }
 
     pub async fn unchoke(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::Unchoke(Unchoke)).await?;
+        self.send(BtMessage::Unchoke(Unchoke)).await?;
         self.choked_them = false;
         Ok(())
     }
 
     pub async fn choke(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::Choke(Choke)).await?;
+        self.send(BtMessage::Choke(Choke)).await?;
         self.choked_them = true;
         Ok(())
     }
 
     pub async fn show_interest(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::Interested(Interested)).await?;
+        self.send(BtMessage::Interested(Interested)).await?;
         self.interested_them = true;
         Ok(())
     }
 
     pub async fn send_bitfield(&mut self, bit_field: BitField) -> io::Result<()> {
-        self.socket.send(BtMessage::BitField(bit_field)).await
+        self.send(BtMessage::BitField(bit_field)).await
     }
 
     /// BEP 6: sent in place of `BitField` when we have every piece.
     pub async fn send_have_all(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::HaveAll(HaveAll)).await
+        self.send(BtMessage::HaveAll(HaveAll)).await
     }
 
     /// BEP 6: sent in place of `BitField` when we have no pieces at all.
     pub async fn send_have_none(&mut self) -> io::Result<()> {
-        self.socket.send(BtMessage::HaveNone(HaveNone)).await
+        self.send(BtMessage::HaveNone(HaveNone)).await
     }
 
     /// BEP 3: `Have` isn't the piece's data and isn't subject to choking, so it goes out
     /// regardless of choke/interest state.
     pub async fn send_have(&mut self, index: u32) -> io::Result<()> {
-        self.socket.send(BtMessage::Have(Have { checked: index })).await
+        self.send(BtMessage::Have(Have { checked: index })).await
     }
 
     /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
@@ -422,12 +464,11 @@ impl Peer {
 
     /// BEP 5: where our DHT node listens.
     pub async fn send_port(&mut self, port: u16) -> io::Result<()> {
-        self.socket.send(BtMessage::Port(Port { port })).await
+        self.send(BtMessage::Port(Port { port })).await
     }
 
     pub async fn send_cancel(&mut self, req: Request) -> io::Result<()> {
-        self.socket
-            .send(BtMessage::Cancel(Cancel {
+        self.send(BtMessage::Cancel(Cancel {
                 index: req.index,
                 begin: req.begin,
                 length: req.length,
@@ -440,8 +481,7 @@ impl Peer {
         if !self.remote_supports_fast {
             return Ok(());
         }
-        self.socket
-            .send(BtMessage::RejectRequest(RejectRequest {
+        self.send(BtMessage::RejectRequest(RejectRequest {
                 index: req.index,
                 begin: req.begin,
                 length: req.length,
@@ -451,7 +491,7 @@ impl Peer {
 
     pub async fn send_block(&mut self, piece: Piece) -> io::Result<()> {
         let length = piece.length as usize;
-        self.socket.send(BtMessage::Piece(piece)).await?;
+        self.send(BtMessage::Piece(piece)).await?;
         self.stats.block_sent(length);
         Ok(())
     }
@@ -462,8 +502,7 @@ impl Peer {
         let Some(their_id) = self.their_ut_metadata_id else {
             return Ok(());
         };
-        self.socket
-            .send(BtMessage::Extended(Extended {
+        self.send(BtMessage::Extended(Extended {
                 ext_id: their_id,
                 payload: build_ut_metadata_data_message(piece, total_size, data).into_boxed_slice(),
             }))
@@ -476,12 +515,63 @@ impl Peer {
         let Some(their_id) = self.their_ut_pex_id else {
             return Ok(());
         };
-        self.socket
-            .send(BtMessage::Extended(Extended {
+        self.send(BtMessage::Extended(Extended {
                 ext_id: their_id,
                 payload: build_pex_message(added).into_boxed_slice(),
             }))
             .await
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        for task in &self.io_tasks {
+            task.abort();
+        }
+    }
+}
+
+type Sink = SplitSink<Framed<PeerStream, BtCodec>, BtMessage>;
+type Source = SplitStream<Framed<PeerStream, BtCodec>>;
+
+async fn read_loop(mut source: Source, addr: SocketAddr, conn: u64, inbox: Inbox) {
+    loop {
+        let msg = source.next().await;
+        let last = !matches!(msg, Some(Ok(_)));
+        if inbox.send(Incoming { addr, conn, msg }).await.is_err() || last {
+            return;
+        }
+    }
+}
+
+/// Writes everything queued, then flushes once: a burst of Requests or Haves goes out in one
+/// syscall rather than one each. A write that can't finish within `WRITE_TIMEOUT` ends the
+/// connection, reported to the swarm like a read error.
+async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr: SocketAddr, conn: u64, inbox: Inbox) {
+    async fn timed<F: Future<Output = io::Result<()>>>(write: F) -> io::Result<()> {
+        tokio::time::timeout(WRITE_TIMEOUT, write)
+            .await
+            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out")))
+    }
+    let written: io::Result<()> = async {
+        while let Some(msg) = queued.recv().await {
+            timed(sink.feed(msg)).await?;
+            while let Ok(msg) = queued.try_recv() {
+                timed(sink.feed(msg)).await?;
+            }
+            timed(sink.flush()).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = inbox
+            .send(Incoming {
+                addr,
+                conn,
+                msg: Some(Err(e)),
+            })
+            .await;
     }
 }
 
@@ -970,7 +1060,16 @@ mod test {
             .await
             .unwrap();
         let _other_end = listener.accept().await.unwrap();
-        let mut peer = Peer::new(PeerStream::Tcp(tcp), "10.0.0.1:1".parse().unwrap(), 4, false, [0u8; 20]);
+        let (inbox, _incoming) = mpsc::channel(8);
+        let mut peer = Peer::new(
+            PeerStream::Tcp(tcp),
+            "10.0.0.1:1".parse().unwrap(),
+            4,
+            false,
+            [0u8; 20],
+            0,
+            inbox,
+        );
         let limit = Duration::from_millis(50);
 
         assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");

@@ -5,14 +5,14 @@ use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
 use crate::limiter::RateLimiter;
 use crate::peer::{
-    PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
+    Inbox, Incoming, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
     parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
     ENDGAME_MAX_RACED_BYTES, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
     MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL,
-    PEX_MAX_ADDED_PEERS,
+    PEX_MAX_ADDED_PEERS, SWARM_INBOX,
 };
 use crate::storage::TorrentStorage;
 use crate::stream::{DialHints, PeerStream};
@@ -21,8 +21,6 @@ use crate::utp::UtpWatch;
 use crate::wire::{BitField, BtMessage, Piece, Request};
 use anyhow::Context;
 use bitvec::prelude::*;
-use futures::StreamExt;
-use futures::future::select_all;
 use rand::seq::IndexedRandom;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -374,9 +372,11 @@ pub struct TorrentSwarm {
     /// every address that ever connected, disconnected, or failed to dial; not pruned, a
     /// swarm sees a few thousand at most
     known: BTreeMap<SocketAddr, KnownPeer>,
-    /// rotates the order peers' sockets are polled in, so a chatty peer at the front of the
-    /// list can't starve the rest (`select_all` returns the first ready future in order)
-    poll_offset: usize,
+    /// every peer's reader delivers here (see `Peer`)
+    inbox: Inbox,
+    incoming: mpsc::Receiver<Incoming>,
+    /// the next connection's `Peer::conn`
+    next_conn: u64,
 
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
@@ -467,6 +467,7 @@ impl TorrentSwarm {
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
 
         let (events_tx, events_rx) = mpsc::channel(512);
+        let (inbox, incoming) = mpsc::channel(SWARM_INBOX);
         let (peers_tx, peers_rx) = watch::channel(vec![]);
         let events_tx_weak = events_tx.downgrade();
         let announcers = CancellationToken::new();
@@ -503,7 +504,9 @@ impl TorrentSwarm {
             known: BTreeMap::new(),
             subsample: BTreeSet::new(),
             subsample_size,
-            poll_offset: 0,
+            inbox,
+            incoming,
+            next_conn: 0,
             torrent,
             storage,
             id,
@@ -561,11 +564,10 @@ impl TorrentSwarm {
         });
     }
 
-    /// The one event loop for this torrent. Every peer socket is polled from here, and every
-    /// piece of per-torrent state is mutated from here, so nothing needs a lock or a channel to
-    /// reach it. The flip side, chosen deliberately: a write to one peer that blocks (its
-    /// kernel send buffer is full because it stopped reading) stalls this whole loop, every
-    /// other peer included, until it drains or the socket dies.
+    /// The one event loop for this torrent. Every peer's messages arrive here through the
+    /// inbox, and every piece of per-torrent state is mutated from here, so nothing needs a
+    /// lock to reach it. Sends to peers only queue (see `Peer`), so nothing here waits on a
+    /// socket.
     async fn work_loop(mut self) {
         let mut housekeeping_ticker = interval(Duration::from_secs(1));
         let mut keepalive_ticker = interval(KEEPALIVE_INTERVAL);
@@ -575,11 +577,14 @@ impl TorrentSwarm {
         let mut pex_ticker = interval(PEX_INTERVAL);
 
         loop {
-            let offset = self.poll_offset;
             tokio::select! {
-                (idx, next) = next_peer_message(&mut self.peers, offset) => {
-                    self.poll_offset = self.poll_offset.wrapping_add(1);
-                    match next {
+                Some(Incoming { addr, conn, msg }) = self.incoming.recv() => {
+                    // a message from a connection that's already been dropped (possibly
+                    // replaced by a newer one to the same address) is stale
+                    let Some(idx) = self.peer_index(addr).filter(|&idx| self.peers[idx].conn == conn) else {
+                        continue;
+                    };
+                    match msg {
                         Some(Ok(msg)) => self.on_peer_message(idx, msg).await,
                         Some(Err(e)) => {
                             info!("{} read failed ({e}), disconnecting", self.peers[idx].remote_addr);
@@ -791,6 +796,7 @@ impl TorrentSwarm {
         let peer = &mut self.peers[idx];
         let choked = matches!(msg, BtMessage::Choke(_));
         let choked_us_before = peer.choked_us;
+        let became_interested = matches!(msg, BtMessage::Interested(_)) && !peer.interested_us;
         let msg = match peer.apply(msg) {
             Ok(None) => {
                 if peer.choked_us != choked_us_before {
@@ -809,6 +815,10 @@ impl TorrentSwarm {
                     for piece in self.pieces_held_by(addr) {
                         self.release_claim(piece, addr);
                     }
+                }
+                if became_interested {
+                    self.unchoke_if_slot_free(idx).await;
+                    return;
                 }
                 // a Have/BitField/Unchoke may have just made a piece requestable
                 self.schedule().await;
@@ -1352,12 +1362,15 @@ impl TorrentSwarm {
         }
 
         let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port);
+        self.next_conn += 1;
         let mut peer = Peer::new(
             connected.stream,
             remote_addr,
             self.torrent.pieces.len(),
             connected.remote_supports_fast,
             connected.peer_id,
+            self.next_conn,
+            self.inbox.clone(),
         );
         peer.stats = known.stats.clone();
         let opening = async {
@@ -1460,6 +1473,26 @@ impl TorrentSwarm {
     /// point -- and unchokes the top MAX_UNCHOKED_PEERS. Every OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS
     /// rounds, one additional peer is unchoked at random so a new or under-rated peer gets a
     /// chance to prove itself instead of the same top N being unchoked forever.
+    /// A peer that just declared interest gets a free upload slot now rather than at the next
+    /// choking round, up to 10 s away; the round still decides who keeps one.
+    async fn unchoke_if_slot_free(&mut self, idx: usize) {
+        let interested = self.peers.iter().filter(|p| p.interested_us).count();
+        let unchoked = self.peers.iter().filter(|p| !p.choked_them).count();
+        let peer = &mut self.peers[idx];
+        if !peer.choked_them || unchoked >= upload_slots(interested) {
+            return;
+        }
+        self.bus.emit(Event::ChokeChanged {
+            info_hash: self.torrent.info_hash,
+            addr: peer.remote_addr,
+            choked: false,
+            by_us: true,
+        });
+        if peer.unchoke().await.is_err() {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
     async fn run_choking_algorithm(&mut self, round: u64) {
         let mut interested: Vec<(SocketAddr, f64)> = self
             .peers
@@ -1469,7 +1502,8 @@ impl TorrentSwarm {
             .collect();
         interested.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        let mut to_unchoke: Vec<SocketAddr> = interested.iter().take(MAX_UNCHOKED_PEERS).map(|p| p.0).collect();
+        let slots = upload_slots(interested.len());
+        let mut to_unchoke: Vec<SocketAddr> = interested.iter().take(slots).map(|p| p.0).collect();
 
         if round.is_multiple_of(OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS) {
             let candidates: Vec<_> = interested.iter().filter(|p| !to_unchoke.contains(&p.0)).collect();
@@ -1535,20 +1569,11 @@ impl TorrentSwarm {
 }
 
 /// The next message from any peer, polled starting at `offset` so no peer is always first.
-/// Pends forever with no peers, so the caller's `select!` just waits on its other arms.
-async fn next_peer_message(peers: &mut [Peer], offset: usize) -> (usize, Option<io::Result<BtMessage>>) {
-    if peers.is_empty() {
-        return std::future::pending().await;
-    }
-    let n = peers.len();
-    let order: Vec<usize> = (0..n).map(|i| (i + offset) % n).collect();
-    let mut sockets: Vec<Option<&mut Peer>> = peers.iter_mut().map(Some).collect();
-    let nexts: Vec<_> = order
-        .iter()
-        .map(|&i| sockets[i].take().expect("each index visited once").socket.next())
-        .collect();
-    let (msg, position, _rest) = select_all(nexts).await;
-    (order[position], msg)
+/// Regular (non-optimistic) upload slots for `interested` peers. A handful of slots reciprocates
+/// with only a handful of a big swarm's leechers, and the rest have no reason to send us
+/// anything, so the count grows with the square root of the demand.
+fn upload_slots(interested: usize) -> usize {
+    MAX_UNCHOKED_PEERS.max(interested.isqrt() + 1)
 }
 
 async fn dial(
@@ -1584,6 +1609,7 @@ async fn dial(
 #[cfg(test)]
 mod test {
     use super::*;
+    use futures::StreamExt;
     use crate::metadata::build_torrent_file;
     use crate::settings::MIN_REQUEST_WINDOW;
     use crate::torrent::parse_torrent;

@@ -37,6 +37,19 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// that stalls here holds nothing worth waiting for.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one write to a peer may take before the connection is given up on. A peer that
+/// stops reading (zero receive window) otherwise holds its writer forever.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Messages queued for one peer's writer. Sends are queued without waiting, so a peer whose
+/// queue is full isn't keeping up with what we send it and is disconnected rather than
+/// buffered for without bound.
+pub const PEER_OUTBOX: usize = 1024;
+
+/// Messages from all of a torrent's peers waiting for the swarm. Readers wait when it's full,
+/// which pushes back on the peers through TCP rather than piling up here.
+pub const SWARM_INBOX: usize = 4096;
+
 /// Endgame: once every missing piece is in flight and a peer still has room, the pieces
 /// furthest from done are also requested from other peers, in the opposite block order,
 /// and whoever finishes second gets Cancel for the rest. This many peers may hold the
@@ -85,8 +98,9 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(220);
 /// optimistic unchoke). Real clients commonly use 10s.
 pub const CHOKING_ROUND_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How many interested peers we keep unchoked at once based on reciprocation (the download
-/// rate they've been giving us), not counting the optimistic slot.
+/// The fewest interested peers we keep unchoked at once based on reciprocation (the download
+/// rate they've been giving us), not counting the optimistic slot; a bigger swarm gets more
+/// (see `torrent_swarm::upload_slots`).
 pub const MAX_UNCHOKED_PEERS: usize = 4;
 
 /// Every this-many choking rounds, one additional peer is unchoked at random regardless of
