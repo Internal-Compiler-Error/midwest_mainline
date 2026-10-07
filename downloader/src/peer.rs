@@ -1,12 +1,15 @@
+use crate::defs::Identity;
 use crate::settings::{
     BLOCK_SIZE, MAX_QUEUED_UPLOADS, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW,
     REQUEST_PIPELINE_TARGET, WRITE_TIMEOUT,
 };
-use crate::stream::PeerStream;
+use crate::stream::{DialHints, PeerStream};
+use crate::torrent::Torrent;
 use crate::wire::{
     BitField, BlockRef, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
     Port, Unchoke,
 };
+use anyhow::Context;
 use bitvec::prelude::*;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -152,6 +155,47 @@ pub(crate) struct ConnectedPeer {
     /// BEP 52: the connection can carry hash requests (see `V2Support::v2_peer`)
     pub remote_supports_v2: bool,
     pub peer_id: [u8; 20],
+}
+
+impl ConnectedPeer {
+    /// Dials `addr` and goes through the handshake for `torrent`, within HANDSHAKE_TIMEOUT.
+    pub async fn dial(
+        addr: SocketAddr,
+        torrent: &Torrent,
+        our_id: &Identity,
+        utp: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+        hints: DialHints,
+    ) -> anyhow::Result<ConnectedPeer> {
+        let (stream, handshake) = tokio::time::timeout(
+            crate::settings::HANDSHAKE_TIMEOUT,
+            crate::stream::connect(
+                addr,
+                &torrent.info_hash,
+                torrent.v2_support(),
+                our_id,
+                utp.as_ref(),
+                hints,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+        .with_context(|| format!("Failed to connect to {addr}"))?;
+        tracing::info!(
+            "Peer connection to {addr} established{}{}",
+            if stream.is_utp() { " over uTP" } else { "" },
+            if stream.is_encrypted() { " (encrypted)" } else { "" }
+        );
+        Ok(ConnectedPeer {
+            stream,
+            dialed: true,
+            remote_addr: addr,
+            remote_supports_extensions: handshake.supports_extensions(),
+            remote_supports_fast: handshake.supports_fast_extension(),
+            remote_supports_dht: handshake.supports_dht(),
+            remote_supports_v2: torrent.v2_support().v2_peer(&handshake),
+            peer_id: handshake.peer_id,
+        })
+    }
 }
 
 /// What a peer's reader (or a failing writer) hands the swarm: the next message, `None` when the

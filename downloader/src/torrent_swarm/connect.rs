@@ -1,17 +1,13 @@
 //! Getting connected: dialing what discovery hands out, taking on handshaken sockets (making
 //! room at the connection cap by BEP 40), and our side of the opening exchange.
 
-use crate::defs::Identity;
 use crate::events::{Event, PeerSource};
 use crate::peer::Peer;
 use crate::settings::MAX_HALF_OPEN;
 use crate::stream::DialHints;
-use crate::torrent::Torrent;
 use crate::wire::BitField;
-use anyhow::Context;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 use tracing::info;
@@ -23,47 +19,6 @@ use super::{ConnectedPeer, SwarmEvent, TorrentSwarm, canonical};
 /// for a `HALF_OPEN` slot is a task and an entry in `dialing`. Far more than can be dialled at
 /// once anyway.
 pub(super) const MAX_PENDING_DIALS: usize = 1024;
-
-/// See `MAX_HALF_OPEN`.
-pub(super) static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HALF_OPEN);
-
-pub(super) async fn dial(
-    addr: SocketAddr,
-    torrent: &Torrent,
-    our_id: &Identity,
-    utp: Option<Arc<librqbit_utp::UtpSocketUdp>>,
-    hints: DialHints,
-) -> anyhow::Result<ConnectedPeer> {
-    let (stream, handshake) = tokio::time::timeout(
-        crate::settings::HANDSHAKE_TIMEOUT,
-        crate::stream::connect(
-            addr,
-            &torrent.info_hash,
-            torrent.v2_support(),
-            our_id,
-            utp.as_ref(),
-            hints,
-        ),
-    )
-    .await
-    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
-    .with_context(|| format!("Failed to connect to {addr}"))?;
-    info!(
-        "Peer connection to {addr} established{}{}",
-        if stream.is_utp() { " over uTP" } else { "" },
-        if stream.is_encrypted() { " (encrypted)" } else { "" }
-    );
-    Ok(ConnectedPeer {
-        stream,
-        dialed: true,
-        remote_addr: addr,
-        remote_supports_extensions: handshake.supports_extensions(),
-        remote_supports_fast: handshake.supports_fast_extension(),
-        remote_supports_dht: handshake.supports_dht(),
-        remote_supports_v2: torrent.v2_support().v2_peer(&handshake),
-        peer_id: handshake.peer_id,
-    })
-}
 
 impl TorrentSwarm {
     /// Our address as peers see it, for BEP 40: the agreed public IP and our listening port.
@@ -292,7 +247,9 @@ impl TorrentSwarm {
                 encrypted = tracing::field::Empty,
                 error = tracing::field::Empty,
             );
-            let dialed = dial(addr, &torrent, &our_id, utp, hints).instrument(span.clone()).await;
+            let dialed = ConnectedPeer::dial(addr, &torrent, &our_id, utp, hints)
+                .instrument(span.clone())
+                .await;
             let result = match dialed {
                 Ok(connected) => {
                     span.record("transport", if connected.stream.is_utp() { "utp" } else { "tcp" });
@@ -313,6 +270,9 @@ impl TorrentSwarm {
         });
     }
 }
+
+/// See `MAX_HALF_OPEN`.
+static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HALF_OPEN);
 
 #[cfg(test)]
 mod test {
