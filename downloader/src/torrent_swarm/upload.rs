@@ -70,15 +70,36 @@ impl TorrentSwarm {
             let Some(idx) = self.peer_index(to) else {
                 continue;
             };
-            if !self.limiter.take_upload(block.length as usize) {
+            if let Some(block) = self.deliver(idx, block) {
                 self.held_uploads.push_front((to, block));
                 break;
             }
-            self.stat.uploaded += block.length as u64;
-            if self.peers[idx].send_block(block).is_err() {
-                self.drop_peer(idx, "send failed");
-            }
         }
+    }
+
+    /// Sends a block read for the peer at `idx`, if it still wants it (no Cancel came) and may
+    /// have it (it isn't choked: then it's rejected). A block stays in the peer's `uploads`
+    /// until it's sent, and is handed back if the upload limit says not yet.
+    fn deliver(&mut self, idx: usize, block: Piece) -> Option<Piece> {
+        let peer = &mut self.peers[idx];
+        let request = Request::from(&block);
+        if !peer.uploads.contains(&request) {
+            return None;
+        }
+        if !peer.choked_them && !self.limiter.take_upload(block.length as usize) {
+            return Some(block);
+        }
+        peer.uploads.remove(&request);
+        let sent = if peer.choked_them {
+            peer.send_reject(request)
+        } else {
+            self.stat.uploaded += block.length as u64;
+            peer.send_block(block)
+        };
+        if sent.is_err() {
+            self.drop_peer(idx, "send failed");
+        }
+        None
     }
 
     /// BEP 3: a choked peer isn't entitled to any data, full stop. BEP 6 turns "ignore it"
@@ -177,29 +198,18 @@ impl TorrentSwarm {
         let Some(idx) = self.peer_index(to) else {
             return;
         };
-        let peer = &mut self.peers[idx];
-        let request = match &block {
-            Ok(b) => Request::from(b),
-            Err(request) => *request,
-        };
-        if !peer.uploads.remove(&request) {
-            // cancelled meanwhile
-            return;
-        }
-        let sent = match block {
-            Ok(block) if !peer.choked_them => {
-                if !self.limiter.take_upload(block.length as usize) {
+        match block {
+            Ok(block) => {
+                if let Some(block) = self.deliver(idx, block) {
                     self.held_uploads.push_back((to, block));
-                    return;
                 }
-                self.stat.uploaded += block.length as u64;
-                peer.send_block(block)
             }
-            Ok(_) => peer.send_reject(request),
-            Err(request) => peer.send_reject(request),
-        };
-        if sent.is_err() {
-            self.drop_peer(idx, "send failed");
+            Err(request) => {
+                let peer = &mut self.peers[idx];
+                if peer.uploads.remove(&request) && peer.send_reject(request).is_err() {
+                    self.drop_peer(idx, "send failed");
+                }
+            }
         }
     }
 
@@ -299,6 +309,66 @@ mod test {
             .unwrap();
         let answer = tokio::time::timeout(Duration::from_millis(500), leech.next()).await;
         assert!(answer.is_err(), "a choked peer must get nothing back, got {answer:?}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A block the upload limit holds back is still the peer's to cancel: it isn't sent once
+    /// the limit allows.
+    #[tokio::test]
+    async fn a_cancelled_block_held_by_the_upload_limit_is_not_sent() {
+        let settings = crate::config::Settings {
+            upload_limit: 16_000,
+            ..Default::default()
+        };
+        let (swarm, handle, path) = swarm_with_settings("held", true, settings);
+        tokio::spawn(swarm.work_loop());
+        let mut leech = fake_peer_with(&handle, "10.0.0.4:6881", true).await;
+        leech
+            .send(BtMessage::Interested(crate::wire::Interested))
+            .await
+            .unwrap();
+        let next_piece = async |leech: &mut Wire| loop {
+            match leech.next().await {
+                Some(Ok(BtMessage::Piece(piece))) => return piece,
+                Some(Ok(_)) => {}
+                other => panic!("connection ended: {other:?}"),
+            }
+        };
+        loop {
+            if let Some(Ok(BtMessage::Unchoke(_))) = leech.next().await {
+                break;
+            }
+        }
+        let (first, second) = (
+            Request {
+                index: 0,
+                begin: 0,
+                length: 16_000,
+            },
+            Request {
+                index: 1,
+                begin: 0,
+                length: 16_000,
+            },
+        );
+        leech.send(BtMessage::Request(first)).await.unwrap();
+        leech.send(BtMessage::Request(second)).await.unwrap();
+        // the first spends the second's allowance; the second is read, and held
+        let piece = tokio::time::timeout(Duration::from_secs(5), next_piece(&mut leech))
+            .await
+            .unwrap();
+        assert_eq!(piece.index, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        leech
+            .send(BtMessage::Cancel(crate::wire::Cancel {
+                index: 1,
+                begin: 0,
+                length: 16_000,
+            }))
+            .await
+            .unwrap();
+        let late = tokio::time::timeout(Duration::from_millis(2500), next_piece(&mut leech)).await;
+        assert!(late.is_err(), "the cancelled block was sent");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
