@@ -100,12 +100,20 @@
     }
   }
 
+  /// bumped whenever an add, resume or removal lands, so a poll that was already under way
+  /// (and so doesn't show it yet) is dropped rather than undoing the new selection
+  let changes = 0
+
   async function refresh() {
-    ;[torrents, status] = await Promise.all([api.torrents(), api.status()])
+    const asked = changes
+    const [rows, now] = await Promise.all([api.torrents(), api.status()])
+    if (asked !== changes) return
+    torrents = rows
+    status = now
     notifyCompletions()
     // torrents that were there at startup (resumed, or given on the command line) get the
-    // details panel too, without a click
-    if (selected === null && torrents.length > 0) selected = torrents[0].id
+    // details panel too, without a click, and so does the next one when the selected one goes
+    if (!torrents.some((t) => t.id === selected)) selected = torrents[0]?.id ?? null
     await logs.poll()
   }
 
@@ -150,16 +158,20 @@
     if (typeof dir !== 'string') return
     downloadDir = dir
     selected = await api.addTorrent(source, dir)
+    changes++
   }
 
   async function remove(id: TorrentId, deleteFiles: boolean) {
     await api.removeTorrent(id, deleteFiles)
-    if (selected === id) selected = null
+    changes++
+    torrents = torrents.filter((t) => t.id !== id)
+    if (selected === id) selected = torrents[0]?.id ?? null
     rescanSoon()
   }
 
   async function resume(path: string) {
     selected = await api.resumeTorrent(path)
+    changes++
     rescanSoon()
   }
 </script>
