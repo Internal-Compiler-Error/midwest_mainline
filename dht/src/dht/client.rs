@@ -1,6 +1,6 @@
-//! The client half of the DHT: iterative lookups (find_node, get_peers), ping, and
-//! announce_peer, using the shared state. Clone it freely, everything it touches is
-//! shared.
+//! The client half of the DHT: iterative lookups (find_node, get_peers, BEP 33's scrape,
+//! BEP 44's get and put), ping, announce_peer and BEP 51's sample_infohashes, using the shared
+//! state. Clone it freely, everything it touches is shared.
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::dht::bep42;
 use crate::dht::item::{self, MutableItem};
@@ -25,17 +25,6 @@ use crate::message::{
 use crate::our_error::{OurError, naur};
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 use ed25519_dalek::SigningKey;
-
-/// What one node answers a `get_peers` with
-struct GetPeersReply {
-    /// to announce with
-    token: Option<Token>,
-    /// closer nodes
-    nodes: Vec<NodeInfo>,
-    values: Vec<SocketAddr>,
-    /// BEP 33, when asked for
-    scrape: Option<ScrapeFilters>,
-}
 
 /// What a BEP 44 put came to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +93,6 @@ async fn patiently<T, Fut: Future<Output = Result<T, OurError>>>(
 
 /// What a lookup makes of one node's answer
 struct Heard {
-    /// nodes it refers us to
-    nodes: Vec<NodeInfo>,
     /// whether the answer counts towards the lookup's end
     useful: bool,
     /// the lookup has what it came for
@@ -135,6 +122,19 @@ pub struct GetPeersResult {
     pub announce_candidates: Vec<(NodeInfo, Token)>,
 }
 
+/// The k of `holders` to write to at `target`: the closest, BEP 42 compliant ones first (BEP 42
+/// would have nothing stored on the others)
+fn closest_holders(mut holders: Vec<(NodeInfo, Token)>, target: NodeId) -> Vec<(NodeInfo, Token)> {
+    holders.sort_by_cached_key(|(node, _)| {
+        (
+            !bep42::compliant(&node.id(), node.end_point().ip()),
+            node.id().dist(&target),
+        )
+    });
+    holders.truncate(LOOKUP_K);
+    holders
+}
+
 #[derive(Debug, Clone)]
 pub struct DhtClient {
     state: Arc<SharedState>,
@@ -162,49 +162,56 @@ impl DhtClient {
         (sibling.routing_table.node_count() < SEED_SIBLING_BELOW).then_some(Want::BOTH)
     }
 
+    /// Asks `dest` a query answered with nodes (find_node, get_peers, sample_infohashes, get)
+    async fn ask(&self, dest: SocketAddr, query: KrpcBody) -> Result<FindNodeGetPeersResponse, OurError> {
+        let method = query.method();
+        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
+            KrpcBody::FindNodeGetPeersResponse(res) => Ok(res),
+            other => Err(naur!("unexpected answer to {method:?}: {other:?}")),
+        }
+    }
+
+    /// Sends `dest` a query answered with just an id (ping, announce_peer, put), and returns
+    /// the id
+    async fn tell(&self, dest: SocketAddr, query: KrpcBody) -> Result<NodeId, OurError> {
+        let method = query.method();
+        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
+            KrpcBody::PingAnnouncePeerResponse(res) => Ok(res.queried()),
+            other => Err(naur!("unexpected answer to {method:?}: {other:?}")),
+        }
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn ping(&self, peer: SocketAddr) -> Result<NodeId, OurError> {
-        let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.state.our_id));
-
-        let response = self.state.rpc_manager.query(ping_msg, &peer, REQ_TIMEOUT).await?;
-
-        return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
-            // the routing table learns of it from the broker too, but in its own time; a
-            // lookup right after the ping (bootstrapping) needs it there now
-            self.state.routing_table.add(response.queried(), peer);
-            Ok(response.queried())
-        } else {
-            warn!("Unexpected response to ping: {:?}", response);
-            Err(naur!("Unexpected response to ping"))
-        };
+        let id = self
+            .tell(peer, KrpcBody::PingQuery(PingQuery::new(self.our_id())))
+            .await?;
+        // the routing table learns of it from the broker too, but in its own time; a lookup
+        // right after the ping (bootstrapping) needs it there now
+        self.state.routing_table.add(id, peer);
+        Ok(id)
     }
 
     /// The nodes closest to `target` that answered us, closest first; just the one if a node
     /// with exactly that id turned up.
     #[tracing::instrument(skip(self))]
     pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
-        // if we already know the node, then no need for any network requests
         if let Some(node) = self.state.routing_table.find_exact(&target) {
             return vec![node];
         }
 
-        let want = self.want();
+        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.our_id(), target).with_want(self.want()));
+        let family = self.family();
         let mut exact = None;
         let mut closest = self
-            .lookup(
-                target,
-                |node| self.send_find_nodes_rpc(node.end_point(), target, want),
-                |node, nodes: Vec<NodeInfo>| {
-                    exact = std::iter::once(node)
-                        .chain(nodes.iter().copied())
-                        .find(|n| n.id() == target);
-                    Heard {
-                        useful: !nodes.is_empty(),
-                        done: exact.is_some(),
-                        nodes,
-                    }
-                },
-            )
+            .lookup(target, query, |node, res| {
+                let nodes = res.nodes_of(family);
+                exact = std::iter::once(&node).chain(nodes).find(|n| n.id() == target).copied();
+                Heard {
+                    useful: !nodes.is_empty(),
+                    done: exact.is_some(),
+                }
+            })
             .await;
         if let Some(exact) = exact {
             return vec![exact];
@@ -215,29 +222,26 @@ impl DhtClient {
 
     /// An iterative Kademlia lookup towards `target`, streaming rather than in rounds:
     /// CONCURRENT_REQS queries are always in flight, and each answer starts the next query at
-    /// once instead of waiting for a round's slowest node. `query` asks one node; `heard` makes
-    /// of its answer the nodes it refers us to, and whether the lookup is done early. The
-    /// lookup ends when the LOOKUP_K closest nodes that answered usefully leave nothing closer
-    /// to ask. Returns those that answered usefully, closest first.
-    async fn lookup<T, Fut>(
+    /// once instead of waiting for a round's slowest node. Each node is asked `query`; `heard`
+    /// makes of its answer whether it counts towards the lookup's end, and whether the lookup
+    /// is done early. The lookup ends when the LOOKUP_K closest nodes that answered usefully
+    /// leave nothing closer to ask. Returns those that answered usefully, closest first.
+    async fn lookup(
         &self,
         target: NodeId,
-        query: impl Fn(NodeInfo) -> Fut,
-        mut heard: impl FnMut(NodeInfo, T) -> Heard,
-    ) -> Vec<NodeInfo>
-    where
-        Fut: Future<Output = Result<T, OurError>>,
-    {
+        query: KrpcBody,
+        mut heard: impl FnMut(NodeInfo, &FindNodeGetPeersResponse) -> Heard,
+    ) -> Vec<NodeInfo> {
+        let family = self.family();
         let by_distance = |l: &NodeInfo, r: &NodeInfo| cmp_resp(&l.id(), &r.id(), &target);
         // one node per public IP (see `RoutingTable::ip_taken`), here too: a Sybil's many ids
         // around the target would otherwise fill every slot of the lookup
-        let mut seen: HashSet<NodeId> = HashSet::from([self.state.our_id]);
+        let mut seen: HashSet<NodeId> = HashSet::from([self.our_id()]);
         let mut seen_ips: HashSet<IpAddr> = HashSet::new();
         let mut fresh_node = move |n: &NodeInfo| {
             seen.insert(n.id()) && sybil_group(&n.end_point().ip()).is_none_or(|group| seen_ips.insert(group))
         };
         let mut known = self.state.routing_table.find_closest_n(target, LOOKUP_SEEDS);
-        known.sort_unstable_by(by_distance);
         known.retain(|n| fresh_node(n));
         let mut queried: HashSet<NodeId> = HashSet::new();
         // nodes that answered usefully, closest first; the lookup is done when nothing
@@ -262,7 +266,8 @@ impl DhtClient {
                 }
                 queried.insert(node.id());
                 prompt.push(node);
-                in_flight.push(patiently(node, Box::pin(query(node)), Some(SLOW_REPLY)));
+                let asked = Box::pin(self.ask(node.end_point(), query.clone()));
+                in_flight.push(patiently(node, asked, Some(SLOW_REPLY)));
             }
             // the k closest have answered and nothing closer is left to ask: what's still in
             // flight past SLOW_REPLY, typically dead nodes running out their timeouts, is
@@ -285,8 +290,8 @@ impl DhtClient {
                 }
             };
             match result {
-                Ok(reply) => {
-                    let Heard { nodes, useful, done } = heard(node, reply);
+                Ok(res) => {
+                    let Heard { useful, done } = heard(node, &res);
                     if done {
                         break;
                     }
@@ -298,20 +303,18 @@ impl DhtClient {
                         let at = answered.partition_point(|a| by_distance(a, &node).is_lt());
                         answered.insert(at, node);
                     }
-                    let nodes_len = nodes.len();
-                    let fresh: Vec<NodeInfo> = nodes.into_iter().filter(|n| fresh_node(n)).collect();
+                    let nodes = res.nodes_of(family);
+                    let before = known.len();
+                    known.extend(nodes.iter().filter(|n| fresh_node(n)));
                     debug!(
                         "lookup: {} answered with {} nodes ({} new); {} known, {} queried",
                         node.end_point(),
-                        nodes_len,
-                        fresh.len(),
+                        nodes.len(),
+                        known.len() - before,
                         known.len(),
                         queried.len()
                     );
-                    if !fresh.is_empty() {
-                        known.extend(fresh);
-                        known.sort_unstable_by(by_distance);
-                    }
+                    known.sort_unstable_by(by_distance);
                 }
                 // our own network can't reach the node (no IPv6 route, say): not its fault
                 Err(OurError::IoError(_)) => {}
@@ -327,71 +330,50 @@ impl DhtClient {
         answered
     }
 
-    // attempt to find the target node via a peer on this address
-    #[tracing::instrument(skip(self))]
-    async fn send_find_nodes_rpc(
-        &self,
-        dest: SocketAddr,
-        target: NodeId,
-        want: Option<Want>,
-    ) -> Result<Vec<NodeInfo>, OurError> {
-        // construct the message to query our friends
-        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.state.our_id, target).with_want(want));
-
-        // send the message and await for a response
-        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
-        let body = response.body;
-
-        if let KrpcBody::FindNodeGetPeersResponse(find_node_response) = body {
-            let mut nodes: Vec<_> = find_node_response.nodes_of(self.state.family).to_vec();
-
-            // some clients will return duplicate nodes, so we remove them
-            nodes.sort_unstable();
-            nodes.dedup();
-
-            Ok(nodes)
-        } else {
-            debug!("Did not get a find node response, got {:?}", body);
-            Err(naur!("Did not get a find node response"))
-        }
-    }
-
     /// BEP 51: a sample of the info hashes the node at `dest` stores, and the nodes it knows
     /// closest to `target`
     #[tracing::instrument(skip(self))]
     pub async fn sample_infohashes(&self, dest: SocketAddr, target: NodeId) -> Result<Sampled, OurError> {
-        let query = KrpcBody::SampleInfohashesQuery(SampleInfohashesQuery::new(self.state.our_id, target));
-        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
-        match response.body {
-            KrpcBody::FindNodeGetPeersResponse(res) => {
-                let Some(samples) = res.samples() else {
-                    return Err(naur!("{dest} answered sample_infohashes without samples"));
-                };
-                Ok(Sampled {
-                    node: NodeInfo::new(res.queried(), dest),
-                    interval: Duration::from_secs(samples.interval.into()),
-                    num: samples.num,
-                    samples: samples.samples.clone(),
-                    nodes: res.nodes_of(self.state.family).to_vec(),
-                })
-            }
-            other => Err(naur!("unexpected answer to sample_infohashes: {other:?}")),
-        }
+        let query = KrpcBody::SampleInfohashesQuery(SampleInfohashesQuery::new(self.our_id(), target));
+        let res = self.ask(dest, query).await?;
+        let Some(samples) = res.samples() else {
+            return Err(naur!("{dest} answered sample_infohashes without samples"));
+        };
+        Ok(Sampled {
+            node: NodeInfo::new(res.queried(), dest),
+            interval: Duration::from_secs(samples.interval.into()),
+            num: samples.num,
+            samples: samples.samples.clone(),
+            nodes: res.nodes_of(self.family()).to_vec(),
+        })
     }
 
+    /// The peers for `info_hash` the nodes nearest it hold, and the nodes to announce to. Never
+    /// fails as such: nobody answering is no peers and no one to announce to.
     #[tracing::instrument(skip(self))]
     pub async fn get_peers(&self, info_hash: InfoHash) -> Result<GetPeersResult, OurError> {
         self.get_peers_with(info_hash, |_| {}).await
     }
 
-    /// `get_peers`, also handing each batch of peers to `found` the moment a node returns it,
-    /// seconds before the lookup as a whole converges.
+    /// `get_peers`, also handing each batch of peers to `found` the moment it turns up, seconds
+    /// before the lookup as a whole converges. The peers announced *to us* come first; the
+    /// lookup still goes out, since the store holds only what was announced here, and the walk
+    /// is what earns the tokens our own announce needs.
     pub async fn get_peers_with(
         &self,
         info_hash: InfoHash,
-        found: impl FnMut(&[SocketAddr]) + Send,
+        mut found: impl FnMut(&[SocketAddr]) + Send,
     ) -> Result<GetPeersResult, OurError> {
-        let (result, _) = self.lookup_with_local(info_hash, false, found).await;
+        let ours = self.state.swarm_peers(&info_hash, self.family());
+        if !ours.is_empty() {
+            found(&ours);
+        }
+        let (mut result, _) = self.lookup_peers(info_hash, false, found).await;
+        for peer in ours {
+            if !result.peers.contains(&peer) {
+                result.peers.push(peer);
+            }
+        }
         Ok(result)
     }
 
@@ -401,111 +383,64 @@ impl DhtClient {
     #[tracing::instrument(skip(self))]
     pub async fn scrape(&self, info_hash: InfoHash) -> Result<SwarmEstimate, OurError> {
         let (_, filters) = self.lookup_peers(info_hash, true, |_| {}).await;
-        Ok(self.estimate(&info_hash, filters))
-    }
-
-    fn estimate(&self, info_hash: &InfoHash, filters: Vec<ScrapeFilters>) -> SwarmEstimate {
-        let ours = self.state.scrape_filters(info_hash);
         let answered = filters.len();
-        let both = filters
-            .into_iter()
-            .chain(ours)
-            .fold(ScrapeFilters::default(), |acc, f| ScrapeFilters {
+        let both = filters.into_iter().chain(self.state.scrape_filters(&info_hash)).fold(
+            ScrapeFilters::default(),
+            |acc, f| ScrapeFilters {
                 seeds: acc.seeds.union(&f.seeds),
                 peers: acc.peers.union(&f.peers),
-            });
-        SwarmEstimate {
+            },
+        );
+        Ok(SwarmEstimate {
             seeds: both.seeds.estimate().round() as u64,
             peers: both.peers.estimate().round() as u64,
             nodes: answered,
-        }
+        })
     }
 
-    /// A lookup that hands over the peers announced *to us* first. It still goes out to the
-    /// network: the store holds only what was announced here, and the walk is what earns the
-    /// tokens our own announce needs.
-    async fn lookup_with_local(
-        &self,
-        info_hash: InfoHash,
-        scrape: bool,
-        mut found: impl FnMut(&[SocketAddr]) + Send,
-    ) -> (GetPeersResult, Vec<ScrapeFilters>) {
-        let known = self.state.swarm_peers(&info_hash, self.state.family);
-        if !known.is_empty() {
-            found(&known);
-        }
-        let (mut result, filters) = self.lookup_peers(info_hash, scrape, found).await;
-        for peer in known {
-            if !result.peers.contains(&peer) {
-                result.peers.push(peer);
-            }
-        }
-        (result, filters)
-    }
-
-    /// The iterative lookup behind `get_peers` and `scrape`: query the closest-known nodes,
-    /// follow their `nodes` referrals towards the info hash, and harvest peers, tokens and,
-    /// with `scrape`, BEP 33 filters along the way
+    /// The lookup behind `get_peers` and `scrape`: harvests peers, tokens and, with `scrape`,
+    /// BEP 33 filters along the way
     async fn lookup_peers(
         &self,
         info_hash: InfoHash,
         scrape: bool,
         mut found: impl FnMut(&[SocketAddr]) + Send,
     ) -> (GetPeersResult, Vec<ScrapeFilters>) {
-        let want = self.want();
+        let target = NodeId(info_hash.0);
+        let query = KrpcBody::GetPeersQuery(
+            GetPeersQuery::new(self.our_id(), info_hash)
+                .with_want(self.want())
+                .with_scrape(scrape),
+        );
+        let family = self.family();
         let mut peers: Vec<SocketAddr> = vec![];
-        let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
+        let mut holders: Vec<(NodeInfo, Token)> = vec![];
         let mut filters = vec![];
-        self.lookup(
-            NodeId(info_hash.0),
-            |node| self.send_get_peers_rpc(node.end_point(), info_hash, want, scrape),
-            |node, reply: GetPeersReply| {
-                let GetPeersReply {
-                    token,
-                    nodes,
-                    values,
-                    scrape,
-                } = reply;
-                debug!("get_peers: {} answered with {} peers", node.end_point(), values.len());
-                if !values.is_empty() {
-                    found(&values);
-                }
-                // BEP 5 has a node without peers return closer nodes; one that sends neither
-                // (typically a crawler parked next to popular hashes to collect announces) gets
-                // no say in when the lookup is done, and leaves the table
-                let useful = !(values.is_empty() && nodes.is_empty());
-                if !useful {
-                    self.state.routing_table.evict(&node.id());
-                }
-                peers.extend(values);
-                if let Some(token) = token {
-                    announce_candidates.push((node, token));
-                }
-                filters.extend(scrape);
-                Heard {
-                    nodes,
-                    useful,
-                    done: false,
-                }
-            },
-        )
+        self.lookup(target, query, |node, res| {
+            let values = res.values();
+            debug!("get_peers: {} answered with {} peers", node.end_point(), values.len());
+            if !values.is_empty() {
+                found(values);
+            }
+            // BEP 5 has a node without peers return closer nodes; one that sends neither
+            // (typically a crawler parked next to popular hashes to collect announces) gets
+            // no say in when the lookup is done, and leaves the table
+            let useful = !(values.is_empty() && res.nodes_of(family).is_empty());
+            if !useful {
+                self.state.routing_table.evict(&node.id());
+            }
+            peers.extend_from_slice(values);
+            holders.extend(res.token().map(|token| (node, token.clone())));
+            filters.extend(res.scrape().copied());
+            Heard { useful, done: false }
+        })
         .await;
 
         peers.sort_unstable();
         peers.dedup();
-        // announces go where lookups look: the k closest that gave us a token, BEP 42 compliant
-        // ones first (BEP 42 would have nothing stored on the others)
-        announce_candidates.sort_by_cached_key(|(node, _)| {
-            (
-                !bep42::compliant(&node.id(), node.end_point().ip()),
-                node.id().dist(&NodeId(info_hash.0)),
-            )
-        });
-        announce_candidates.truncate(LOOKUP_K);
-
         let result = GetPeersResult {
             peers,
-            announce_candidates,
+            announce_candidates: closest_holders(holders, target),
         };
         (result, filters)
     }
@@ -540,7 +475,7 @@ impl DhtClient {
         check_value(&value)?;
         let target = item::immutable_target(&value);
         self.put(target, None, |token| {
-            PutQuery::new(self.state.our_id, token, value.clone(), None)
+            PutQuery::new(self.our_id(), token, value.clone(), None)
         })
         .await
     }
@@ -570,7 +505,7 @@ impl DhtClient {
         };
         let target = item::mutable_target(&public, salt);
         self.put(target, Some(seq), |token| {
-            PutQuery::new(self.state.our_id, token, value.clone(), Some(signed.clone())).with_cas(cas)
+            PutQuery::new(self.our_id(), token, value.clone(), Some(signed.clone())).with_cas(cas)
         })
         .await
     }
@@ -587,7 +522,7 @@ impl DhtClient {
         };
         let target = item::mutable_target(&found.key, &found.salt);
         self.put(target, Some(found.seq), |token| {
-            PutQuery::new(self.state.our_id, token, found.value.clone(), Some(signed.clone()))
+            PutQuery::new(self.our_id(), token, found.value.clone(), Some(signed.clone()))
         })
         .await
     }
@@ -603,15 +538,9 @@ impl DhtClient {
         if holders.is_empty() {
             return Err(naur!("no node near {target:?} gave us a write token"));
         }
-        let puts = holders.into_iter().map(|(node, token)| {
-            let body = KrpcBody::PutQuery(query(token));
-            async move {
-                match self.state.rpc_manager.query(body, &node, REQ_TIMEOUT).await?.body {
-                    KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
-                    other => Err(naur!("unexpected answer to put: {other:?}")),
-                }
-            }
-        });
+        let puts = holders
+            .into_iter()
+            .map(|(node, token)| self.tell(node.end_point(), KrpcBody::PutQuery(query(token))));
         let results = futures::future::join_all(puts).await;
         let stored = results.iter().filter(|r| r.is_ok()).count();
         for e in results.into_iter().filter_map(Result::err) {
@@ -628,51 +557,26 @@ impl DhtClient {
         newer_than: Option<i64>,
         wanted: impl Fn(&Item) -> bool,
     ) -> (Vec<(NodeInfo, Token)>, Vec<Item>) {
-        let want = self.want();
+        let query = KrpcBody::GetQuery(
+            GetQuery::new(self.our_id(), target)
+                .with_seq(newer_than)
+                .with_want(self.want()),
+        );
+        let family = self.family();
         let mut holders: Vec<(NodeInfo, Token)> = vec![];
         let mut items = vec![];
-        self.lookup(
-            target,
-            |node| self.send_get_rpc(node.end_point(), target, newer_than, want),
-            |node, res: FindNodeGetPeersResponse| {
-                let nodes = res.nodes_of(self.state.family).to_vec();
-                if let Some(token) = res.token() {
-                    holders.push((node, token.clone()));
-                }
-                let item = res.item().cloned();
-                let done = item.as_ref().is_some_and(&wanted);
-                let useful = item.is_some() || !nodes.is_empty();
-                items.extend(item);
-                Heard { nodes, useful, done }
-            },
-        )
+        self.lookup(target, query, |node, res| {
+            holders.extend(res.token().map(|token| (node, token.clone())));
+            let item = res.item().cloned();
+            let heard = Heard {
+                useful: item.is_some() || !res.nodes_of(family).is_empty(),
+                done: item.as_ref().is_some_and(&wanted),
+            };
+            items.extend(item);
+            heard
+        })
         .await;
-        holders.sort_by_cached_key(|(node, _)| {
-            (
-                !bep42::compliant(&node.id(), node.end_point().ip()),
-                node.id().dist(&target),
-            )
-        });
-        holders.truncate(LOOKUP_K);
-        (holders, items)
-    }
-
-    async fn send_get_rpc(
-        &self,
-        dest: SocketAddr,
-        target: NodeId,
-        newer_than: Option<i64>,
-        want: Option<Want>,
-    ) -> Result<FindNodeGetPeersResponse, OurError> {
-        let query = KrpcBody::GetQuery(
-            GetQuery::new(self.state.our_id, target)
-                .with_seq(newer_than)
-                .with_want(want),
-        );
-        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
-            KrpcBody::FindNodeGetPeersResponse(res) => Ok(res),
-            other => Err(naur!("unexpected answer to get: {other:?}")),
-        }
+        (closest_holders(holders, target), items)
     }
 
     /// Announces us as a peer for `info_hash` to `recipient`, on `port` or, `None`, the port
@@ -686,74 +590,11 @@ impl DhtClient {
         token: Token,
         seed: bool,
     ) -> Result<(), OurError> {
-        // 6881 is a default port when implied_port is used
-        let query = KrpcBody::AnnouncePeerQuery(
-            AnnouncePeerQuery::new(
-                self.state.our_id,
-                port.is_none(),
-                port.unwrap_or(6881),
-                info_hash,
-                token,
-            )
-            .with_seed(seed),
-        );
-
-        let response = self.state.rpc_manager.query(query, &recipient, REQ_TIMEOUT).await?;
-
-        return match response.body {
-            KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
-            KrpcBody::ErrorResponse(err) => Err(naur!(
-                "node responded with an error to our announce peer request {err:?}"
-            )),
-            _ => Err(naur!("non-compliant response from DHT node")),
-        };
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn send_get_peers_rpc(
-        &self,
-        dest: SocketAddr,
-        info_hash: InfoHash,
-        want: Option<Want>,
-        scrape: bool,
-    ) -> Result<GetPeersReply, OurError> {
-        let query = KrpcBody::GetPeersQuery(
-            GetPeersQuery::new(self.state.our_id, info_hash)
-                .with_want(want)
-                .with_scrape(scrape),
-        );
-
-        // send the message and await for a response
-        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
-
-        return match response.body {
-            KrpcBody::ErrorResponse(response) => {
-                warn!("Got an error response to get peers: {:?}", response);
-                return Err(naur!("Got an error response to get peers"));
-            }
-            KrpcBody::FindNodeGetPeersResponse(response) => {
-                let token = response.token().cloned();
-
-                let mut nodes = response.nodes_of(self.state.family).to_vec();
-                nodes.sort_unstable_by_key(|node| node.end_point());
-                nodes.dedup();
-
-                let mut values = response.values().to_vec();
-                values.sort_unstable();
-                values.dedup();
-
-                Ok(GetPeersReply {
-                    token,
-                    nodes,
-                    values,
-                    scrape: response.scrape().copied(),
-                })
-            }
-            other => {
-                debug!("Unexpected response to get peers: {:?}", other);
-                Err(naur!("Unexpected response to get peers"))
-            }
-        };
+        // with implied_port the port isn't used, but BEP 5 has it sent all the same
+        let query = AnnouncePeerQuery::new(self.our_id(), port.is_none(), port.unwrap_or(6881), info_hash, token)
+            .with_seed(seed);
+        self.tell(recipient, KrpcBody::AnnouncePeerQuery(query)).await?;
+        Ok(())
     }
 }
 
