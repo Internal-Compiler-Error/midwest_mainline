@@ -353,17 +353,18 @@ mod test {
         );
         leech.send(BtMessage::Request(first)).await.unwrap();
         leech.send(BtMessage::Request(second)).await.unwrap();
-        // the first spends the second's allowance; the second is read, and held
+        // the reads run in parallel, so either block may go first and spend the other's
+        // allowance; the other is read, and held
         let piece = tokio::time::timeout(Duration::from_secs(5), next_piece(&mut leech))
             .await
             .unwrap();
-        assert_eq!(piece.index, 0);
+        let held = if piece.index == 0 { second } else { first };
         tokio::time::sleep(Duration::from_millis(200)).await;
         leech
             .send(BtMessage::Cancel(crate::wire::Cancel {
-                index: 1,
-                begin: 0,
-                length: 16_000,
+                index: held.index,
+                begin: held.begin,
+                length: held.length,
             }))
             .await
             .unwrap();
