@@ -233,6 +233,12 @@ struct FeedUpdate {
     root: PathBuf,
     key: FeedKey,
     found: Found,
+    /// the predecessor's feed, marked superseded only once the update has resolved: until
+    /// then the predecessor is still the follower, so quitting early loses nothing
+    previous_feed: watch::Sender<Option<Feed>>,
+    /// the predecessor's file selection and modes, carried over
+    selected: Vec<bool>,
+    modes: Modes,
 }
 
 type Claimed = Arc<std::sync::Mutex<HashSet<InfoHash>>>;
@@ -812,8 +818,8 @@ impl TorrentTask {
     }
 
     /// Polls the key the torrent follows (BEP 46), if it follows one, until it names a newer
-    /// version, which goes to the session to add; this torrent is marked superseded then and
-    /// only seeds. Stops when the returned guard is dropped.
+    /// version, which goes to the session to add; once that resolves, this torrent is marked
+    /// superseded and only seeds. Stops when the returned guard is dropped.
     fn follow(&self, torrent: &Arc<Torrent>, root: &Path, soon: bool) -> Option<tokio_util::sync::DropGuard> {
         let feed = self.feed.borrow().clone().filter(|f| f.superseded.is_none())?;
         let stop = CancellationToken::new();
@@ -824,6 +830,7 @@ impl TorrentTask {
             self.bus.clone(),
         );
         let (torrent, root) = (torrent.clone(), root.to_path_buf());
+        let (selected, modes) = (self.selected.subscribe(), self.modes.subscribe());
         let follow = async move {
             let set = {
                 let feed_tx = feed_tx.clone();
@@ -845,16 +852,14 @@ impl TorrentTask {
                 update: found.version.info_hash,
                 seq: found.seq,
             });
-            feed_tx.send_modify(|feed| {
-                if let Some(feed) = feed {
-                    feed.superseded = Some(found.seq);
-                }
-            });
             let _ = updates.send(FeedUpdate {
                 previous: torrent,
                 root,
                 key: feed.key,
                 found,
+                previous_feed: feed_tx,
+                selected: selected.borrow().clone(),
+                modes: *modes.borrow(),
             });
             Some(())
         };
@@ -1331,10 +1336,21 @@ impl Session {
             root,
             key,
             found,
+            previous_feed,
+            selected,
+            modes,
         } = update;
+        let supersede = move |seq| {
+            previous_feed.send_modify(|feed| {
+                if let Some(feed) = feed {
+                    feed.superseded = Some(seq);
+                }
+            })
+        };
         let info_hash = found.version.info_hash;
         if self.torrents.values().any(|e| e.info_hash() == Some(info_hash)) {
             tracing::info!("{info_hash}, the BEP 46 update of {}, is here already", previous.name);
+            supersede(found.seq);
             return None;
         }
         let source = crate::feed::magnet_uri(
@@ -1357,13 +1373,14 @@ impl Session {
                 let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
                 let torrent = loaded.torrent;
                 let seq = found.seq;
-                let (torrent, root, reused) = tokio::task::spawn_blocking(move || {
+                let (torrent, root, reused, previous) = tokio::task::spawn_blocking(move || {
                     let (root, reused) = place_update(&previous, &root, &torrent, seq)?;
-                    anyhow::Ok((torrent, root, reused))
+                    anyhow::Ok((torrent, root, reused, previous))
                 })
                 .await??;
+                supersede(seq);
                 Ok(Resolved {
-                    selected: vec![true; torrent.files.len()],
+                    selected: carried_selection(&previous, &selected, &torrent),
                     verified: bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice(),
                     torrent,
                     root,
@@ -1371,7 +1388,7 @@ impl Session {
                     paused: false,
                     peers: loaded.peers,
                     uploaded: 0,
-                    modes: Modes::default(),
+                    modes,
                     feed: Some(feed),
                     check_first: reused,
                     poll_soon: false,
@@ -1802,6 +1819,22 @@ fn progress(
 /// N)`. The predecessor's files the update has too, same path and size, are copied over
 /// (a clone on APFS and the like) and the rest laid down empty, for a check to sort out what
 /// is still good; returns whether any were.
+/// An update's file selection: the predecessor's choice for a file at the same path, and
+/// selected for one it didn't have.
+fn carried_selection(previous: &Torrent, selected: &[bool], torrent: &Torrent) -> Vec<bool> {
+    let before: HashMap<&Path, bool> = previous
+        .files
+        .iter()
+        .zip(selected)
+        .map(|((_, path), on)| (path.as_path(), *on))
+        .collect();
+    torrent
+        .files
+        .iter()
+        .map(|(_, path)| before.get(path.as_path()).copied().unwrap_or(true))
+        .collect()
+}
+
 fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) -> std::io::Result<(PathBuf, bool)> {
     let top = torrent.top_level();
     let mut new_root = root.to_path_buf();
@@ -2599,7 +2632,8 @@ mod test {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A newer version a key names joins the session as an entry of its own, once
+    /// A newer version a key names joins the session as an entry of its own, once; its
+    /// predecessor is superseded only once the newer one has resolved
     #[test]
     fn an_update_is_added_unless_already_there() {
         let dir = scratch("update");
@@ -2609,7 +2643,7 @@ mod test {
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         let previous = Arc::new(crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap());
         let signing = midwest_mainline::dht::item::SigningKey::from_bytes(&[1; 32]);
-        let update = |info_hash: InfoHash| {
+        let update = |info_hash: InfoHash, previous_feed: watch::Sender<Option<Feed>>| {
             let version = crate::feed::Version::v1(info_hash);
             let value = crate::feed::item_value(&version);
             FeedUpdate {
@@ -2627,12 +2661,34 @@ mod test {
                         value,
                     },
                 },
+                previous_feed,
+                selected: vec![true],
+                modes: Modes::default(),
             }
         };
-        session.updates.0.send(update(previous.info_hash)).unwrap();
+        let following = || {
+            watch::channel(Some(Feed {
+                key: FeedKey::of(&signing, b""),
+                seq: Some(1),
+                superseded: None,
+            }))
+            .0
+        };
+        let here_already = following();
+        session
+            .updates
+            .0
+            .send(update(previous.info_hash, here_already.clone()))
+            .unwrap();
         assert_eq!(session.torrents().len(), 1, "the session has that one already");
+        assert_eq!(here_already.borrow().as_ref().unwrap().superseded, Some(2));
 
-        session.updates.0.send(update(InfoHash([5; 20]))).unwrap();
+        let unresolved = following();
+        session
+            .updates
+            .0
+            .send(update(InfoHash([5; 20]), unresolved.clone()))
+            .unwrap();
         let torrents = session.torrents();
         assert_eq!(torrents.len(), 2);
         let (_, added) = &torrents[1];
@@ -2642,8 +2698,29 @@ mod test {
         };
         assert!(source.contains(&format!("xt=urn:btih:{}", "05".repeat(20))), "{source}");
         assert!(source.contains("xs=urn:btpk:"), "{source}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(session.torrents()[1].1, TorrentState::Resolving { .. }));
+        assert_eq!(
+            unresolved.borrow().as_ref().unwrap().superseded,
+            None,
+            "while the update resolves, its predecessor is still the follower"
+        );
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_update_keeps_its_predecessors_choice_of_files() {
+        let file = |path: &str| (1, PathBuf::from(path));
+        let mut previous =
+            crate::parse_torrent(&std::fs::read(write_torrent_file(&scratch("carry"))).unwrap()).unwrap();
+        let mut next = previous.clone();
+        previous.files = vec![file("a"), file("b"), file("c")];
+        next.files = vec![file("c"), file("new"), file("a")];
+        assert_eq!(
+            carried_selection(&previous, &[true, true, false], &next),
+            [false, true, true]
+        );
     }
 
     /// An update whose name is taken goes beside it, starting from the files it shares

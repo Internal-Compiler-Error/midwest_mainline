@@ -55,8 +55,6 @@ Every BEP worth having has been started. What's left are gaps in implemented one
 | BEP | Gap | Notes |
 |---|---|---|
 | 52 | See row 52's "Not done" | |
-| 46 | An update found before its metadata arrives is lost if the app quits then: the old version is already marked superseded | Mark it superseded only once the new version resolves, or persist pending updates |
-| 46 | An update downloads every file; the old version's selection and sequential/super-seed modes aren't carried over | |
 | 43, 45 | No downloader setting for read-only DHT or one node per address | Library and `json_rpc_server` only |
 
 ## Not planned
