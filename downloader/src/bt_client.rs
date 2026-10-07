@@ -578,11 +578,13 @@ impl Drop for Adding {
     }
 }
 
-/// A settings watch that stays at the defaults, for a client with nobody to change them.
-pub fn default_settings() -> SettingsWatch {
-    let (tx, rx) = watch::channel(Settings::default());
-    std::mem::forget(tx);
-    rx
+/// A settings watch that stays at the defaults, for a client with nobody to change them. Its
+/// sender lives for good: a watch whose sender is gone reports a change, an error, on every
+/// call, and a loop that waits for changes would spin on it.
+pub(crate) fn default_settings() -> SettingsWatch {
+    static DEFAULTS: std::sync::LazyLock<watch::Sender<Settings>> =
+        std::sync::LazyLock::new(|| watch::Sender::new(Settings::default()));
+    DEFAULTS.subscribe()
 }
 
 #[cfg(test)]
