@@ -662,6 +662,28 @@ fn an_inconsistent_hybrid_trusts_sha1() {
     assert!(!bare.valid_piece(3, &piece(&theirs, 3)));
 }
 
+/// Three piece-aligned files of nearly 2^63 bytes each, in both halves of a hybrid: their
+/// offsets run past u64 while the halves are compared, which is an error, not an overflow.
+#[test]
+fn a_hybrid_too_big_to_lay_out_is_refused() {
+    let len = (1u64 << 63) - 16384;
+    let mut info = b"d9:file treed".to_vec();
+    for name in ["a", "b", "c"] {
+        info.extend_from_slice(format!("1:{name}d0:d6:lengthi{len}e11:pieces root32:").as_bytes());
+        info.extend_from_slice(&[1; 32]);
+        info.extend_from_slice(b"ee");
+    }
+    info.extend_from_slice(b"e5:filesl");
+    for name in ["a", "b", "c"] {
+        info.extend_from_slice(format!("d6:lengthi{len}e4:pathl1:{name}ee").as_bytes());
+    }
+    info.extend_from_slice(b"e12:meta versioni2e4:name1:x12:piece lengthi16384e6:pieces20:");
+    info.extend_from_slice(&[0; 20]);
+    info.push(b'e');
+    let err = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap_err();
+    assert!(format!("{err:#}").contains("overflows"), "{err:#}");
+}
+
 #[test]
 fn an_inconsistent_hybrid_falls_back_to_v1() {
     let files = files();
