@@ -232,6 +232,19 @@ impl BtClient {
         self.add_torrent_with(torrent, root, verified, true)
     }
 
+    /// `add_torrent` for files a check has just measured: what's missing or short is laid
+    /// down, and the pieces in `verified` are taken as had. Blocking.
+    pub fn add_torrent_checked(&self, torrent: Torrent, root: &Path, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
+        if verified.len() != torrent.num_pieces() {
+            bail!(
+                "bitfield covers {} pieces but the torrent has {}",
+                verified.len(),
+                torrent.num_pieces()
+            );
+        }
+        self.add_torrent_with(torrent, root, verified, true)
+    }
+
     /// Picks `torrent` back up where a previous run left it: pieces set in `verified` are
     /// taken to be on disk and correct, so they're neither downloaded nor re-hashed. Target
     /// files are opened in place and must already be their full size -- a missing or
@@ -536,13 +549,22 @@ fn open_files(torrent: &Torrent, root: &Path, fresh: bool) -> anyhow::Result<Vec
         }
         // never truncated: a fresh add may be over the very data the torrent describes,
         // which the check that follows finds
-        let f = File::options()
+        let opened = File::options()
             .read(true)
             .write(true)
             .create(fresh)
             .truncate(false)
-            .open(&file)
-            .with_context(|| format!("opening {}", file.display()))?;
+            .open(&file);
+        let f = match opened {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root.is_dir() => {
+                bail!("{} isn't there; is its drive mounted?", root.display())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{} is gone; a recheck downloads what's missing again", file.display())
+            }
+            Err(e) => return Err(e).with_context(|| format!("opening {}", file.display())),
+        };
         if fresh {
             if f.metadata()?.len() < *size {
                 f.set_len(*size).with_context(|| format!("sizing {}", file.display()))?;

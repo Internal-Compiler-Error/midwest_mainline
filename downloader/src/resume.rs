@@ -1009,7 +1009,7 @@ mod test {
         let err = client
             .add_torrent_resumed(torrent.clone(), &dir, some.clone())
             .unwrap_err();
-        assert!(err.to_string().contains("opening"), "{err:#}");
+        assert!(err.to_string().contains("is gone; a recheck"), "{err:#}");
         assert!(!dir.join("resume-test.bin").exists(), "resume must not create the file");
 
         std::fs::write(dir.join("resume-test.bin"), b"short").unwrap();

@@ -598,12 +598,15 @@ impl TorrentTask {
                     .await
                     .unwrap_or(false)
             });
+        // a check just measured what's on disk, so whatever is missing can be laid down
+        let mut checked = false;
         let action = loop {
             let action = if std::mem::take(&mut check) {
                 // back to whichever of running or paused it was in, with what the disk holds
                 match self.check(&torrent, &root, &mut verified).await {
                     Ok(pause_asked) => {
                         resumed = true;
+                        checked = true;
                         paused = pause_asked.unwrap_or(paused);
                         continue;
                     }
@@ -614,7 +617,7 @@ impl TorrentTask {
                     .await
             } else {
                 match self
-                    .run_until_stopped(&torrent, &root, &mut verified, &mut resumed, &mut peers)
+                    .run_until_stopped(&torrent, &root, &mut verified, (&mut resumed, &mut checked), &mut peers)
                     .await
                 {
                     Ok((action, stats)) => {
@@ -807,7 +810,7 @@ impl TorrentTask {
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &mut BitBox<u8, Msb0>,
-        resumed: &mut bool,
+        (resumed, checked): (&mut bool, &mut bool),
         peers: &mut Vec<std::net::SocketAddr>,
     ) -> anyhow::Result<(Action, Option<TorrentSwarmStats>)> {
         // held while downloading; released on completion so seeding never counts
@@ -818,23 +821,24 @@ impl TorrentTask {
                 Err(action) => return Ok((action, None)),
             },
         };
-        // one paused before it ever ran has no files to pick up: they're laid down like a new
-        // torrent's, provided its root is there (and not on a drive that isn't mounted)
+        // one paused before it ever ran has no files to pick up, and one just checked has had
+        // what's missing measured: either is laid down like a new torrent, provided its root is
+        // there (and not on a drive that isn't mounted)
         let adding = {
             let (client, torrent, root) = (self.client.clone(), (**torrent).clone(), root.to_path_buf());
-            let (resumed, verified) = (*resumed, verified.clone());
+            let (resumed, checked, verified) = (*resumed, *checked, verified.clone());
             tokio::task::spawn_blocking(move || {
-                let nothing_to_pick_up = verified.not_any() && root.is_dir();
+                let nothing_to_pick_up = (checked || verified.not_any()) && root.is_dir();
                 if resumed && !nothing_to_pick_up {
                     client.add_torrent_resumed(torrent, &root, verified)
                 } else {
-                    client.add_torrent(torrent, &root)
+                    client.add_torrent_checked(torrent, &root, verified)
                 }
             })
         };
         adding.await??;
         // whatever happens next, the files exist
-        *resumed = true;
+        (*resumed, *checked) = (true, false);
         let info_hash = &torrent.info_hash;
         self.client.add_peers(info_hash, std::mem::take(peers));
         let selected = self.controls.selected.borrow().clone();
@@ -2553,6 +2557,56 @@ mod test {
         session.unpause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         assert_eq!(std::fs::metadata(root.join("session.bin")).unwrap().len(), 40);
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A torrent whose data was deleted (its resume file kept) fails saying a recheck brings
+    /// it back, and one does: the files are laid down again and it downloads from what's left.
+    #[test]
+    fn a_recheck_downloads_deleted_data_again() {
+        let dir = scratch("deleted-data");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        let torrent = crate::parse_torrent(&std::fs::read(&torrent_file).unwrap()).unwrap();
+        let data = ResumeData::from_torrent(&torrent, &root, &bitvec![u8, Msb0; 1; 3]);
+        let path = dir.join("resume").join(ResumeData::file_name(&torrent.info_hash));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        data.write(&path).unwrap();
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.resume(&path);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Failed { .. })));
+        let Some((_, TorrentState::Failed { error, .. })) = session.torrents().into_iter().find(|(i, _)| *i == id)
+        else {
+            panic!()
+        };
+        assert!(error.contains("a recheck downloads"), "{error}");
+        session.recheck(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.verified_pieces == 0),
+        );
+        assert_eq!(std::fs::metadata(root.join("session.bin")).unwrap().len(), 40);
+
+        // only some of it lost: what survived is kept
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        std::fs::write(root.join("session.bin"), [7u8; 16]).unwrap();
+        session.recheck(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.verified_pieces == 1),
+        );
+        session.unpause(id);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.verified_pieces == 1),
+        );
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
