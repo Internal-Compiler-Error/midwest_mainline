@@ -2,6 +2,7 @@
 // kept here so the timeline can redraw from them. Finished spans accumulate; open ones are
 // replaced by each poll, since they're still changing.
 import { traces, type TraceSpan } from './api'
+import { humanBytes } from './format'
 
 /** How far back finished spans are kept on this side; the recorder keeps more. */
 const KEEP_MS = 30 * 60 * 1000
@@ -62,6 +63,11 @@ export class Traces {
 
 export function field(span: TraceSpan, name: string): string | undefined {
   return span.fields.find(([n]) => n === name)?.[1]
+}
+
+/** A field as it reads best: byte counts in binary units, everything else as recorded. */
+export function fieldValue(name: string, value: string): string {
+  return (name === 'downloaded' || name === 'uploaded' || name === 'size') && /^\d+$/.test(value) ? humanBytes(Number(value)) : value
 }
 
 /** Whether `span` is about `peer`: its own `peer` field, or an event inside it naming the peer
