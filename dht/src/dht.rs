@@ -1196,6 +1196,42 @@ mod bep44_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn anyone_can_put_a_signed_item_again() {
+        let dir = scratch_dir("bep44-republish");
+        let (stores, writer, reader) = network(&dir).await;
+        let key = SigningKey::from_bytes(&[8; 32]);
+        writer
+            .session
+            .handle()
+            .put_mutable(&key, b"", 4, b"3:abc".to_vec(), None)
+            .await
+            .unwrap();
+        let found = reader
+            .session
+            .handle()
+            .get_mutable(key.verifying_key().to_bytes(), b"", None)
+            .await
+            .unwrap();
+
+        // a store the writer never reached takes it from the reader
+        let late = node(&dir, "late", LOOPBACK).await;
+        late.session
+            .bootstrap(vec![stores[0].session.local_addr()])
+            .await
+            .unwrap();
+        reader.session.bootstrap(vec![late.session.local_addr()]).await.unwrap();
+        let put = reader.session.handle().put_signed(&found).await.unwrap();
+        assert!(put.stored >= 4, "{put:?}");
+        let target = item::mutable_target(&found.key, b"");
+        assert!(late.session.state.stored_item(&target, None).is_some());
+
+        let mut forged = found.clone();
+        forged.value = b"3:xyz".to_vec();
+        assert_eq!(reader.session.handle().put_signed(&forged).await.unwrap().stored, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_put_that_breaks_the_rules_gets_bep_44s_error() {
         let dir = scratch_dir("bep44-errors");
         let store = node(&dir, "store", LOOPBACK).await;

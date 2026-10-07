@@ -575,6 +575,23 @@ impl DhtClient {
         .await
     }
 
+    /// BEP 44: stores a mutable item someone else signed, as found, at the nodes closest to its
+    /// target. What keeps an item alive past its publisher (BEP 46 has its followers do it).
+    #[tracing::instrument(skip_all, fields(seq = found.seq))]
+    pub async fn put_signed(&self, found: &MutableItem) -> Result<PutOutcome, OurError> {
+        let signed = Signed {
+            key: found.key,
+            salt: found.salt.clone(),
+            seq: found.seq,
+            sig: found.sig,
+        };
+        let target = item::mutable_target(&found.key, &found.salt);
+        self.put(target, Some(found.seq), |token| {
+            PutQuery::new(self.state.our_id, token, found.value.clone(), Some(signed.clone()))
+        })
+        .await
+    }
+
     /// Gets write tokens from the nodes closest to `target` and puts `query(token)` to each
     async fn put(
         &self,
