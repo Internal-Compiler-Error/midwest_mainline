@@ -27,6 +27,7 @@ pub mod client;
 pub mod crawler;
 mod external_ip;
 pub mod item;
+mod query_limit;
 pub mod routing_table;
 pub mod rpc_manager;
 mod scope;

@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use diesel::{
@@ -27,7 +27,7 @@ use crate::{
     utils::db_put,
 };
 
-use super::{TxnIdGenerator, external_ip::ExternalIp, scope::Scope};
+use super::{TxnIdGenerator, external_ip::ExternalIp, query_limit::QueryLimit, scope::Scope};
 
 /// BEP 5's `v`, which every message we send carries
 const CLIENT_VERSION: &[u8] = b"MW01";
@@ -115,6 +115,7 @@ impl RpcManager {
     #[instrument(skip_all, fields(family = %self.family))]
     pub async fn run(&self) {
         let mut buf = [0u8; 1500];
+        let mut limit = QueryLimit::new(Instant::now());
 
         loop {
             // recv_from can fail transiently (e.g. ICMP port-unreachable from an
@@ -132,7 +133,9 @@ impl RpcManager {
                     trace!("{} sent {:?}", socket_addr, msg);
                     // a query is never the answer to one of ours, whatever its transaction id
                     if msg.is_query() {
-                        self.fan_out(&msg, socket_addr);
+                        if limit.allows(socket_addr.ip(), Instant::now()) {
+                            self.fan_out(&msg, socket_addr);
+                        }
                         continue;
                     }
                     // an answer is only news if it's to a query of ours, from where it went:
@@ -153,7 +156,9 @@ impl RpcManager {
                 }
                 // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
                 // we're read-only (BEP 43) and answer nothing
-                Err(OurError::UnsupportedQuery(txn)) if !self.is_read_only() => {
+                Err(OurError::UnsupportedQuery(txn))
+                    if !self.is_read_only() && limit.allows(socket_addr.ip(), Instant::now()) =>
+                {
                     let response = Krpc::new(txn, KrpcBody::ErrorResponse(KrpcError::new_method_unknown()));
                     self.send_msg_background(response, socket_addr);
                 }
