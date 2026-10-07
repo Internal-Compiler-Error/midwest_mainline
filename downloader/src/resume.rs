@@ -42,8 +42,9 @@ pub struct ResumeData {
     pub verified: BitBox<u8, Msb0>,
     /// the user paused it; resuming the session leaves it paused rather than starting it
     pub paused: bool,
-    /// indices into the torrent's files of the ones the user doesn't want
-    pub skip: Vec<u32>,
+    /// one flag per file, whether the user wants it; stored as the indices of the ones they
+    /// don't (`skip`)
+    pub selected: Vec<bool>,
     /// bytes uploaded over the torrent's whole life, for the seeding ratio
     pub uploaded: u64,
     pub modes: Modes,
@@ -75,17 +76,12 @@ impl ResumeData {
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
             modes: Modes::default(),
-            skip: vec![],
+            selected: vec![true; torrent.files.len()],
             uploaded: 0,
             web_seeds: torrent.web_seeds.clone(),
             piece_layers: torrent.piece_layers_bencoded(),
             feed: None,
         }
-    }
-
-    /// One flag per file from `skip`.
-    pub fn selected(&self, files: usize) -> Vec<bool> {
-        (0..files).map(|i| !self.skip.contains(&(i as u32))).collect()
     }
 
     pub fn info_hash(&self) -> InfoHash {
@@ -130,8 +126,9 @@ impl ResumeData {
         }
         dict.bytes(b"root", self.root.as_os_str().as_encoded_bytes());
         dict.flag(b"sequential", self.modes.sequential);
-        if !self.skip.is_empty() {
-            dict.int_list(b"skip", self.skip.iter().map(|&i| i64::from(i)));
+        if self.selected.contains(&false) {
+            let skipped = self.selected.iter().enumerate().filter(|(_, on)| !**on);
+            dict.int_list(b"skip", skipped.map(|(i, _)| i as i64));
         }
         dict.flag(b"super seed", self.modes.super_seed);
         dict.bytes_list(b"trackers", self.trackers.iter().map(String::as_bytes));
@@ -183,16 +180,7 @@ impl ResumeData {
             Some(BencodeItemView::Integer(n)) => u64::try_from(n).unwrap_or(0),
             _ => 0,
         };
-        let skip: Vec<u32> = match dict.remove(b"skip".as_slice()) {
-            Some(BencodeItemView::List(items)) => items
-                .into_iter()
-                .filter_map(|i| match i {
-                    BencodeItemView::Integer(i) => u32::try_from(i).ok(),
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![],
-        };
+        let skip = dict.remove(b"skip".as_slice());
 
         let web_seeds = match dict.remove(b"url-list".as_slice()) {
             Some(BencodeItemView::List(urls)) => crate::torrent::web_seed_urls(urls.iter().filter_map(|u| match u {
@@ -213,6 +201,16 @@ impl ResumeData {
 
         let torrent = parse_torrent(&build_torrent_file_with(&raw_info, &trackers, piece_layers.as_deref()))
             .context("resume file's info dict didn't parse as a torrent")?;
+        let mut selected = vec![true; torrent.files.len()];
+        if let Some(BencodeItemView::List(skip)) = skip {
+            for index in skip {
+                if let BencodeItemView::Integer(i) = index
+                    && let Some(on) = usize::try_from(i).ok().and_then(|i| selected.get_mut(i))
+                {
+                    *on = false;
+                }
+            }
+        }
         let pieces = torrent.num_pieces();
         if verified.len() != pieces.div_ceil(8) {
             bail!(
@@ -233,7 +231,7 @@ impl ResumeData {
             root,
             verified: verified.into_boxed_bitslice(),
             paused,
-            skip,
+            selected,
             uploaded,
             modes,
             web_seeds,
@@ -450,16 +448,6 @@ async fn save_in_background(
     None
 }
 
-/// The file indices a selection leaves out, as the resume file stores them.
-fn skipped(selected: &[bool]) -> Vec<u32> {
-    selected
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !**s)
-        .map(|(i, _)| i as u32)
-        .collect()
-}
-
 /// Keeps `dir/<info hash>.resume` up to date with `stats` until `shutdown` fires, then writes
 /// it one last time. Meant to be spawned alongside the torrent's swarm.
 ///
@@ -501,7 +489,7 @@ pub(crate) async fn save_paused(
 #[derive(Clone, PartialEq)]
 struct Saved {
     verified: BitBox<u8, Msb0>,
-    skip: Vec<u32>,
+    selected: Vec<bool>,
     modes: Modes,
     uploaded: u64,
     feed: Option<Feed>,
@@ -510,12 +498,13 @@ struct Saved {
 impl Saved {
     /// Worth a write straight away, rather than only with the next round of counters.
     fn differs_beyond_counters(&self, other: &Saved) -> bool {
-        (&self.verified, &self.skip, self.modes, &self.feed) != (&other.verified, &other.skip, other.modes, &other.feed)
+        (&self.verified, &self.selected, self.modes, &self.feed)
+            != (&other.verified, &other.selected, other.modes, &other.feed)
     }
 
     fn to_data(&self, torrent: &Torrent, root: &Path) -> ResumeData {
         ResumeData {
-            skip: self.skip.clone(),
+            selected: self.selected.clone(),
             modes: self.modes,
             uploaded: self.uploaded,
             feed: self.feed.clone(),
@@ -614,7 +603,7 @@ impl ResumeInputs {
     fn snapshot(&self, verified: &BitSlice<u8, Msb0>, uploaded: u64) -> Saved {
         Saved {
             verified: verified.to_bitvec().into_boxed_bitslice(),
-            skip: skipped(&self.selected.borrow()),
+            selected: self.selected.borrow().clone(),
             modes: *self.modes.borrow(),
             uploaded: self.uploaded_before + uploaded,
             feed: self.feed.borrow().clone(),
@@ -816,17 +805,24 @@ mod test {
         assert_eq!(decoded.to_torrent().unwrap(), torrent);
         assert!(!decoded.paused, "the flag is absent unless set");
 
-        let paused = ResumeData { paused: true, ..data };
+        let paused = ResumeData {
+            paused: true,
+            ..data.clone()
+        };
         assert!(ResumeData::decode(&paused.encode()).unwrap().paused);
 
         let skipping = ResumeData {
-            skip: vec![0, 2],
+            selected: vec![false],
             uploaded: 123_456,
-            ..paused
+            ..paused.clone()
         };
         let decoded = ResumeData::decode(&skipping.encode()).unwrap();
-        assert_eq!(decoded.skip, vec![0, 2]);
-        assert_eq!(decoded.selected(4), vec![false, true, false, true]);
+        assert_eq!(decoded.selected, vec![false]);
+        assert!(
+            data.encode().windows(8).all(|w| w != b"4:skipli"),
+            "nothing skipped, no list"
+        );
+        assert!(skipping.encode().windows(10).any(|w| w == b"4:skipli0e"));
         assert_eq!(decoded.uploaded, 123_456);
 
         let following = ResumeData {
@@ -1101,7 +1097,7 @@ mod test {
 
         tx.send_modify(|stats| stats.uploaded = 20);
         selected_tx.send(vec![false]).unwrap();
-        file_comes_to(&path, |data| data.skip == [0]).await;
+        file_comes_to(&path, |data| data.selected == [false]).await;
         tx.send_modify(|stats| stats.uploaded = 30);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(ResumeData::read(&path).unwrap().uploaded, 1020);

@@ -231,7 +231,7 @@ impl Resolved {
         let data = ResumeData::read(path)?;
         let torrent = data.to_torrent()?;
         Ok(Self {
-            selected: data.selected(torrent.files.len()),
+            selected: data.selected,
             torrent,
             root: data.root,
             verified: data.verified,
@@ -2861,7 +2861,7 @@ mod test {
         );
         let path = list_resume_files(&dir.join("resume"))[0].path.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !ResumeData::read(&path).is_ok_and(|d| d.paused && d.modes.sequential && d.skip == [0]) {
+        while !ResumeData::read(&path).is_ok_and(|d| d.paused && d.modes.sequential && d.selected == [false]) {
             assert!(Instant::now() < deadline, "{:?}", ResumeData::read(&path));
             std::thread::sleep(Duration::from_millis(20));
         }
