@@ -443,29 +443,35 @@ impl BtClient {
 /// with a relative link so the download can be moved. Best effort: an existing entry is left
 /// alone, and a failure only costs the link.
 fn make_symlink(torrent: &Torrent, root: &Path, relative: &Path, target: &Path) {
-    let depth = relative.components().count();
-    if depth < 2 {
+    let mut components = relative.components();
+    let (Some(top), Some(_)) = (components.next(), components.next()) else {
         return;
-    }
-    let mut link_target = std::path::PathBuf::new();
-    for _ in 0..depth - 2 {
-        link_target.push("..");
-    }
-    link_target.push(target);
+    };
     let link = root.join(relative);
     if link.symlink_metadata().is_ok() {
         return;
     }
-    let made = link
-        .parent()
-        .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| std::os::unix::fs::symlink(&link_target, &link));
+    let made = (|| {
+        let parent = link.parent().expect("a path of two components has a parent");
+        fs::create_dir_all(parent)?;
+        // the link's directory may run through the torrent's other links, so it's counted up
+        // to the top level where it really is, not where its path says: the target then
+        // resolves inside the torrent, as do the files later written through this link
+        let real_top = root.join(top).canonicalize()?;
+        let real_parent = parent.canonicalize()?;
+        let below = real_parent
+            .strip_prefix(&real_top)
+            .map_err(|_| std::io::Error::other("its directory is outside the torrent's"))?;
+        let mut link_target: std::path::PathBuf = below.components().map(|_| "..").collect();
+        link_target.push(target);
+        std::os::unix::fs::symlink(&link_target, &link)
+    })();
     if let Err(e) = made {
         tracing::warn!(
             "{}: couldn't link {} to {}: {e}",
             torrent.name,
             link.display(),
-            link_target.display()
+            target.display()
         );
     }
 }
@@ -542,4 +548,64 @@ pub fn default_settings() -> SettingsWatch {
     let (tx, rx) = watch::channel(Settings::default());
     std::mem::forget(tx);
     rx
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// BEP 47 symlink targets are paths from the torrent's top level, but a link whose own
+    /// directory runs through another of the torrent's links sits shallower than its path
+    /// says: `a/b/c` links to `x`, so `a/b/c/c1/c2/c3/link` is really `x/c1/c2/c3/link`, two levels
+    /// up. Its target must still land inside the torrent, and so must a file written through it.
+    #[tokio::test]
+    async fn symlinks_cannot_reach_outside_the_torrent() {
+        let scratch = std::env::temp_dir().join(format!("downloader-symlink-escape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let (root, outside) = (scratch.join("dl"), scratch.join("outside"));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut info = b"d5:filesl".to_vec();
+        info.extend_from_slice(b"d6:lengthi1e4:pathl1:x4:keepee");
+        info.extend_from_slice(b"d4:attr1:l6:lengthi0e4:pathl1:d1:le12:symlink pathl1:x4:keepee");
+        info.extend_from_slice(b"d4:attr1:l6:lengthi0e4:pathl1:a1:b1:ce12:symlink pathl1:xee");
+        info.extend_from_slice(b"d4:attr1:l6:lengthi0e4:pathl1:a1:b1:c2:c12:c22:c34:linke");
+        info.extend_from_slice(b"12:symlink pathl7:outsideee");
+        info.extend_from_slice(b"d6:lengthi1e4:pathl1:a1:b1:c2:c12:c22:c34:link5:pwnedee");
+        info.extend_from_slice(b"e4:name1:t12:piece lengthi16e6:pieces20:01234567890123456789e");
+        let torrent = crate::torrent::parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+
+        let client = BtClient::new(
+            Identity {
+                peer_id: *b"-DL0100-symlinktest.",
+                serving: SocketAddr::from(([127, 0, 0, 1], 1)),
+                dht: false,
+                encryption: crate::config::Encryption::Disabled,
+            },
+            crate::dht::Dht::none(),
+        );
+        let _ = client.add_torrent(torrent, &root);
+
+        assert!(
+            !outside.join("pwned").exists(),
+            "a file was written outside the download root"
+        );
+        let top = root.join("t").canonicalize().unwrap();
+        assert_eq!(
+            fs::read_link(root.join("t/d/l")).unwrap(),
+            Path::new("../x/keep"),
+            "an ordinary link is relative"
+        );
+        let link = root.join("t/a/b/c/c1/c2/c3/link");
+        if let Ok(resolved) = link.canonicalize() {
+            assert!(
+                resolved.starts_with(&top),
+                "{} resolves to {}",
+                link.display(),
+                resolved.display()
+            );
+        }
+        fs::remove_dir_all(&scratch).unwrap();
+    }
 }
