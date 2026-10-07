@@ -214,9 +214,14 @@ async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
     };
     let port = Some(tcp_port);
     let mut retry = DHT_RETRY;
+    let mut last_scrape = None;
 
     loop {
         let started = Instant::now();
+        let scrape_due = last_scrape.is_none_or(|at: Instant| at.elapsed() >= SCRAPE_INTERVAL / 2);
+        if scrape_due {
+            last_scrape = Some(started);
+        }
         let lookups = handle.clients().into_iter().map(|client| {
             // peers go to the swarm as nodes return them; waiting for the lookup to converge
             // would leave them idle for the seconds that takes
@@ -227,6 +232,8 @@ async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
                 family = %client.family(),
                 peers = tracing::field::Empty,
                 announce_to = tracing::field::Empty,
+                seeds = tracing::field::Empty,
+                swarm_peers = tracing::field::Empty,
                 error = tracing::field::Empty,
             );
             async move {
@@ -235,9 +242,20 @@ async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
                         let _ = events.try_send(SwarmEvent::PeersDiscovered(peers.to_vec(), PeerSource::Dht));
                     }
                 });
-                let lookup = streamed.instrument(span.clone()).await;
+                // a walk of its own: nodes answer BEP 33's scrape=1 with filters instead of peers
+                let scrape = async {
+                    if scrape_due {
+                        client.scrape(info_hash).await.ok()
+                    } else {
+                        None
+                    }
+                };
+                let (lookup, estimate) = futures::future::join(streamed, scrape).instrument(span.clone()).await;
+                let lookup = lookup.map(|result| (result, estimate.unwrap_or_default()));
                 match &lookup {
-                    Ok(result) => {
+                    Ok((result, estimate)) => {
+                        span.record("seeds", estimate.seeds);
+                        span.record("swarm_peers", estimate.peers);
                         span.record("peers", result.peers.len());
                         span.record("announce_to", result.announce_candidates.len());
                     }
@@ -255,14 +273,29 @@ async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
         let mut peers: Vec<SocketAddr> = vec![];
         let mut announces = vec![];
         let mut errors = vec![];
+        let mut swarm = SwarmCounts::default();
         for (client, lookup) in lookups {
             match lookup {
-                Ok(result) => {
+                Ok((result, estimate)) => {
+                    // the families' filters can't be merged, so the larger estimate stands
+                    if scrape_due && estimate.nodes > 0 {
+                        let max = |a: Option<u32>, b: u64| Some(a.unwrap_or(0).max(b as u32));
+                        swarm.seeders = max(swarm.seeders, estimate.seeds);
+                        swarm.leechers = max(swarm.leechers, estimate.peers);
+                    }
                     info!(
-                        "{} DHT lookup found {} peers, {} nodes accept our announce",
+                        "{} DHT lookup found {} peers, {} nodes accept our announce{}",
                         client.family(),
                         result.peers.len(),
-                        result.announce_candidates.len()
+                        result.announce_candidates.len(),
+                        if scrape_due {
+                            format!(
+                                "; the swarm is ~{} seeds and ~{} peers by {} nodes' filters",
+                                estimate.seeds, estimate.peers, estimate.nodes
+                            )
+                        } else {
+                            String::new()
+                        }
                     );
                     peers.extend(result.peers);
                     announces.extend(result.announce_candidates.into_iter().map(|c| (client.clone(), c)));
@@ -297,6 +330,7 @@ async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
                 row.state = TrackerState::Working;
                 row.peers = peers.len();
                 row.next_announce = Some(Instant::now() + wait);
+                row.swarm = row.swarm.updated(swarm);
             });
             // the whole set again, in case a batch above found the queue full; the swarm
             // and the metadata fetch both skip addresses they already have

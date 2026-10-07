@@ -57,7 +57,7 @@ fn check_value(value: &[u8]) -> Result<(), OurError> {
 }
 
 /// BEP 33's estimate of a swarm's size
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SwarmEstimate {
     pub seeds: u64,
     /// peers that aren't seeds
@@ -389,19 +389,9 @@ impl DhtClient {
     pub async fn get_peers_with(
         &self,
         info_hash: InfoHash,
-        mut found: impl FnMut(&[SocketAddr]) + Send,
+        found: impl FnMut(&[SocketAddr]) + Send,
     ) -> Result<GetPeersResult, OurError> {
-        // peers others announced *to us* are served from the local store immediately
-        let known_peers = self.state.swarm_peers(&info_hash, self.state.family);
-        if !known_peers.is_empty() {
-            found(&known_peers);
-            return Ok(GetPeersResult {
-                peers: known_peers,
-                announce_candidates: vec![],
-            });
-        }
-
-        let (result, _) = self.lookup_peers(info_hash, false, found).await;
+        let (result, _) = self.lookup_with_local(info_hash, false, found).await;
         Ok(result)
     }
 
@@ -411,7 +401,11 @@ impl DhtClient {
     #[tracing::instrument(skip(self))]
     pub async fn scrape(&self, info_hash: InfoHash) -> Result<SwarmEstimate, OurError> {
         let (_, filters) = self.lookup_peers(info_hash, true, |_| {}).await;
-        let ours = self.state.scrape_filters(&info_hash);
+        Ok(self.estimate(&info_hash, filters))
+    }
+
+    fn estimate(&self, info_hash: &InfoHash, filters: Vec<ScrapeFilters>) -> SwarmEstimate {
+        let ours = self.state.scrape_filters(info_hash);
         let answered = filters.len();
         let both = filters
             .into_iter()
@@ -420,11 +414,33 @@ impl DhtClient {
                 seeds: acc.seeds.union(&f.seeds),
                 peers: acc.peers.union(&f.peers),
             });
-        Ok(SwarmEstimate {
+        SwarmEstimate {
             seeds: both.seeds.estimate().round() as u64,
             peers: both.peers.estimate().round() as u64,
             nodes: answered,
-        })
+        }
+    }
+
+    /// A lookup that hands over the peers announced *to us* first. It still goes out to the
+    /// network: the store holds only what was announced here, and the walk is what earns the
+    /// tokens our own announce needs.
+    async fn lookup_with_local(
+        &self,
+        info_hash: InfoHash,
+        scrape: bool,
+        mut found: impl FnMut(&[SocketAddr]) + Send,
+    ) -> (GetPeersResult, Vec<ScrapeFilters>) {
+        let known = self.state.swarm_peers(&info_hash, self.state.family);
+        if !known.is_empty() {
+            found(&known);
+        }
+        let (mut result, filters) = self.lookup_peers(info_hash, scrape, found).await;
+        for peer in known {
+            if !result.peers.contains(&peer) {
+                result.peers.push(peer);
+            }
+        }
+        (result, filters)
     }
 
     /// The iterative lookup behind `get_peers` and `scrape`: query the closest-known nodes,

@@ -140,8 +140,14 @@
                   title={trackerStatus(tracker)}>{trackerStatus(tracker)}</Table.Cell
                 >
                 <Table.Cell class="w-24 whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
-                <Table.Cell class="w-48 whitespace-nowrap text-muted-foreground tabular-nums" title="the swarm as this tracker counts it">
-                  {#if tracker.seeders !== null}{tracker.seeders} seeds · {tracker.leechers ?? '?'} leechers{/if}
+                {@const estimated = tracker.url.startsWith('DHT')}
+                <Table.Cell
+                  class="w-48 whitespace-nowrap text-muted-foreground tabular-nums"
+                  title={estimated
+                    ? 'estimated from the bloom filters of the DHT nodes nearest the hash (BEP 33)'
+                    : 'the swarm as this tracker counts it'}
+                >
+                  {#if tracker.seeders !== null}{estimated ? '~' : ''}{tracker.seeders} seeds · {tracker.leechers ?? '?'} leechers{/if}
                   {#if tracker.downloaded !== null}· {tracker.downloaded} done{/if}
                 </Table.Cell>
                 <Table.Cell class="w-36 whitespace-nowrap text-muted-foreground tabular-nums">
