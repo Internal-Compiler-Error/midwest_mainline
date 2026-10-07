@@ -9,6 +9,7 @@ use crate::wire::V2Support;
 use anyhow::{Context, bail, ensure};
 use midwest_mainline::types::InfoHash;
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,8 +28,9 @@ pub struct MagnetLink {
     pub web_seeds: Vec<String>,
     /// `x.pe=`: peers to try first, before any tracker or the DHT has answered
     pub peers: Vec<SocketAddr>,
-    /// BEP 53 `so=`: the indices of the files to download; `None` for all of them
-    pub select_only: Option<Vec<usize>>,
+    /// BEP 53 `so=`: the files to download, as sorted, disjoint ranges of indices; `None` for
+    /// all of them
+    pub select_only: Option<Vec<RangeInclusive<usize>>>,
     /// BEP 46 `xs=urn:btpk:` (and `s=`): the key whose DHT item names the torrent's newest
     /// version; see `parse_feed` for a magnet that has only this
     pub feed: Option<FeedKey>,
@@ -39,7 +41,7 @@ impl MagnetLink {
     /// `so=`, or when none of its indices exists.
     pub fn selection(&self, files: usize) -> Vec<bool> {
         let picked: Vec<bool> = (0..files)
-            .map(|i| self.select_only.as_ref().is_none_or(|only| only.contains(&i)))
+            .map(|i| self.select_only.as_ref().is_none_or(|only| selects(only, i)))
             .collect();
         if picked.contains(&true) {
             picked
@@ -65,25 +67,34 @@ impl MagnetLink {
 }
 
 /// BEP 53: comma-separated indices and inclusive ranges, `0,2,4,6-8`. Malformed parts are
-/// skipped; a range is capped so a hostile `0-4294967295` can't allocate the world.
-fn parse_select_only(value: &str) -> Vec<usize> {
-    const MAX_RANGE: usize = 1 << 20;
-    let mut out = Vec::new();
-    for part in value.split(',') {
-        match part.split_once('-') {
-            Some((from, to)) => {
-                if let (Ok(from), Ok(to)) = (from.trim().parse::<usize>(), to.trim().parse::<usize>())
-                    && from <= to
-                {
-                    out.extend(from..=to.min(from + MAX_RANGE));
-                }
+/// skipped. Kept as ranges, so a hostile `0-18446744073709551615` costs nothing.
+fn parse_select_only(value: &str) -> impl Iterator<Item = RangeInclusive<usize>> + '_ {
+    value.split(',').filter_map(|part| {
+        let (from, to) = part.split_once('-').unwrap_or((part, part));
+        let (from, to) = (from.trim().parse::<usize>().ok()?, to.trim().parse::<usize>().ok()?);
+        (from <= to).then_some(from..=to)
+    })
+}
+
+/// `ranges` sorted, with the overlapping and adjacent ones merged.
+fn merged(mut ranges: Vec<RangeInclusive<usize>>) -> Vec<RangeInclusive<usize>> {
+    ranges.sort_unstable_by_key(|r| *r.start());
+    let mut out: Vec<RangeInclusive<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match out.last_mut() {
+            Some(last) if *range.start() <= last.end().saturating_add(1) => {
+                *last = *last.start()..=*last.end().max(range.end());
             }
-            None => out.extend(part.trim().parse::<usize>()),
+            _ => out.push(range),
         }
     }
-    out.sort_unstable();
-    out.dedup();
     out
+}
+
+/// Whether sorted, disjoint `ranges` take in `index`.
+fn selects(ranges: &[RangeInclusive<usize>], index: usize) -> bool {
+    let after = ranges.partition_point(|r| *r.end() < index);
+    ranges.get(after).is_some_and(|r| r.contains(&index))
 }
 
 /// True if `s` looks like a magnet URI, so callers can accept either this or a file path.
@@ -135,7 +146,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
     let mut trackers = Vec::new();
     let mut web_seeds = Vec::new();
     let mut peers = Vec::new();
-    let mut select_only: Option<Vec<usize>> = None;
+    let mut select_only: Option<Vec<RangeInclusive<usize>>> = None;
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -175,7 +186,7 @@ pub fn parse_magnet(uri: &str) -> anyhow::Result<MagnetLink> {
         trackers,
         web_seeds: crate::torrent::web_seed_urls(web_seeds.iter().map(|u| u.as_bytes())),
         peers,
-        select_only,
+        select_only: select_only.map(merged),
         feed,
     })
 }
@@ -269,6 +280,7 @@ fn decode_base32(s: &str) -> anyhow::Result<[u8; 20]> {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init, reason = "selections of a single range")]
 mod test {
     #[test]
     fn select_only_and_peer_addresses() {
@@ -277,7 +289,7 @@ mod test {
             "magnet:?xt=urn:btih:{hash}&so=0,2,4-6,x,9-7&x.pe=10.0.0.1:6881&x.pe=[::1]:7000&x.pe=host.test:1"
         ))
         .unwrap();
-        assert_eq!(magnet.select_only, Some(vec![0, 2, 4, 5, 6]));
+        assert_eq!(magnet.select_only, Some(vec![0..=0, 2..=2, 4..=6]));
         assert_eq!(
             magnet.peers,
             [
@@ -294,11 +306,24 @@ mod test {
         );
         let plain = parse_magnet(&format!("magnet:?xt=urn:btih:{hash}")).unwrap();
         assert_eq!(plain.selection(2), [true, true]);
-        assert_eq!(
-            parse_select_only("0-4294967295").len(),
-            (1 << 20) + 1,
-            "ranges are capped"
-        );
+    }
+
+    /// A range of every index there is, or one at the very end, is two numbers, not a list of
+    /// them (or an overflow)
+    #[test]
+    fn select_only_ranges_cost_nothing() {
+        let hash = "f45add9d1a5185d8588df7dd6cd89993dd0174fa";
+        let max = usize::MAX;
+        let magnet = parse_magnet(&format!(
+            "magnet:?xt=urn:btih:{hash}&so={max}-{max},0-{max},5-{max},3,{}",
+            "1-4294967295,".repeat(1000)
+        ))
+        .unwrap();
+        assert_eq!(magnet.select_only, Some(vec![0..=max]));
+        assert_eq!(magnet.selection(3), [true; 3]);
+        assert_eq!(merged(vec![5..=6, 0..=1, 2..=3, 9..=9]), [0..=3, 5..=6, 9..=9]);
+        let picked = parse_magnet(&format!("magnet:?xt=urn:btih:{hash}&so=1&so=3-4,9")).unwrap();
+        assert_eq!(picked.selection(6), [false, true, false, true, true, false]);
     }
 
     use super::*;
@@ -442,7 +467,7 @@ mod test {
         assert_eq!(resolved.info_hash.0, expected_bytes());
         assert_eq!(resolved.display_name.as_deref(), Some("x"));
         assert_eq!(resolved.trackers, ["udp://t.test:1"]);
-        assert_eq!(resolved.select_only, Some(vec![1]));
+        assert_eq!(resolved.select_only, Some(vec![1..=1]));
         assert_eq!(resolved.feed, Some(feed_of(&only_key)));
         let stale = format!("magnet:?xt=urn:btih:{}&xs=urn:btpk:{key}", "00".repeat(20));
         assert_eq!(
