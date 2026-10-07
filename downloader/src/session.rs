@@ -798,13 +798,19 @@ impl TorrentTask {
         };
         // one paused before it ever ran has no files to pick up: they're laid down like a new
         // torrent's, provided its root is there (and not on a drive that isn't mounted)
-        let nothing_to_pick_up = verified.not_any() && root.is_dir();
-        if *resumed && !nothing_to_pick_up {
-            self.client
-                .add_torrent_resumed((**torrent).clone(), root, verified.clone())?;
-        } else {
-            self.client.add_torrent((**torrent).clone(), root)?;
-        }
+        let adding = {
+            let (client, torrent, root) = (self.client.clone(), (**torrent).clone(), root.to_path_buf());
+            let (resumed, verified) = (*resumed, verified.clone());
+            tokio::task::spawn_blocking(move || {
+                let nothing_to_pick_up = verified.not_any() && root.is_dir();
+                if resumed && !nothing_to_pick_up {
+                    client.add_torrent_resumed(torrent, &root, verified)
+                } else {
+                    client.add_torrent(torrent, &root)
+                }
+            })
+        };
+        adding.await??;
         // whatever happens next, the files exist
         *resumed = true;
         let info_hash = &torrent.info_hash;

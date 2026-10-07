@@ -18,7 +18,7 @@ use anyhow::{Context, bail};
 use bitvec::prelude::*;
 use futures::future::select_all;
 use midwest_mainline::types::InfoHash;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::net::SocketAddr;
@@ -40,6 +40,9 @@ pub struct BtClient {
     id: Arc<Identity>,
     /// the handle is all there is of a swarm here; dropping it stops the swarm
     swarms: Arc<Mutex<HashMap<InfoHash, TorrentSwarmHandle>>>,
+    /// torrents whose files are being opened, which can take a while; not in `swarms` yet,
+    /// but a second add of one is refused all the same
+    adding: Arc<Mutex<HashSet<InfoHash>>>,
     /// cancelled to trigger a graceful shutdown: each tracker gets a best-effort
     /// event=stopped announce before the process exits
     shutdown: CancellationToken,
@@ -122,6 +125,7 @@ impl BtClient {
             lsd: Arc::new(Lsd::spawn(Arc::downgrade(&swarms), id.serving.port(), shutdown.clone())),
             id: Arc::new(id),
             swarms,
+            adding: Arc::default(),
             shutdown,
             dht,
             limiter: Arc::new(RateLimiter::new(settings.clone())),
@@ -219,9 +223,10 @@ impl BtClient {
         true
     }
 
-    /// Starts `torrent` from scratch under `root`: target files are created (or truncated)
+    /// Starts `torrent` from scratch under `root`: target files are created (never truncated)
     /// and sized. A single-file torrent becomes `root/<name>`, a multi-file one
-    /// `root/<name>/...`, the way every mainstream client lays a download out.
+    /// `root/<name>/...`, the way every mainstream client lays a download out. Blocking: it
+    /// does file I/O, which on a slow disk takes a while.
     pub fn add_torrent(&self, torrent: Torrent, root: &Path) -> anyhow::Result<()> {
         let verified = bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice();
         self.add_torrent_with(torrent, root, verified, true)
@@ -230,7 +235,8 @@ impl BtClient {
     /// Picks `torrent` back up where a previous run left it: pieces set in `verified` are
     /// taken to be on disk and correct, so they're neither downloaded nor re-hashed. Target
     /// files are opened in place and must already be their full size -- a missing or
-    /// wrong-sized file is an error, since the bitfield can't be trusted against it.
+    /// wrong-sized file is an error, since the bitfield can't be trusted against it. Blocking,
+    /// like `add_torrent`.
     pub fn add_torrent_resumed(&self, torrent: Torrent, root: &Path, verified: BitBox<u8, Msb0>) -> anyhow::Result<()> {
         if verified.len() != torrent.num_pieces() {
             bail!(
@@ -249,53 +255,18 @@ impl BtClient {
         verified: BitBox<u8, Msb0>,
         fresh: bool,
     ) -> anyhow::Result<()> {
-        // held while the files are opened too: a second add of the same torrent must not get
-        // as far as truncating files the first one is downloading into
-        let mut swarms = self.swarms.lock().unwrap();
-        if swarms.contains_key(&torrent.info_hash) {
-            bail!("{} is already added", torrent.name);
-        }
-
-        let mut files = vec![];
-        for entry in &torrent.files {
-            let (size, relative, attr) = (&entry.len, &entry.path, &entry.attr);
-            let file = root.join(relative);
-            if attr.virtual_file() {
-                if let Some(target) = &attr.symlink {
-                    make_symlink(&torrent, root, relative, target);
-                }
-                files.push(None);
-                continue;
+        let _adding = {
+            let swarms = self.swarms.lock().unwrap();
+            let mut adding = self.adding.lock().unwrap();
+            if swarms.contains_key(&torrent.info_hash) || !adding.insert(torrent.info_hash) {
+                bail!("{} is already added", torrent.name);
             }
-            fs::create_dir_all(file.parent().unwrap())?;
-            // never truncated: a fresh add may be over the very data the torrent describes,
-            // which the check that follows finds
-            let f = File::options()
-                .read(true)
-                .write(true)
-                .create(fresh)
-                .truncate(false)
-                .open(&file)
-                .with_context(|| format!("opening {}", file.display()))?;
-            if fresh {
-                if f.metadata()?.len() < *size {
-                    f.set_len(*size)?;
-                }
-                if attr.executable {
-                    use std::os::unix::fs::PermissionsExt;
-                    f.set_permissions(fs::Permissions::from_mode(0o755))?;
-                }
-            } else {
-                let on_disk = f.metadata()?.len();
-                if on_disk != *size {
-                    bail!(
-                        "{} is {on_disk} bytes on disk but the torrent says {size}; can't resume",
-                        file.display()
-                    );
-                }
+            Adding {
+                adding: self.adding.clone(),
+                info_hash: torrent.info_hash,
             }
-            files.push(Some(f));
-        }
+        };
+        let files = open_files(&torrent, root, fresh)?;
 
         let torrent = Arc::new(torrent);
         let storage = TorrentStorage::new(torrent.clone(), files);
@@ -312,11 +283,13 @@ impl BtClient {
             shutdown: self.shutdown.clone(),
         };
         let handle = TorrentSwarm::spawn(torrent.clone(), storage, verified, shared);
+        let mut swarms = self.swarms.lock().unwrap();
         // BEP 52: a hybrid's peers may come knocking with its v2 hash, truncated
         if let Some(v2) = torrent.hybrid_v2_hash() {
             swarms.insert(v2, handle.clone());
         }
         swarms.insert(torrent.info_hash, handle);
+        drop(swarms);
         self.lsd.announce();
         Ok(())
     }
@@ -542,6 +515,67 @@ async fn welcome(
             peer_id: handshake.peer_id,
         })
         .await;
+}
+
+/// Opens (and, `fresh`, creates and sizes) the files of `torrent` under `root`; `None` for the
+/// ones that live only in the piece stream (BEP 47 padding, symlinks, which are made here).
+fn open_files(torrent: &Torrent, root: &Path, fresh: bool) -> anyhow::Result<Vec<Option<File>>> {
+    let mut files = vec![];
+    for entry in &torrent.files {
+        let (size, relative, attr) = (&entry.len, &entry.path, &entry.attr);
+        let file = root.join(relative);
+        if attr.virtual_file() {
+            if let Some(target) = &attr.symlink {
+                make_symlink(torrent, root, relative, target);
+            }
+            files.push(None);
+            continue;
+        }
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // never truncated: a fresh add may be over the very data the torrent describes,
+        // which the check that follows finds
+        let f = File::options()
+            .read(true)
+            .write(true)
+            .create(fresh)
+            .truncate(false)
+            .open(&file)
+            .with_context(|| format!("opening {}", file.display()))?;
+        if fresh {
+            if f.metadata()?.len() < *size {
+                f.set_len(*size).with_context(|| format!("sizing {}", file.display()))?;
+            }
+            if attr.executable {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(0o755))?;
+            }
+        } else {
+            let on_disk = f.metadata()?.len();
+            if on_disk != *size {
+                bail!(
+                    "{} is {on_disk} bytes on disk but the torrent says {size}; can't resume",
+                    file.display()
+                );
+            }
+        }
+        files.push(Some(f));
+    }
+
+    Ok(files)
+}
+
+/// A torrent's place in `BtClient::adding`, given up when the add is done either way.
+struct Adding {
+    adding: Arc<Mutex<HashSet<InfoHash>>>,
+    info_hash: InfoHash,
+}
+
+impl Drop for Adding {
+    fn drop(&mut self) {
+        self.adding.lock().unwrap().remove(&self.info_hash);
+    }
 }
 
 /// A settings watch that stays at the defaults, for a client with nobody to change them.
