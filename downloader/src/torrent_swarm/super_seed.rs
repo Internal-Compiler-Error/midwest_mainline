@@ -5,14 +5,31 @@ use std::time::{Duration, Instant};
 
 use super::TorrentSwarm;
 
+/// BEP 16, torrent-wide; each peer's own view is its `Peer::super_seed`.
+pub(super) struct SuperSeed {
+    /// switched on, whether or not there's everything to show yet (see `super_seeding`)
+    pub(super) on: bool,
+    /// how many peers each piece has been revealed to
+    pub(super) offers: Vec<u32>,
+}
+
+impl SuperSeed {
+    pub(super) fn new(pieces: usize) -> Self {
+        SuperSeed {
+            on: false,
+            offers: vec![0; pieces],
+        }
+    }
+}
+
 impl TorrentSwarm {
     /// BEP 16: super-seeding is on, and there's every piece to show.
     pub(super) fn super_seeding(&self) -> bool {
-        self.super_seed && self.stat.all_verified()
+        self.super_seed.on && self.stat.all_verified()
     }
 
     pub(super) fn set_super_seed(&mut self, on: bool) {
-        self.super_seed = on;
+        self.super_seed.on = on;
         if on {
             // peers already connected have seen everything; it applies to newcomers
             return;
@@ -42,10 +59,10 @@ impl TorrentSwarm {
         let peer = &self.peers[idx];
         let Some(view) = &peer.super_seed else { return };
         let scatter = rand::random::<u32>();
-        let pick = (0..self.availability.len() as u32)
+        let pick = (0..self.picker.availability.len() as u32)
             .filter(|&p| !peer.they_have(p) && !view.offered.contains(&p))
             .min_by_key(|&p| {
-                let seen = self.availability[p as usize] + self.super_seed_offers[p as usize];
+                let seen = self.picker.availability[p as usize] + self.super_seed.offers[p as usize];
                 (seen, p.wrapping_mul(0x9E37_79B9) ^ scatter)
             });
         let peer = &mut self.peers[idx];
@@ -55,8 +72,8 @@ impl TorrentSwarm {
             return;
         };
         view.offered.insert(piece);
-        view.current = Some((piece, self.availability[piece as usize], Instant::now()));
-        self.super_seed_offers[piece as usize] += 1;
+        view.current = Some((piece, self.picker.availability[piece as usize], Instant::now()));
+        self.super_seed.offers[piece as usize] += 1;
         if peer.send_have(piece).is_err() {
             self.drop_peer(idx, "send failed");
         }
@@ -79,7 +96,7 @@ impl TorrentSwarm {
                     return false;
                 };
                 let theirs = p.they_have(piece);
-                let others_now = self.availability[piece as usize] - theirs as u32;
+                let others_now = self.picker.availability[piece as usize] - theirs as u32;
                 others_now > others_then || (theirs && (lone || shown.elapsed() >= PATIENCE))
             })
             .map(|p| p.remote_addr)

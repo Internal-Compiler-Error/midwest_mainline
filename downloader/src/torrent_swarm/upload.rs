@@ -3,12 +3,14 @@
 
 use crate::events::Event;
 use crate::layers::{self, MAX_HASH_READS};
+use crate::merkle::Hash;
 use crate::peer::parse_ut_metadata_request;
 use crate::settings::{
     MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS,
 };
 use crate::wire::{BlockRef, BtMessage, HashRequest, Piece};
 use rand::seq::IndexedRandom;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use tracing::warn;
 
@@ -19,6 +21,18 @@ use super::{SwarmEvent, TorrentSwarm};
 /// that asks for much and reads little would have us hold blocks in memory for it. As deep as
 /// the queue our `reqq` advertises, at the usual block size.
 pub(super) const MAX_UPLOAD_BACKLOG: usize = MAX_QUEUED_UPLOADS * crate::settings::BLOCK_SIZE;
+
+/// What serving peers keeps besides each peer's own queue.
+#[derive(Default)]
+pub(super) struct Uploads {
+    /// blocks read off disk that the upload limit didn't allow out yet, oldest first;
+    /// housekeeping sends what the limit allows
+    pub(super) held: VecDeque<(SocketAddr, Piece)>,
+    /// hash requests being answered from data on disk, at most `MAX_HASH_READS`
+    pub(super) hash_reads: usize,
+    /// per file, the Merkle tree above its piece layer, built for the first hash request
+    pub(super) hash_trees: BTreeMap<usize, Vec<Vec<Hash>>>,
+}
 
 /// Regular (non-optimistic) upload slots for `interested` peers. A handful of slots reciprocates
 /// with only a handful of a big swarm's leechers, and the rest have no reason to send us
@@ -53,13 +67,13 @@ impl TorrentSwarm {
             _ if !self.torrent.v2_consistent() => BtMessage::HashReject(req),
             Some(pieces) => {
                 let had = pieces.clone().all(|p| self.stat.verified[p as usize]);
-                if had && self.hash_reads < MAX_HASH_READS {
+                if had && self.uploads.hash_reads < MAX_HASH_READS {
                     self.answer_from_data(self.peers[idx].remote_addr, req, pieces);
                     return;
                 }
                 BtMessage::HashReject(req)
             }
-            None => match layers::answer(&self.torrent, &mut self.hash_trees, &req) {
+            None => match layers::answer(&self.torrent, &mut self.uploads.hash_trees, &req) {
                 Some(hashes) => BtMessage::Hashes(hashes),
                 None => BtMessage::HashReject(req),
             },
@@ -72,12 +86,12 @@ impl TorrentSwarm {
     /// Sends blocks the upload limit held back, as far as it allows now. A block for a peer
     /// that has since gone is dropped.
     pub(super) fn send_held_uploads(&mut self) {
-        while let Some((to, block)) = self.held_uploads.pop_front() {
+        while let Some((to, block)) = self.uploads.held.pop_front() {
             let Some(idx) = self.peer_index(to) else {
                 continue;
             };
             if let Some(block) = self.deliver(idx, block) {
-                self.held_uploads.push_front((to, block));
+                self.uploads.held.push_front((to, block));
                 break;
             }
         }
@@ -92,7 +106,7 @@ impl TorrentSwarm {
         if !peer.wants_upload(&request) {
             return None;
         }
-        if !peer.choked_them && !self.limiter.take_upload(block.len() as usize) {
+        if !peer.choked_them && !self.shared.limiter.take_upload(block.len() as usize) {
             return Some(block);
         }
         peer.take_upload(&request);
@@ -170,7 +184,7 @@ impl TorrentSwarm {
     /// blocking pool; the answer (or a reject, if the data didn't hash right) comes back as
     /// `HashesRead`.
     pub(super) fn answer_from_data(&mut self, to: SocketAddr, req: HashRequest, pieces: std::ops::Range<u32>) {
-        self.hash_reads += 1;
+        self.uploads.hash_reads += 1;
         let (torrent, storage, events) = (self.torrent.clone(), self.storage.clone(), self.events_tx.clone());
         tokio::task::spawn_blocking(move || {
             let answer = layers::answer_from_data(&torrent, &req, |piece| {
@@ -191,7 +205,7 @@ impl TorrentSwarm {
     }
 
     pub(super) fn hashes_read(&mut self, to: SocketAddr, reply: BtMessage) {
-        self.hash_reads -= 1;
+        self.uploads.hash_reads -= 1;
         if let Some(idx) = self.peer_index(to)
             && self.peers[idx].send(reply).is_err()
         {
@@ -208,7 +222,7 @@ impl TorrentSwarm {
         match block {
             Ok(block) => {
                 if let Some(block) = self.deliver(idx, block) {
-                    self.held_uploads.push_back((to, block));
+                    self.uploads.held.push_back((to, block));
                 }
             }
             Err(request) => {
@@ -229,7 +243,7 @@ impl TorrentSwarm {
         if !peer.choked_them || unchoked >= upload_slots(interested) {
             return;
         }
-        self.bus.emit(Event::ChokeChanged {
+        self.shared.events.emit(Event::ChokeChanged {
             info_hash: self.torrent.info_hash,
             addr: peer.remote_addr,
             choked: false,
@@ -267,7 +281,7 @@ impl TorrentSwarm {
         for peer in &self.peers {
             let should_unchoke = to_unchoke.contains(&peer.remote_addr);
             if should_unchoke == peer.choked_them {
-                self.bus.emit(Event::ChokeChanged {
+                self.shared.events.emit(Event::ChokeChanged {
                     info_hash: self.torrent.info_hash,
                     addr: peer.remote_addr,
                     choked: !should_unchoke,

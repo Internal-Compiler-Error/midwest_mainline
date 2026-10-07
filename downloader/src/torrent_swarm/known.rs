@@ -4,6 +4,7 @@
 use crate::peer::PeerStatistics;
 use crate::settings::{BAD_PEER_BAN, DIAL_BACKOFF, DIAL_BACKOFF_MAX, FRUITLESS_PEER_COOLDOWN};
 use crate::stream::DialHints;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -71,6 +72,27 @@ impl KnownPeer {
     }
 }
 
+/// The addresses the swarm knows besides its connected peers.
+#[derive(Default)]
+pub(super) struct Directory {
+    /// addresses with a dial in progress, so the same peer isn't dialed twice
+    pub(super) dialing: BTreeSet<SocketAddr>,
+    /// every address that connected, disconnected, or failed to dial; pruned once it's large
+    /// (see `prune_known`)
+    pub(super) known: BTreeMap<SocketAddr, KnownPeer>,
+}
+
+impl Directory {
+    /// What's remembered about `addr`, starting from nothing.
+    pub(super) fn entry(&mut self, addr: SocketAddr) -> &mut KnownPeer {
+        self.known.entry(addr).or_default()
+    }
+
+    pub(super) fn banned(&self, addr: SocketAddr, now: Instant) -> bool {
+        self.known.get(&addr).is_some_and(|k| k.banned(now))
+    }
+}
+
 /// See `prune_known`. A few thousand is a busy swarm's worth over days.
 pub(super) const KNOWN_PEERS_MAX: usize = 20_000;
 
@@ -79,13 +101,13 @@ impl TorrentSwarm {
     /// entries that remember nothing worth keeping go (never delivered, not banned, not
     /// connected or being dialled, not waiting out a dial backoff).
     pub(super) fn prune_known(&mut self) {
-        if self.known.len() <= KNOWN_PEERS_MAX {
+        if self.directory.known.len() <= KNOWN_PEERS_MAX {
             return;
         }
         let now = Instant::now();
         let peers = &self.peers;
-        let dialing = &self.dialing;
-        self.known.retain(|addr, k| {
+        let dialing = &self.directory.dialing;
+        self.directory.known.retain(|addr, k| {
             k.stats.received > 0
                 || k.banned(now)
                 || k.dial_after.is_some_and(|after| after > now)

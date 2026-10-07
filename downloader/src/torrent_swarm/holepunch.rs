@@ -11,7 +11,7 @@ impl TorrentSwarm {
     /// what it sent out to first. The peer that told us about it is connected to it, so it can
     /// tell both of us to connect at once (over uTP), which opens both NATs. Once per address.
     pub(super) fn try_holepunch(&mut self, addr: SocketAddr) {
-        let Some(known) = self.known.get_mut(&addr) else {
+        let Some(known) = self.directory.known.get_mut(&addr) else {
             return;
         };
         let Some(relay) = known.via.filter(|_| !known.holepunched) else {
@@ -23,10 +23,10 @@ impl TorrentSwarm {
         else {
             return;
         };
-        if self.utp.borrow().is_none() {
+        if self.shared.utp.borrow().is_none() {
             return;
         }
-        if let Some(known) = self.known.get_mut(&addr) {
+        if let Some(known) = self.directory.known.get_mut(&addr) {
             known.holepunched = true;
         }
         tracing::debug!("asking {relay} to introduce us to {addr} (holepunch)");
@@ -73,20 +73,25 @@ impl TorrentSwarm {
             // a relay introduced us: dial now, over uTP, while the other side dials us
             Holepunch::Connect(addr) => {
                 let addr = canonical(addr);
-                let cap = self.settings.borrow().peer_cap();
+                let cap = self.shared.settings.borrow().peer_cap();
                 // a dial backoff doesn't count: a peer we failed to dial is who we asked for
-                let banned = self.known.get(&addr).is_some_and(|k| k.banned(Instant::now()));
-                if self.utp.borrow().is_none()
+                let banned = self.directory.banned(addr, Instant::now());
+                if self.shared.utp.borrow().is_none()
                     || !self.room_to_dial(cap)
                     || banned
                     || addr.port() == 0
                     || self.peer_index(addr).is_some()
-                    || self.dialing.contains(&addr)
+                    || self.directory.dialing.contains(&addr)
                 {
                     return;
                 }
-                self.dialing.insert(addr);
-                let mut hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
+                self.directory.dialing.insert(addr);
+                let mut hints = self
+                    .directory
+                    .known
+                    .get(&addr)
+                    .map(KnownPeer::dial_hints)
+                    .unwrap_or_default();
                 hints.utp_only = true;
                 tracing::debug!("{from} introduced us to {addr}, dialing (holepunch)");
                 self.spawn_dial(addr, hints);
@@ -164,14 +169,17 @@ mod test {
         let (mut swarm, _handle, path) = swarm_with("holepunch-flood", true);
         let mut utp = crate::utp::start(0, tokio_util::sync::CancellationToken::new());
         utp.wait_for(Option::is_some).await.unwrap();
-        swarm.utp = utp;
+        swarm.shared.utp = utp;
         let (relay, _theirs) = fake_connection("10.0.0.1:6881", false).await;
         swarm.add_peer(relay);
 
         let banned: SocketAddr = "127.0.0.1:9".parse().unwrap();
         swarm.ban(banned);
         swarm.on_holepunch(0, Holepunch::Connect(banned));
-        assert!(swarm.dialing.is_empty(), "a banned peer was dialled on an introduction");
+        assert!(
+            swarm.directory.dialing.is_empty(),
+            "a banned peer was dialled on an introduction"
+        );
 
         let local = |n: usize| SocketAddr::from((Ipv4Addr::LOCALHOST, 10_000 + n as u16));
         for n in 0..MAX_PENDING_DIALS {
@@ -181,7 +189,7 @@ mod test {
             .map(|n| (local(n), false))
             .collect();
         swarm.connect_to_peers(gossip, None);
-        assert_eq!(swarm.dialing.len(), MAX_PENDING_DIALS);
+        assert_eq!(swarm.directory.dialing.len(), MAX_PENDING_DIALS);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

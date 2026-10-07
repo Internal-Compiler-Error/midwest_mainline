@@ -23,8 +23,8 @@ pub(super) const MAX_PENDING_DIALS: usize = 1024;
 impl TorrentSwarm {
     /// Our address as peers see it, for BEP 40: the agreed public IP and our listening port.
     pub(super) fn our_address(&self) -> Option<SocketAddr> {
-        let ip = self.external.best()?;
-        Some(SocketAddr::new(ip, self.id.serving.port()))
+        let ip = self.shared.external.best()?;
+        Some(SocketAddr::new(ip, self.shared.id.serving.port()))
     }
 
     /// At the cap, the connection `newcomer` may replace (BEP 40): the lowest ranked of those
@@ -49,29 +49,29 @@ impl TorrentSwarm {
     /// joins `peers`, so nothing else can be written to it first.
     pub(super) fn add_peer(&mut self, connected: ConnectedPeer) {
         let remote_addr = canonical(connected.remote_addr);
-        self.dialing.remove(&remote_addr);
+        self.directory.dialing.remove(&remote_addr);
         if self.peer_index(remote_addr).is_some() {
             info!("{remote_addr} is already connected, dropping the duplicate");
             return;
         }
-        if self.known.get(&remote_addr).is_some_and(|k| k.banned(Instant::now())) {
+        if self.directory.banned(remote_addr, Instant::now()) {
             info!("{remote_addr} is banned, refusing it");
             return;
         }
-        if self.peers.len() >= self.settings.borrow().peer_cap() {
+        if self.peers.len() >= self.shared.settings.borrow().peer_cap() {
             match self.make_room_for(remote_addr) {
                 Some(idx) => self.drop_peer(idx, "replaced by a peer of higher BEP 40 priority"),
                 None => {
                     tracing::debug!("{remote_addr} refused, at the connection cap");
-                    self.known.entry(remote_addr).or_default().connected();
+                    self.directory.entry(remote_addr).connected();
                     return;
                 }
             }
         }
-        let known = self.known.entry(remote_addr).or_default();
+        let known = self.directory.entry(remote_addr);
         known.connected();
         // a dialled peer that came up plaintext under `Prefer` refused the encrypted opening
-        if connected.dialed && self.id.encryption == crate::config::Encryption::Prefer {
+        if connected.dialed && self.shared.id.encryption == crate::config::Encryption::Prefer {
             known.plaintext_only = !connected.stream.is_encrypted();
         }
 
@@ -86,9 +86,8 @@ impl TorrentSwarm {
         let opened = self.open(&mut peer, extensions, dht);
         if let Err(e) = opened {
             info!("{remote_addr} went away during the opening exchange ({e})");
-            self.known
+            self.directory
                 .entry(remote_addr)
-                .or_default()
                 .disconnected(&peer.stats, Instant::now());
             return;
         }
@@ -106,7 +105,7 @@ impl TorrentSwarm {
             uploaded = tracing::field::Empty,
             reason = tracing::field::Empty,
         );
-        self.bus.emit(Event::PeerConnected {
+        self.shared.events.emit(Event::PeerConnected {
             info_hash: self.torrent.info_hash,
             addr: remote_addr,
             client: crate::peer::client_name(&peer.peer_id),
@@ -126,7 +125,7 @@ impl TorrentSwarm {
                 self.torrent.metadata_size(),
                 self.torrent.private,
                 self.partial_seed(),
-                self.id.serving.port(),
+                self.shared.id.serving.port(),
             )?;
         }
         // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
@@ -148,7 +147,12 @@ impl TorrentSwarm {
             peer.send_bitfield(BitField { has })?;
         }
         // BEP 5: a peer that has a DHT node too gets told where ours listens
-        let dht_port = self.dht.borrow().as_ref().map(|d| d.udp_port_for(&peer.remote_addr));
+        let dht_port = self
+            .shared
+            .dht
+            .borrow()
+            .as_ref()
+            .map(|d| d.udp_port_for(&peer.remote_addr));
         if dht && let Some(port) = dht_port {
             peer.send_port(port)?;
         }
@@ -159,7 +163,7 @@ impl TorrentSwarm {
 
     /// Addresses from a tracker, the DHT, LSD or the metadata fetch.
     pub(super) fn peers_discovered(&mut self, peers: Vec<SocketAddr>, source: PeerSource) {
-        self.bus.emit(Event::PeersDiscovered {
+        self.shared.events.emit(Event::PeersDiscovered {
             info_hash: self.torrent.info_hash,
             source,
             count: peers.len(),
@@ -170,13 +174,13 @@ impl TorrentSwarm {
     /// A dial has failed: the address waits out a backoff, and one PEX told us about may be
     /// reachable through a holepunch.
     pub(super) fn dial_failed(&mut self, addr: SocketAddr) {
-        self.bus.emit(Event::DialFailed {
+        self.shared.events.emit(Event::DialFailed {
             info_hash: self.torrent.info_hash,
             addr,
         });
-        self.dialing.remove(&addr);
+        self.directory.dialing.remove(&addr);
         let addr = canonical(addr);
-        self.known.entry(addr).or_default().dial_failed(Instant::now());
+        self.directory.entry(addr).dial_failed(Instant::now());
         self.try_holepunch(addr);
     }
 
@@ -185,7 +189,7 @@ impl TorrentSwarm {
     /// that get dialled, so gossip about peers we never call doesn't pile up in `known`.
     pub(super) fn connect_to_peers(&mut self, mut peers: Vec<(SocketAddr, bool)>, via: Option<SocketAddr>) {
         let now = Instant::now();
-        let cap = self.settings.borrow().peer_cap();
+        let cap = self.shared.settings.borrow().peer_cap();
         // best BEP 40 rank first: what the cap cuts off, and what waits longest for a
         // half-open slot, is the end of the list
         if let Some(us) = self.our_address() {
@@ -199,8 +203,8 @@ impl TorrentSwarm {
             if !self.worth_dialing(addr, now) {
                 continue;
             }
-            self.dialing.insert(addr);
-            let known = self.known.entry(addr).or_default();
+            self.directory.dialing.insert(addr);
+            let known = self.directory.entry(addr);
             if utp_capable {
                 known.prefers_utp = true;
             }
@@ -214,16 +218,16 @@ impl TorrentSwarm {
 
     /// Whether another dial fits under the connection cap and `MAX_PENDING_DIALS`.
     pub(super) fn room_to_dial(&self, cap: usize) -> bool {
-        self.peers.len() + self.dialing.len() < cap && self.dialing.len() < MAX_PENDING_DIALS
+        self.peers.len() + self.directory.dialing.len() < cap && self.directory.dialing.len() < MAX_PENDING_DIALS
     }
 
     /// Not connected or being dialled, not banned or backing off, and with a port: trackers
     /// and PEX both hand out port 0 for peers whose port they don't know.
     pub(super) fn worth_dialing(&self, addr: SocketAddr, now: Instant) -> bool {
         addr.port() != 0
-            && self.known.get(&addr).is_none_or(|k| k.may_dial(now))
+            && self.directory.known.get(&addr).is_none_or(|k| k.may_dial(now))
             && self.peer_index(addr).is_none()
-            && !self.dialing.contains(&addr)
+            && !self.directory.dialing.contains(&addr)
     }
 
     /// Dials `addr` in the background (one of the `MAX_HALF_OPEN` at a time); the outcome comes
@@ -231,8 +235,8 @@ impl TorrentSwarm {
     pub(super) fn spawn_dial(&self, addr: SocketAddr, hints: DialHints) {
         let events = self.events_tx.clone();
         let torrent = self.torrent.clone();
-        let our_id = self.id.clone();
-        let utp = self.utp.borrow().clone();
+        let our_id = self.shared.id.clone();
+        let utp = self.shared.utp.borrow().clone();
         tokio::spawn(async move {
             let Ok(_permit) = HALF_OPEN.acquire().await else {
                 return;
@@ -289,8 +293,8 @@ mod test {
         };
         let (swarm, handle, path) = swarm_with_settings("bep40", true, settings);
         let ours: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        swarm.external.vote(ours, "a");
-        swarm.external.vote(ours, "b");
+        swarm.shared.external.vote(ours, "a");
+        swarm.shared.external.vote(ours, "b");
         let us = SocketAddr::new(ours, 0);
         tokio::spawn(swarm.work_loop());
         let mut candidates: Vec<SocketAddr> = (1..=3)

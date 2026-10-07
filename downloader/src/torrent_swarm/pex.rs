@@ -50,7 +50,7 @@ impl TorrentSwarm {
             .map(|(addr, flags)| (addr, flags & PEX_UTP != 0))
             .collect();
         let from = self.peers[idx].remote_addr;
-        self.bus.emit(Event::PeersDiscovered {
+        self.shared.events.emit(Event::PeersDiscovered {
             info_hash: self.torrent.info_hash,
             source: PeerSource::Pex { from },
             count: gossiped.len(),

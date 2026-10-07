@@ -16,7 +16,7 @@ pub(super) use bitvec::prelude::*;
 pub(super) use futures::SinkExt;
 pub(super) use futures::StreamExt;
 pub(super) use sha1::{Digest, Sha1};
-pub(super) use std::collections::{BTreeMap, BTreeSet};
+pub(super) use std::collections::BTreeMap;
 pub(super) use std::net::{Ipv4Addr, SocketAddrV4};
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;

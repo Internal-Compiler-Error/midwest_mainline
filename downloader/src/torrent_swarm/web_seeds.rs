@@ -45,15 +45,15 @@ impl TorrentSwarm {
     /// lowest so consecutive jobs read the files front to back; the lowest when sequential.
     pub(super) fn pick_piece_for_web(&self) -> Option<usize> {
         let rank = |piece: u32| {
-            if self.sequential {
+            if self.picker.sequential {
                 (0, piece)
             } else {
-                (self.availability[piece as usize], piece)
+                (self.picker.availability[piece as usize], piece)
             }
         };
-        (0..self.missing.len())
-            .filter(|&pos| self.verifiable(self.missing[pos]))
-            .min_by_key(|&pos| rank(self.missing[pos]))
+        (0..self.picker.missing.len())
+            .filter(|&pos| self.verifiable(self.picker.missing[pos]))
+            .min_by_key(|&pos| rank(self.picker.missing[pos]))
     }
 
     /// Gives web seed `seed` a run of consecutive missing pieces, as long as its rate earns
@@ -64,17 +64,17 @@ impl TorrentSwarm {
             return None;
         }
         let first_pos = self.pick_piece_for_web()?;
-        let first = self.missing[first_pos];
+        let first = self.picker.missing[first_pos];
         let piece_size = self.torrent.piece_size as usize;
         let max_pieces = (self.web_seeds[seed].run_bytes().min(budget) / piece_size).max(1);
         // where each of the next pieces sits in `missing`, if it's there
         let mut next = vec![None; max_pieces - 1];
-        for (pos, &piece) in self.missing.iter().enumerate() {
+        for (pos, &piece) in self.picker.missing.iter().enumerate() {
             if piece > first && ((piece - first) as usize) < max_pieces && self.verifiable(piece) {
                 next[(piece - first - 1) as usize] = Some(pos);
             }
         }
-        let limit = match self.settings.borrow().download_limit {
+        let limit = match self.shared.settings.borrow().download_limit {
             0 => usize::MAX,
             limit => limit as usize,
         };
@@ -88,7 +88,7 @@ impl TorrentSwarm {
                 .torrent
                 .nth_piece_size(first + i as u32)
                 .expect("piece index in range");
-            if !self.limiter.take_download(size.min(limit)) {
+            if !self.shared.limiter.take_download(size.min(limit)) {
                 break;
             }
             positions.push(pos);
@@ -101,7 +101,7 @@ impl TorrentSwarm {
         // highest first, so each swap_remove moves in an element that isn't one of ours
         positions.sort_unstable_by(|a, b| b.cmp(a));
         for pos in positions {
-            self.missing.swap_remove(pos);
+            self.picker.missing.swap_remove(pos);
         }
 
         let addr = self.web_seeds[seed].addr;
@@ -129,7 +129,7 @@ impl TorrentSwarm {
             .web_seeds
             .iter()
             .enumerate()
-            .map(|(i, w)| (i, w.stats.score(self.total_picks, rate_scale)))
+            .map(|(i, w)| (i, w.stats.score(self.picker.total_picks, rate_scale)))
             .collect();
         seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
         for (seed, _) in seeds {
@@ -166,7 +166,7 @@ impl TorrentSwarm {
         let piece_size = self.torrent.piece_size as u64;
         let pieces = (start / piece_size) as u32..=((end - 1) / piece_size) as u32;
         let blocks = (end - start).div_ceil(BLOCK_SIZE as u64) as usize;
-        self.total_picks += blocks;
+        self.picker.total_picks += blocks;
         let id = self.next_web_job;
         self.next_web_job += 1;
         let w = &mut self.web_seeds[seed];

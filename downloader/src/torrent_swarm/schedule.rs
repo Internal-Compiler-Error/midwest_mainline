@@ -6,10 +6,48 @@ use crate::peer::Peer;
 use crate::settings::{BLOCK_SIZE, ENDGAME_LAST_PIECES, ENDGAME_LAST_RACERS, ENDGAME_RACERS, MAX_INFLIGHT_BYTES};
 use rand::RngExt;
 use rand::seq::IndexedRandom;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use super::{TorrentSwarm, in_flight::InFlight};
+
+/// What picking pieces and peers goes by.
+pub(super) struct Picker {
+    /// pieces neither verified nor in flight
+    pub(super) missing: Vec<u32>,
+    /// per piece, how many connected peers have it; rarest-first reads this instead of
+    /// scanning every peer's bitfield for every pick
+    pub(super) availability: Vec<u32>,
+    /// pick the lowest missing piece instead of the rarest
+    pub(super) sequential: bool,
+    /// Peers that haven't sent us anything yet and are being given pieces to find out how
+    /// they do. Bayati et al., "The Unreasonable Effectiveness of Greedy Algorithms in
+    /// Multi-Armed Bandit with Many Arms": with more arms than about sqrt(horizon), trying
+    /// each one already costs order-k regret, and sampling sqrt(horizon) of them is
+    /// rate-optimal. Unlike the bandit, a swarm can play every good arm at once, so the bound
+    /// applies to exploration only: a peer that has delivered is always eligible, and at most
+    /// `explore_slots` unproven ones are on trial at a time. A trial ends when the peer
+    /// delivers (it graduates), chokes us, or goes away.
+    pub(super) exploring: BTreeSet<SocketAddr>,
+    pub(super) explore_slots: usize,
+    /// block requests sent to any peer this session, UCB's `t`
+    pub(super) total_picks: usize,
+}
+
+impl Picker {
+    /// With `missing` of a torrent's `pieces` still to get.
+    pub(super) fn new(missing: Vec<u32>, pieces: usize) -> Self {
+        Picker {
+            explore_slots: ((missing.len() as f64).sqrt().ceil() as usize).max(1),
+            missing,
+            availability: vec![0; pieces],
+            sequential: false,
+            exploring: BTreeSet::new(),
+            total_picks: 0,
+        }
+    }
+}
 
 /// Who a piece can be handed to.
 #[derive(Clone, Copy)]
@@ -33,7 +71,7 @@ impl TorrentSwarm {
         }
         self.admit_to_exploring();
         self.assign_pieces(None);
-        if self.missing.is_empty() {
+        if self.picker.missing.is_empty() {
             self.race_the_last_pieces();
             self.race_web_seeds();
         }
@@ -56,7 +94,7 @@ impl TorrentSwarm {
         };
         let peer = &self.peers[idx];
         if peer.requested.len() < peer.request_window() {
-            if self.missing.is_empty() {
+            if self.picker.missing.is_empty() {
                 self.race_for_peer(idx);
             } else {
                 self.assign_pieces(Some(idx));
@@ -66,7 +104,7 @@ impl TorrentSwarm {
     }
 
     fn eligible(&self, peer: &Peer) -> bool {
-        peer.ready() && (peer.proven() || self.exploring.contains(&peer.remote_addr))
+        peer.ready() && (peer.proven() || self.picker.exploring.contains(&peer.remote_addr))
     }
 
     /// Whether the peer's window has room past what it's asked for and what its pieces still
@@ -87,7 +125,7 @@ impl TorrentSwarm {
             .iter()
             .enumerate()
             .filter(|&(idx, p)| only.is_none_or(|o| o == idx) && self.eligible(p) && self.has_room(p))
-            .map(|(idx, p)| (Source::Peer(idx), p.stats.score(self.total_picks, rate_scale)))
+            .map(|(idx, p)| (Source::Peer(idx), p.stats.score(self.picker.total_picks, rate_scale)))
             .collect();
         if only.is_none() {
             let now = Instant::now();
@@ -96,7 +134,7 @@ impl TorrentSwarm {
                     .iter()
                     .enumerate()
                     .filter(|(_, w)| w.has_room(now))
-                    .map(|(i, w)| (Source::Web(i), w.stats.score(self.total_picks, rate_scale))),
+                    .map(|(i, w)| (Source::Web(i), w.stats.score(self.picker.total_picks, rate_scale))),
             );
         }
         order.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -123,7 +161,7 @@ impl TorrentSwarm {
                 let Some(pos) = self.pick_piece_for(idx) else {
                     continue;
                 };
-                let piece = self.missing.swap_remove(pos);
+                let piece = self.picker.missing.swap_remove(pos);
                 let addr = self.peers[idx].remote_addr;
                 self.emit_pick(idx, piece, rate_scale);
                 let in_flight = InFlight::new(&self.torrent, piece, addr, addr);
@@ -145,7 +183,7 @@ impl TorrentSwarm {
     /// random so peers starting together spread out; the lowest one when sequential.
     pub(super) fn pick_piece_for(&self, idx: usize) -> Option<usize> {
         let peer = &self.peers[idx];
-        let n = self.missing.len();
+        let n = self.picker.missing.len();
         if n == 0 {
             return None;
         }
@@ -155,14 +193,14 @@ impl TorrentSwarm {
         let offset = rand::rng().random_range(0..n);
         let mut best: Option<(usize, u32)> = None;
         for pos in (offset..n).chain(0..offset) {
-            let piece = self.missing[pos];
+            let piece = self.picker.missing[pos];
             if !peer.they_have(piece) || !self.verifiable(piece) {
                 continue;
             }
-            let rank = if self.sequential {
+            let rank = if self.picker.sequential {
                 piece
             } else {
-                self.availability[piece as usize]
+                self.picker.availability[piece as usize]
             };
             if best.is_none_or(|(_, best_rank)| rank < best_rank) {
                 best = Some((pos, rank));
@@ -255,13 +293,13 @@ impl TorrentSwarm {
         let room = peer.request_window().saturating_sub(peer.requested.len());
         for _ in 0..room.min(self.in_flight.backlog(peer.remote_addr)) {
             // over the download limit for now; housekeeping's schedule() retries
-            if !self.limiter.take_download(BLOCK_SIZE) {
+            if !self.shared.limiter.take_download(BLOCK_SIZE) {
                 return;
             }
             let Some(req) = self.in_flight.next_request(peer.remote_addr) else {
                 return;
             };
-            self.total_picks += 1;
+            self.picker.total_picks += 1;
             if peer.request_block(req).is_err() {
                 self.drop_peer(idx, "send failed");
                 return;
@@ -273,43 +311,43 @@ impl TorrentSwarm {
     /// ones in the free slots, picking at random among the unproven peers that are ready.
     pub(super) fn admit_to_exploring(&mut self) {
         let peers = &self.peers;
-        self.exploring.retain(|addr| {
+        self.picker.exploring.retain(|addr| {
             peers
                 .binary_search_by_key(addr, |p| p.remote_addr)
                 .is_ok_and(|idx| peers[idx].ready() && !peers[idx].proven())
         });
-        let free = self.explore_slots.saturating_sub(self.exploring.len());
+        let free = self.picker.explore_slots.saturating_sub(self.picker.exploring.len());
         if free == 0 {
             return;
         }
         let candidates: Vec<SocketAddr> = self
             .peers
             .iter()
-            .filter(|p| p.ready() && !p.proven() && !self.exploring.contains(&p.remote_addr))
+            .filter(|p| p.ready() && !p.proven() && !self.picker.exploring.contains(&p.remote_addr))
             .map(|p| p.remote_addr)
             .collect();
         for addr in candidates.sample(&mut rand::rng(), free) {
-            self.exploring.insert(*addr);
+            self.picker.exploring.insert(*addr);
         }
     }
 
     /// The pick just made, with the two halves of the score that decided it.
     pub(super) fn emit_pick(&self, idx: usize, piece: u32, rate_scale: f64) {
         let peer = &self.peers[idx];
-        let (exploit, explore) = if self.total_picks == 0 || peer.stats.picked_count == 0 {
+        let (exploit, explore) = if self.picker.total_picks == 0 || peer.stats.picked_count == 0 {
             (0.0, None)
         } else {
-            let (exploit, explore) = peer.stats.ucb_terms(self.total_picks, rate_scale);
+            let (exploit, explore) = peer.stats.ucb_terms(self.picker.total_picks, rate_scale);
             (exploit, Some(explore))
         };
-        self.bus.emit(Event::PeerPicked {
+        self.shared.events.emit(Event::PeerPicked {
             info_hash: self.torrent.info_hash,
             addr: peer.remote_addr,
             piece,
             exploit,
             explore,
             picked_count: peer.stats.picked_count,
-            total_picks: self.total_picks,
+            total_picks: self.picker.total_picks,
         });
     }
 
@@ -322,7 +360,7 @@ impl TorrentSwarm {
             .iter()
             .enumerate()
             .filter(|(_, p)| self.eligible(p) && p.they_have(piece) && self.has_room(p) && !already_on_it(p))
-            .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
+            .map(|(idx, p)| (idx, p.stats.score(self.picker.total_picks, rate_scale)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
     }
@@ -426,7 +464,7 @@ mod test {
     #[tokio::test]
     async fn only_the_subsample_is_asked_for_pieces() {
         let (swarm, handle, path) = swarm("subsample");
-        assert_eq!(swarm.explore_slots, 2);
+        assert_eq!(swarm.picker.explore_slots, 2);
         tokio::spawn(swarm.work_loop());
 
         let mut a = fake_peer(&handle, "10.0.0.1:6881").await;

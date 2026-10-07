@@ -6,7 +6,6 @@ use crate::events::{Event, EventBus, PeerSource};
 use crate::external::ExternalAddress;
 use crate::layers::LayerFetch;
 use crate::limiter::RateLimiter;
-use crate::merkle::Hash;
 pub(crate) use crate::peer::ConnectedPeer;
 use crate::peer::{Inbox, Incoming, Peer, PeerSnapshot};
 use crate::settings::{
@@ -18,7 +17,7 @@ use crate::utp::UtpWatch;
 use crate::webseed::{Failure, WebSeed};
 use crate::wire::{BlockRef, BtMessage, Piece, V2Support};
 use bitvec::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,7 +42,10 @@ mod upload;
 mod web_seeds;
 
 use in_flight::InFlightPieces;
-use known::KnownPeer;
+use known::Directory;
+use schedule::Picker;
+use super_seed::SuperSeed;
+use upload::Uploads;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TorrentSwarmStats {
@@ -258,11 +260,8 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
 pub struct TorrentSwarm {
     /// sorted by `remote_addr`; there's only ever one connection per address
     peers: Vec<Peer>,
-    /// addresses with a dial in progress, so the same peer isn't dialed twice
-    dialing: BTreeSet<SocketAddr>,
-    /// every address that connected, disconnected, or failed to dial; pruned once it's large
-    /// (see `prune_known`)
-    known: BTreeMap<SocketAddr, KnownPeer>,
+    /// addresses beyond `peers`: being dialled, and remembered from earlier connections
+    directory: Directory,
     /// every peer's reader delivers here (see `Peer`)
     inbox: Inbox,
     incoming: mpsc::Receiver<Incoming>,
@@ -271,63 +270,26 @@ pub struct TorrentSwarm {
 
     torrent: Arc<Torrent>,
     storage: Arc<TorrentStorage>,
-
-    id: Arc<Identity>,
-    /// the client's DHT node, if it has one, for pinging the nodes peers tell us about
-    dht: DhtWatch,
-    utp: UtpWatch,
-    /// live user settings: the connection cap
-    settings: SettingsWatch,
-    /// the client-wide download and upload limits
-    limiter: Arc<RateLimiter>,
-    bus: EventBus,
-    /// blocks read off disk that the upload limit didn't allow out yet, oldest first;
-    /// housekeeping sends what the limit allows
-    held_uploads: VecDeque<(SocketAddr, Piece)>,
+    shared: Shared,
 
     events_rx: mpsc::Receiver<SwarmEvent>,
     /// for the tasks the swarm spawns for itself (announcers, dials, block reads) to report
     /// back on; weak so they can't keep the swarm alive, only a `TorrentSwarmHandle` can
     events_tx: mpsc::WeakSender<SwarmEvent>,
 
-    /// Peers that haven't sent us anything yet and are being given pieces to find out how
-    /// they do. Bayati et al., "The Unreasonable Effectiveness of Greedy Algorithms in
-    /// Multi-Armed Bandit with Many Arms": with more arms than about sqrt(horizon), trying
-    /// each one already costs order-k regret, and sampling sqrt(horizon) of them is
-    /// rate-optimal. Unlike the bandit, a swarm can play every good arm at once, so the bound
-    /// applies to exploration only: a peer that has delivered is always eligible, and at most
-    /// `explore_slots` unproven ones are on trial at a time. A trial ends when the peer
-    /// delivers (it graduates), chokes us, or goes away.
-    exploring: BTreeSet<SocketAddr>,
-    explore_slots: usize,
-    /// per piece, how many connected peers have it; rarest-first reads this instead of
-    /// scanning every peer's bitfield for every pick
-    availability: Vec<u32>,
-
-    /// pieces neither verified nor in flight
-    missing: Vec<u32>,
-    /// pick the lowest missing piece instead of the rarest
-    sequential: bool,
-    super_seed: bool,
-    /// BEP 16: how many peers each piece has been revealed to
-    super_seed_offers: Vec<u32>,
+    /// which pieces are still to be assigned, and to whom
+    picker: Picker,
     in_flight: InFlightPieces,
-    /// our public address by the votes of peers (`yourip`) and trackers
-    external: ExternalAddress,
     /// complete pieces off being hashed and written (see `piece_assembled`)
     hashing: BTreeSet<u32>,
-    /// block requests sent to any peer this session, UCB's `t`
-    total_picks: usize,
     /// BEP 52: the piece layers a v2 torrent from a magnet still needs from peers; its pieces
     /// can't be checked (so aren't picked) until their file's layer is in
     layers: LayerFetch,
-    /// per file, the Merkle tree above its piece layer, built for the first hash request
-    hash_trees: BTreeMap<usize, Vec<Vec<Hash>>>,
-    /// hash requests being answered from data on disk, at most `MAX_HASH_READS`
-    hash_reads: usize,
     /// BEP 19, in `torrent.web_seeds` order; the index is how their jobs report back
     web_seeds: Vec<WebSeed>,
     next_web_job: u64,
+    uploads: Uploads,
+    super_seed: SuperSeed,
 
     stat: TorrentSwarmStats,
     stat_snapshot_tx: watch::Sender<TorrentSwarmStats>,
@@ -358,24 +320,13 @@ impl TorrentSwarm {
         verified: BitBox<u8, Msb0>,
         shared: Shared,
     ) -> (TorrentSwarm, TorrentSwarmHandle) {
-        let Shared {
-            events: bus,
-            id,
-            dht,
-            utp,
-            settings,
-            limiter,
-            external,
-            shutdown,
-        } = shared;
         assert_eq!(
             verified.len(),
             torrent.num_pieces(),
             "verified bitfield must have one bit per piece"
         );
         let pieces = torrent.num_pieces();
-        let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
-        let explore_slots = ((missing.len() as f64).sqrt().ceil() as usize).max(1);
+        let picker = Picker::new(verified.iter_zeros().map(|p| p as u32).collect(), pieces);
         let wanted = bitvec![u8, Msb0; 1; torrent.num_pieces()].into_boxed_bitslice();
         let stat = TorrentSwarmStats::for_verified(&torrent, verified, wanted);
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
@@ -384,21 +335,21 @@ impl TorrentSwarm {
         let (inbox, incoming) = mpsc::channel(SWARM_INBOX);
         let (peers_tx, peers_rx) = watch::channel(vec![]);
         let events_tx_weak = events_tx.downgrade();
-        let announcers = shutdown.child_token();
+        let announcers = shared.shutdown.child_token();
         let trackers = spawn_announcers(Announcing {
             trackers: torrent.all_trackers(),
             private: torrent.private,
             info_hash: torrent.info_hash,
-            identity: id.clone(),
+            identity: shared.id.clone(),
             stats: stat_rx.clone(),
             events: events_tx_weak.clone(),
             shutdown: announcers.clone(),
-            dht: dht.clone(),
-            bus: bus.clone(),
-            external: external.clone(),
+            dht: shared.dht.clone(),
+            bus: shared.events.clone(),
+            external: shared.external.clone(),
             v2: torrent.hybrid_v2_hash(),
         });
-        bus.emit(Event::PiecesKnown {
+        shared.events.emit(Event::PiecesKnown {
             info_hash: torrent.info_hash,
             bitfield: hex::encode(stat.verified.as_raw_slice()),
         });
@@ -420,38 +371,23 @@ impl TorrentSwarm {
             .collect();
         let swarm = TorrentSwarm {
             peers: vec![],
-            dialing: BTreeSet::new(),
-            known: BTreeMap::new(),
-            exploring: BTreeSet::new(),
-            explore_slots,
-            availability: vec![0; pieces],
-            layers: LayerFetch::new(&torrent),
-            hash_trees: BTreeMap::new(),
-            hash_reads: 0,
+            directory: Directory::default(),
             inbox,
             incoming,
             next_conn: 0,
+            layers: LayerFetch::new(&torrent),
             torrent,
             storage,
-            id,
-            dht,
-            utp,
-            settings,
-            limiter,
-            bus,
-            held_uploads: VecDeque::new(),
+            shared,
             events_rx,
             events_tx,
-            missing,
-            sequential: false,
-            super_seed: false,
-            super_seed_offers: vec![0; pieces],
+            picker,
             in_flight: InFlightPieces::default(),
-            external,
             hashing: BTreeSet::new(),
-            total_picks: 0,
             web_seeds,
             next_web_job: 0,
+            uploads: Uploads::default(),
+            super_seed: SuperSeed::new(pieces),
             stat,
             stat_snapshot_tx: stat_tx,
             peers_snapshot_tx: peers_tx,
@@ -464,7 +400,7 @@ impl TorrentSwarm {
     fn sample_peers(&self) {
         let info_hash = self.torrent.info_hash;
         for peer in &self.peers {
-            self.bus.emit(Event::PeerSample {
+            self.shared.events.emit(Event::PeerSample {
                 info_hash,
                 addr: peer.remote_addr,
                 rx_bps: peer.stats.rx_rate,
@@ -475,7 +411,7 @@ impl TorrentSwarm {
                 choked_them: peer.choked_them,
             });
         }
-        self.bus.emit(Event::Traffic {
+        self.shared.events.emit(Event::Traffic {
             info_hash,
             downloaded: self.stat.downloaded,
             uploaded: self.stat.uploaded,
@@ -556,7 +492,7 @@ impl TorrentSwarm {
         match event {
             SwarmEvent::PeersDiscovered(peers, source) => self.peers_discovered(peers, source),
             SwarmEvent::FilesSelected(selected) => self.select_files(&selected),
-            SwarmEvent::Sequential(on) => self.sequential = on,
+            SwarmEvent::Sequential(on) => self.picker.sequential = on,
             SwarmEvent::SuperSeed(on) => self.set_super_seed(on),
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected),
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block),
@@ -577,7 +513,7 @@ impl TorrentSwarm {
     /// join the pile. Completion and `left` follow the new selection.
     fn select_files(&mut self, selected: &[bool]) {
         self.stat.wanted = self.torrent.wanted_pieces(selected);
-        self.missing = self
+        self.picker.missing = self
             .stat
             .wanted
             .iter_ones()
@@ -642,7 +578,7 @@ impl TorrentSwarm {
     }
 
     fn ban(&mut self, addr: SocketAddr) {
-        self.known.entry(addr).or_default().ban(Instant::now());
+        self.directory.entry(addr).ban(Instant::now());
     }
 
     fn peer_index(&self, addr: SocketAddr) -> Option<usize> {
@@ -655,20 +591,19 @@ impl TorrentSwarm {
         peer.span.record("downloaded", peer.stats.received as u64);
         peer.span.record("uploaded", peer.stats.sent as u64);
         peer.span.record("reason", reason);
-        self.bus.emit(Event::PeerDisconnected {
+        self.shared.events.emit(Event::PeerDisconnected {
             info_hash: self.torrent.info_hash,
             addr: peer.remote_addr,
             downloaded: peer.stats.received as u64,
             uploaded: peer.stats.sent as u64,
             reason,
         });
-        self.exploring.remove(&peer.remote_addr);
+        self.picker.exploring.remove(&peer.remote_addr);
         for piece in peer.pieces() {
-            self.availability[piece as usize] -= 1;
+            self.picker.availability[piece as usize] -= 1;
         }
-        self.known
+        self.directory
             .entry(peer.remote_addr)
-            .or_default()
             .disconnected(&peer.stats, Instant::now());
         for piece in self.in_flight.held_by(peer.remote_addr) {
             self.release_claim(piece, peer.remote_addr);
@@ -694,7 +629,7 @@ impl TorrentSwarm {
     /// deselected meanwhile; `select_files` brings it back if they're selected again.
     fn put_back(&mut self, piece: u32) {
         if self.stat.wanted[piece as usize] {
-            self.missing.push(piece);
+            self.picker.missing.push(piece);
         }
     }
 
@@ -773,7 +708,7 @@ mod test {
     #[tokio::test]
     async fn the_bus_hears_peers_come_and_go() {
         let (swarm, handle, path) = swarm("bus");
-        let mut events = swarm.bus.subscribe();
+        let mut events = swarm.shared.events.subscribe();
         tokio::spawn(swarm.work_loop());
         let mut seeder = fake_peer(&handle, "10.0.0.1:6881").await;
         open_as_seeder(&mut seeder).await;
@@ -891,9 +826,9 @@ mod test {
         swarm.on_peer_message(0, BtMessage::Choke(crate::wire::Choke));
         assert!(swarm.in_flight.held_by(addr).is_empty(), "a choke releases its pieces");
         assert!(
-            !swarm.missing.contains(&unwanted),
+            !swarm.picker.missing.contains(&unwanted),
             "piece {unwanted} is to be downloaded again: {:?}",
-            swarm.missing
+            swarm.picker.missing
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -44,14 +44,14 @@ impl TorrentSwarm {
             BtMessage::BitField(_) | BtMessage::HaveAll(_) | BtMessage::HaveNone(_)
         );
         if replaces_bitfield {
-            peer.pieces().for_each(|p| self.availability[p as usize] -= 1);
+            peer.pieces().for_each(|p| self.picker.availability[p as usize] -= 1);
         }
         let applied = peer.apply(msg);
         if replaces_bitfield {
-            peer.pieces().for_each(|p| self.availability[p as usize] += 1);
+            peer.pieces().for_each(|p| self.picker.availability[p as usize] += 1);
         }
         if let Some(ip) = peer.yourip.take()
-            && let Some(agreed) = self.external.vote(ip, &peer.remote_addr.to_string())
+            && let Some(agreed) = self.shared.external.vote(ip, &peer.remote_addr.to_string())
         {
             info!("peers agree our public address is {agreed}");
         }
@@ -59,7 +59,7 @@ impl TorrentSwarm {
             let choke_changed = peer.choked_us != choked_us_before;
             if choke_changed {
                 tracing::debug!(parent: &peer.span, choked = peer.choked_us, "choke changed by the peer");
-                self.bus.emit(Event::ChokeChanged {
+                self.shared.events.emit(Event::ChokeChanged {
                     info_hash: self.torrent.info_hash,
                     addr: peer.remote_addr,
                     choked: peer.choked_us,
@@ -67,7 +67,7 @@ impl TorrentSwarm {
                 });
             }
             if let Some(piece) = new_piece {
-                self.availability[piece as usize] += 1;
+                self.picker.availability[piece as usize] += 1;
                 self.schedule_peer(idx);
             } else if choked {
                 // BEP 3: a choke discards our outstanding requests, and nothing more will be
@@ -130,7 +130,7 @@ impl TorrentSwarm {
     /// is how the table fills from a swarm rather than the routers.
     fn ping_dht_node(&self, idx: usize, port: u16) {
         let addr = self.peers[idx].remote_addr;
-        let client = self.dht.borrow().as_ref().and_then(|dht| dht.client_for(&addr));
+        let client = self.shared.dht.borrow().as_ref().and_then(|dht| dht.client_for(&addr));
         if let Some(client) = client {
             let node = SocketAddr::new(addr.ip(), port);
             tokio::spawn(async move {
@@ -173,7 +173,7 @@ impl TorrentSwarm {
         if !peer.drop_have(piece) {
             return;
         }
-        self.availability[piece as usize] -= 1;
+        self.picker.availability[piece as usize] -= 1;
         let addr = peer.remote_addr;
         if self.in_flight.holds(addr, piece) {
             self.release_claim(piece, addr);

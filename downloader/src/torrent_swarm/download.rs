@@ -72,7 +72,7 @@ impl TorrentSwarm {
     /// Bytes that came in for nothing.
     pub(super) fn wasted(&mut self, from: SocketAddr, len: u32, why: &'static str) {
         self.stat.wasted += len as u64;
-        self.bus.emit(Event::BlockWasted {
+        self.shared.events.emit(Event::BlockWasted {
             info_hash: self.torrent.info_hash,
             addr: from,
             len,
@@ -167,7 +167,7 @@ impl TorrentSwarm {
     fn piece_verified(&mut self, piece: u32, senders: BTreeSet<SocketAddr>) {
         let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
         self.stat.verified.set(piece as usize, true);
-        self.bus.emit(Event::PieceVerified {
+        self.shared.events.emit(Event::PieceVerified {
             info_hash: self.torrent.info_hash,
             piece,
             len: size,
@@ -188,7 +188,7 @@ impl TorrentSwarm {
                 let (size, private, port) = (
                     self.torrent.metadata_size(),
                     self.torrent.private,
-                    self.id.serving.port(),
+                    self.shared.id.serving.port(),
                 );
                 self.broadcast(|peer| peer.send_extended_handshake(size, private, true, port));
             }
@@ -204,7 +204,7 @@ impl TorrentSwarm {
     /// A piece is downloaded whole from one sender unless it was raced, so a bad one usually
     /// convicts its sender; a raced one can't tell who lied, and is just fetched again.
     fn piece_failed(&mut self, piece: u32, senders: BTreeSet<SocketAddr>) {
-        self.bus.emit(Event::PieceFailed {
+        self.shared.events.emit(Event::PieceFailed {
             info_hash: self.torrent.info_hash,
             piece,
             peers: senders.iter().copied().collect(),
