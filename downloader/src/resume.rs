@@ -171,7 +171,8 @@ impl ResumeData {
         let Some(BencodeItemView::ByteString(root)) = dict.remove(b"root".as_slice()) else {
             bail!("missing 'root' path");
         };
-        let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
+        // a Unix path is bytes, as `encode` writes it
+        let root = PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(root));
         let mut flag = |key: &[u8]| matches!(dict.remove(key), Some(BencodeItemView::Integer(1)));
         let paused = flag(b"paused");
         let modes = Modes {
@@ -866,6 +867,16 @@ mod test {
             seeded,
             "a magnet's ws= seeds survive a restart"
         );
+    }
+
+    /// A Unix path is bytes, and a download root that isn't UTF-8 comes back as it was.
+    #[test]
+    fn a_root_that_is_not_utf8_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+        let torrent = test_torrent(&content(100), 16, &["udp://a.test:1"]);
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/downloads/caf\xe9"));
+        let data = ResumeData::from_torrent(&torrent, root, &bitvec![u8, Msb0; 0; 7]);
+        assert_eq!(ResumeData::decode(&data.encode()).unwrap().root, root);
     }
 
     #[test]
