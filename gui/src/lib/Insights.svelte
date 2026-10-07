@@ -2,7 +2,7 @@
   // Live charts over the event bus (see bus.svelte.ts for what is accumulated). Every
   // chart is an ECharts option derived from the store; ECharts animates the changes.
   import { Button } from '$lib/components/ui/button'
-  import { humanBytes } from './api'
+  import { humanBytes, timeOfDay } from './format'
   import { echart, base, type Option } from './echart'
   import type { Insights, PeerRecord } from './bus.svelte'
   import type { Kind, Stamped } from './events'
@@ -11,7 +11,7 @@
   let filter = $state<Kind | null>(null)
   let pieceTorrent = $state<string | null>(null)
 
-  const clock = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour12: false })
+  const perSecond = (bytes: number) => `${humanBytes(bytes)}/s`
   const short = (addr: string) => addr.replace(/^\[?([^\]]+)\]?:(\d+)$/, '$1:$2')
 
   let connected = $derived([...insights.peers.values()].filter((p) => p.left_at === null))
@@ -21,10 +21,10 @@
   let throughput = $derived.by((): Option => {
     const t = insights.rates.map((p) => p.t * 1000)
     return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => `${humanBytes(Number(v))}/s` },
+      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
       legend: { top: 0, right: 0, icon: 'circle' },
       xAxis: { type: 'time', axisLabel: { formatter: '{HH}:{mm}:{ss}' }, splitLine: { show: false } },
-      yAxis: { type: 'value', axisLabel: { formatter: (v: number) => `${humanBytes(v)}/s` }, splitNumber: 3 },
+      yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
       series: [
         {
           name: 'down',
@@ -93,8 +93,8 @@
   let race = $derived.by((): Option => {
     const top = byRate.slice(0, 8).reverse()
     return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => `${humanBytes(Number(v))}/s` },
-      xAxis: { type: 'value', axisLabel: { formatter: (v: number) => `${humanBytes(v)}/s` }, splitNumber: 3 },
+      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
+      xAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
       yAxis: { type: 'category', data: top.map((p) => `${short(p.addr)} · ${p.client}`), axisLabel: { fontSize: 10, interval: 0 }, animationDuration: 300, animationDurationUpdate: 300 },
       series: [
         {
@@ -113,10 +113,10 @@
   let history = $derived.by((): Option => {
     const top = byRate.slice(0, 8)
     return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => `${humanBytes(Number(v))}/s` },
+      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
       legend: { top: 0, right: 0, icon: 'circle', textStyle: { fontSize: 9 } },
       xAxis: { type: 'category', data: [...Array(60).keys()].map((i) => `${i - 59}s`), axisLabel: { interval: 19 } },
-      yAxis: { type: 'value', axisLabel: { formatter: (v: number) => `${humanBytes(v)}/s` }, splitNumber: 3 },
+      yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
       series: top.map((p) => ({
         name: short(p.addr),
         type: 'line',
@@ -350,7 +350,7 @@
       <ul class="mt-1 max-h-44 overflow-auto font-mono text-[11px] leading-4">
         {#each [...insights.announces].reverse() as a (a.at + a.url)}
           <li class="truncate" class:text-destructive={!a.ok}>
-            {clock(a.at)} {a.url.replace(/^\w+:\/\//, '').slice(0, 32)} → {a.ok ? `${a.peers} peers, ${a.detail}` : a.detail}
+            {timeOfDay(a.at)} {a.url.replace(/^\w+:\/\//, '').slice(0, 32)} → {a.ok ? `${a.peers} peers, ${a.detail}` : a.detail}
           </li>
         {:else}
           <li class="text-muted-foreground">nothing yet</li>
@@ -361,7 +361,7 @@
       <h3 class="font-medium">Lifecycle</h3>
       <ul class="mt-1 max-h-44 overflow-auto font-mono text-[11px] leading-4">
         {#each [...insights.lifecycle].reverse() as e (e.seq)}
-          <li class="truncate">{clock(e.at_ms)} <b>{e.kind}</b> {describe(e)}</li>
+          <li class="truncate">{timeOfDay(e.at_ms)} <b>{e.kind}</b> {describe(e)}</li>
         {:else}
           <li class="text-muted-foreground">nothing yet</li>
         {/each}
@@ -380,7 +380,7 @@
       </div>
       <ul class="mt-1 max-h-56 overflow-auto font-mono text-[11px] leading-4 select-text">
         {#each shownFeed as e (e.seq + '-' + e.at_ms)}
-          <li class="truncate"><span class="text-muted-foreground">{clock(e.at_ms)}</span> <b>{e.kind}</b> {describe(e)}</li>
+          <li class="truncate"><span class="text-muted-foreground">{timeOfDay(e.at_ms)}</span> <b>{e.kind}</b> {describe(e)}</li>
         {/each}
       </ul>
     </section>

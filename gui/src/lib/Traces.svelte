@@ -4,8 +4,9 @@
   // Open spans grow up to now. Clicking a span pins its fields and events on the right.
   import * as echarts from 'echarts'
   import { Button } from '$lib/components/ui/button'
-  import { humanBytes, type TraceSpan } from './api'
+  import type { TraceSpan } from './api'
   import { echart, type Interactive } from './echart'
+  import { humanBytes } from './format'
   import { field, involves, type Traces } from './spans.svelte'
 
   let { traces }: { traces: Traces } = $props()

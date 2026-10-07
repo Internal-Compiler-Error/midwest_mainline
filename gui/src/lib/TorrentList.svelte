@@ -5,12 +5,11 @@
   import { Button } from '$lib/components/ui/button'
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import * as Table from '$lib/components/ui/table'
-  import type { TorrentId, TorrentRow } from './api'
-  import { fraction, rate } from './api'
+  import { isKnown, type TorrentId, type TorrentRow } from './api'
+  import { fraction, rate } from './format'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import ProgressBar from './ProgressBar.svelte'
-
 
   let {
     torrents,
@@ -54,8 +53,6 @@
         return t.completed ? 'seeding' : 'downloading'
     }
   }
-
-
 </script>
 
 <Table.Root>
@@ -64,7 +61,7 @@
       <Table.Row data-state={t.id === selected ? 'selected' : undefined} onclick={() => onselect(t.id)}>
         <Table.Cell class="w-full max-w-0 truncate" title={name(t)}>{name(t)}</Table.Cell>
         <Table.Cell class="w-44 min-w-44">
-          {#if t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued'}
+          {#if isKnown(t)}
             <ProgressBar fraction={fraction(t.verified_pieces, t.total_pieces)} done={t.completed} />
           {:else if t.kind === 'checking'}
             <ProgressBar fraction={fraction(t.checked_pieces, t.total_pieces)} done={false} />
@@ -105,7 +102,7 @@
               {/snippet}
             </DropdownMenu.Trigger>
             <DropdownMenu.Content align="end">
-              {#if t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued'}
+              {#if isKnown(t)}
                 <DropdownMenu.Item onclick={() => onreveal(t.id)}>Show in Finder</DropdownMenu.Item>
                 <DropdownMenu.Item onclick={() => onrecheck(t.id)}>Force recheck</DropdownMenu.Item>
                 <DropdownMenu.Separator />

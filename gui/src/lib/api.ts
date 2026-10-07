@@ -104,6 +104,13 @@ export type TorrentRow = { id: TorrentId } & (
   | { kind: 'failed'; source: string; error: string }
 )
 
+/** A row whose torrent is known: running, paused, or waiting its turn. */
+export type Known = Extract<TorrentRow, { kind: 'downloading' | 'paused' | 'queued' }>
+
+export function isKnown(row: TorrentRow): row is Known {
+  return row.kind === 'downloading' || row.kind === 'paused' || row.kind === 'queued'
+}
+
 export interface Resumable {
   path: string
   name: string
@@ -174,45 +181,6 @@ export const isMagnetUri = (s: string) => s.trim().toLowerCase().startsWith('mag
 
 /** a BEP 46 magnet, which names a DHT key the torrent updates through */
 export const isFeedUri = (s: string) => isMagnetUri(s) && /[?&]xs=urn(:|%3A)btpk(:|%3A)/i.test(s)
-
-export function fraction(verified: number, total: number): number {
-  if (total === 0) return 0
-  return Math.min(1, Math.max(0, verified / total))
-}
-
-const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-
-export function humanBytes(bytes: number): string {
-  return humanBytesLike(bytes, bytes)
-}
-
-/** `bytes` in the unit `humanBytes(like)` would pick. An animated figure formats its
- * in-between values like its destination, so only the digits move, never the unit. */
-export function humanBytesLike(bytes: number, like: number): string {
-  let scale = 1
-  let unit = 0
-  while (like / scale >= 1024 && unit < UNITS.length - 1) {
-    scale *= 1024
-    unit++
-  }
-  return unit === 0 ? `${Math.round(bytes)} B` : `${(bytes / scale).toFixed(1)} ${UNITS[unit]}`
-}
-
-/** Rates are always in KiB/s, so a moving figure never changes unit. */
-/** A transfer rate to about three significant figures, so only digits that mean something move;
- * the unit comes from `like` (the value being animated towards) so it doesn't flip mid-glide. */
-export function rate(bps: number, like: number = bps): string {
-  const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s']
-  let unit = 0
-  let scale = 1
-  while (unit < units.length - 1 && Math.abs(like) >= scale * 1024) {
-    scale *= 1024
-    unit++
-  }
-  const v = Math.max(bps, 0) / scale
-  const digits = unit === 0 || v >= 100 ? 0 : v >= 10 ? 1 : 2
-  return `${v.toFixed(digits)} ${units[unit]}`
-}
 
 /** One span of a torrent's work (see downloader::telemetry), open or finished. */
 export interface TraceSpan {

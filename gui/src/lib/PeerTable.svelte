@@ -6,7 +6,8 @@
   import { untrack } from 'svelte'
   import * as Table from '$lib/components/ui/table'
   import type { Peer } from './api'
-  import { humanBytes, rate, peerFlags } from './api'
+  import { peerFlags } from './api'
+  import { humanBytes, percent, rate } from './format'
   import { clock } from './clock.svelte'
   import Num from './Num.svelte'
 
@@ -131,7 +132,7 @@
       >
         <Table.Cell class="truncate font-mono select-text" title={peer.addr}>{peer.addr}</Table.Cell>
         <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
-        <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>
+        <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={percent} /></Table.Cell>
         <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
           <Num value={peer.download_bps} format={rate} />
         </Table.Cell>

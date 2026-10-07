@@ -10,8 +10,8 @@
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
   import { getCurrentWebview } from '@tauri-apps/api/webview'
-  import { rate } from './lib/api'
-  import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
+  import { isKnown, type Resumable, type TorrentId, type TorrentRow, type Status } from './lib/api'
+  import { rate } from './lib/format'
   import Console from './lib/Console.svelte'
   import Insights from './lib/Insights.svelte'
   import TracesPane from './lib/Traces.svelte'
@@ -89,7 +89,7 @@
 
   function reveal(id: TorrentId) {
     const t = torrents.find((t) => t.id === id)
-    if (t && (t.kind === 'downloading' || t.kind === 'paused' || t.kind === 'queued')) {
+    if (t && isKnown(t)) {
       // a multi-file torrent is a directory named after it, a single-file one is the file
       revealItemInDir(`${t.root}/${t.files.length > 1 ? t.name : t.files[0]?.path ?? t.name}`)
     }
@@ -149,7 +149,7 @@
     rescan()
     // torrents complete at startup were complete before; only later ones get a notification
     api.torrents().then((initial) => {
-      for (const t of initial) if (t.kind !== 'resolving' && t.kind !== 'failed' && t.kind !== 'checking' && t.completed) announced.add(t.id)
+      for (const t of initial) if (isKnown(t) && t.completed) announced.add(t.id)
       isPermissionGranted()
         .then((granted) => (granted ? 'granted' : requestPermission()))
         .then((state) => (notifyReady = state === 'granted'))

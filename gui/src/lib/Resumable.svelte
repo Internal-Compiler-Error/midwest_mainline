@@ -3,7 +3,7 @@
   import { Button } from '$lib/components/ui/button'
   import * as Table from '$lib/components/ui/table'
   import type { Resumable } from './api'
-  import { fraction } from './api'
+  import { fraction } from './format'
   import ProgressBar from './ProgressBar.svelte'
 
   let {

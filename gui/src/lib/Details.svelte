@@ -5,13 +5,12 @@
   import { Label } from '$lib/components/ui/label'
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
-  import type { TorrentRow } from './api'
-  import { fraction, humanBytes, humanBytesLike, isFeedUri, isMagnetUri, rate, trackerStatus } from './api'
+  import { isFeedUri, isKnown, isMagnetUri, trackerStatus, type TorrentRow } from './api'
+  import { fraction, humanBytes, rate } from './format'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import PeerTable from './PeerTable.svelte'
   import ProgressBar from './ProgressBar.svelte'
-
 
   let {
     torrent,
@@ -44,7 +43,7 @@
   )
 
   function toggleFile(index: number, checked: boolean) {
-    if (torrent.kind !== 'downloading' && torrent.kind !== 'paused' && torrent.kind !== 'queued') return
+    if (!isKnown(torrent)) return
     const selected = torrent.files.map((f) => f.selected)
     selected[index] = checked
     onselectfiles(selected)
@@ -82,15 +81,15 @@
       <dt class="font-medium">Location</dt>
       <dd>{torrent.root}</dd>
       <dt class="font-medium">Downloaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={rate} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytes} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={rate} />)</dd>
       <dt class="font-medium">Uploaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={rate} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytes} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={rate} />)</dd>
       <dt class="font-medium">Ratio</dt>
       <dd class="tabular-nums"><Num value={torrent.total_size ? torrent.uploaded / torrent.total_size : 0} format={(n) => n.toFixed(2)} /></dd>
       <dt class="font-medium">Wasted</dt>
-      <dd class="tabular-nums"><Num value={torrent.wasted} format={humanBytesLike} /></dd>
+      <dd class="tabular-nums"><Num value={torrent.wasted} format={humanBytes} /></dd>
       <dt class="font-medium">Remaining</dt>
-      <dd class="tabular-nums"><Num value={torrent.left} format={humanBytesLike} /></dd>
+      <dd class="tabular-nums"><Num value={torrent.left} format={humanBytes} /></dd>
       <dt class="font-medium">Total size</dt>
       <dd class="tabular-nums">{humanBytes(torrent.total_size)}</dd>
       {#if torrent.feed}
