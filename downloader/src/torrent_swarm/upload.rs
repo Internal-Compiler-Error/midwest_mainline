@@ -2,8 +2,11 @@
 //! choking algorithm, ut_metadata pieces and BEP 52 hash requests.
 
 use crate::events::Event;
-use crate::layers;
-use crate::settings::{MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS};
+use crate::layers::{self, MAX_HASH_READS};
+use crate::peer::parse_ut_metadata_request;
+use crate::settings::{
+    MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS,
+};
 use crate::wire::{BtMessage, HashRequest, Piece, Request};
 use rand::seq::IndexedRandom;
 use std::net::SocketAddr;
@@ -19,6 +22,47 @@ pub(super) fn upload_slots(interested: usize) -> usize {
 }
 
 impl TorrentSwarm {
+    /// BEP 9: we always have the full metadata, so any piece of it in range is served.
+    pub(super) fn serve_metadata(&mut self, idx: usize, payload: &[u8]) {
+        let Some(piece) = parse_ut_metadata_request(payload) else {
+            return;
+        };
+        let info = &self.torrent.raw_info;
+        let start = piece as usize * METADATA_PIECE_SIZE;
+        if start >= info.len() {
+            return;
+        }
+        let data = &info[start..(start + METADATA_PIECE_SIZE).min(info.len())];
+        let total_size = self.torrent.metadata_size();
+        if self.peers[idx].send_metadata_piece(piece, total_size, data).is_err() {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
+    /// BEP 52: hashes at or above the piece layer come from the layers we have; below it,
+    /// from the data of pieces we've verified, read on the blocking pool (`answer_from_data`).
+    /// A hybrid whose halves disagree answers nothing: its v2 hashes aren't to be trusted.
+    pub(super) fn answer_hash_request(&mut self, idx: usize, req: HashRequest) {
+        let reply = match layers::pieces_for(&self.torrent, &req) {
+            _ if !self.torrent.v2_consistent() => BtMessage::HashReject(req),
+            Some(pieces) => {
+                let had = pieces.clone().all(|p| self.stat.verified[p as usize]);
+                if had && self.hash_reads < MAX_HASH_READS {
+                    self.answer_from_data(self.peers[idx].remote_addr, req, pieces);
+                    return;
+                }
+                BtMessage::HashReject(req)
+            }
+            None => match layers::answer(&self.torrent, &mut self.hash_trees, &req) {
+                Some(hashes) => BtMessage::Hashes(hashes),
+                None => BtMessage::HashReject(req),
+            },
+        };
+        if self.peers[idx].send(reply).is_err() {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
     /// Sends blocks the upload limit held back, as far as it allows now. A block for a peer
     /// that has since gone is dropped.
     pub(super) fn send_held_uploads(&mut self) {

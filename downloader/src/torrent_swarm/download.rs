@@ -2,7 +2,8 @@
 //! what a bad hash or a failed write means. Also BEP 52 piece layers fetched for a magnet.
 
 use crate::events::Event;
-use crate::wire::{BtMessage, Piece, Request};
+use crate::layers::Received;
+use crate::wire::{BtMessage, Hashes, Piece, Request};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -34,6 +35,24 @@ impl TorrentSwarm {
                 && self.peers[idx].send(BtMessage::HashRequest(req)).is_err()
             {
                 self.drop_peer(idx, "send failed");
+            }
+        }
+    }
+
+    /// BEP 52: piece hashes we asked for; a layer that's complete makes its file's pieces
+    /// checkable, so they can be picked.
+    pub(super) fn hashes_arrived(&mut self, idx: usize, hashes: Hashes) {
+        let addr = self.peers[idx].remote_addr;
+        match self.layers.received(&self.torrent, addr, &hashes) {
+            Received::Partial => {}
+            Received::Layer(file) => {
+                info!("piece layer of {:?} in from {addr}", self.torrent.files[file].1);
+                self.schedule();
+            }
+            Received::Bad => {
+                warn!("{addr} sent piece hashes that don't add up, disconnecting");
+                self.drop_peer(idx, "bad hashes");
+                self.ban(addr);
             }
         }
     }

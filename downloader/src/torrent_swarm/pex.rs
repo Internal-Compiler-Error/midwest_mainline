@@ -1,5 +1,7 @@
-//! BEP 11: telling peers about each other.
+//! BEP 11: telling peers about each other, and hearing from them about others.
 
+use crate::events::{Event, PeerSource};
+use crate::peer::{PEX_UTP, parse_pex_message};
 use crate::settings::PEX_MAX_ADDED_PEERS;
 use rand::seq::IndexedRandom;
 use std::net::SocketAddr;
@@ -32,5 +34,27 @@ impl TorrentSwarm {
             }
             peer.send_pex(&added)
         });
+    }
+
+    /// The peers a peer told us about are dialled, as far as the connection cap allows.
+    pub(super) fn on_pex(&mut self, idx: usize, payload: &[u8]) {
+        // BEP 27: we don't offer ut_pex on a private torrent, but a peer may send it anyway
+        if self.torrent.private {
+            return;
+        }
+        // BEP 11 caps a message at 50 added peers; a peer sending thousands would otherwise
+        // have us dial whoever it likes
+        let gossiped: Vec<(SocketAddr, bool)> = parse_pex_message(payload)
+            .into_iter()
+            .take(PEX_MAX_ADDED_PEERS)
+            .map(|(addr, flags)| (addr, flags & PEX_UTP != 0))
+            .collect();
+        let from = self.peers[idx].remote_addr;
+        self.bus.emit(Event::PeersDiscovered {
+            info_hash: self.torrent.info_hash,
+            source: PeerSource::Pex { from },
+            count: gossiped.len(),
+        });
+        self.connect_to_peers(gossiped, Some(from));
     }
 }
