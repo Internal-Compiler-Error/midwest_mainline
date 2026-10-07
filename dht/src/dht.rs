@@ -73,6 +73,10 @@ pub(crate) const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migratio
 /// How much longer bootstrap waits for the other routers once one answered: they answer within
 /// a round trip or not at all
 const BOOTSTRAP_STRAGGLERS: Duration = Duration::from_millis(300);
+/// Nodes a bootstrap wants in the table before it's done, and the rounds of lookups it gives
+/// up after; the table goes on growing from every lookup afterwards
+const BOOTSTRAP_ENOUGH: usize = 32;
+const BOOTSTRAP_RETRIES: usize = 3;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -360,7 +364,8 @@ impl DhtSession {
 
     /// Bootstraps from those of `known_nodes` in this node's address family; the rest are
     /// skipped. Every one is pinged; once the first answers (and the others had a moment to),
-    /// one lookup of our own id fills the table. Slow or dead ones don't hold that up.
+    /// lookups of our own id and two random ones fill the table. Slow or dead routers don't
+    /// hold that up.
     pub async fn bootstrap(&self, known_nodes: Vec<SocketAddr>) -> Result<(), OurError> {
         let client = self.handle();
         let mut pings: FuturesUnordered<_> = known_nodes
@@ -388,7 +393,25 @@ impl DhtSession {
             }
         }
         info!("bootstrap routers answered in {:?}", started.elapsed());
-        client.find_node(client.our_id()).await;
+        // our own neighbourhood, and two random ones beside it: routers hand out a node or
+        // three, and if those are dead one lookup dead-ends where three rarely all do
+        let random = || NodeId(rand::rng().random());
+        futures::future::join_all([client.our_id(), random(), random()].map(|target| client.find_node(target))).await;
+        // still next to nothing: the routers' few referrals were all dead; they hand out
+        // others for other targets
+        let mut known = self.node_count();
+        for _ in 0..BOOTSTRAP_RETRIES {
+            if known >= BOOTSTRAP_ENOUGH {
+                break;
+            }
+            futures::future::join_all([random(), random(), random()].map(|target| client.find_node(target))).await;
+            // a small network (or a LAN) that's all known already
+            let now = self.node_count();
+            if now == known {
+                break;
+            }
+            known = now;
+        }
 
         let (compliant, nodes) = self.bep42_compliance();
         info!(
@@ -1005,7 +1028,9 @@ mod bep45_tests {
         assert_eq!(primary.session.node_count(), 1);
         assert_eq!(second.session.node_count(), 0);
         second.session.bootstrap(vec![x.session.local_addr()]).await.unwrap();
-        assert_eq!(second.session.node_count(), 1);
+        // X, and the primary X told it of: to the second, just another node
+        assert_eq!(second.session.node_count(), 2);
+        assert!(second.session.routing_table.contains(&primary_id));
         assert_eq!(x.session.node_count(), 2, "the network sees two nodes");
 
         // a token is the socket's that issued it

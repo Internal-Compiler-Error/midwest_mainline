@@ -24,7 +24,8 @@
 //!
 //! - [`message`] — the KRPC wire protocol (BEP 5): bencode parsing and encoding for the
 //!   four queries (ping, find_node, get_peers, announce_peer), their responses, and
-//!   errors. Pure data, no I/O.
+//!   errors, plus the extensions' (`sample_infohashes`, BEP 51; `get`/`put`, BEP 44; BEP 33's
+//!   scrape filters, BEP 43's `ro`). Pure data, no I/O.
 //! - [`dht::rpc_manager`] — the message broker and sole owner of the UDP socket. An
 //!   outbound query gets a fresh transaction id and a oneshot waiting for its response
 //!   (matched on both transaction id *and* sender address); every inbound packet is also
@@ -36,8 +37,9 @@
 //!   periodic refresh pings.
 //! - [`dht::client`] / `dht::server` — the two halves of the node, sharing one
 //!   `SharedState`. The client runs iterative lookups (closest-known nodes, `CONCURRENT_REQS`
-//!   at a time, following referrals); the server answers inbound queries and stores
-//!   announced peers (token-validated per BEP 5, tokens from `token_generator`).
+//!   in flight, following referrals; BEP 42 compliant answers decide when one is done); the
+//!   server answers inbound queries and stores announced peers and BEP 44 items
+//!   (token-validated per BEP 5, tokens from `token_generator`).
 //!   Peers are served for 45 minutes after their last announce; past that they're deleted,
 //!   or with [`dht::Retention::Forever`] kept so the node is also a long-term index
 //!   ([`dht::DhtSession::stored_swarms`], [`dht::DhtSession::stored_peers`]).
@@ -63,6 +65,11 @@
 //! - [x] security extension [BEP-42](https://www.bittorrent.org/beps/bep_0042.html)
 //! - [x] announce
 //! - [x] IPv6 [BEP-32](https://www.bittorrent.org/beps/bep_0032.html)
+//! - [x] DHT scrape [BEP-33](https://www.bittorrent.org/beps/bep_0033.html)
+//! - [x] read-only nodes [BEP-43](https://www.bittorrent.org/beps/bep_0043.html)
+//! - [x] arbitrary data [BEP-44](https://www.bittorrent.org/beps/bep_0044.html)
+//! - [x] multiple-address operation [BEP-45](https://www.bittorrent.org/beps/bep_0045.html)
+//! - [x] `sample_infohashes` and a crawler [BEP-51](https://www.bittorrent.org/beps/bep_0051.html)
 //! - [x] respond to ping
 //! - [x] respond to get peers
 //! - [x] respond to announce
