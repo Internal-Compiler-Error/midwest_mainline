@@ -89,24 +89,36 @@ impl Row {
     }
 }
 
-/// What every announcer of one torrent shares.
-#[derive(Clone)]
+/// A torrent to announce: its hashes, where to announce them, and what its announcers share.
 pub(crate) struct Announcing {
-    pub trackers: Vec<String>,
     pub info_hash: InfoHash,
+    /// BEP 52: a hybrid's truncated v2 hash, announced too (to the DHT and every tracker, as
+    /// a swarm of its own) so v2-only peers find us
+    pub v2: Option<InfoHash>,
+    pub trackers: Vec<String>,
+    pub dht: DhtWatch,
     pub identity: Arc<Identity>,
     /// what to tell the trackers about our progress
     pub stats: watch::Receiver<TorrentSwarmStats>,
     /// where discovered peers go
     pub events: mpsc::WeakSender<SwarmEvent>,
     pub shutdown: CancellationToken,
-    pub dht: DhtWatch,
     pub bus: EventBus,
     /// where trackers' BEP 24 `external ip` goes
     pub external: ExternalAddress,
-    /// BEP 52: a hybrid's truncated v2 hash, announced too (to the DHT and every tracker, as
-    /// a swarm of its own) so v2-only peers find us
-    pub v2: Option<InfoHash>,
+}
+
+/// What one announcer works with: the hash it announces, and the rest of `Announcing` that
+/// every announcer of the torrent shares.
+#[derive(Clone)]
+struct Announcer {
+    info_hash: InfoHash,
+    identity: Arc<Identity>,
+    stats: watch::Receiver<TorrentSwarmStats>,
+    events: mpsc::WeakSender<SwarmEvent>,
+    shutdown: CancellationToken,
+    bus: EventBus,
+    external: ExternalAddress,
 }
 
 /// Where one announcer gets its peers.
@@ -132,22 +144,34 @@ impl Source {
 /// Spawns an announcer per source: the DHT if the client has (or may yet have) a node, and
 /// every usable URL in `trackers`; a hybrid gets two of each, one per hash. Every source has
 /// a row on the returned board from the start, an unusable tracker URL a failed one.
-pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerStatus>> {
+pub(crate) fn spawn_announcers(torrent: Announcing) -> watch::Receiver<Vec<TrackerStatus>> {
+    let Announcing {
+        info_hash,
+        v2,
+        trackers,
+        dht,
+        identity,
+        stats,
+        events,
+        shutdown,
+        bus,
+        external,
+    } = torrent;
     let per_hash = |label: &str| {
-        std::iter::once((label.to_owned(), args.info_hash))
-            .chain(args.v2.map(|v2| (format!("{label} (v2 hash)"), v2)))
+        std::iter::once((label.to_owned(), info_hash))
+            .chain(v2.map(|v2| (format!("{label} (v2 hash)"), v2)))
             .collect::<Vec<_>>()
     };
     let mut planned: Vec<(String, Result<Source, String>, InfoHash)> = vec![];
     // a watch whose sender is gone is a client with no DHT, now or ever; no row for it
-    if args.dht.has_changed().is_ok() {
+    if dht.has_changed().is_ok() {
         planned.extend(
             per_hash("DHT")
                 .into_iter()
                 .map(|(label, hash)| (label, Ok(Source::Dht), hash)),
         );
     }
-    for url in args.trackers.iter().filter_map(|t| Url::parse(t).ok()) {
+    for url in trackers.iter().filter_map(|t| Url::parse(t).ok()) {
         match Source::of(&url) {
             Ok(source) => planned.extend(
                 per_hash(url.as_str())
@@ -156,7 +180,7 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
             ),
             Err(why) => {
                 warn!("ignoring tracker {url}: {why}");
-                planned.push((url.to_string(), Err(why), args.info_hash));
+                planned.push((url.to_string(), Err(why), info_hash));
             }
         }
     }
@@ -182,19 +206,24 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
             board: board.clone(),
             slot,
         };
-        let args = Announcing {
+        let announcer = Announcer {
             info_hash,
-            ..args.clone()
+            identity: identity.clone(),
+            stats: stats.clone(),
+            events: events.clone(),
+            shutdown: shutdown.clone(),
+            bus: bus.clone(),
+            external: external.clone(),
         };
         match source {
             Source::Dht => {
-                tokio::spawn(dht::announce(args, row));
+                tokio::spawn(dht::announce(announcer, dht.clone(), row));
             }
             Source::Http(url) => {
-                tokio::spawn(tracker::run(Tracker::new(url, args, row), Client::Http));
+                tokio::spawn(tracker::run(Tracker::new(url, announcer, row), Client::Http));
             }
             Source::Udp(url) => {
-                tokio::spawn(tracker::run(Tracker::new(url, args, row), Client::udp()));
+                tokio::spawn(tracker::run(Tracker::new(url, announcer, row), Client::udp()));
             }
         }
     }
@@ -244,6 +273,20 @@ mod test {
             bus: EventBus::new(),
             external: Default::default(),
             v2: None,
+        }
+    }
+
+    /// An announcer of `announcing`'s torrent.
+    pub(super) fn announcer(events: &mpsc::Sender<SwarmEvent>) -> Announcer {
+        let torrent = announcing(events);
+        Announcer {
+            info_hash: torrent.info_hash,
+            identity: torrent.identity,
+            stats: torrent.stats,
+            events: torrent.events,
+            shutdown: torrent.shutdown,
+            bus: torrent.bus,
+            external: torrent.external,
         }
     }
 

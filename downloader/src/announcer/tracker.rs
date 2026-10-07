@@ -2,7 +2,7 @@
 //! event bookkeeping, when to scrape, where outcomes go, and the loop that drives either.
 
 use super::udp::UdpClient;
-use super::{Announcing, Row, SwarmCounts, TrackerState, http};
+use super::{Announcer, Row, SwarmCounts, TrackerState, http};
 use crate::events::{Event as BusEvent, PeerSource};
 use crate::settings::{ANNOUNCE_INTERVAL_MAX, ANNOUNCE_INTERVAL_MIN, ANNOUNCE_RETRY, ANNOUNCE_RETRY_MAX};
 use crate::torrent_swarm::SwarmEvent;
@@ -122,7 +122,7 @@ impl Client {
 
 /// Announces to one tracker until shutdown, scraping it now and then, and says goodbye.
 pub(super) async fn run(mut tracker: Tracker, mut client: Client) {
-    let shutdown = tracker.args.shutdown.clone();
+    let shutdown = tracker.announcer.shutdown.clone();
     while tracker.due().await {
         let event = tracker.next_event();
         let span = tracker.announce_span(event);
@@ -153,7 +153,7 @@ pub(super) async fn run(mut tracker: Tracker, mut client: Client) {
 pub(super) struct Tracker {
     pub url: Url,
     /// the torrent's, with the hash this announcer announces as its `info_hash`
-    pub args: Announcing,
+    pub announcer: Announcer,
     row: Row,
     next_ready: Instant,
     sent_started: bool,
@@ -166,13 +166,13 @@ pub(super) struct Tracker {
 }
 
 impl Tracker {
-    pub fn new(url: Url, args: Announcing, row: Row) -> Self {
+    pub fn new(url: Url, announcer: Announcer, row: Row) -> Self {
         // a torrent that was already complete when resumed must not announce
         // event=completed again (BEP 3)
-        let sent_completed = args.stats.borrow().completed;
+        let sent_completed = announcer.stats.borrow().completed;
         Tracker {
             url,
-            args,
+            announcer,
             row,
             next_ready: Instant::now() + Duration::from_millis(10),
             sent_started: false,
@@ -184,7 +184,7 @@ impl Tracker {
     }
 
     pub fn progress(&self) -> Progress {
-        let stats = self.args.stats.borrow();
+        let stats = self.announcer.stats.borrow();
         Progress {
             uploaded: stats.uploaded,
             downloaded: stats.downloaded,
@@ -199,12 +199,12 @@ impl Tracker {
         loop {
             tokio::select! {
                 _ = sleep_until(self.next_ready) => return true,
-                Ok(()) = self.args.stats.changed(), if !self.sent_completed => {
-                    if self.args.stats.borrow().completed && self.failures == 0 {
+                Ok(()) = self.announcer.stats.changed(), if !self.sent_completed => {
+                    if self.announcer.stats.borrow().completed && self.failures == 0 {
                         self.next_ready = Instant::now();
                     }
                 }
-                _ = self.args.shutdown.cancelled() => return false,
+                _ = self.announcer.shutdown.cancelled() => return false,
             }
         }
     }
@@ -212,7 +212,7 @@ impl Tracker {
     /// BEP 3: the first announce must carry event=started, and one carrying event=completed
     /// follows the download finishing (standing in for started if it comes first).
     fn next_event(&self) -> AnnounceEvent {
-        if !self.sent_completed && self.args.stats.borrow().completed {
+        if !self.sent_completed && self.announcer.stats.borrow().completed {
             AnnounceEvent::Completed
         } else if !self.sent_started {
             AnnounceEvent::Started
@@ -255,7 +255,7 @@ impl Tracker {
     fn scrape_span(&self) -> tracing::Span {
         tracing::info_span!(
             "tracker.scrape",
-            info_hash = %self.args.info_hash,
+            info_hash = %self.announcer.info_hash,
             url = %self.traced_url(),
             seeders = tracing::field::Empty,
             error = tracing::field::Empty,
@@ -265,7 +265,7 @@ impl Tracker {
     fn announce_span(&self, event: AnnounceEvent) -> tracing::Span {
         tracing::info_span!(
             "tracker.announce",
-            info_hash = %self.args.info_hash,
+            info_hash = %self.announcer.info_hash,
             url = %self.traced_url(),
             event = ?event,
             peers = tracing::field::Empty,
@@ -311,19 +311,19 @@ impl Tracker {
                     row.next_announce = Some(next);
                     row.swarm = row.swarm.updated(counts);
                 });
-                self.args.bus.emit(BusEvent::Announced {
-                    info_hash: self.args.info_hash,
+                self.announcer.bus.emit(BusEvent::Announced {
+                    info_hash: self.announcer.info_hash,
                     url: self.url.to_string(),
                     peers: count,
                     interval_secs: interval.as_secs(),
                 });
-                if let Some(events) = self.args.events.upgrade() {
+                if let Some(events) = self.announcer.events.upgrade() {
                     let source = PeerSource::Tracker {
                         url: self.url.to_string(),
                     };
                     tokio::select! {
                         _ = events.send(SwarmEvent::PeersDiscovered(peers, source)) => {}
-                        _ = self.args.shutdown.cancelled() => {}
+                        _ = self.announcer.shutdown.cancelled() => {}
                     }
                 }
             }
@@ -338,8 +338,8 @@ impl Tracker {
                     row.state = TrackerState::Failed(error.clone());
                     row.next_announce = Some(next);
                 });
-                self.args.bus.emit(BusEvent::AnnounceFailed {
-                    info_hash: self.args.info_hash,
+                self.announcer.bus.emit(BusEvent::AnnounceFailed {
+                    info_hash: self.announcer.info_hash,
                     url: self.url.to_string(),
                     error,
                 });
@@ -350,7 +350,7 @@ impl Tracker {
 
 #[cfg(test)]
 mod test {
-    use super::super::test::{announcing, row};
+    use super::super::test::{announcer, row};
     use super::*;
     use anyhow::anyhow;
     use tokio::sync::mpsc;
@@ -389,9 +389,9 @@ mod test {
         let (stats_tx, stats) = super::super::test::stats(false);
         let mut tracker = Tracker::new(
             Url::parse("http://t.test/announce").unwrap(),
-            Announcing {
+            Announcer {
                 stats,
-                ..announcing(&events)
+                ..announcer(&events)
             },
             row(),
         );
@@ -414,9 +414,9 @@ mod test {
 
         let resumed_complete = Tracker::new(
             Url::parse("http://t.test/announce").unwrap(),
-            Announcing {
+            Announcer {
                 stats: super::super::test::stats(true).1,
-                ..announcing(&events)
+                ..announcer(&events)
             },
             row(),
         );
@@ -429,7 +429,7 @@ mod test {
     #[tokio::test]
     async fn scrapes_again_while_announces_leave_counts_out() {
         let (events, _rx) = mpsc::channel(8);
-        let mut tracker = Tracker::new(Url::parse("udp://t.test:1").unwrap(), announcing(&events), row());
+        let mut tracker = Tracker::new(Url::parse("udp://t.test:1").unwrap(), announcer(&events), row());
         let announced = || Announced {
             peers: vec![],
             interval: Duration::from_secs(1800),

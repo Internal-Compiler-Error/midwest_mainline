@@ -5,7 +5,7 @@
 //! collects BEP 33's scrape filters, for an estimate of the swarm's size.
 
 use super::tracker::SCRAPE_INTERVAL;
-use super::{Announcing, Row, SwarmCounts, TrackerState};
+use super::{Announcer, Row, SwarmCounts, TrackerState};
 use crate::dht::{DhtHandle, DhtWatch};
 use crate::events::{Event as BusEvent, PeerSource};
 use crate::settings::{DHT_ANNOUNCE_INTERVAL, DHT_RETRY};
@@ -20,17 +20,16 @@ use tracing::{Instrument, info};
 
 /// Announces to the DHT until shutdown. Waits for the node to come up first, and does nothing
 /// at all if it never does.
-pub(super) async fn announce(args: Announcing, row: Row) {
-    let Announcing {
+pub(super) async fn announce(announcer: Announcer, dht: DhtWatch, row: Row) {
+    let Announcer {
         info_hash,
         identity,
         stats,
         events,
         shutdown,
-        dht,
         bus,
         ..
-    } = args;
+    } = announcer;
     let Some(handle) = node(dht, &shutdown).await else {
         return;
     };

@@ -103,8 +103,8 @@ impl UdpClient {
             connection_id: 0.into(),
             action: (Action::Announce as i32).into(),
             transaction_id: transaction_id.into(),
-            info_hash: tracker.args.info_hash.0,
-            peer_id: tracker.args.identity.peer_id,
+            info_hash: tracker.announcer.info_hash.0,
+            peer_id: tracker.announcer.identity.peer_id,
             downloaded: signed(progress.downloaded).into(),
             left: signed(progress.left).into(),
             uploaded: signed(progress.uploaded).into(),
@@ -112,7 +112,7 @@ impl UdpClient {
             ip: 0.into(),
             key: self.key.into(),
             num_want: (NUMWANT as i32).into(),
-            port: tracker.args.identity.serving.port().into(),
+            port: tracker.announcer.identity.serving.port().into(),
             extensions: 0.into(),
         };
         let reply = self.request(request.as_bytes(), transaction_id, "announce").await?;
@@ -142,7 +142,7 @@ impl UdpClient {
             connection_id: 0.into(),
             action: (Action::Scrape as i32).into(),
             transaction_id: transaction_id.into(),
-            info_hash: tracker.args.info_hash.0,
+            info_hash: tracker.announcer.info_hash.0,
         };
         let reply = self.request(request.as_bytes(), transaction_id, "scrape").await?;
         parse_scrape(&reply)
@@ -363,7 +363,7 @@ fn parse_scrape(reply: &[u8]) -> anyhow::Result<SwarmCounts> {
 
 #[cfg(test)]
 mod test {
-    use super::super::test::{announcing, row};
+    use super::super::test::{announcer, row};
     use super::*;
     use crate::settings::ANNOUNCE_INTERVAL_MIN;
     use tokio::sync::mpsc;
@@ -463,7 +463,7 @@ mod test {
             tracker.send_to(&reply, from).await.unwrap();
         });
         let (events, _rx) = mpsc::channel(1);
-        let tracker = Tracker::new(url, announcing(&events), row());
+        let tracker = Tracker::new(url, announcer(&events), row());
         let mut client = UdpClient::new();
         let announced = client.announce(&tracker, AnnounceEvent::Started).await.unwrap();
         assert_eq!(announced.peers, ["10.0.0.1:6881".parse::<SocketAddr>().unwrap()]);

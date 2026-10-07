@@ -36,10 +36,10 @@ impl AnnounceEvent {
 
 /// One announce: the peers, and the interval until the next.
 pub(super) async fn announce(tracker: &Tracker, event: AnnounceEvent) -> anyhow::Result<Announced> {
-    let identity = &tracker.args.identity;
+    let identity = &tracker.announcer.identity;
     let url = announce_url(
         &tracker.url,
-        &tracker.args.info_hash,
+        &tracker.announcer.info_hash,
         &identity.peer_id,
         identity.serving.port(),
         tracker.progress(),
@@ -61,7 +61,7 @@ pub(super) async fn announce(tracker: &Tracker, event: AnnounceEvent) -> anyhow:
     }
     if let Some(ip) = response.external_ip {
         let _ = tracker
-            .args
+            .announcer
             .external
             .vote(ip, tracker.url.host_str().unwrap_or_default());
     }
@@ -70,7 +70,7 @@ pub(super) async fn announce(tracker: &Tracker, event: AnnounceEvent) -> anyhow:
 
 /// BEP 48: the tracker's count of the swarm, from its scrape URL.
 pub(super) async fn scrape(tracker: &Tracker) -> anyhow::Result<SwarmCounts> {
-    let info_hash = &tracker.args.info_hash;
+    let info_hash = &tracker.announcer.info_hash;
     let url = scrape_url(&tracker.url, info_hash).context("the tracker has no scrape URL")?;
     let (_, body) = get(url, "the scrape").await?;
     parse_scrape(&body, info_hash)
@@ -281,7 +281,7 @@ fn dict_peer(entry: &BencodeItemView) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod test {
-    use super::super::test::{announcing, row};
+    use super::super::test::{announcer, row};
     use super::*;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -452,7 +452,7 @@ mod test {
         let (events, _rx) = mpsc::channel(1);
         let tracker = Tracker::new(
             Url::parse(&format!("{base}/announce?passkey=s3cret")).unwrap(),
-            announcing(&events),
+            announcer(&events),
             row(),
         );
         let e = announce(&tracker, AnnounceEvent::Started).await.unwrap_err();
