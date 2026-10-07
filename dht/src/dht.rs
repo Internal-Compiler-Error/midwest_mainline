@@ -1242,6 +1242,12 @@ mod bep44_tests {
             Some(207)
         );
         assert_eq!(code(put(b"i1e", Some(signed(b"", 5, b"i1e")))).await, None);
+        // the same seq again: with the same value it's a refresh, with another it's refused
+        assert_eq!(code(put(b"i1e", Some(signed(b"", 5, b"i1e")))).await, None);
+        assert_eq!(
+            code(put(b"i9e", Some(signed(b"", 5, b"i9e")))).await.map(|e| e.code()),
+            Some(302)
+        );
         assert_eq!(
             code(put(b"i2e", Some(signed(b"", 4, b"i2e")))).await.map(|e| e.code()),
             Some(302)

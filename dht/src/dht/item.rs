@@ -167,22 +167,23 @@ impl SharedState {
         // immediate: a deferred one that reads first fails at once, busy timeout or not, when
         // another write gets in before its own
         conn.immediate_transaction(|conn| {
-            let stored: Option<Option<i64>> = item::table
+            let stored: Option<(Option<i64>, Vec<u8>)> = item::table
                 .filter(item::target.eq(target.as_bytes()))
-                .select(item::seq)
+                .select((item::seq, item::value))
                 .first(conn)
                 .optional()
                 .inspect_err(|e| warn!("couldn't store a BEP 44 item: {e}"))?;
             if let Some(cas) = put.cas()
-                && stored.flatten() != Some(cas)
+                && stored.as_ref().and_then(|(seq, _)| *seq) != Some(cas)
             {
                 return Err(KrpcError::new(
                     301,
                     "the CAS hash mismatched, re-read value and try again".to_string(),
                 ));
             }
-            if let Some(Some(stored)) = stored
-                && *seq < stored
+            // the same seq is a refresh of the same value, never a new one
+            if let Some((Some(stored_seq), stored_value)) = &stored
+                && (*seq < *stored_seq || (*seq == *stored_seq && stored_value != value))
             {
                 return Err(KrpcError::new(302, "sequence number less than current".to_string()));
             }
