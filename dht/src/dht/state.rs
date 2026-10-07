@@ -281,11 +281,33 @@ impl SharedState {
         }
         let (num, hashes) = or_nothing(self.with_conn(|conn| {
             let num: i64 = swarm::table.count().get_result(conn)?;
-            let hashes = swarm::table
-                .select(swarm::info_hash)
-                .order(diesel::dsl::sql::<diesel::sql_types::Integer>("random()"))
-                .limit(MAX_SAMPLES)
-                .load::<Vec<u8>>(conn)?;
+            // the first hash at or after random points: an index seek each, where ordering
+            // the whole table by random() read every row of a long-term index
+            let mut hashes = std::collections::BTreeSet::new();
+            if num <= MAX_SAMPLES {
+                hashes.extend(swarm::table.select(swarm::info_hash).load::<Vec<u8>>(conn)?);
+                return Ok((num, hashes));
+            }
+            for _ in 0..MAX_SAMPLES * 2 {
+                let at: [u8; 20] = rand::rng().random();
+                let found = swarm::table
+                    .select(swarm::info_hash)
+                    .filter(swarm::info_hash.ge(at.as_slice()))
+                    .order(swarm::info_hash)
+                    .first::<Vec<u8>>(conn)
+                    .optional()?;
+                let found = match found {
+                    Some(found) => found,
+                    None => swarm::table
+                        .select(swarm::info_hash)
+                        .order(swarm::info_hash)
+                        .first(conn)?,
+                };
+                hashes.insert(found);
+                if hashes.len() as i64 == MAX_SAMPLES {
+                    break;
+                }
+            }
             Ok((num, hashes))
         }));
         let samples = Samples {
@@ -379,6 +401,19 @@ mod tests {
         let mut conn = state.conn.get().unwrap();
         let swarms: i64 = swarm::table.count().get_result(&mut conn).unwrap();
         assert_eq!(swarms, 1, "a swarm with no peers left goes too");
+    }
+
+    #[tokio::test]
+    async fn a_sample_of_a_big_store_is_twenty_of_its_hashes() {
+        let state = state().await;
+        for i in 0..200u8 {
+            let peer = SocketAddr::from(([10, 0, 0, 1], 6881));
+            state.store_peer(&InfoHash([i; 20]), peer, false).unwrap();
+        }
+        let sample = state.sample();
+        assert_eq!(sample.num, 200);
+        assert_eq!(sample.samples.len(), MAX_SAMPLES as usize);
+        assert!(sample.samples.iter().all(|h| h.0.iter().all(|b| *b == h.0[0])));
     }
 
     #[tokio::test]
