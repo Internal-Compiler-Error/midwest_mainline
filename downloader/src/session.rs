@@ -14,7 +14,9 @@ use crate::dht::Dht;
 use crate::events::{Event, EventBus, Events, info_hash_hex};
 use crate::peer::PeerSnapshot;
 use crate::portmap::MappingState;
-use crate::resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files, scan_resume_files};
+use crate::resume::{
+    Modes, ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resume_files, scan_resume_files,
+};
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
 use crate::{BtClient, load_source};
@@ -86,6 +88,8 @@ pub struct Progress {
     pub peers: Vec<PeerInfo>,
     /// pieces are fetched in order, see `Session::set_sequential`
     pub sequential: bool,
+    /// BEP 16, see `Session::set_super_seed`
+    pub super_seed: bool,
     /// the trackers and the DHT; empty while paused
     pub trackers: Vec<TrackerInfo>,
 }
@@ -173,7 +177,7 @@ struct Resolved {
     selected: Vec<bool>,
     /// bytes uploaded in earlier sessions
     uploaded: u64,
-    sequential: bool,
+    modes: Modes,
 }
 
 /// The task that owns one torrent for its whole life in the session: resolves the source,
@@ -190,8 +194,8 @@ struct TorrentTask {
     commands: mpsc::UnboundedReceiver<Command>,
     /// the file selection, read by the resume saver and shown in the phase
     selected: watch::Sender<Vec<bool>>,
-    /// same for the sequential switch
-    sequential: watch::Sender<bool>,
+    /// same for the per-torrent switches
+    modes: watch::Sender<Modes>,
     /// the session's active-download slots, see `Settings::max_active_downloads`
     slots: Arc<Slots>,
     /// known before resolving for a magnet or a resume file; names the resume file to
@@ -275,8 +279,8 @@ impl TorrentTask {
         let mut resolve = std::pin::pin!(resolve(self.cancel.clone()));
         // a pause asked for while still resolving applies once resolved
         let mut pause_asked = false;
-        // a sequential switch flipped while resolving wins over what the resume file says
-        let mut sequential_asked = None;
+        // a switch flipped while resolving wins over what the resume file says
+        let (mut sequential_asked, mut super_seed_asked) = (None, None);
         let resolved = loop {
             tokio::select! {
                 resolved = &mut resolve => break resolved,
@@ -287,6 +291,7 @@ impl TorrentTask {
                     Some(Command::Pause) => pause_asked = true,
                     Some(Command::Unpause) => pause_asked = false,
                     Some(Command::Sequential(on)) => sequential_asked = Some(on),
+                    Some(Command::SuperSeed(on)) => super_seed_asked = Some(on),
                     // the files aren't known yet, and there's nothing on disk to check
                     Some(Command::SelectFiles(_) | Command::Recheck) => {}
                 },
@@ -294,7 +299,8 @@ impl TorrentTask {
         };
         let mut resolved = resolved.map(|mut resolved| {
             resolved.paused |= pause_asked;
-            resolved.sequential = sequential_asked.unwrap_or(resolved.sequential);
+            resolved.modes.sequential = sequential_asked.unwrap_or(resolved.modes.sequential);
+            resolved.modes.super_seed = super_seed_asked.unwrap_or(resolved.modes.super_seed);
             resolved
         });
 
@@ -347,7 +353,10 @@ impl TorrentTask {
             paused: recheck && data.paused,
             peers: vec![],
             uploaded: data.uploaded,
-            sequential: data.sequential,
+            modes: Modes {
+                sequential: data.sequential,
+                super_seed: data.super_seed,
+            },
         })
     }
 
@@ -363,7 +372,7 @@ impl TorrentTask {
             mut peers,
             selected,
             uploaded,
-            sequential,
+            modes,
         } = resolved;
         let torrent = Arc::new(torrent);
         self.persisted = match resumed {
@@ -379,11 +388,14 @@ impl TorrentTask {
             files: torrent.files.len(),
         });
         self.selected.send_replace(selected);
-        self.sequential.send_replace(sequential);
+        self.modes.send_replace(modes);
         self.uploaded_before = uploaded;
 
         let mut last_stats = None;
-        let mut next = recheck_first.then_some(Ok((Stop::Recheck, None)));
+        // a newly added torrent whose files are already there (its creator seeding it, or a
+        // download moved over from another client) starts with a check, not from nothing
+        let mut next =
+            (recheck_first || (!resumed && has_data_on_disk(&torrent, &root))).then_some(Ok((Stop::Recheck, None)));
         let stop = loop {
             let stop = if let Some(stop) = next.take() {
                 stop
@@ -481,7 +493,10 @@ impl TorrentTask {
                         self.selected.send_replace(selected);
                     }
                     Some(Command::Sequential(on)) => {
-                        self.sequential.send_replace(on);
+                        self.modes.send_modify(|m| m.sequential = on);
+                    }
+                    Some(Command::SuperSeed(on)) => {
+                        self.modes.send_modify(|m| m.super_seed = on);
                     }
                     Some(Command::Recheck) => {}
                 },
@@ -595,8 +610,12 @@ impl TorrentTask {
             self.client
                 .select_files(&torrent.info_hash, self.selected.borrow().clone());
         }
-        if *self.sequential.borrow() {
+        let modes = *self.modes.borrow();
+        if modes.sequential {
             self.client.set_sequential(&torrent.info_hash, true);
+        }
+        if modes.super_seed {
+            self.client.set_super_seed(&torrent.info_hash, true);
         }
         let Some(stats) = self.client.stats(torrent) else {
             self.client.remove_torrent(&torrent.info_hash);
@@ -614,7 +633,7 @@ impl TorrentTask {
             stats.clone(),
             ResumeInputs {
                 selected: self.selected.subscribe(),
-                sequential: self.sequential.subscribe(),
+                modes: self.modes.subscribe(),
                 uploaded_before: self.uploaded_before,
                 persisted: self.persisted.clone(),
             },
@@ -628,7 +647,7 @@ impl TorrentTask {
             peers,
             trackers,
             selected: self.selected.subscribe(),
-            sequential: self.sequential.subscribe(),
+            modes: self.modes.subscribe(),
             uploaded_before: self.uploaded_before,
         });
         self.bus.emit(Event::TorrentStarted {
@@ -671,7 +690,11 @@ impl TorrentTask {
                     }
                     Some(Command::Sequential(on)) => {
                         self.client.set_sequential(&torrent.info_hash, on);
-                        self.sequential.send_replace(on);
+                        self.modes.send_modify(|m| m.sequential = on);
+                    }
+                    Some(Command::SuperSeed(on)) => {
+                        self.client.set_super_seed(&torrent.info_hash, on);
+                        self.modes.send_modify(|m| m.super_seed = on);
                     }
                     Some(Command::Unpause) => {}
                     None => break Ok(Stop::Shutdown),
@@ -732,7 +755,7 @@ impl TorrentTask {
                 root: root.to_path_buf(),
                 stats: TorrentSwarmStats::for_verified(torrent, verified.clone(), wanted),
                 selected: self.selected.subscribe(),
-                sequential: self.sequential.subscribe(),
+                modes: self.modes.subscribe(),
                 uploaded_before: self.uploaded_before,
             });
             tokio::select! {
@@ -746,7 +769,10 @@ impl TorrentTask {
                         self.selected.send_replace(selected);
                     }
                     Some(Command::Sequential(on)) => {
-                        self.sequential.send_replace(on);
+                        self.modes.send_modify(|m| m.sequential = on);
+                    }
+                    Some(Command::SuperSeed(on)) => {
+                        self.modes.send_modify(|m| m.super_seed = on);
                     }
                     Some(Command::Unpause) => {}
                     None => return Err(Stop::Shutdown),
@@ -792,7 +818,7 @@ impl TorrentTask {
             root: root.to_path_buf(),
             stats: stats.clone(),
             selected: self.selected.subscribe(),
-            sequential: self.sequential.subscribe(),
+            modes: self.modes.subscribe(),
             uploaded_before: self.uploaded_before,
         });
         self.bus.emit(Event::TorrentPaused {
@@ -801,7 +827,9 @@ impl TorrentTask {
         let mut data = ResumeData::from_torrent(torrent, root, verified);
         data.paused = true;
         data.skip = crate::resume::skipped(&self.selected.borrow());
-        data.sequential = *self.sequential.borrow();
+        let modes = *self.modes.borrow();
+        data.sequential = modes.sequential;
+        data.super_seed = modes.super_seed;
         data.uploaded = self.uploaded_before;
         let written = {
             let (torrent, persisted) = (torrent.clone(), self.persisted.clone());
@@ -826,7 +854,11 @@ impl TorrentTask {
                         break Stop::Pause;
                     }
                     Some(Command::Sequential(on)) => {
-                        self.sequential.send_replace(on);
+                        self.modes.send_modify(|m| m.sequential = on);
+                        break Stop::Pause;
+                    }
+                    Some(Command::SuperSeed(on)) => {
+                        self.modes.send_modify(|m| m.super_seed = on);
                         break Stop::Pause;
                     }
                     Some(Command::Pause) => {}
@@ -851,7 +883,7 @@ enum Phase {
         peers: watch::Receiver<Vec<PeerSnapshot>>,
         trackers: watch::Receiver<Vec<TrackerStatus>>,
         selected: watch::Receiver<Vec<bool>>,
-        sequential: watch::Receiver<bool>,
+        modes: watch::Receiver<Modes>,
         uploaded_before: u64,
     },
     Paused {
@@ -860,7 +892,7 @@ enum Phase {
         /// the last stats before the swarm was stopped
         stats: TorrentSwarmStats,
         selected: watch::Receiver<Vec<bool>>,
-        sequential: watch::Receiver<bool>,
+        modes: watch::Receiver<Modes>,
         uploaded_before: u64,
     },
     Queued {
@@ -868,7 +900,7 @@ enum Phase {
         root: PathBuf,
         stats: TorrentSwarmStats,
         selected: watch::Receiver<Vec<bool>>,
-        sequential: watch::Receiver<bool>,
+        modes: watch::Receiver<Modes>,
         uploaded_before: u64,
     },
     Checking {
@@ -889,6 +921,7 @@ enum Command {
     SelectFiles(Vec<bool>),
     Recheck,
     Sequential(bool),
+    SuperSeed(bool),
 }
 
 /// The whole session at a glance, for a status bar.
@@ -1131,7 +1164,7 @@ impl Session {
                 paused: false,
                 peers: loaded.peers,
                 uploaded: 0,
-                sequential: false,
+                modes: Modes::default(),
             })
         })
     }
@@ -1163,7 +1196,10 @@ impl Session {
                     paused: data.paused,
                     peers: vec![],
                     uploaded: data.uploaded,
-                    sequential: data.sequential,
+                    modes: Modes {
+                        sequential: data.sequential,
+                        super_seed: data.super_seed,
+                    },
                 })
             },
         )
@@ -1219,6 +1255,14 @@ impl Session {
     /// downloads. Remembered across restarts.
     pub fn set_sequential(&mut self, id: TorrentId, on: bool) {
         self.command(id, Command::Sequential(on));
+    }
+
+    /// BEP 16 super-seeding: once the torrent is complete, each newly connected peer is shown
+    /// one piece at a time, and the next only after it passed the last one on. For the first
+    /// seeder of a torrent, it spreads the pieces with less of its own upload. Unknown ids are
+    /// ignored.
+    pub fn set_super_seed(&mut self, id: TorrentId, on: bool) {
+        self.command(id, Command::SuperSeed(on));
     }
 
     /// Removes a torrent: its connections close and its resume file is deleted, and with
@@ -1280,7 +1324,7 @@ impl Session {
             phase: phase_tx,
             commands: commands_rx,
             selected: watch::channel(vec![]).0,
-            sequential: watch::channel(false).0,
+            modes: watch::channel(Modes::default()).0,
             slots: self.slots.clone(),
             info_hash,
             resume_path,
@@ -1395,7 +1439,7 @@ impl Entry {
                 peers,
                 trackers,
                 selected,
-                sequential,
+                modes,
                 uploaded_before,
             } => {
                 let stats = stats.borrow().clone();
@@ -1405,7 +1449,7 @@ impl Entry {
                     &root,
                     &stats,
                     &selected.borrow(),
-                    *sequential.borrow(),
+                    *modes.borrow(),
                     &self.rates,
                 );
                 progress.uploaded += uploaded_before;
@@ -1418,7 +1462,7 @@ impl Entry {
                 root,
                 stats,
                 selected,
-                sequential,
+                modes,
                 uploaded_before,
             }
             | Phase::Queued {
@@ -1426,7 +1470,7 @@ impl Entry {
                 root,
                 stats,
                 selected,
-                sequential,
+                modes,
                 uploaded_before,
             } => {
                 self.rates = Rates::new();
@@ -1436,7 +1480,7 @@ impl Entry {
                     &root,
                     &stats,
                     &selected.borrow(),
-                    *sequential.borrow(),
+                    *modes.borrow(),
                     &self.rates,
                 );
                 progress.uploaded += uploaded_before;
@@ -1477,12 +1521,20 @@ impl Entry {
     }
 }
 
+fn has_data_on_disk(torrent: &Torrent, root: &Path) -> bool {
+    torrent
+        .files
+        .iter()
+        .zip(&torrent.attrs)
+        .any(|((_, path), attr)| !attr.pad && std::fs::metadata(root.join(path)).is_ok_and(|m| m.len() > 0))
+}
+
 fn progress(
     torrent: &Torrent,
     root: &Path,
     stats: &TorrentSwarmStats,
     selected: &[bool],
-    sequential: bool,
+    modes: Modes,
     rates: &Rates,
 ) -> Progress {
     Progress {
@@ -1511,7 +1563,8 @@ fn progress(
         download_bps: rates.download_bps,
         upload_bps: rates.upload_bps,
         peers: vec![],
-        sequential,
+        sequential: modes.sequential,
+        super_seed: modes.super_seed,
         trackers: vec![],
     }
 }
@@ -1698,6 +1751,7 @@ mod test {
             upload_bps: 0.0,
             peers: vec![],
             sequential: false,
+            super_seed: false,
             trackers: vec![],
         };
         // a zero-piece torrent must not divide by zero
@@ -2168,17 +2222,18 @@ mod test {
     /// with the torrent. These go through `watch` senders that have no receiver yet at that
     /// point, where a plain `send` silently drops the value.
     #[test]
-    fn a_resumed_torrent_keeps_its_sequential_mode() {
+    fn a_resumed_torrent_keeps_its_modes() {
         let dir = scratch("sequential");
         let torrent_file = write_torrent_file(&dir);
         let mut session = Session::new(test_config(&dir)).unwrap();
         let id = session.add(torrent_file.display().to_string(), dir.join("downloads"));
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         session.set_sequential(id, true);
+        session.set_super_seed(id, true);
         wait_for(
             &mut session,
             id,
-            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.sequential),
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.sequential && p.super_seed),
         );
         session.pause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
@@ -2189,8 +2244,29 @@ mod test {
         wait_for(
             &mut session,
             ids[0],
-            |s| matches!(s, Some(TorrentState::Paused(p)) if p.sequential),
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.sequential && p.super_seed),
         );
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Adding a torrent over the data it describes (as its creator does to seed it) keeps
+    /// that data and finds every piece, rather than starting over on an emptied file.
+    #[test]
+    fn adding_a_torrent_over_its_data_seeds_it() {
+        let dir = scratch("over-data");
+        let torrent_file = write_torrent_file(&dir);
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("session.bin"), [7u8; 40]).unwrap();
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), downloads.clone());
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Downloading(p)) if p.completed && p.verified_pieces == 3),
+        );
+        assert_eq!(std::fs::read(downloads.join("session.bin")).unwrap(), [7u8; 40]);
         session.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

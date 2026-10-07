@@ -198,6 +198,15 @@ impl BtClient {
         }
     }
 
+    /// BEP 16 super-seeding: while the torrent is complete, each newly connected peer is
+    /// shown one piece at a time. Unknown torrents are ignored.
+    pub fn set_super_seed(&self, info_hash: &InfoHash, on: bool) {
+        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
+        if let Some(handle) = handle {
+            tokio::spawn(async move { handle.set_super_seed(on).await });
+        }
+    }
+
     /// Tells a torrent's swarm about peers found some other way than its own announces, such
     /// as the ones a magnet's metadata fetch met. Unknown torrents are ignored.
     pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {
@@ -267,15 +276,19 @@ impl BtClient {
                 continue;
             }
             fs::create_dir_all(file.parent().unwrap())?;
+            // never truncated: a fresh add may be over the very data the torrent describes,
+            // which the check that follows finds
             let f = File::options()
                 .read(true)
                 .write(true)
                 .create(fresh)
-                .truncate(fresh)
+                .truncate(false)
                 .open(&file)
                 .with_context(|| format!("opening {}", file.display()))?;
             if fresh {
-                f.set_len(*size)?;
+                if f.metadata()?.len() < *size {
+                    f.set_len(*size)?;
+                }
                 if attr.executable {
                     use std::os::unix::fs::PermissionsExt;
                     f.set_permissions(fs::Permissions::from_mode(0o755))?;

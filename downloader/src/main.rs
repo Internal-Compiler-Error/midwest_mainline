@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing_subscriber::Layer;
 
-const USAGE: &str = "usage: downloader [--seed] <path-to-.torrent | magnet-uri> [download-dir]
-       downloader [--seed] <path-to-.resume>
+const USAGE: &str = "usage: downloader [--seed] [--super-seed] <path-to-.torrent | magnet-uri> [download-dir]
+       downloader [--seed] [--super-seed] <path-to-.resume>
 
-  --seed   keep uploading after the download completes, until Ctrl-C or the seed ratio limit";
+  --seed         keep uploading after the download completes, until Ctrl-C or the seed ratio limit
+  --super-seed   as the first seeder, show each peer a piece at a time (BEP 16); implies --seed";
 
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
@@ -26,10 +27,12 @@ fn main() -> anyhow::Result<()> {
     let telemetry = Telemetry::install(tracing_subscriber::fmt::layer().pretty().boxed())?;
 
     let mut seed = false;
+    let mut super_seed = false;
     let mut positional = Vec::new();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--seed" => seed = true,
+            "--super-seed" => (seed, super_seed) = (true, true),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -74,6 +77,9 @@ fn main() -> anyhow::Result<()> {
         }
         None => session.add(source, root),
     };
+    if super_seed {
+        session.set_super_seed(id, true);
+    }
 
     let mut last_report = Instant::now();
     let mut announced_metadata = false;

@@ -167,6 +167,11 @@ impl TorrentSwarmHandle {
     pub(crate) async fn set_sequential(&self, on: bool) {
         let _ = self.tx.send(SwarmEvent::Sequential(on)).await;
     }
+
+    /// BEP 16: while we have every piece, show each new peer only a piece at a time.
+    pub(crate) async fn set_super_seed(&self, on: bool) {
+        let _ = self.tx.send(SwarmEvent::SuperSeed(on)).await;
+    }
 }
 
 /// What every swarm of one client has in common: who we are and the client-wide services.
@@ -204,6 +209,7 @@ pub(crate) enum SwarmEvent {
     FilesSelected(Vec<bool>),
     /// see `TorrentSwarmHandle::set_sequential`
     Sequential(bool),
+    SuperSeed(bool),
     /// a socket finished its handshake and is ours to own
     PeerConnected(ConnectedPeer),
     /// a block a peer asked for has been read off disk (or couldn't be), see `serve_request`
@@ -225,7 +231,11 @@ pub(crate) enum SwarmEvent {
     /// needs to actually leave the set on failure.
     DialFailed(SocketAddr),
     /// a web seed's job (see `start_web_job`) fetched a block
-    WebSeedBlock { seed: usize, job: u64, block: Piece },
+    WebSeedBlock {
+        seed: usize,
+        job: u64,
+        block: Piece,
+    },
     /// a web seed's job ended; every block it delivered came before this
     WebSeedDone {
         seed: usize,
@@ -497,6 +507,9 @@ pub struct TorrentSwarm {
     missing: Vec<u32>,
     /// pick the lowest missing piece instead of the rarest
     sequential: bool,
+    super_seed: bool,
+    /// BEP 16: how many peers each piece has been revealed to
+    super_seed_offers: Vec<u32>,
     in_flight: BTreeMap<u32, InFlight>,
     /// our public address by the votes of peers (`yourip`) and trackers
     external: ExternalAddress,
@@ -559,6 +572,7 @@ impl TorrentSwarm {
             torrent.num_pieces(),
             "verified bitfield must have one bit per piece"
         );
+        let pieces = torrent.num_pieces();
         let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
         let explore_slots = ((missing.len() as f64).sqrt().ceil() as usize).max(1);
         let wanted = bitvec![u8, Msb0; 1; torrent.num_pieces()].into_boxed_bitslice();
@@ -611,7 +625,7 @@ impl TorrentSwarm {
             known: BTreeMap::new(),
             exploring: BTreeSet::new(),
             explore_slots,
-            availability: vec![0; torrent.num_pieces()],
+            availability: vec![0; pieces],
             layers: LayerFetch::new(&torrent),
             hash_trees: BTreeMap::new(),
             inbox,
@@ -630,6 +644,8 @@ impl TorrentSwarm {
             events_tx,
             missing,
             sequential: false,
+            super_seed: false,
+            super_seed_offers: vec![0; pieces],
             in_flight: BTreeMap::new(),
             holdings: BTreeMap::new(),
             external,
@@ -749,6 +765,7 @@ impl TorrentSwarm {
             }
             SwarmEvent::FilesSelected(selected) => self.select_files(&selected).await,
             SwarmEvent::Sequential(on) => self.sequential = on,
+            SwarmEvent::SuperSeed(on) => self.set_super_seed(on).await,
             SwarmEvent::PeerConnected(connected) => self.add_peer(connected).await,
             SwarmEvent::BlockRead { to, block } => self.send_block(to, block).await,
             SwarmEvent::PieceDone {
@@ -1096,6 +1113,9 @@ impl TorrentSwarm {
                     // an unchoke or a bitfield may have made pieces requestable
                     self.schedule().await;
                 }
+                if new_piece.is_some() || replaces_bitfield {
+                    self.reveal_where_spread().await;
+                }
                 return;
             }
             Ok(Some(msg)) => msg,
@@ -1259,7 +1279,11 @@ impl TorrentSwarm {
         // never serve a piece we haven't hash-verified, nor a block size or queue depth past
         // what a well-behaved peer asks for: each accepted request costs a disk read and its
         // block in memory until sent
-        let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b);
+        let verified = self.stat.verified.get(request.index as usize).is_some_and(|b| *b)
+            && peer
+                .super_seed
+                .as_ref()
+                .is_none_or(|view| view.offered.contains(&request.index));
         let sane = request.length > 0 && request.length <= MAX_SERVED_BLOCK;
         if !verified || !sane || peer.uploads.len() >= MAX_QUEUED_UPLOADS {
             if peer.send_reject(request).await.is_err() {
@@ -1795,6 +1819,91 @@ impl TorrentSwarm {
     }
 
     /// BEP 21: everything selected is in, but not everything there is.
+    fn super_seeding(&self) -> bool {
+        self.super_seed && self.stat.all_verified()
+    }
+
+    async fn set_super_seed(&mut self, on: bool) {
+        self.super_seed = on;
+        if on {
+            // peers already connected have seen everything; it applies to newcomers
+            return;
+        }
+        for idx in (0..self.peers.len()).rev() {
+            let peer = &mut self.peers[idx];
+            let Some(view) = peer.super_seed.take() else { continue };
+            let hidden: Vec<u32> = self
+                .stat
+                .verified
+                .iter_ones()
+                .map(|p| p as u32)
+                .filter(|p| !view.offered.contains(p) && !peer.they_have(*p))
+                .collect();
+            for piece in hidden {
+                if peer.send_have(piece).await.is_err() {
+                    self.drop_peer(idx, "send failed");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// BEP 16: shows a super-seeded peer one more piece it lacks: the least common, counting
+    /// both who has it and who it was shown to, so one copy of each goes out before seconds.
+    async fn reveal_next_piece(&mut self, idx: usize) {
+        let peer = &self.peers[idx];
+        let Some(view) = &peer.super_seed else { return };
+        let scatter = rand::random::<u32>();
+        let pick = (0..self.availability.len() as u32)
+            .filter(|&p| !peer.they_have(p) && !view.offered.contains(&p))
+            .min_by_key(|&p| {
+                let seen = self.availability[p as usize] + self.super_seed_offers[p as usize];
+                (seen, p.wrapping_mul(0x9E37_79B9) ^ scatter)
+            });
+        let others = pick.map(|p| self.availability[p as usize]);
+        let peer = &mut self.peers[idx];
+        let view = peer.super_seed.as_mut().expect("checked above");
+        let (Some(piece), Some(others)) = (pick, others) else {
+            view.current = None;
+            return;
+        };
+        view.offered.insert(piece);
+        view.current = Some((piece, others, Instant::now()));
+        self.super_seed_offers[piece as usize] += 1;
+        if peer.send_have(piece).await.is_err() {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
+    /// BEP 16: a peer gets its next piece once the one it was shown turns up at another peer,
+    /// which means it passed it on. Alone in the swarm, or holding its piece for a while with
+    /// no taker, it gets the next one anyway rather than waiting forever.
+    async fn reveal_where_spread(&mut self) {
+        if !self.peers.iter().any(|p| p.super_seed.is_some()) {
+            return;
+        }
+        const PATIENCE: Duration = Duration::from_secs(120);
+        let lone = self.peers.len() == 1;
+        let ready: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter(|p| {
+                let Some((piece, others_then, shown)) = p.super_seed.as_ref().and_then(|v| v.current) else {
+                    return false;
+                };
+                let theirs = p.they_have(piece);
+                let others_now = self.availability[piece as usize] - theirs as u32;
+                others_now > others_then || (theirs && (lone || shown.elapsed() >= PATIENCE))
+            })
+            .map(|p| p.remote_addr)
+            .collect();
+        for addr in ready {
+            if let Some(idx) = self.peer_index(addr) {
+                self.reveal_next_piece(idx).await;
+            }
+        }
+    }
+
     fn partial_seed(&self) -> bool {
         self.stat.completed && !self.stat.all_verified()
     }
@@ -2272,7 +2381,15 @@ impl TorrentSwarm {
             }
             // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
             // place of a BitField for the "everything"/"nothing" cases
-            if peer.remote_supports_fast && self.stat.all_verified() {
+            if self.super_seeding() {
+                peer.super_seed = Some(Default::default());
+                if peer.remote_supports_fast {
+                    peer.send_have_none().await?;
+                } else {
+                    let has = vec![0u8; self.torrent.num_pieces().div_ceil(8)].into_boxed_slice();
+                    peer.send_bitfield(BitField { has }).await?;
+                }
+            } else if peer.remote_supports_fast && self.stat.all_verified() {
                 peer.send_have_all().await?;
             } else if peer.remote_supports_fast && self.stat.verified_cnt() == 0 {
                 peer.send_have_none().await?;
@@ -2322,6 +2439,7 @@ impl TorrentSwarm {
         });
         let insert_at = self.peers.partition_point(|p| p.remote_addr < remote_addr);
         self.peers.insert(insert_at, peer);
+        self.reveal_next_piece(insert_at).await;
     }
 
     /// Dials every address in `peers` we're not already connected to or dialing. Shared by
@@ -3602,6 +3720,90 @@ mod test {
             .unwrap();
         let answer = tokio::time::timeout(Duration::from_millis(500), leech.next()).await;
         assert!(answer.is_err(), "a choked peer must get nothing back, got {answer:?}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// BEP 16: super-seeding hides our pieces, shows each newcomer a different one, shows the
+    /// next only once the last has spread, serves only what was shown, and switching it off
+    /// reveals the rest.
+    #[tokio::test]
+    async fn super_seeding_reveals_a_piece_at_a_time() {
+        let (swarm, handle, path) = swarm_with("superseed", true);
+        tokio::spawn(swarm.work_loop());
+        handle.set_super_seed(true).await;
+
+        type Wire = Framed<tokio::net::TcpStream, BtCodec>;
+        async fn next_have(peer: &mut Wire) -> u32 {
+            let have = async {
+                loop {
+                    match peer.next().await {
+                        Some(Ok(BtMessage::Have(have))) => return have.checked,
+                        Some(Ok(BtMessage::HaveAll(_) | BtMessage::BitField(_))) => panic!("revealed everything"),
+                        Some(Ok(_)) => {}
+                        other => panic!("connection ended: {other:?}"),
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), have)
+                .await
+                .expect("no Have")
+        }
+        let mut a = fake_peer_with(&handle, "10.0.0.1:6881", true).await;
+        let Some(Ok(BtMessage::HaveNone(_))) = a.next().await else {
+            panic!("a super-seed greets with HaveNone");
+        };
+        let first = next_have(&mut a).await;
+        let mut b = fake_peer_with(&handle, "10.0.0.2:6881", true).await;
+        let shown_b = next_have(&mut b).await;
+        assert_ne!(first, shown_b, "each newcomer is shown a different piece");
+
+        // b got a's piece from a: a passed it on, so a is shown another
+        b.send(BtMessage::Have(crate::wire::Have { checked: first }))
+            .await
+            .unwrap();
+        let second = next_have(&mut a).await;
+        assert_ne!(second, first);
+
+        a.send(BtMessage::Interested(crate::wire::Interested)).await.unwrap();
+        let unchoked = async {
+            loop {
+                if let Some(Ok(BtMessage::Unchoke(_))) = a.next().await {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(CHOKING_ROUND_INTERVAL + Duration::from_secs(5), unchoked)
+            .await
+            .expect("never unchoked");
+        let hidden = (0..3).find(|p| ![first, second].contains(p)).unwrap();
+        let ask = |index| Request {
+            index,
+            begin: 0,
+            length: 16,
+        };
+        a.send(BtMessage::Request(ask(hidden))).await.unwrap();
+        a.send(BtMessage::Request(ask(first))).await.unwrap();
+        let (mut rejected, mut served) = (false, false);
+        let answers = async {
+            while !(rejected && served) {
+                match a.next().await {
+                    Some(Ok(BtMessage::RejectRequest(r))) => {
+                        assert_eq!(r.index, hidden);
+                        rejected = true;
+                    }
+                    Some(Ok(BtMessage::Piece(piece))) => {
+                        assert_eq!(piece.index, first);
+                        served = true;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("connection ended: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), answers).await.unwrap();
+
+        handle.set_super_seed(false).await;
+        assert_eq!(next_have(&mut a).await, hidden, "switching off reveals the rest");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

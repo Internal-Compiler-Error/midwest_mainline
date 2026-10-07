@@ -21,6 +21,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 12 | Multitracker (`announce-list`) | `torrent.rs`, `announcer.rs` |
 | 14 | Local service discovery | `lsd.rs` |
 | 15 | UDP trackers (connect, announce, scrape; retransmits, connection-id expiry) | `announcer.rs` |
+| 16 | Super-seeding, per torrent (Details switch, CLI `--super-seed`, kept in the resume file): while complete, a new peer gets HaveNone (or an empty bitfield) and one piece at a time, the least seen; the next once that piece turns up at another peer (or the peer is alone, or 2 min pass); requests for unshown pieces are rejected; switching off reveals the rest. Locally, two leechers off one super-seed: the seed sent 1.01x the torrent, against 1.29x without | `torrent_swarm.rs` (`reveal_next_piece`, `reveal_where_spread`), `peer.rs` (`SuperSeedView`), `session.rs` / `resume.rs` (`Modes`) |
 | 19 | Web seeds (`url-list`, magnet `ws=`): HTTP(S) range requests over a shared HTTP/2 client, runs of consecutive pieces scheduled by UCB next to peers, endgame racing, backoff/give-up; `webseed` spans | `webseed.rs`, `torrent_swarm.rs`, `torrent.rs`, `magnet.rs` |
 | 20 | Peer id convention (`-DL0100-` + random) | `defs.rs` (`random_peer_id`) |
 | 21 | Partial seeds: `upload_only` re-sent when the selection completes but not every piece is in; peers' flag read (PEX marks them as seeds) | `torrent_swarm.rs` (`partial_seed`), `peer.rs` |
@@ -51,7 +52,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 46 | Updating torrents via BEP 44 mutable items | Builds on 44: a magnet with a public key, the torrent's info hash as the item; the downloader would poll for new seqs |
-| 16 | Super-seeding | Only useful when we're the initial seeder |
 
 ## Not planned
 

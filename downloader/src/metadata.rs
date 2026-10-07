@@ -89,9 +89,12 @@ pub async fn fetch(
     bus: EventBus,
 ) -> anyhow::Result<Fetched> {
     // a watch whose sender is gone is a client with no DHT, now or ever (`Dht::none`, or a
-    // node that failed to start); with no trackers either there's nowhere to find a peer
-    if magnet.trackers.is_empty() && dht.has_changed().is_err() {
-        bail!("magnet URI has no trackers (`tr=`) and the DHT is off, so there's no way to find peers");
+    // node that failed to start); with no trackers or `x.pe` peers either there's nowhere to
+    // find a peer
+    if magnet.trackers.is_empty() && magnet.peers.is_empty() && dht.has_changed().is_err() {
+        bail!(
+            "magnet URI has no trackers (`tr=`) or peers (`x.pe=`) and the DHT is off, so there's no way to find peers"
+        );
     }
     // The announcers report progress they can't possibly know yet; they only need something
     // shaped like stats to read `left`/`uploaded`/`downloaded` out of.

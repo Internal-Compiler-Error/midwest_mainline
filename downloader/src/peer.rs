@@ -115,6 +115,15 @@ pub(crate) struct Incoming {
 
 pub(crate) type Inbox = mpsc::Sender<Incoming>;
 
+/// BEP 16: the pieces a super-seed has revealed to one peer, and the one it waits to see
+/// spread before revealing another.
+#[derive(Debug, Default)]
+pub(crate) struct SuperSeedView {
+    pub offered: std::collections::BTreeSet<u32>,
+    /// the latest piece shown, how many other peers had it then, and when it was shown
+    pub current: Option<(u32, u32, std::time::Instant)>,
+}
+
 /// One connected peer, owned by its `TorrentSwarm`. The socket itself belongs to two tasks: a
 /// reader that forwards each message to the swarm's inbox, and a writer that drains this peer's
 /// outbox, batching whatever is queued into one flush. The swarm never waits on a socket, so a
@@ -146,6 +155,8 @@ pub(crate) struct Peer {
     pub listen_port: Option<u16>,
     /// we dialed it, so `remote_addr` is where it listens
     pub dialed: bool,
+    /// BEP 16: what super-seeding has shown this peer; `None` when it saw our real bitfield
+    pub super_seed: Option<SuperSeedView>,
     /// BEP 10 `yourip`: our address as the peer sees it, until the swarm takes it to vote with
     pub yourip: Option<IpAddr>,
 
@@ -321,6 +332,7 @@ impl Peer {
             their_ut_holepunch_id: None,
             listen_port: None,
             dialed: false,
+            super_seed: None,
             conn,
             outbox,
             io_tasks: [reader.abort_handle(), writer.abort_handle()],

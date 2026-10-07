@@ -17,11 +17,13 @@
     torrent,
     onselectfiles,
     onsequential,
+    onsuperseed,
     onpeer,
   }: {
     torrent: TorrentRow
     onselectfiles: (selected: boolean[]) => void
     onsequential: (on: boolean) => void
+    onsuperseed: (on: boolean) => void
     onpeer?: (addr: string) => void
   } = $props()
 
@@ -104,6 +106,11 @@
       <Switch id="sequential" checked={torrent.sequential} onCheckedChange={(on) => onsequential(on)} />
       <Label for="sequential">Sequential download</Label>
       <span class="text-muted-foreground">(pieces in order, for playing while it downloads)</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <Switch id="super-seed" checked={torrent.super_seed} onCheckedChange={(on) => onsuperseed(on)} />
+      <Label for="super-seed">Super-seeding</Label>
+      <span class="text-muted-foreground">(once complete: a piece at a time per peer, for the first seeder)</span>
     </div>
 
     <div class="font-medium">Files ({shownFiles.length})</div>

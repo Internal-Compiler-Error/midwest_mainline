@@ -23,6 +23,7 @@ export interface Progress {
   peers: Peer[]
   /** pieces are fetched in order, for playing a file while it downloads */
   sequential: boolean
+  super_seed: boolean
   /** the trackers and the DHT; empty while paused */
   trackers: Tracker[]
 }
@@ -125,6 +126,7 @@ export const selectFiles = (id: TorrentId, selected: boolean[]) => invoke<void>(
 export const unpauseTorrent = (id: TorrentId) => invoke<void>('unpause_torrent', { id })
 export const recheckTorrent = (id: TorrentId) => invoke<void>('recheck_torrent', { id })
 export const setSequential = (id: TorrentId, on: boolean) => invoke<void>('set_sequential', { id, on })
+export const setSuperSeed = (id: TorrentId, on: boolean) => invoke<void>('set_super_seed', { id, on })
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })
 export const clearLogs = () => invoke<void>('clear_logs')

@@ -77,6 +77,7 @@ struct ProgressDto {
     upload_bps: f64,
     peers: Vec<PeerDto>,
     sequential: bool,
+    super_seed: bool,
     trackers: Vec<TrackerDto>,
 }
 
@@ -189,6 +190,7 @@ impl From<Progress> for ProgressDto {
             upload_bps: p.upload_bps,
             peers: p.peers.into_iter().map(PeerDto::from).collect(),
             sequential: p.sequential,
+            super_seed: p.super_seed,
             trackers: p.trackers.into_iter().map(TrackerDto::from).collect(),
         }
     }
@@ -317,6 +319,11 @@ fn recheck_torrent(app: State<App>, id: TorrentId) {
 #[tauri::command]
 fn set_sequential(app: State<App>, id: TorrentId, on: bool) {
     app.session.lock().unwrap().set_sequential(id, on);
+}
+
+#[tauri::command]
+fn set_super_seed(app: State<App>, id: TorrentId, on: bool) {
+    app.session.lock().unwrap().set_super_seed(id, on);
 }
 
 #[tauri::command]
@@ -528,6 +535,7 @@ fn main() {
             unpause_torrent,
             recheck_torrent,
             set_sequential,
+            set_super_seed,
             select_files,
             resumable,
             logs_since,

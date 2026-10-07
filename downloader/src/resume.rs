@@ -45,10 +45,19 @@ pub struct ResumeData {
     pub uploaded: u64,
     /// pieces are fetched in order rather than rarest first
     pub sequential: bool,
+    /// BEP 16: seeding shows peers a piece at a time
+    pub super_seed: bool,
     /// BEP 19 web seeds; a magnet's `ws=` ones exist nowhere else
     pub web_seeds: Vec<String>,
     /// BEP 52 piece layers (a bencoded dict), which the info dict doesn't hold
     pub piece_layers: Option<Vec<u8>>,
+}
+
+/// The per-torrent switches the user flips, which live in the resume file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modes {
+    pub sequential: bool,
+    pub super_seed: bool,
 }
 
 impl ResumeData {
@@ -62,6 +71,7 @@ impl ResumeData {
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
             sequential: false,
+            super_seed: false,
             skip: vec![],
             uploaded: 0,
             web_seeds: torrent.web_seeds.clone(),
@@ -127,6 +137,10 @@ impl ResumeData {
             }
             out.push(b'e');
         }
+        if self.super_seed {
+            out.extend_from_slice(&bstr(b"super seed"));
+            out.extend_from_slice(b"i1e");
+        }
         out.extend_from_slice(&bstr(b"trackers"));
         out.push(b'l');
         for t in &self.trackers {
@@ -181,6 +195,7 @@ impl ResumeData {
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
         let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
         let sequential = matches!(dict.remove(b"sequential".as_slice()), Some(BencodeItemView::Integer(1)));
+        let super_seed = matches!(dict.remove(b"super seed".as_slice()), Some(BencodeItemView::Integer(1)));
         let uploaded = match dict.remove(b"uploaded".as_slice()) {
             Some(BencodeItemView::Integer(n)) => u64::try_from(n).unwrap_or(0),
             _ => 0,
@@ -232,6 +247,7 @@ impl ResumeData {
             skip,
             uploaded,
             sequential,
+            super_seed,
             web_seeds,
             piece_layers,
         })
@@ -365,14 +381,14 @@ pub async fn keep_saving(
 struct Saved {
     verified: BitBox<u8, Msb0>,
     skip: Vec<u32>,
-    sequential: bool,
+    modes: Modes,
     uploaded: u64,
 }
 
 impl Saved {
     /// Worth a write straight away, rather than only with the next round of counters.
     fn differs_beyond_counters(&self, other: &Saved) -> bool {
-        (&self.verified, &self.skip, self.sequential) != (&other.verified, &other.skip, other.sequential)
+        (&self.verified, &self.skip, self.modes) != (&other.verified, &other.skip, other.modes)
     }
 }
 
@@ -387,26 +403,27 @@ async fn save_every(
 ) -> BitBox<u8, Msb0> {
     let ResumeInputs {
         mut selected,
-        mut sequential,
+        mut modes,
         uploaded_before,
         mut persisted,
     } = inputs;
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
     let snapshot = |stats: &watch::Receiver<TorrentSwarmStats>,
                     selected: &watch::Receiver<Vec<bool>>,
-                    sequential: &watch::Receiver<bool>| {
+                    modes: &watch::Receiver<Modes>| {
         let stats = stats.borrow();
         Saved {
             verified: stats.verified.clone(),
             skip: skipped(&selected.borrow()),
-            sequential: *sequential.borrow(),
+            modes: *modes.borrow(),
             uploaded: uploaded_before + stats.uploaded,
         }
     };
     let save = async |saved: &Saved, persisted: &mut BitBox<u8, Msb0>| {
         let mut data = ResumeData::from_torrent(&torrent, &root, &saved.verified);
         data.skip = saved.skip.clone();
-        data.sequential = saved.sequential;
+        data.sequential = saved.modes.sequential;
+        data.super_seed = saved.modes.super_seed;
         data.uploaded = saved.uploaded;
         let written = {
             let (torrent, path, had) = (torrent.clone(), path.clone(), persisted.clone());
@@ -419,7 +436,7 @@ async fn save_every(
         }
     };
 
-    let mut last = snapshot(&stats, &selected, &sequential);
+    let mut last = snapshot(&stats, &selected, &modes);
     save(&last, &mut persisted).await;
     let mut last_write = tokio::time::Instant::now();
     // set while only the counters have changed since the last write
@@ -428,7 +445,7 @@ async fn save_every(
         tokio::select! {
             changed = stats.changed() => if changed.is_err() { break },
             changed = selected.changed() => if changed.is_err() { break },
-            changed = sequential.changed() => if changed.is_err() { break },
+            changed = modes.changed() => if changed.is_err() { break },
             _ = tokio::time::sleep_until(counters_due.unwrap_or_else(tokio::time::Instant::now)),
                 if counters_due.is_some() => {}
             _ = shutdown.cancelled() => break,
@@ -440,8 +457,8 @@ async fn save_every(
         }
         stats.mark_unchanged();
         selected.mark_unchanged();
-        sequential.mark_unchanged();
-        let now = snapshot(&stats, &selected, &sequential);
+        modes.mark_unchanged();
+        let now = snapshot(&stats, &selected, &modes);
         if now.differs_beyond_counters(&last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters) {
             save(&now, &mut persisted).await;
             last = now;
@@ -451,7 +468,7 @@ async fn save_every(
             counters_due = Some(last_write + counters);
         }
     }
-    let now = snapshot(&stats, &selected, &sequential);
+    let now = snapshot(&stats, &selected, &modes);
     if now != last {
         save(&now, &mut persisted).await;
     }
@@ -462,7 +479,7 @@ async fn save_every(
 /// read live, the upload count from before this run, and the bitfield the file already holds.
 pub struct ResumeInputs {
     pub selected: watch::Receiver<Vec<bool>>,
-    pub sequential: watch::Receiver<bool>,
+    pub modes: watch::Receiver<Modes>,
     pub uploaded_before: u64,
     /// pieces already claimed by the resume file on disk, so known to be on disk themselves;
     /// anything verified beyond these gets its data flushed before the file claims it
@@ -866,7 +883,7 @@ mod test {
         std::fs::write(dir.join("resume-test.bin"), content(100)).unwrap();
         let (tx, rx) = watch::channel(no_progress());
         let (selected_tx, selected_rx) = watch::channel(vec![true]);
-        let (_sequential_tx, sequential_rx) = watch::channel(false);
+        let (_modes_tx, modes_rx) = watch::channel(Modes::default());
         let shutdown = CancellationToken::new();
         let saver = tokio::spawn(save_every(
             torrent.clone(),
@@ -874,7 +891,7 @@ mod test {
             rx,
             ResumeInputs {
                 selected: selected_rx,
-                sequential: sequential_rx,
+                modes: modes_rx,
                 uploaded_before: 1000,
                 persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
             },
@@ -952,7 +969,7 @@ mod test {
         let stats = no_progress();
         let (tx, rx) = watch::channel(stats.clone());
         let (_selected_tx, selected_rx) = watch::channel(vec![true]);
-        let (_sequential_tx, sequential_rx) = watch::channel(false);
+        let (_modes_tx, modes_rx) = watch::channel(Modes::default());
         let shutdown = CancellationToken::new();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
@@ -960,7 +977,7 @@ mod test {
             rx,
             ResumeInputs {
                 selected: selected_rx,
-                sequential: sequential_rx,
+                modes: modes_rx,
                 uploaded_before: 0,
                 persisted: bitvec![u8, Msb0; 0; 7].into_boxed_bitslice(),
             },
