@@ -121,6 +121,16 @@ fn random_pad() -> Vec<u8> {
     pad
 }
 
+/// PadC and PadD may be at most `MAX_PAD` long; a longer one is a peer making us read more
+/// than the spec allows.
+fn pad_len(bytes: &[u8]) -> io::Result<usize> {
+    let len = u16_of(bytes);
+    if len > MAX_PAD {
+        return Err(err("padding longer than 512 bytes"));
+    }
+    Ok(len)
+}
+
 fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
@@ -304,7 +314,7 @@ pub(crate) async fn initiate<S: AsyncRead + AsyncWrite + Unpin>(
     if u32::from_be_bytes(select.try_into().unwrap()) != CRYPTO_RC4 {
         return Err(err("peer didn't select RC4"));
     }
-    let pad_len = u16_of(&take(&mut stream, &mut ahead, Some(&mut rx), 2).await?);
+    let pad_len = pad_len(&take(&mut stream, &mut ahead, Some(&mut rx), 2).await?)?;
     take(&mut stream, &mut ahead, Some(&mut rx), pad_len).await?;
     rx.apply(&mut ahead);
     Ok(Encrypted::new(stream, rx, tx, ahead.into()))
@@ -346,7 +356,7 @@ pub(crate) async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
     if provide & CRYPTO_RC4 == 0 {
         return Err(err("peer doesn't offer RC4"));
     }
-    let pad_len = u16_of(&fields[VC.len() + 4..]);
+    let pad_len = pad_len(&fields[VC.len() + 4..])?;
     take(&mut stream, &mut ahead, Some(&mut rx), pad_len).await?;
     let payload_len = u16_of(&take(&mut stream, &mut ahead, Some(&mut rx), 2).await?);
     let mut leftover = take(&mut stream, &mut ahead, Some(&mut rx), payload_len).await?;
@@ -427,5 +437,12 @@ mod test {
         b.read_exact(&mut head).await.unwrap();
         respond(b, &head, &served).await.unwrap();
         initiator.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn padding_past_the_spec_is_refused() {
+        assert_eq!(pad_len(&[0x02, 0x00]).unwrap(), 512);
+        assert!(pad_len(&[0x02, 0x01]).is_err());
+        assert!(pad_len(&[0xff, 0xff]).is_err());
     }
 }
