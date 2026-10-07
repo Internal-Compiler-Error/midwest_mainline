@@ -33,6 +33,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
 | 54 | `lt_donthave`: received (availability and claims follow); we never drop pieces, so never sent | `torrent_swarm.rs`, `peer.rs` (`drop_have`) |
+| 55 | Holepunch: a failed dial to a PEX-learned peer asks the peer that told us about it to relay (once); as a relay we introduce both sides or answer with the error; a `connect` is dialled over uTP only. Seen working against the live Arch swarm | `torrent_swarm.rs` (`try_holepunch`, `on_holepunch`), `peer.rs` (`Holepunch`), `stream.rs` (`DialHints::utp_only`) |
 | 53 | Magnet `so=` (select only): indices and ranges, applied when the metadata arrives; nothing valid selects all | `magnet.rs` (`MagnetLink::selection`), `session.rs` (`add`) |
 | magnet `x.pe` | Peer addresses in a magnet (address literals only), tried first by the metadata fetch | `magnet.rs`, `metadata.rs` |
 | MSE | Message stream encryption (not a BEP; the Vuze/libtorrent spec) | `mse.rs` |
@@ -42,7 +43,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 52 + 47 | BitTorrent v2 (SHA-256 Merkle trees, `piece layers`, `btmh` magnets) and padding files / file attributes | Hybrid v1+v2 torrents are increasingly common; without 47 we'd write pad files to disk. Big: per-file Merkle verification, hash requests (`hash request`/`hashes`/`hash reject` messages), v2 info hash in the handshake |
-| 55 | Holepunch (`ut_holepunch`, via a relaying peer, over uTP) | More reachable peers behind NAT |
 | 40 | Canonical peer priority | Deterministic choice of which connections to keep under churn |
 | 42 (verify) | Check other nodes' ids against their IPs | Complements the one-node-per-IP Sybil defence in the routing table |
 | 51 | DHT `sample_infohashes` | Fits the DHT's long-term index mode (`Retention::Forever`) |

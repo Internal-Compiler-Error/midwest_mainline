@@ -26,6 +26,83 @@ pub(crate) const UT_METADATA_ID: u8 = 1;
 pub(crate) const UT_PEX_ID: u8 = 2;
 /// BEP 54: the id we take `lt_donthave` on. We never drop a piece, so we only ever receive it.
 pub(crate) const LT_DONTHAVE_ID: u8 = 3;
+/// BEP 55: the id we take `ut_holepunch` on.
+pub(crate) const UT_HOLEPUNCH_ID: u8 = 4;
+
+/// BEP 55 messages: ask a peer we share with `addr` to introduce us (`Rendezvous`), be told
+/// to connect to `addr` now (`Connect`), or hear why an introduction failed (`Error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holepunch {
+    Rendezvous(SocketAddr),
+    Connect(SocketAddr),
+    Error(SocketAddr, HolepunchError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolepunchError {
+    NoSuchPeer = 1,
+    NotConnected = 2,
+    NoSupport = 3,
+    NoSelf = 4,
+}
+
+impl Holepunch {
+    pub fn encode(&self) -> Vec<u8> {
+        let (kind, addr, error) = match *self {
+            Holepunch::Rendezvous(addr) => (0u8, addr, None),
+            Holepunch::Connect(addr) => (1, addr, None),
+            Holepunch::Error(addr, e) => (2, addr, Some(e as u32)),
+        };
+        let mut out = vec![kind];
+        match addr.ip().to_canonical() {
+            IpAddr::V4(ip) => {
+                out.push(0);
+                out.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                out.push(1);
+                out.extend_from_slice(&ip.octets());
+            }
+        }
+        out.extend_from_slice(&addr.port().to_be_bytes());
+        out.extend(error.into_iter().flat_map(u32::to_be_bytes));
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Holepunch> {
+        let (&kind, rest) = payload.split_first()?;
+        let (&family, rest) = rest.split_first()?;
+        let (ip, rest): (IpAddr, &[u8]) = match family {
+            0 => {
+                let (ip, rest) = rest.split_first_chunk::<4>()?;
+                ((*ip).into(), rest)
+            }
+            1 => {
+                let (ip, rest) = rest.split_first_chunk::<16>()?;
+                ((*ip).into(), rest)
+            }
+            _ => return None,
+        };
+        let (port, rest) = rest.split_first_chunk::<2>()?;
+        let addr = SocketAddr::new(ip, u16::from_be_bytes(*port));
+        Some(match kind {
+            0 => Holepunch::Rendezvous(addr),
+            1 => Holepunch::Connect(addr),
+            2 => {
+                let code = u32::from_be_bytes(*rest.first_chunk::<4>()?);
+                let error = match code {
+                    1 => HolepunchError::NoSuchPeer,
+                    2 => HolepunchError::NotConnected,
+                    3 => HolepunchError::NoSupport,
+                    4 => HolepunchError::NoSelf,
+                    _ => return None,
+                };
+                Holepunch::Error(addr, error)
+            }
+            _ => return None,
+        })
+    }
+}
 
 /// What a peer's reader (or a failing writer) hands the swarm: the next message, `None` when the
 /// peer hung up, or the error that ended the connection. `conn` tells this connection apart from
@@ -63,6 +140,12 @@ pub(crate) struct Peer {
     pub their_ut_pex_id: Option<u8>,
     /// BEP 21: the peer says it won't download anything more (a partial seed)
     pub upload_only: bool,
+    /// BEP 55: the id the remote wants holepunch messages on
+    pub their_ut_holepunch_id: Option<u8>,
+    /// BEP 10 `p`: the port the peer listens on, which an inbound TCP connection's own port isn't
+    pub listen_port: Option<u16>,
+    /// we dialed it, so `remote_addr` is where it listens
+    pub dialed: bool,
     /// BEP 10 `yourip`: our address as the peer sees it, until the swarm takes it to vote with
     pub yourip: Option<IpAddr>,
 
@@ -235,6 +318,9 @@ impl Peer {
             their_ut_pex_id: None,
             upload_only: false,
             yourip: None,
+            their_ut_holepunch_id: None,
+            listen_port: None,
+            dialed: false,
             conn,
             outbox,
             io_tasks: [reader.abort_handle(), writer.abort_handle()],
@@ -398,6 +484,12 @@ impl Peer {
             if let Some(item) = m.get(b"ut_pex".as_slice()) {
                 self.their_ut_pex_id = id(item);
             }
+            if let Some(item) = m.get(b"ut_holepunch".as_slice()) {
+                self.their_ut_holepunch_id = id(item);
+            }
+        }
+        if let Some(BencodeItemView::Integer(port)) = dict.get(b"p".as_slice()) {
+            self.listen_port = u16::try_from(*port).ok().filter(|p| *p != 0);
         }
         if let Some(BencodeItemView::Integer(flag)) = dict.get(b"upload_only".as_slice()) {
             self.upload_only = *flag != 0;
@@ -409,6 +501,27 @@ impl Peer {
                 _ => None,
             };
         }
+    }
+
+    /// Where others can reach this peer: the address we dialed, the uTP socket it came from
+    /// (it listens on that same one), or its advertised listen port.
+    pub fn reachable_addr(&self) -> SocketAddr {
+        match self.listen_port {
+            Some(port) if !self.dialed && !self.utp => SocketAddr::new(self.remote_addr.ip(), port),
+            _ => self.remote_addr,
+        }
+    }
+
+    /// BEP 55; a silent no-op for a peer that never said it speaks holepunch.
+    pub async fn send_holepunch(&mut self, msg: Holepunch) -> io::Result<()> {
+        let Some(their_id) = self.their_ut_holepunch_id else {
+            return Ok(());
+        };
+        self.send(BtMessage::Extended(Extended {
+            ext_id: their_id,
+            payload: msg.encode().into_boxed_slice(),
+        }))
+        .await
     }
 
     /// BEP 54: the peer no longer has `piece`. False if it never said it had it.
@@ -458,11 +571,13 @@ impl Peer {
         metadata_size: u32,
         private: bool,
         upload_only: bool,
+        listen_port: u16,
     ) -> io::Result<()> {
         let payload = build_extended_handshake(
             metadata_size,
             private,
             upload_only,
+            listen_port,
             self.remote_addr.ip().to_canonical(),
         );
         self.send(BtMessage::Extended(Extended {
@@ -660,17 +775,25 @@ async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr:
 /// flag even if we ourselves never act on what we'd receive.
 /// `yourip` (BEP 10) tells the peer where we see it from, which helps it learn its own public
 /// address; `v` names this client. Keys in bencode order.
-fn build_extended_handshake(metadata_size: u32, private: bool, upload_only: bool, yourip: IpAddr) -> Vec<u8> {
+fn build_extended_handshake(
+    metadata_size: u32,
+    private: bool,
+    upload_only: bool,
+    listen_port: u16,
+    yourip: IpAddr,
+) -> Vec<u8> {
     let pex = if private {
         String::new()
     } else {
         format!("6:ut_pexi{UT_PEX_ID}e")
     };
-    let m = format!("d11:lt_donthavei{LT_DONTHAVE_ID}e11:ut_metadatai{UT_METADATA_ID}e{pex}e");
+    let m = format!(
+        "d11:lt_donthavei{LT_DONTHAVE_ID}e12:ut_holepunchi{UT_HOLEPUNCH_ID}e11:ut_metadatai{UT_METADATA_ID}e{pex}e"
+    );
     let upload_only = if upload_only { "11:upload_onlyi1e" } else { "" };
     let version = concat!("downloader ", env!("CARGO_PKG_VERSION"));
     let mut out = format!(
-        "d1:m{m}13:metadata_sizei{metadata_size}e4:reqqi{MAX_QUEUED_UPLOADS}e{upload_only}1:v{}:{version}",
+        "d1:m{m}13:metadata_sizei{metadata_size}e1:pi{listen_port}e4:reqqi{MAX_QUEUED_UPLOADS}e{upload_only}1:v{}:{version}",
         version.len()
     )
     .into_bytes();
@@ -903,6 +1026,31 @@ impl PeerStatistics {
 mod test {
     use super::*;
 
+    #[test]
+    fn holepunch_messages_round_trip_and_junk_is_refused() {
+        for msg in [
+            Holepunch::Rendezvous("10.0.0.1:6881".parse().unwrap()),
+            Holepunch::Connect("[2001:db8::1]:7000".parse().unwrap()),
+            Holepunch::Error("10.0.0.2:1".parse().unwrap(), HolepunchError::NotConnected),
+        ] {
+            assert_eq!(Holepunch::decode(&msg.encode()), Some(msg));
+        }
+        assert_eq!(
+            Holepunch::decode(&[1, 0, 1, 2, 3, 4, 0, 5]),
+            Some(Holepunch::Connect("1.2.3.4:5".parse().unwrap()))
+        );
+        for junk in [
+            &[][..],
+            &[0],
+            &[0, 0, 1, 2],
+            &[0, 9, 1, 2, 3, 4, 0, 5],
+            &[2, 0, 1, 2, 3, 4, 0, 5],
+            &[7, 0, 1, 2, 3, 4, 0, 5],
+        ] {
+            assert_eq!(Holepunch::decode(junk), None, "{junk:?}");
+        }
+    }
+
     #[tokio::test]
     async fn their_handshake_sets_ids_upload_only_and_yourip_and_donthave_clears_a_piece() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -944,7 +1092,7 @@ mod test {
 
     #[test]
     fn extended_handshake_is_valid_bencode_with_expected_fields() {
-        let payload = build_extended_handshake(12345, false, false, "203.0.113.9".parse().unwrap());
+        let payload = build_extended_handshake(12345, false, false, 6881, "203.0.113.9".parse().unwrap());
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
         assert!(
             remaining.is_empty(),
@@ -972,7 +1120,7 @@ mod test {
 
     #[test]
     fn private_torrent_extended_handshake_omits_ut_pex() {
-        let payload = build_extended_handshake(12345, true, true, "::1".parse().unwrap());
+        let payload = build_extended_handshake(12345, true, true, 6881, "::1".parse().unwrap());
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
         assert!(remaining.is_empty());
 

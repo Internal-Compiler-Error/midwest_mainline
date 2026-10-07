@@ -6,8 +6,8 @@ use crate::events::{Event, EventBus, PeerSource};
 use crate::external::ExternalAddress;
 use crate::limiter::RateLimiter;
 use crate::peer::{
-    Inbox, Incoming, LT_DONTHAVE_ID, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID,
-    UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
+    Holepunch, HolepunchError, Inbox, Incoming, LT_DONTHAVE_ID, PEX_UTP, Peer, PeerSnapshot, PeerStatistics,
+    ProtocolViolation, UT_HOLEPUNCH_ID, UT_METADATA_ID, UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
@@ -358,6 +358,10 @@ struct KnownPeer {
     prefers_utp: bool,
     /// it refused the encrypted opening when we dialled it
     plaintext_only: bool,
+    /// the peer whose PEX told us about it: who to ask for a holepunch if dialing fails
+    via: Option<SocketAddr>,
+    /// a holepunch was asked for already; one try per address
+    holepunched: bool,
 }
 
 impl KnownPeer {
@@ -365,6 +369,7 @@ impl KnownPeer {
         DialHints {
             prefer_utp: self.prefers_utp,
             plaintext: self.plaintext_only,
+            utp_only: false,
         }
     }
 }
@@ -725,6 +730,7 @@ impl TorrentSwarm {
                     .entry(canonical(addr))
                     .or_default()
                     .dial_failed(Instant::now());
+                self.try_holepunch(canonical(addr)).await;
             }
         }
     }
@@ -1066,6 +1072,11 @@ impl TorrentSwarm {
                     self.drop_peer(idx, "send failed");
                 }
             }
+            BtMessage::Extended(ext) if ext.ext_id == UT_HOLEPUNCH_ID => {
+                if let Some(msg) = Holepunch::decode(&ext.payload) {
+                    self.on_holepunch(idx, msg).await;
+                }
+            }
             BtMessage::Extended(ext) if ext.ext_id == LT_DONTHAVE_ID => {
                 // BEP 54: the peer dropped a piece; it can't be given that piece any more
                 let Ok(raw) = <[u8; 4]>::try_from(&ext.payload[..]) else {
@@ -1097,7 +1108,8 @@ impl TorrentSwarm {
                         source: PeerSource::Pex { from: peer.remote_addr },
                         count: gossiped.len(),
                     });
-                    self.connect_to_peers(gossiped);
+                    let via = peer.remote_addr;
+                    self.connect_to_peers(gossiped, Some(via));
                 }
             }
             BtMessage::Extended(ext) => {
@@ -1402,8 +1414,12 @@ impl TorrentSwarm {
             info!("download complete, {} bytes were received twice", self.stat.wasted);
             if self.partial_seed() {
                 // BEP 21: done with what's selected, but not a seed: tell peers we won't ask
-                let (size, private) = (self.torrent.metadata_size(), self.torrent.private);
-                self.broadcast(move |peer| Box::pin(peer.send_extended_handshake(size, private, true)))
+                let (size, private, port) = (
+                    self.torrent.metadata_size(),
+                    self.torrent.private,
+                    self.id.serving.port(),
+                );
+                self.broadcast(move |peer| Box::pin(peer.send_extended_handshake(size, private, true, port)))
                     .await;
             }
         }
@@ -2108,10 +2124,16 @@ impl TorrentSwarm {
             self.inbox.clone(),
         );
         peer.stats = known.stats.clone();
+        peer.dialed = connected.dialed;
         let opening = async {
             if connected.remote_supports_extensions {
-                peer.send_extended_handshake(self.torrent.metadata_size(), self.torrent.private, self.partial_seed())
-                    .await?;
+                peer.send_extended_handshake(
+                    self.torrent.metadata_size(),
+                    self.torrent.private,
+                    self.partial_seed(),
+                    self.id.serving.port(),
+                )
+                .await?;
             }
             // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
             // place of a BitField for the "everything"/"nothing" cases
@@ -2169,13 +2191,13 @@ impl TorrentSwarm {
     /// Dials every address in `peers` we're not already connected to or dialing. Shared by
     /// tracker-discovered peers and BEP 11 (PEX) peers -- both are just addresses.
     fn connect_to_discovered_peers(&mut self, peers: Vec<SocketAddr>) {
-        self.connect_to_peers(peers.into_iter().map(|addr| (addr, false)).collect());
+        self.connect_to_peers(peers.into_iter().map(|addr| (addr, false)).collect(), None);
     }
 
     /// Dials what a tracker, the DHT, LSD or PEX handed out, as far as the peer cap allows.
     /// The flag marks an address PEX said speaks uTP; it's remembered only for addresses
     /// that get dialled, so gossip about peers we never call doesn't pile up in `known`.
-    fn connect_to_peers(&mut self, peers: Vec<(SocketAddr, bool)>) {
+    fn connect_to_peers(&mut self, peers: Vec<(SocketAddr, bool)>, via: Option<SocketAddr>) {
         let now = Instant::now();
         let cap = self.settings.borrow().peer_cap();
         for (addr, utp_capable) in peers {
@@ -2191,46 +2213,137 @@ impl TorrentSwarm {
             if !worth_it || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
                 continue;
             }
+            let known = self.known.entry(addr).or_default();
             if utp_capable {
-                self.known.entry(addr).or_default().prefers_utp = true;
+                known.prefers_utp = true;
             }
-            let events = self.events_tx.clone();
-            let torrent = self.torrent.clone();
-            let our_id = self.id.clone();
-            let utp = self.utp.borrow().clone();
-            let hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
-            tokio::spawn(async move {
-                let Ok(_permit) = HALF_OPEN.acquire().await else {
-                    return;
-                };
-                // from here, not from the queueing above: a dial waiting for a slot isn't dialling
-                let span = tracing::info_span!(
-                    "dial",
-                    info_hash = %torrent.info_hash,
-                    peer = %addr,
-                    transport = tracing::field::Empty,
-                    encrypted = tracing::field::Empty,
-                    error = tracing::field::Empty,
-                );
-                let dialed = dial(addr, &torrent, &our_id, utp, hints).instrument(span.clone()).await;
-                let result = match dialed {
-                    Ok(connected) => {
-                        span.record("transport", if connected.stream.is_utp() { "utp" } else { "tcp" });
-                        span.record("encrypted", connected.stream.is_encrypted());
-                        SwarmEvent::PeerConnected(connected)
-                    }
-                    Err(e) => {
-                        tracing::debug!("couldn't connect to {addr}: {e:#}");
-                        span.record("error", format!("{e:#}"));
-                        SwarmEvent::DialFailed(addr)
-                    }
-                };
-                drop(span);
-                // if the swarm is gone meanwhile, the socket just drops here
-                if let Some(events) = events.upgrade() {
-                    let _ = events.send(result).await;
+            if via.is_some() {
+                known.via = via;
+            }
+            let hints = known.dial_hints();
+            self.spawn_dial(addr, hints);
+        }
+    }
+
+    /// Dials `addr` in the background (one of the `MAX_HALF_OPEN` at a time); the outcome comes
+    /// back as `PeerConnected` or `DialFailed`. The caller has put it in `dialing`.
+    fn spawn_dial(&self, addr: SocketAddr, hints: DialHints) {
+        let events = self.events_tx.clone();
+        let torrent = self.torrent.clone();
+        let our_id = self.id.clone();
+        let utp = self.utp.borrow().clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = HALF_OPEN.acquire().await else {
+                return;
+            };
+            // from here, not from the queueing above: a dial waiting for a slot isn't dialling
+            let span = tracing::info_span!(
+                "dial",
+                info_hash = %torrent.info_hash,
+                peer = %addr,
+                holepunch = hints.utp_only,
+                transport = tracing::field::Empty,
+                encrypted = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
+            let dialed = dial(addr, &torrent, &our_id, utp, hints).instrument(span.clone()).await;
+            let result = match dialed {
+                Ok(connected) => {
+                    span.record("transport", if connected.stream.is_utp() { "utp" } else { "tcp" });
+                    span.record("encrypted", connected.stream.is_encrypted());
+                    SwarmEvent::PeerConnected(connected)
                 }
-            });
+                Err(e) => {
+                    tracing::debug!("couldn't connect to {addr}: {e:#}");
+                    span.record("error", format!("{e:#}"));
+                    SwarmEvent::DialFailed(addr)
+                }
+            };
+            drop(span);
+            // if the swarm is gone meanwhile, the socket just drops here
+            if let Some(events) = events.upgrade() {
+                let _ = events.send(result).await;
+            }
+        });
+    }
+
+    /// BEP 55, as the initiator: a peer we couldn't dial may be behind a NAT that only lets in
+    /// what it sent out to first. The peer that told us about it is connected to it, so it can
+    /// tell both of us to connect at once (over uTP), which opens both NATs. Once per address.
+    async fn try_holepunch(&mut self, addr: SocketAddr) {
+        let Some(known) = self.known.get_mut(&addr) else {
+            return;
+        };
+        let Some(relay) = known.via.filter(|_| !known.holepunched) else {
+            return;
+        };
+        let Some(idx) = self
+            .peer_index(relay)
+            .filter(|&idx| self.peers[idx].their_ut_holepunch_id.is_some())
+        else {
+            return;
+        };
+        if self.utp.borrow().is_none() {
+            return;
+        }
+        if let Some(known) = self.known.get_mut(&addr) {
+            known.holepunched = true;
+        }
+        tracing::debug!("asking {relay} to introduce us to {addr} (holepunch)");
+        if self.peers[idx]
+            .send_holepunch(Holepunch::Rendezvous(addr))
+            .await
+            .is_err()
+        {
+            self.drop_peer(idx, "send failed");
+        }
+    }
+
+    /// BEP 55: a holepunch message from the peer at `idx`.
+    async fn on_holepunch(&mut self, idx: usize, msg: Holepunch) {
+        let from = self.peers[idx].remote_addr;
+        match msg {
+            // we're the relay: introduce the two, or say why not
+            Holepunch::Rendezvous(target) => {
+                let target = canonical(target);
+                let error = if target == from || target == self.peers[idx].reachable_addr() {
+                    Some(HolepunchError::NoSelf)
+                } else {
+                    match self
+                        .peers
+                        .iter()
+                        .position(|p| p.reachable_addr() == target || p.remote_addr == target)
+                    {
+                        None => Some(HolepunchError::NotConnected),
+                        Some(t) if self.peers[t].their_ut_holepunch_id.is_none() => Some(HolepunchError::NoSupport),
+                        Some(t) => {
+                            let initiator = self.peers[idx].reachable_addr();
+                            tracing::debug!("introducing {from} and {target} (holepunch)");
+                            let to_target = self.peers[t].send_holepunch(Holepunch::Connect(initiator)).await;
+                            let to_initiator = self.peers[idx].send_holepunch(Holepunch::Connect(target)).await;
+                            if to_target.is_err() || to_initiator.is_err() {
+                                tracing::debug!("couldn't pass on a holepunch between {from} and {target}");
+                            }
+                            None
+                        }
+                    }
+                };
+                if let Some(error) = error {
+                    let _ = self.peers[idx].send_holepunch(Holepunch::Error(target, error)).await;
+                }
+            }
+            // a relay introduced us: dial now, over uTP, while the other side dials us
+            Holepunch::Connect(addr) => {
+                let addr = canonical(addr);
+                if self.utp.borrow().is_none() || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
+                    return;
+                }
+                let mut hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
+                hints.utp_only = true;
+                tracing::debug!("{from} introduced us to {addr}, dialing (holepunch)");
+                self.spawn_dial(addr, hints);
+            }
+            Holepunch::Error(addr, error) => tracing::debug!("{from} couldn't introduce us to {addr}: {error:?}"),
         }
     }
 
@@ -2522,6 +2635,61 @@ mod test {
 
     /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
     /// (as if it had just completed a handshake), the test keeps the other.
+    /// BEP 55, as the relay: two peers that speak holepunch are introduced to each other on
+    /// one's request, and a request for a peer we don't have gets the matching error.
+    #[tokio::test]
+    async fn relays_a_holepunch_between_two_peers() {
+        let (swarm, handle, path) = swarm_with("holepunch", true);
+        tokio::spawn(swarm.work_loop());
+        let (a_addr, b_addr): (SocketAddr, SocketAddr) =
+            ("10.0.0.1:6881".parse().unwrap(), "10.0.0.2:6881".parse().unwrap());
+        let mut a = fake_peer(&handle, &a_addr.to_string()).await;
+        let mut b = fake_peer(&handle, &b_addr.to_string()).await;
+        let speaks_holepunch = BtMessage::Extended(crate::wire::Extended {
+            ext_id: 0,
+            payload: Box::from(&b"d1:md12:ut_holepunchi9eee"[..]),
+        });
+        for peer in [&mut a, &mut b] {
+            peer.send(speaks_holepunch.clone()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = |msg: Holepunch| {
+            BtMessage::Extended(crate::wire::Extended {
+                ext_id: UT_HOLEPUNCH_ID,
+                payload: msg.encode().into_boxed_slice(),
+            })
+        };
+        a.send(ask(Holepunch::Rendezvous(b_addr))).await.unwrap();
+
+        // the first holepunch message each gets, skipping the opening exchange
+        async fn next_holepunch(peer: &mut Framed<tokio::net::TcpStream, BtCodec>) -> Holepunch {
+            loop {
+                if let Some(Ok(BtMessage::Extended(ext))) = peer.next().await
+                    && ext.ext_id == 9
+                {
+                    return Holepunch::decode(&ext.payload).unwrap();
+                }
+            }
+        }
+        let timeout = Duration::from_secs(5);
+        assert_eq!(
+            tokio::time::timeout(timeout, next_holepunch(&mut b)).await.unwrap(),
+            Holepunch::Connect(a_addr)
+        );
+        assert_eq!(
+            tokio::time::timeout(timeout, next_holepunch(&mut a)).await.unwrap(),
+            Holepunch::Connect(b_addr)
+        );
+
+        let stranger: SocketAddr = "10.0.0.9:1".parse().unwrap();
+        a.send(ask(Holepunch::Rendezvous(stranger))).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(timeout, next_holepunch(&mut a)).await.unwrap(),
+            Holepunch::Error(stranger, HolepunchError::NotConnected)
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -> Framed<tokio::net::TcpStream, BtCodec> {
         fake_peer_with(handle, pretend_addr, false).await
     }

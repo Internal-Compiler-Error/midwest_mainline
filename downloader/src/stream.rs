@@ -47,6 +47,8 @@ pub(crate) struct DialHints {
     pub prefer_utp: bool,
     /// it refused the encrypted opening last time: with `Prefer`, go straight to plaintext
     pub plaintext: bool,
+    /// BEP 55: a holepunch, where both ends send uTP at once to open their NATs; TCP can't
+    pub utp_only: bool,
 }
 
 /// How a second connection to the same peer is made, for the plaintext retry of `Prefer`.
@@ -100,7 +102,13 @@ pub(crate) async fn connect(
     utp: Option<&Arc<UtpSocketUdp>>,
     hints: DialHints,
 ) -> io::Result<(PeerStream, Handshake)> {
-    let (first, transport) = open_transport(addr, utp, hints.prefer_utp).await?;
+    let (first, transport) = if hints.utp_only {
+        let utp = utp.ok_or_else(|| io::Error::other("holepunch without a uTP socket"))?;
+        let transport = Transport::Utp(utp.clone());
+        (transport.dial(addr).await?, transport)
+    } else {
+        open_transport(addr, utp, hints.prefer_utp).await?
+    };
     let policy = match our_id.encryption {
         Encryption::Prefer if hints.plaintext => Encryption::Disabled,
         policy => policy,
@@ -501,6 +509,7 @@ mod test {
         let hints = DialHints {
             prefer_utp: true,
             plaintext: true,
+            ..Default::default()
         };
         let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Prefer), Some(&client), hints)
             .await
@@ -543,6 +552,7 @@ mod test {
         let hints = DialHints {
             prefer_utp: true,
             plaintext: false,
+            ..Default::default()
         };
         let started = tokio::time::Instant::now();
         let (stream, _) = connect(addr, &hash, &identity(1, Encryption::Disabled), Some(&client), hints)

@@ -60,7 +60,8 @@ case ${1:-} in
   cli)
     source=${2:?usage: driver.sh cli <torrent-or-magnet> [seconds]}
     secs=${3:-60}
-    rm -rf "$RUN_DIR/cli-download"
+    # the resume files go too: a resume whose data is gone fails on purpose (an unmounted drive)
+    rm -rf "$RUN_DIR/cli-download" "$RUN_DIR/data/resume"
     # always the current code: a stale binary against a database the newer GUI has migrated
     # fails in confusing ways
     (cd "$ROOT" && cargo build -q -p downloader)
