@@ -116,13 +116,33 @@ pub const PEX_INTERVAL: Duration = Duration::from_secs(60);
 /// five minutes.
 pub const LSD_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// How often to look a torrent up in the DHT and re-announce ourselves for it. Announced
-/// peers expire from nodes after roughly 45 minutes, so this is comfortably inside that.
 /// After a failed announce, how long before the next try; doubles per consecutive failure up
 /// to `ANNOUNCE_RETRY_MAX`.
 pub const ANNOUNCE_RETRY: Duration = Duration::from_secs(60);
 pub const ANNOUNCE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 
+/// Bounds on the wait between regular tracker announces, whatever interval the tracker asks
+/// for: zero or negative would hammer it, and a huge one would starve the swarm of peers.
+pub const ANNOUNCE_INTERVAL_MIN: Duration = Duration::from_secs(60);
+pub const ANNOUNCE_INTERVAL_MAX: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Bound on a whole HTTP announce, from connecting to the last byte of the response.
+pub const HTTP_TRACKER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An announce response is a few KiB of peers; past this the tracker is broken or hostile.
+pub const TRACKER_RESPONSE_MAX: usize = 2 * 1024 * 1024;
+
+/// BEP 15: a UDP tracker request is retransmitted if no answer comes within 15 * 2^n seconds,
+/// n counting tries from 0. The spec goes on to n = 8, over an hour; after these three tries
+/// (15 + 30 + 60 s) the announce counts as failed and `ANNOUNCE_RETRY` takes over.
+pub const UDP_TRACKER_TIMEOUT: Duration = Duration::from_secs(15);
+pub const UDP_TRACKER_ATTEMPTS: u32 = 3;
+
+/// BEP 15: a connection ID may be used for a minute after it was received.
+pub const UDP_CONNECTION_ID_TTL: Duration = Duration::from_secs(60);
+
+/// How often to look a torrent up in the DHT and re-announce ourselves for it. Announced
+/// peers expire from nodes after roughly 45 minutes, so this is comfortably inside that.
 pub const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// First retry after a DHT lookup that found no peers or failed, doubling up to
 /// `DHT_ANNOUNCE_INTERVAL`. Lookups right after the node comes up often converge on a sparse
