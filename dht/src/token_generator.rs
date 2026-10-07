@@ -1,99 +1,62 @@
-use std::{
-    net::IpAddr,
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
+//! BEP 5's write tokens: what a get_peers (or BEP 44 get) answer hands the querier, to be shown
+//! with its announce_peer (or put). A token is a keyed hash of the querier's IP and the current
+//! epoch, so nothing is kept per querier; it stays good for the epoch it was issued in and the
+//! next, 5 to 10 minutes, as BEP 5 suggests.
+
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use sha3::{Digest, Sha3_256};
 
 use crate::types::Token;
 
-pub const TOKEN_EXPIRATION_TIME: Duration = Duration::from_secs(60 * 5);
+const EPOCH: Duration = Duration::from_secs(5 * 60);
+/// Opaque to the querier, so as short as is still unguessable; it rides in every answer
+const TOKEN_LEN: usize = 8;
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-struct TokenGenInner {
-    state: u128,
-    last_update: Instant,
+#[derive(Debug, Clone)]
+pub(crate) struct TokenGenerator {
+    secret: [u8; 32],
+    started: Instant,
 }
 
-impl TokenGenInner {
-    pub fn new(state: u128) -> Self {
+impl TokenGenerator {
+    pub(crate) fn new(secret: [u8; 32]) -> Self {
         Self {
-            state,
-            last_update: Instant::now(),
+            secret,
+            started: Instant::now(),
         }
     }
 
-    fn gen_token_with_state(state: u128, ip: &IpAddr) -> Token {
-        // tokens bind to the requester's IP (BEP 5): a host may only announce with a
-        // token that was issued to its own address
+    fn epoch(&self) -> u64 {
+        (self.started.elapsed().as_secs() / EPOCH.as_secs()) + 1
+    }
+
+    /// The token of `ip` in `epoch`; tokens bind to the querier's IP (BEP 5), so a host may
+    /// only announce with a token that was issued to its own address
+    fn token_in(&self, epoch: u64, ip: &IpAddr) -> Token {
         let mut hasher = Sha3_256::new();
-        hasher.update(state.to_be_bytes());
+        hasher.update(self.secret);
+        hasher.update(epoch.to_be_bytes());
         match ip {
             IpAddr::V4(ip) => hasher.update(ip.octets()),
             IpAddr::V6(ip) => hasher.update(ip.octets()),
         }
-
-        let digest = hasher.finalize();
-        Token::from_bytes(digest.as_slice())
+        Token::from_bytes(&hasher.finalize()[..TOKEN_LEN])
     }
 
-    /// See as the moment of calling, is the token correct?
-    pub fn token_acceptable(&self, ip: &IpAddr, token: &Token) -> bool {
-        // we accept the current token and one token before it, similar to the 10 min window in the
-        // official spec
-        let previous = Self::gen_token_with_state(self.state - 1, ip);
-        let current = self.generate_token(ip);
-
-        token == &current || token == &previous
-    }
-
-    pub fn needs_advancing(&self) -> bool {
-        Instant::now().duration_since(self.last_update) > TOKEN_EXPIRATION_TIME
-    }
-
-    pub fn advance(&mut self) {
-        self.state += 1;
-        self.last_update = Instant::now();
-    }
-
-    fn generate_token(&self, ip: &IpAddr) -> Token {
-        Self::gen_token_with_state(self.state, ip)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct TokenGenerator {
-    inner: Arc<RwLock<TokenGenInner>>,
-}
-
-impl TokenGenerator {
-    pub(crate) fn new(state: u128) -> Self {
-        Self {
-            // I wish we had the Haskell function composition syntax for things like this
-            inner: Arc::new(RwLock::new(TokenGenInner::new(state))),
-        }
-    }
-
-    /// Generate the current token for the IP
+    /// The token to hand `ip` now
     pub(crate) fn token_for_ip(&self, ip: &IpAddr) -> Token {
-        {
-            let inner = self.inner.read().unwrap();
-            if !inner.needs_advancing() {
-                return inner.generate_token(ip);
-            }
-        }
-
-        let mut inner = self.inner.write().unwrap();
-        if inner.needs_advancing() {
-            inner.advance();
-        }
-
-        inner.generate_token(ip)
+        self.token_in(self.epoch(), ip)
     }
 
+    /// Whether `token` was handed to `ip` in this epoch or the one before
     pub(crate) fn is_valid_token(&self, ip: &IpAddr, token: &Token) -> bool {
-        self.inner.read().unwrap().token_acceptable(ip, token)
+        self.is_valid_in(self.epoch(), ip, token)
+    }
+
+    fn is_valid_in(&self, epoch: u64, ip: &IpAddr, token: &Token) -> bool {
+        *token == self.token_in(epoch, ip) || *token == self.token_in(epoch - 1, ip)
     }
 }
 
@@ -103,28 +66,28 @@ mod tests {
 
     #[test]
     fn tokens_bind_to_the_requesters_ip() {
-        let tokens = TokenGenerator::new(42);
+        let tokens = TokenGenerator::new([42; 32]);
         let a: IpAddr = "1.2.3.4".parse().unwrap();
         let b: IpAddr = "5.6.7.8".parse().unwrap();
 
         let token = tokens.token_for_ip(&a);
+        assert_eq!(token.as_bytes().len(), TOKEN_LEN);
         assert!(tokens.is_valid_token(&a, &token));
         assert!(
             !tokens.is_valid_token(&b, &token),
             "a token must not validate from another IP"
         );
+        assert!(!TokenGenerator::new([43; 32]).is_valid_token(&a, &token));
     }
 
     #[test]
-    fn previous_state_token_stays_valid_exactly_one_rotation() {
-        let tokens = TokenGenerator::new(42);
+    fn a_token_is_good_for_its_epoch_and_the_next_whether_or_not_others_were_issued() {
+        let tokens = TokenGenerator::new([42; 32]);
         let a: IpAddr = "1.2.3.4".parse().unwrap();
-
-        let old = tokens.token_for_ip(&a);
-        tokens.inner.write().unwrap().advance();
-        assert!(tokens.is_valid_token(&a, &old), "current-1 must still be accepted");
-
-        tokens.inner.write().unwrap().advance();
-        assert!(!tokens.is_valid_token(&a, &old), "current-2 must be rejected");
+        let issued = tokens.token_in(7, &a);
+        assert!(tokens.is_valid_in(7, &a, &issued));
+        assert!(tokens.is_valid_in(8, &a, &issued));
+        assert!(!tokens.is_valid_in(9, &a, &issued));
+        assert!(!tokens.is_valid_in(6, &a, &issued));
     }
 }
