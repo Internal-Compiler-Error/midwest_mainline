@@ -29,6 +29,17 @@ LOG_PORT=9999
 DHT_PORT=${DHT_PORT:-44444}
 RPC_PORT=${RPC_PORT:-3000}
 mkdir -p "$RUN_DIR" "$DATA_DIR"
+# the user's own GUI holds 6881/6882 (the defaults): runs listen elsewhere unless settings.json
+# already names a port, and download into the scratch dir rather than ~/Downloads
+LISTEN_PORT=${LISTEN_PORT:-51001}
+python3 - "$DATA_DIR/settings.json" "$LISTEN_PORT" "$RUN_DIR/gui-download" <<'PY'
+import json, sys, os
+path, port, downloads = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+settings = json.load(open(path)) if os.path.exists(path) else {}
+settings.setdefault("listen_port", port)
+settings.setdefault("download_dir", downloads)
+json.dump(settings, open(path, "w"))
+PY
 
 summarize() {
   # counts the lines that say what happened; the log has ANSI colour and no timestamps in
@@ -94,7 +105,6 @@ case ${1:-} in
     # the GUI downloads into its settings' download_dir, which defaults to ~/Downloads: point
     # it at the scratch dir so a test run never writes into the user's own folders
     mkdir -p "$DATA_DIR" "$RUN_DIR/gui-download"
-    [[ -f $DATA_DIR/settings.json ]] || printf '{"download_dir": "%s"}\n' "$RUN_DIR/gui-download" > "$DATA_DIR/settings.json"
     # DOWNLOADER_WINDOW_ON_TOP: the window opens behind whatever is in front (a full-screen
     # terminal, say) and WebKit stops painting a covered window, which screenshots as blank
     DOWNLOADER_DATA_DIR=$DATA_DIR DOWNLOADER_LOG_ADDR=127.0.0.1:$LOG_PORT DOWNLOADER_WINDOW_ON_TOP=1 \
