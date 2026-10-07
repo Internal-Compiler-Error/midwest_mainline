@@ -28,9 +28,9 @@
 //!   scrape filters, BEP 43's `ro`). Pure data, no I/O.
 //! - [`dht::rpc_manager`] — the message broker and sole owner of the UDP socket. An
 //!   outbound query gets a fresh transaction id and a oneshot waiting for its response
-//!   (matched on both transaction id *and* sender address); every inbound packet is also
-//!   fanned out to all subscribers. Send work is spawned so a slow write never stalls
-//!   the receive loop.
+//!   (matched on both transaction id *and* sender address); inbound queries and matched
+//!   answers are also fanned out to all subscribers. Send work is spawned so a slow
+//!   write never stalls the receive loop.
 //! - [`dht::routing_table`] — the k-bucket contact store, persisted in SQLite so contacts
 //!   and our node id survive restarts. It subscribes to the broker's inbound fan-out and
 //!   learns from everything we hear; dead nodes are evicted by a failure counter plus

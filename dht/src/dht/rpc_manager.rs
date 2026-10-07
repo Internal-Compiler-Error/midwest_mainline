@@ -130,12 +130,15 @@ impl RpcManager {
             match Krpc::decode(&buf[..amount]) {
                 Ok(msg) => {
                     trace!("{} sent {:?}", socket_addr, msg);
-                    self.fan_out(&msg, socket_addr);
                     // a query is never the answer to one of ours, whatever its transaction id
                     if msg.is_query() {
+                        self.fan_out(&msg, socket_addr);
                         continue;
                     }
+                    // an answer is only news if it's to a query of ours, from where it went:
+                    // anything else is a stray or a spoof, and nobody hears of it
                     let Some(waiting) = self.take_pending(msg.transaction_id(), socket_addr) else {
+                        trace!("{socket_addr} answered nothing we asked");
                         continue;
                     };
                     // only answers to our own queries get a say in what our external address
@@ -143,6 +146,7 @@ impl RpcManager {
                     if let Some(seen) = msg.ip {
                         self.record_external_ip(socket_addr.ip(), seen.ip());
                     }
+                    self.fan_out(&msg, socket_addr);
                     // failing means the receiver has dropped, meaning they are no longer
                     // interested in the message, not a bug
                     let _ = waiting.send((msg, socket_addr));

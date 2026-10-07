@@ -2,8 +2,8 @@
 //!
 //! - [`RpcManager`] is the message broker: the only owner of the UDP socket. Outbound
 //!   queries register their transaction id and await the response on a oneshot; inbound
-//!   packets are fanned out to every subscriber (routing table, server) and matched to
-//!   pending queries.
+//!   queries, and answers matched to a pending query of ours, are fanned out to every
+//!   subscriber (routing table, server); other answers are dropped.
 //! - [`RoutingTable`] is the k-bucket store, persisted in SQLite so contacts survive
 //!   restarts. It also learns passively from every inbound packet.
 //! - [`DhtClient`] (handle via [`DhtSession::handle`]) runs iterative lookups.
@@ -796,6 +796,32 @@ mod lifecycle_tests {
             }
         };
         assert!(rebound.is_ok(), "the port is still bound: {rebound:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod spoofing_tests {
+    use super::*;
+    use crate::message::Krpc;
+    use crate::message::find_node_get_peers_response::Builder as ResBuilder;
+    use crate::test_support::{node, scratch_dir};
+    use crate::types::TransactionId;
+
+    const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_nothing_we_asked_teaches_the_table_nothing() {
+        let dir = scratch_dir("unsolicited");
+        let us = node(&dir, "us", LOOPBACK).await;
+        let liar = UdpSocket::bind(LOOPBACK).await.unwrap();
+        let mentioned = NodeInfo::new(NodeId([0x77; 20]), SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+        let body = KrpcBody::FindNodeGetPeersResponse(ResBuilder::new(NodeId([0x66; 20])).with_node(mentioned).build());
+        let packet = Krpc::new(TransactionId::from_bytes(b"zz"), body).encode();
+        liar.send_to(&packet, us.session.local_addr()).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(us.session.node_count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
