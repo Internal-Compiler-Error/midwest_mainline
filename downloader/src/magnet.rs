@@ -6,7 +6,7 @@
 
 use crate::feed::FeedKey;
 use crate::wire::V2Support;
-use anyhow::{bail, ensure};
+use anyhow::{Context, bail, ensure};
 use midwest_mainline::types::InfoHash;
 use std::net::SocketAddr;
 use url::Url;
@@ -113,7 +113,7 @@ pub fn parse_feed(uri: &str) -> anyhow::Result<Option<FeedKey>> {
                 }
             }
             "s" => {
-                salt = crate::feed::unhex(&value)?;
+                salt = hex::decode(value.as_ref()).context("the salt `s=` isn't hex")?;
                 ensure!(
                     salt.len() <= midwest_mainline::dht::item::MAX_SALT,
                     "a BEP 46 salt is at most 64 bytes"
@@ -233,19 +233,8 @@ fn parse_multihash(raw: &str) -> anyhow::Result<[u8; 32]> {
 pub(crate) fn decode_hex<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
     ensure!(s.len() == 2 * N, "expected {} hex digits, got {}", 2 * N, s.len());
     let mut out = [0u8; N];
-    for (byte, &[hi, lo]) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
-        *byte = (hex_val(hi)? << 4) | hex_val(lo)?;
-    }
+    hex::decode_to_slice(s, &mut out).with_context(|| format!("{s:?} isn't hex"))?;
     Ok(out)
-}
-
-fn hex_val(c: u8) -> anyhow::Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => bail!("invalid hex character {:?}", c as char),
-    }
 }
 
 /// RFC 4648 base32 (A-Z, 2-7), no padding. 32 characters is exactly 160 bits, so this only has
@@ -419,7 +408,7 @@ mod test {
     fn parses_bep_46_keys() {
         let key = "8543d3e6115f0f98c944077a4493dcd543e49c739fd998550a1f614ab36ed63e";
         let feed = parse_feed(&format!("magnet:?xs=urn:btpk:{key}&s=6e")).unwrap().unwrap();
-        assert_eq!(crate::feed::hex(&feed.public), key);
+        assert_eq!(hex::encode(feed.public), key);
         assert_eq!(feed.salt, b"n");
         let unsalted = parse_feed(&format!("magnet:?xs=urn:BTPK:{}", key.to_uppercase()))
             .unwrap()

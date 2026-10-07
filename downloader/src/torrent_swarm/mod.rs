@@ -408,12 +408,7 @@ impl TorrentSwarm {
         });
         bus.emit(Event::PiecesKnown {
             info_hash: torrent.info_hash,
-            bitfield: stat
-                .verified
-                .as_raw_slice()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
+            bitfield: hex::encode(stat.verified.as_raw_slice()),
         });
         let handle = TorrentSwarmHandle {
             tx: events_tx,

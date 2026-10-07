@@ -1343,6 +1343,7 @@ dependencies = [
  "dirs 7.0.0",
  "dontfrag",
  "futures",
+ "hex",
  "igd-next",
  "juicy_bencode",
  "librqbit-dualstack-sockets",

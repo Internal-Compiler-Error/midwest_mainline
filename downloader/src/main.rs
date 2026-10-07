@@ -4,7 +4,7 @@
 //! resume data either way, so running the same command again carries on where it stopped.
 
 use anyhow::Context;
-use downloader::feed::{FeedKey, Version, hex, unhex};
+use downloader::feed::{FeedKey, Version};
 use downloader::{
     ResumeData, Session, SessionConfig, Settings, Telemetry, TorrentId, TorrentState, data_dir, is_magnet_uri,
     parse_magnet, parse_torrent, random_peer_id,
@@ -246,13 +246,13 @@ fn publish(key_file: &Path, target: &str, salt: &[u8]) -> anyhow::Result<()> {
 
 /// 40 hex digits as an info hash.
 fn parse_info_hash(text: &str) -> Option<InfoHash> {
-    InfoHash::try_from_bytes(&unhex(text).ok()?)
+    InfoHash::try_from_bytes(&hex::decode(text).ok()?)
 }
 
 /// The ed25519 secret key in `path` (64 hex digits), or a new one written there
 fn signing_key(path: &Path) -> anyhow::Result<SigningKey> {
     let seed: [u8; 32] = match std::fs::read_to_string(path) {
-        Ok(text) => unhex(text.trim())
+        Ok(text) => hex::decode(text.trim())
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
             .with_context(|| format!("{} must hold 64 hex digits", path.display()))?,
@@ -262,7 +262,7 @@ fn signing_key(path: &Path) -> anyhow::Result<SigningKey> {
             options.write(true).create_new(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            std::io::Write::write_all(&mut options.open(path)?, format!("{}\n", hex(&seed)).as_bytes())?;
+            std::io::Write::write_all(&mut options.open(path)?, format!("{}\n", hex::encode(seed)).as_bytes())?;
             eprintln!("made a new key in {}", path.display());
             seed
         }

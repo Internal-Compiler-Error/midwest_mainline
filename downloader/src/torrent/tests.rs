@@ -341,10 +341,6 @@ fn rejects_path_traversal_in_file_path() {
 const LIBTORRENT_V2: &[u8] = include_bytes!("../../testdata/bittorrent-v2-test.torrent");
 const LIBTORRENT_HYBRID: &[u8] = include_bytes!("../../testdata/bittorrent-v2-hybrid-test.torrent");
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// libtorrent's own v2 test torrent: parsing it checks every piece layer against its
 /// file's root, so our Merkle trees agree with libtorrent's.
 #[test]
@@ -353,7 +349,7 @@ fn parses_libtorrents_v2_test_torrent() {
     assert!(t.v2_only());
     let v2 = t.v2.as_ref().unwrap();
     assert_eq!(
-        hex(&v2.info_hash),
+        hex::encode(v2.info_hash),
         "caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e"
     );
     assert_eq!(t.info_hash.as_bytes(), &v2.info_hash[..20]);
@@ -382,13 +378,19 @@ fn parses_libtorrents_v2_test_torrent() {
 fn parses_libtorrents_hybrid_test_torrent() {
     let t = parse_torrent(LIBTORRENT_HYBRID).unwrap();
     assert!(!t.v2_only());
-    assert_eq!(hex(t.info_hash.as_bytes()), "631a31dd0a46257d5078c0dee4e66e26f73e42ac");
+    assert_eq!(
+        hex::encode(t.info_hash.as_bytes()),
+        "631a31dd0a46257d5078c0dee4e66e26f73e42ac"
+    );
     let v2 = t.v2.as_ref().expect("the halves agree");
     assert_eq!(
-        hex(&v2.info_hash),
+        hex::encode(v2.info_hash),
         "d8dd32ac93357c368556af3ac1d95c9d76bd0dff6fa9833ecdac3d53134efabb"
     );
-    assert_eq!(hex(t.hybrid_v2_hash().unwrap().as_bytes()), hex(&v2.info_hash[..20]));
+    assert_eq!(
+        hex::encode(t.hybrid_v2_hash().unwrap().as_bytes()),
+        hex::encode(&v2.info_hash[..20])
+    );
     assert_eq!(swarm_info_hash(&t.raw_info), t.info_hash, "a hybrid goes by v1");
     assert_eq!(t.files.len(), 17);
     assert_eq!(t.files.iter().filter(|f| f.attr.pad).count(), 8);

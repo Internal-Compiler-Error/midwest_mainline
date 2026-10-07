@@ -40,7 +40,7 @@ impl FeedKey {
     }
 
     pub fn public_hex(&self) -> String {
-        hex(&self.public)
+        hex::encode(self.public)
     }
 }
 
@@ -50,7 +50,7 @@ impl serde::Serialize for FeedKey {
         use serde::ser::SerializeStruct;
         let mut key = s.serialize_struct("FeedKey", 2)?;
         key.serialize_field("key", &self.public_hex())?;
-        key.serialize_field("salt", &hex(&self.salt))?;
+        key.serialize_field("salt", &hex::encode(&self.salt))?;
         key.end()
     }
 }
@@ -86,7 +86,7 @@ impl Version {
     /// The `xt` that names it in a magnet
     pub fn exact_topic(&self) -> String {
         match &self.info_hash_v2 {
-            Some(v2) => format!("urn:btmh:1220{}", hex(v2)),
+            Some(v2) => format!("urn:btmh:1220{}", hex::encode(v2)),
             None => format!("urn:btih:{}", self.info_hash),
         }
     }
@@ -136,7 +136,7 @@ pub fn magnet_uri(key: &FeedKey, version: Option<&Version>, name: Option<&str>, 
     }
     uri.push_str(&format!("xs=urn:btpk:{}", key.public_hex()));
     if !key.salt.is_empty() {
-        uri.push_str(&format!("&s={}", hex(&key.salt)));
+        uri.push_str(&format!("&s={}", hex::encode(&key.salt)));
     }
     let encode = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
     if let Some(name) = name {
@@ -358,21 +358,6 @@ pub(crate) async fn follow(
         }
         wait = next_poll(failures, schedule.poll, schedule.retry);
     }
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Hex of any even length
-pub fn unhex(s: &str) -> anyhow::Result<Vec<u8>> {
-    ensure!(s.len().is_multiple_of(2), "odd number of hex digits");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16).map_err(|_| anyhow::anyhow!("invalid hex {s:?}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]

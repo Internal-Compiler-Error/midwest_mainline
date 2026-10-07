@@ -82,22 +82,18 @@ pub fn layers_above(layer: &[Hash], pad: Hash) -> Vec<Vec<Hash>> {
 mod test {
     use super::*;
 
-    fn hex(h: &Hash) -> String {
-        h.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     /// Reference values from Python's hashlib, built straight from BEP 52's definition.
     #[test]
     fn roots_match_a_reference() {
         // one short block: the root is its hash
         assert_eq!(
-            hex(&data_root(b"abc", 1)),
+            hex::encode(data_root(b"abc", 1)),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         // 40000 bytes of 0x61: three blocks, the last 7232 bytes, a fourth zero leaf
         let data = vec![b'a'; 40000];
         assert_eq!(
-            hex(&data_root(&data, file_leaves(40000))),
+            hex::encode(data_root(&data, file_leaves(40000))),
             "225106564456ed33b02cc22e9d6f5014fd9f4c5383bee6605e07664a44d260ea"
         );
     }
