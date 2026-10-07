@@ -199,21 +199,23 @@ impl RoutingTable {
     pub async fn run(&self, mut inbound: mpsc::Receiver<(Krpc, SocketAddr)>) {
         // the refresh runs beside the inbox, which it would otherwise hold up for as long as
         // it takes
-        let refreshing = {
-            let this = self.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_EVERY, REFRESH_EVERY);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    this.refresh_table().await;
-                }
-            })
+        let refreshing = async {
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_EVERY, REFRESH_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                self.refresh_table().await;
+            }
         };
-        while let Some((msg, from)) = inbound.recv().await {
-            self.learn_from(from, &msg);
+        let learning = async {
+            while let Some((msg, from)) = inbound.recv().await {
+                self.learn_from(from, &msg);
+            }
+        };
+        tokio::select! {
+            _ = refreshing => {}
+            _ = learning => {}
         }
-        refreshing.abort();
     }
 
     /// Returns the bucket index that the target node belongs in

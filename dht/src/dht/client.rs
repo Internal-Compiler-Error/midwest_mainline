@@ -663,7 +663,10 @@ mod tests {
         let our_id = NodeId([0x01; 20]);
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let broker = RpcManager::new(socket, router_pool.clone(), Arc::new(TxnIdGenerator::new()), None);
-        broker.run().await.unwrap();
+        tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.run().await }
+        });
         let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool);
         routing_table.add(NodeId([0xAA; 20]), addr_a.into());
 
@@ -695,7 +698,10 @@ mod tests {
         let our_id = NodeId([0x01; 20]);
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
-        broker.run().await.unwrap();
+        tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.run().await }
+        });
         let routing_table = RoutingTable::new(our_id, broker.clone(), pool.clone());
         for node in known {
             routing_table.add(node.id(), node.end_point());

@@ -466,9 +466,7 @@ impl DhtSession {
         join_set
             .build_task()
             .name(&format!("message broker for {}", self.addr))
-            .spawn(async move {
-                let _ = rpc_manager.run().await;
-            })
+            .spawn(async move { rpc_manager.run().await })
             .unwrap();
 
         let routing_table = self.routing_table.clone();
@@ -764,6 +762,40 @@ mod ipv6_tests {
             .expect("X came in as nodes6");
         assert_eq!(seeded.end_point(), x.session.local_addr());
         assert_eq!(us4.session.routing_table.find_exact(&x_id), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::test_support::scratch_dir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_node_lets_go_of_its_port() {
+        let dir = scratch_dir("stop");
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let db = dir.join("dht.db");
+        let session = Arc::new(DhtSession::with_stable_id(socket, None, db.to_str().unwrap()).unwrap());
+        let run = tokio::spawn({
+            let session = session.clone();
+            async move { session.run().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        run.abort();
+        let _ = run.await;
+        drop(session);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let rebound = loop {
+            match UdpSocket::bind(addr).await {
+                Ok(socket) => break Ok(socket),
+                Err(e) if tokio::time::Instant::now() > deadline => break Err(e),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert!(rebound.is_ok(), "the port is still bound: {rebound:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

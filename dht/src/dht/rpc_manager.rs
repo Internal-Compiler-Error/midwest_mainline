@@ -16,7 +16,6 @@ use diesel::{
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task::JoinHandle,
     time::timeout,
 };
 use tracing::{info, instrument, trace, warn};
@@ -111,93 +110,87 @@ impl RpcManager {
         self.socket.local_addr()
     }
 
+    /// Reads the socket until dropped: the socket lives as long as this future or a clone of
+    /// the broker does
     #[instrument(skip_all, fields(family = %self.family))]
-    pub async fn run(&self) -> io::Result<JoinHandle<()>> {
-        let socket = self.socket.clone();
-        let pending_responses = self.pending_responses.clone();
-        let inbound_subscribers = self.inbound_subscribers.clone();
-        let this = self.clone();
+    pub async fn run(&self) {
+        let mut buf = [0u8; 1500];
 
-        let event_loop = async move {
-            let mut buf = [0u8; 1500];
+        loop {
+            // recv_from can fail transiently (e.g. ICMP port-unreachable from an
+            // earlier send on macOS/BSD); that must not kill the broker loop
+            let (amount, socket_addr) = match self.socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("udp recv_from failed: {e}");
+                    continue;
+                }
+            };
+            trace!("received packet from {socket_addr}");
+            match Krpc::decode(&buf[..amount]) {
+                Ok(msg) => {
+                    trace!("{} sent {:?}", socket_addr, msg);
 
-            loop {
-                // recv_from can fail transiently (e.g. ICMP port-unreachable from an
-                // earlier send on macOS/BSD); that must not kill the broker loop
-                let (amount, socket_addr) = match socket.recv_from(&mut buf).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("udp recv_from failed: {e}");
-                        continue;
-                    }
-                };
-                trace!("received packet from {socket_addr}");
-                match Krpc::decode(&buf[..amount]) {
-                    Ok(msg) => {
-                        trace!("{} sent {:?}", socket_addr, msg);
+                    let id = msg.transaction_id();
+                    trace!(
+                        "received message for transaction id {:?}",
+                        hex::encode_upper(id.as_bytes())
+                    );
 
-                        let id = msg.transaction_id();
-                        trace!(
-                            "received message for transaction id {:?}",
-                            hex::encode_upper(id.as_bytes())
-                        );
+                    // notify those that subscribed for all inbound messages
+                    {
+                        let mut subcribers = self.inbound_subscribers.lock().unwrap();
 
-                        // notify those that subscribed for all inbound messages
-                        {
-                            let mut subcribers = inbound_subscribers.lock().unwrap();
+                        subcribers.retain(|s| !s.is_closed());
 
-                            subcribers.retain(|s| !s.is_closed());
-
-                            for sub in &*subcribers {
-                                // Not using send here because `subcribers` mutex guard
-                                // is not Send and it lives across await points; a lagging
-                                // subscriber loses messages but must not stall the broker
-                                if sub.try_send((msg.clone(), socket_addr)).is_err() {
-                                    warn!("inbound subscriber lagging, dropping a message for it");
-                                }
-                            }
-                        }
-
-                        {
-                            // see if we have a slot for this transaction id, if we do, that means one of the
-                            // messages that we expect, otherwise the message is a query we need to handle
-                            let entry = pending_responses.lock().unwrap().remove(id);
-                            if let Some((expected, sender)) = entry {
-                                if expected == socket_addr {
-                                    // only answers to our own queries get a say in what our
-                                    // external address is; anyone can send a query
-                                    if let Some(seen) = msg.ip {
-                                        this.record_external_ip(socket_addr.ip(), seen.ip());
-                                    }
-                                    // failing means the receiver has dropped, meaning they are no
-                                    // longer interested in the message, not a bug
-                                    let _ = sender.send((msg, socket_addr));
-                                } else {
-                                    warn!(
-                                        "ignoring response for a pending transaction from the wrong address: expected {expected}, got {socket_addr}"
-                                    );
-                                    // the genuine response may still arrive; keep the slot
-                                    pending_responses.lock().unwrap().insert(id.clone(), (expected, sender));
-                                }
+                        for sub in &*subcribers {
+                            // Not using send here because `subcribers` mutex guard
+                            // is not Send and it lives across await points; a lagging
+                            // subscriber loses messages but must not stall the broker
+                            if sub.try_send((msg.clone(), socket_addr)).is_err() {
+                                warn!("inbound subscriber lagging, dropping a message for it");
                             }
                         }
                     }
-                    // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
-                    // we're read-only (BEP 43) and answer nothing
-                    Err(OurError::UnsupportedQuery(txn)) if !this.is_read_only() => {
-                        let response = Krpc::new(txn, KrpcBody::ErrorResponse(KrpcError::new_method_unknown()));
-                        this.send_msg_background(response, socket_addr);
-                    }
-                    Err(e) => {
-                        tracing::debug!("ignoring an unparseable packet from {socket_addr}: {e}")
+
+                    {
+                        // see if we have a slot for this transaction id, if we do, that means one of the
+                        // messages that we expect, otherwise the message is a query we need to handle
+                        let entry = self.pending_responses.lock().unwrap().remove(id);
+                        if let Some((expected, sender)) = entry {
+                            if expected == socket_addr {
+                                // only answers to our own queries get a say in what our
+                                // external address is; anyone can send a query
+                                if let Some(seen) = msg.ip {
+                                    self.record_external_ip(socket_addr.ip(), seen.ip());
+                                }
+                                // failing means the receiver has dropped, meaning they are no
+                                // longer interested in the message, not a bug
+                                let _ = sender.send((msg, socket_addr));
+                            } else {
+                                warn!(
+                                    "ignoring response for a pending transaction from the wrong address: expected {expected}, got {socket_addr}"
+                                );
+                                // the genuine response may still arrive; keep the slot
+                                self.pending_responses
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id.clone(), (expected, sender));
+                            }
+                        }
                     }
                 }
+                // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
+                // we're read-only (BEP 43) and answer nothing
+                Err(OurError::UnsupportedQuery(txn)) if !self.is_read_only() => {
+                    let response = Krpc::new(txn, KrpcBody::ErrorResponse(KrpcError::new_method_unknown()));
+                    self.send_msg_background(response, socket_addr);
+                }
+                Err(e) => {
+                    tracing::debug!("ignoring an unparseable packet from {socket_addr}: {e}")
+                }
             }
-        };
-        use tokio::task::Builder;
-        Builder::new()
-            .name(&format!("Message broker ({})", self.family))
-            .spawn(event_loop)
+        }
     }
 
     /// Subscribe to the reply with the provided transaction_id, expected from `endpoint`
@@ -331,6 +324,11 @@ mod tests {
     use crate::types::NodeId;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
+    fn spawn_run(broker: &RpcManager) {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.run().await });
+    }
+
     async fn test_broker() -> RpcManager {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
@@ -385,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_query_method_gets_a_204_with_version_and_ip() {
         let broker = test_broker().await;
-        broker.run().await.unwrap();
+        spawn_run(&broker);
         let broker_addr = broker.socket.local_addr().unwrap();
 
         let us = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -419,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn responses_from_the_wrong_address_are_ignored() {
         let broker = test_broker().await;
-        broker.run().await.unwrap();
+        spawn_run(&broker);
 
         let legit = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
