@@ -1,5 +1,6 @@
 use crate::settings::{
-    BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW, REQUEST_PIPELINE_TARGET, WRITE_TIMEOUT,
+    BLOCK_SIZE, MAX_REQUEST_WINDOW, MIN_REQUEST_WINDOW, PEER_OUTBOX, RATE_WINDOW, REQUEST_PIPELINE_TARGET,
+    WRITE_TIMEOUT,
 };
 use crate::stream::PeerStream;
 use crate::wire::{
@@ -395,7 +396,9 @@ impl Peer {
     /// socket write would; it completes at once.
     async fn send(&mut self, msg: BtMessage) -> io::Result<()> {
         self.outbox.try_send(msg).map_err(|e| match e {
-            TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "send queue full, the peer isn't reading"),
+            TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "send queue full, the peer isn't reading")
+            }
             TrySendError::Closed(_) => io::ErrorKind::BrokenPipe.into(),
         })
     }
@@ -403,10 +406,10 @@ impl Peer {
     pub async fn send_extended_handshake(&mut self, metadata_size: u32, private: bool) -> io::Result<()> {
         let payload = build_extended_handshake(metadata_size, private);
         self.send(BtMessage::Extended(Extended {
-                ext_id: 0,
-                payload: payload.into_boxed_slice(),
-            }))
-            .await
+            ext_id: 0,
+            payload: payload.into_boxed_slice(),
+        }))
+        .await
     }
 
     pub async fn send_keepalive(&mut self) -> io::Result<()> {
@@ -480,11 +483,11 @@ impl Peer {
 
     pub async fn send_cancel(&mut self, req: Request) -> io::Result<()> {
         self.send(BtMessage::Cancel(Cancel {
-                index: req.index,
-                begin: req.begin,
-                length: req.length,
-            }))
-            .await
+            index: req.index,
+            begin: req.begin,
+            length: req.length,
+        }))
+        .await
     }
 
     /// is exactly what such a peer already expects.
@@ -493,11 +496,11 @@ impl Peer {
             return Ok(());
         }
         self.send(BtMessage::RejectRequest(RejectRequest {
-                index: req.index,
-                begin: req.begin,
-                length: req.length,
-            }))
-            .await
+            index: req.index,
+            begin: req.begin,
+            length: req.length,
+        }))
+        .await
     }
 
     pub async fn send_block(&mut self, piece: Piece) -> io::Result<()> {
@@ -514,10 +517,10 @@ impl Peer {
             return Ok(());
         };
         self.send(BtMessage::Extended(Extended {
-                ext_id: their_id,
-                payload: build_ut_metadata_data_message(piece, total_size, data).into_boxed_slice(),
-            }))
-            .await
+            ext_id: their_id,
+            payload: build_ut_metadata_data_message(piece, total_size, data).into_boxed_slice(),
+        }))
+        .await
     }
 
     /// BEP 11 (PEX): silent no-op if the peer never declared ut_pex support, same reasoning as
@@ -527,10 +530,10 @@ impl Peer {
             return Ok(());
         };
         self.send(BtMessage::Extended(Extended {
-                ext_id: their_id,
-                payload: build_pex_message(added).into_boxed_slice(),
-            }))
-            .await
+            ext_id: their_id,
+            payload: build_pex_message(added).into_boxed_slice(),
+        }))
+        .await
     }
 }
 

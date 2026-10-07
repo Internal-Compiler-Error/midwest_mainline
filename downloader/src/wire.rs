@@ -439,7 +439,10 @@ impl Decoder for BtDecoder {
                 if buf.len() == n {
                     Ok(())
                 } else {
-                    Err(invalid(&format!("message {msg_type} has {} payload bytes, expected {n}", buf.len())))
+                    Err(invalid(&format!(
+                        "message {msg_type} has {} payload bytes, expected {n}",
+                        buf.len()
+                    )))
                 }
             };
             match msg_type {
@@ -449,7 +452,9 @@ impl Decoder for BtDecoder {
                 3 => BtMessage::NotInterested(NotInterested),
                 4 => {
                     exact(4)?;
-                    BtMessage::Have(Have { checked: be_u32(buf, 0) })
+                    BtMessage::Have(Have {
+                        checked: be_u32(buf, 0),
+                    })
                 }
                 5 => BtMessage::BitField(BitField { has: Box::from(buf) }),
                 6 => {
@@ -638,7 +643,7 @@ mod test {
     #[test]
     fn short_and_oversized_messages_are_errors_not_panics() {
         for frame in [
-            &b"\x00\x00\x00\x01\x04"[..],               // Have without its index
+            &b"\x00\x00\x00\x01\x04"[..],                // Have without its index
             b"\x00\x00\x00\x05\x06\x00\x00\x00\x01",     // Request with 4 of 12 bytes
             b"\x00\x00\x00\x03\x07\x00\x00",             // Piece without index and offset
             b"\x00\x00\x00\x01\x08",                     // Cancel
@@ -653,13 +658,19 @@ mod test {
         }
 
         let mut huge = BytesMut::from(&b"\xff\xff\xff\xff\x07"[..]);
-        assert!(BtDecoder.decode(&mut huge).is_err(), "a 4 GiB length is refused before buffering");
+        assert!(
+            BtDecoder.decode(&mut huge).is_err(),
+            "a 4 GiB length is refused before buffering"
+        );
     }
 
     #[test]
     fn a_well_formed_have_still_decodes() {
         let mut src = BytesMut::from(&b"\x00\x00\x00\x05\x04\x00\x00\x00\x2a"[..]);
-        assert!(matches!(BtDecoder.decode(&mut src).unwrap(), Some(BtMessage::Have(Have { checked: 42 }))));
+        assert!(matches!(
+            BtDecoder.decode(&mut src).unwrap(),
+            Some(BtMessage::Have(Have { checked: 42 }))
+        ));
         assert!(src.is_empty());
     }
 

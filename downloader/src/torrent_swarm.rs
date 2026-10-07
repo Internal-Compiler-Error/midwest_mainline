@@ -5,14 +5,14 @@ use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
 use crate::limiter::RateLimiter;
 use crate::peer::{
-    Inbox, Incoming, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID, parse_pex_message,
-    parse_ut_metadata_request,
+    Inbox, Incoming, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID,
+    parse_pex_message, parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
-    ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL, MAX_INFLIGHT_BYTES,
-    MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT, PEX_INTERVAL,
-    PEX_MAX_ADDED_PEERS, SWARM_INBOX,
+    ENDGAME_LAST_PIECES, ENDGAME_LAST_RACERS, ENDGAME_RACERS, FRUITLESS_PEER_COOLDOWN, KEEPALIVE_INTERVAL,
+    MAX_INFLIGHT_BYTES, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS, PEER_TIMEOUT,
+    PEX_INTERVAL, PEX_MAX_ADDED_PEERS, SWARM_INBOX,
 };
 use crate::storage::TorrentStorage;
 use crate::stream::{DialHints, PeerStream};
@@ -830,14 +830,19 @@ impl TorrentSwarm {
         let choked_us_before = peer.choked_us;
         let became_interested = matches!(msg, BtMessage::Interested(_)) && !peer.interested_us;
         let new_piece = match &msg {
-            BtMessage::Have(have) if (have.checked as usize) < self.availability.len() && !peer.they_have(have.checked) => {
+            BtMessage::Have(have)
+                if (have.checked as usize) < self.availability.len() && !peer.they_have(have.checked) =>
+            {
                 Some(have.checked)
             }
             _ => None,
         };
         // a whole bitfield replaces whatever the peer claimed before, so its old pieces stop
         // counting towards availability and the new ones start
-        let replaces_bitfield = matches!(msg, BtMessage::BitField(_) | BtMessage::HaveAll(_) | BtMessage::HaveNone(_));
+        let replaces_bitfield = matches!(
+            msg,
+            BtMessage::BitField(_) | BtMessage::HaveAll(_) | BtMessage::HaveNone(_)
+        );
         if replaces_bitfield {
             for piece in peer.pieces() {
                 self.availability[piece as usize] -= 1;
@@ -1124,7 +1129,10 @@ impl TorrentSwarm {
         tokio::task::spawn_blocking(move || {
             let buf = in_flight.buf;
             let outcome = if torrent.valid_piece(piece, &buf) {
-                storage.write_piece(piece, &buf).map(|()| true).map_err(|e| format!("{e:#}"))
+                storage
+                    .write_piece(piece, &buf)
+                    .map(|()| true)
+                    .map_err(|e| format!("{e:#}"))
             } else {
                 Ok(false)
             };
@@ -1139,7 +1147,13 @@ impl TorrentSwarm {
         });
     }
 
-    async fn piece_done(&mut self, piece: u32, len: usize, senders: BTreeSet<SocketAddr>, outcome: Result<bool, String>) {
+    async fn piece_done(
+        &mut self,
+        piece: u32,
+        len: usize,
+        senders: BTreeSet<SocketAddr>,
+        outcome: Result<bool, String>,
+    ) {
         self.hashing.remove(&piece);
         match outcome {
             Ok(true) => {}
@@ -1371,7 +1385,11 @@ impl TorrentSwarm {
             if !peer.they_have(piece) {
                 continue;
             }
-            let rank = if self.sequential { piece } else { self.availability[piece as usize] };
+            let rank = if self.sequential {
+                piece
+            } else {
+                self.availability[piece as usize]
+            };
             match best {
                 Some((_, best_rank)) if rank > best_rank => {}
                 Some((_, best_rank)) if rank == best_rank => {
@@ -1405,6 +1423,14 @@ impl TorrentSwarm {
         (f.blocks_left() * BLOCK_SIZE) as f64 / rate.max(1.0)
     }
 
+    fn racers_per_piece(&self) -> usize {
+        if self.in_flight.len() <= ENDGAME_LAST_PIECES {
+            ENDGAME_LAST_RACERS
+        } else {
+            ENDGAME_RACERS
+        }
+    }
+
     /// Endgame for every peer with room, furthest-from-done pieces first.
     fn race_the_last_pieces(&mut self) {
         let rate_scale = self.rate_scale();
@@ -1412,7 +1438,7 @@ impl TorrentSwarm {
         let mut by_eta: Vec<(f64, u32)> = self.in_flight.iter().map(|(&piece, f)| (self.eta(f), piece)).collect();
         by_eta.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (_, piece) in by_eta {
-            while self.in_flight[&piece].claims.len() < ENDGAME_RACERS {
+            while self.in_flight[&piece].claims.len() < self.racers_per_piece() {
                 let Some(idx) = self.best_peer(piece, &backlog, rate_scale) else {
                     break;
                 };
@@ -1436,12 +1462,13 @@ impl TorrentSwarm {
         let addr = peer.remote_addr;
         let mut backlog: usize = self.in_flight.values().map(|f| f.unrequested_blocks(addr)).sum();
         let rate_scale = self.rate_scale();
+        let racers = self.racers_per_piece();
         while self.peers[idx].requested.len() + backlog < self.peers[idx].request_window() {
             let peer = &self.peers[idx];
             let Some((_, piece)) = self
                 .in_flight
                 .iter()
-                .filter(|(p, f)| f.claims.len() < ENDGAME_RACERS && !f.claims.contains_key(&addr) && peer.they_have(**p))
+                .filter(|(p, f)| f.claims.len() < racers && !f.claims.contains_key(&addr) && peer.they_have(**p))
                 .map(|(&piece, f)| (self.eta(f), piece))
                 .max_by(|a, b| a.0.total_cmp(&b.0))
             else {
@@ -1828,12 +1855,12 @@ async fn dial(
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::StreamExt;
     use crate::metadata::build_torrent_file;
     use crate::settings::MIN_REQUEST_WINDOW;
     use crate::torrent::parse_torrent;
     use crate::wire::BtCodec;
     use futures::SinkExt;
+    use futures::StreamExt;
     use sha1::{Digest, Sha1};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::path::PathBuf;

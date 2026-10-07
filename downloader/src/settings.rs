@@ -56,6 +56,11 @@ pub const SWARM_INBOX: usize = 4096;
 /// cancelled at the other racers. This many peers may hold the same piece at once.
 pub const ENDGAME_RACERS: usize = 2;
 
+/// For the last few pieces in flight, more racers each: the whole download waits on them, and
+/// with two racers that are both slow the final seconds drag.
+pub const ENDGAME_LAST_PIECES: usize = 8;
+pub const ENDGAME_LAST_RACERS: usize = 4;
+
 /// How long to leave an address alone after a failed dial. Doubles with each consecutive
 /// failure up to DIAL_BACKOFF_MAX; trackers and PEX keep handing out the same dead
 /// addresses, and without this each one is redialed every time it comes around.
