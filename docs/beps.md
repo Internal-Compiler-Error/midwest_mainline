@@ -16,20 +16,23 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 6 | Fast extension (HaveAll/None, Reject, AllowedFast parsed; we don't grant allowed-fast) | `peer.rs`, `torrent_swarm.rs` |
 | 7 | IPv6 tracker peers (`peers6`), and the same split in PEX | `announcer.rs`, `peer.rs` |
 | 9 | Metadata from peers (`ut_metadata`), magnet links | `metadata.rs`, `magnet.rs` |
-| 10 | Extension protocol | `peer.rs` (`build_extended_handshake`, advertises `reqq`) |
+| 10 | Extension protocol: `reqq`, `v`, `yourip` (both ways: we tell peers, and their word on ours is a vote), ids 1..=255 with 0 disabling | `peer.rs` (`build_extended_handshake`, `handle_extended_handshake`), `external.rs` |
 | 11 | PEX | `peer.rs`, `torrent_swarm.rs` (`run_pex_round`; random sample of 50 per round) |
 | 12 | Multitracker (`announce-list`) | `torrent.rs`, `announcer.rs` |
 | 14 | Local service discovery | `lsd.rs` |
 | 15 | UDP trackers (connect, announce, scrape; retransmits, connection-id expiry) | `announcer.rs` |
 | 19 | Web seeds (`url-list`, magnet `ws=`): HTTP(S) range requests over a shared HTTP/2 client, runs of consecutive pieces scheduled by UCB next to peers, endgame racing, backoff/give-up; `webseed` spans | `webseed.rs`, `torrent_swarm.rs`, `torrent.rs`, `magnet.rs` |
 | 20 | Peer id convention (`-DL0100-` + random) | `defs.rs` (`random_peer_id`) |
+| 21 | Partial seeds: `upload_only` re-sent when the selection completes but not every piece is in; peers' flag read (PEX marks them as seeds) | `torrent_swarm.rs` (`partial_seed`), `peer.rs` |
 | 23 | Compact peer lists | `announcer.rs` |
+| 24 | Tracker `external ip`, a vote for our public address (two agreeing voters needed; shown in the status bar when port mapping doesn't know it) | `announcer.rs`, `external.rs` |
 | 27 | Private torrents (no DHT/PEX/LSD for them) | `torrent.rs`, `torrent_swarm.rs`, `announcer.rs` |
 | 29 | uTP (via `librqbit-utp`; happy-eyeballs with TCP) | `utp.rs`, `stream.rs` |
 | 32 | IPv6 DHT: a second `DhtSession` on an IPv6 socket, `nodes6`/`want`, 18-byte values, per-/64 Sybil rule, v6 table seeded from v4 `nodes6` answers (untested on a live v6 route: the dev Mac has none) | `dht/` (`DhtSession::pair_with`, migration `2026-10-07-000000_ipv6_nodes`), `downloader/src/dht.rs` |
 | 41 | UDP tracker extensions: we send an empty option list only | `announcer.rs` |
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
+| 54 | `lt_donthave`: received (availability and claims follow); we never drop pieces, so never sent | `torrent_swarm.rs`, `peer.rs` (`drop_have`) |
 | 53 | Magnet `so=` (select only): indices and ranges, applied when the metadata arrives; nothing valid selects all | `magnet.rs` (`MagnetLink::selection`), `session.rs` (`add`) |
 | magnet `x.pe` | Peer addresses in a magnet (address literals only), tried first by the metadata fetch | `magnet.rs`, `metadata.rs` |
 | MSE | Message stream encryption (not a BEP; the Vuze/libtorrent spec) | `mse.rs` |
@@ -39,9 +42,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 52 + 47 | BitTorrent v2 (SHA-256 Merkle trees, `piece layers`, `btmh` magnets) and padding files / file attributes | Hybrid v1+v2 torrents are increasingly common; without 47 we'd write pad files to disk. Big: per-file Merkle verification, hash requests (`hash request`/`hashes`/`hash reject` messages), v2 info hash in the handshake |
-| 21 | Partial seeds (`upload_only` in the extended handshake) | Tell peers we're done with what we selected; don't count partial seeds as seeds |
-| 54 | `lt_donthave` | Small; needed if pieces can be dropped (e.g. a file deselected and deleted) |
-| 24 + BEP 10 `yourip` | Our external address from trackers and peers | Today only the DHT tells us; feeds BEP 42 ids and port mapping checks |
 | 55 | Holepunch (`ut_holepunch`, via a relaying peer, over uTP) | More reachable peers behind NAT |
 | 40 | Canonical peer priority | Deterministic choice of which connections to keep under churn |
 | 42 (verify) | Check other nodes' ids against their IPs | Complements the one-node-per-IP Sybil defence in the routing table |

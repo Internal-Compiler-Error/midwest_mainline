@@ -112,6 +112,8 @@ pub(crate) struct Announcing {
     pub shutdown: CancellationToken,
     pub dht: DhtWatch,
     pub bus: EventBus,
+    /// where trackers' BEP 24 `external ip` goes
+    pub external: crate::external::ExternalAddress,
 }
 
 /// Spawns a tracker announcer task per usable URL in `trackers`, reporting discovered peers to
@@ -408,6 +410,7 @@ struct Tracker {
     failures: u32,
     last_scrape: Option<Instant>,
     bus: EventBus,
+    external: crate::external::ExternalAddress,
 }
 
 impl Tracker {
@@ -428,6 +431,7 @@ impl Tracker {
             failures: 0,
             last_scrape: None,
             bus: shared.bus.clone(),
+            external: shared.external.clone(),
         }
     }
 
@@ -736,6 +740,8 @@ struct HttpResponse {
     interval: Duration,
     warning: Option<String>,
     counts: SwarmCounts,
+    /// BEP 24: our address as the tracker saw it
+    external_ip: Option<IpAddr>,
 }
 
 /// Parses an HTTP tracker's announce response; a `failure reason` is the error.
@@ -766,6 +772,14 @@ fn parse_http_response(body: &[u8]) -> anyhow::Result<HttpResponse> {
         seeders: count(dict.remove(b"complete".as_slice())),
         leechers: count(dict.remove(b"incomplete".as_slice())),
         downloaded: count(dict.remove(b"downloaded".as_slice())),
+    };
+    let external_ip = match dict.remove(b"external ip".as_slice()) {
+        Some(BencodeItemView::ByteString(ip)) => match ip.len() {
+            4 => Some(IpAddr::from(<[u8; 4]>::try_from(ip).expect("4 bytes"))),
+            16 => Some(IpAddr::from(<[u8; 16]>::try_from(ip).expect("16 bytes"))),
+            _ => None,
+        },
+        _ => None,
     };
 
     let mut peers = vec![];
@@ -814,6 +828,7 @@ fn parse_http_response(body: &[u8]) -> anyhow::Result<HttpResponse> {
         interval: announce_interval(interval, min_interval),
         warning,
         counts,
+        external_ip,
     })
 }
 
@@ -861,6 +876,9 @@ impl HttpAnnouncer {
         };
         if let Some(warning) = &response.warning {
             warn!("Tracker [{}] warns: {warning}", tracker.url);
+        }
+        if let Some(ip) = response.external_ip {
+            let _ = tracker.external.vote(ip, tracker.url.host_str().unwrap_or_default());
         }
         Ok(Announced {
             peers: response.peers,
@@ -1370,7 +1388,9 @@ mod test {
         body.extend_from_slice(b"6:peers618:");
         body.extend_from_slice(&[0; 15]);
         body.extend_from_slice(&[1, 0x1a, 0xe2]);
-        body.extend_from_slice(b"15:warning message2:hi8:completei513e10:incompletei30ee");
+        body.extend_from_slice(
+            b"15:warning message2:hi8:completei513e11:external ip4:\xcb\x00\x71\x0910:incompletei30ee",
+        );
         let response = parse_http_response(&body).unwrap();
         assert_eq!(
             response,
@@ -1383,6 +1403,7 @@ mod test {
                     leechers: Some(30),
                     downloaded: None,
                 },
+                external_ip: Some("203.0.113.9".parse().unwrap()),
             }
         );
 
@@ -1571,6 +1592,7 @@ mod test {
             shutdown: CancellationToken::new(),
             dht: crate::dht::Dht::none(),
             bus: EventBus::new(),
+            external: Default::default(),
         }
     }
 
@@ -1632,6 +1654,7 @@ mod test {
             shutdown: shutdown.clone(),
             dht: crate::dht::Dht::none(),
             bus: EventBus::new(),
+            external: Default::default(),
         });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(
@@ -1659,6 +1682,7 @@ mod test {
             shutdown: shutdown.clone(),
             dht: dht_rx,
             bus: EventBus::new(),
+            external: Default::default(),
         });
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);

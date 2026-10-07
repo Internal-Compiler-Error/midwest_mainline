@@ -253,7 +253,8 @@ fn status(app: State<App>) -> StatusDto {
         dht_nodes: status.dht_nodes,
         listen_port: status.listen_port,
         port_mapping,
-        external_ip,
+        // the gateway's word first; failing that, what peers and trackers say
+        external_ip: external_ip.or(status.external_ip.map(|ip| ip.to_string())),
     }
 }
 

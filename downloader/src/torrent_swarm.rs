@@ -3,10 +3,11 @@ use crate::config::SettingsWatch;
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
+use crate::external::ExternalAddress;
 use crate::limiter::RateLimiter;
 use crate::peer::{
-    Inbox, Incoming, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID, UT_PEX_ID,
-    parse_pex_message, parse_ut_metadata_request,
+    Inbox, Incoming, LT_DONTHAVE_ID, PEX_UTP, Peer, PeerSnapshot, PeerStatistics, ProtocolViolation, UT_METADATA_ID,
+    UT_PEX_ID, parse_pex_message, parse_ut_metadata_request,
 };
 use crate::settings::{
     BAD_PEER_BAN, BLOCK_REQUEST_TIMEOUT, BLOCK_SIZE, CHOKING_ROUND_INTERVAL, DIAL_BACKOFF, DIAL_BACKOFF_MAX,
@@ -171,6 +172,7 @@ pub(crate) struct Shared {
     /// live settings; the connection cap and the rate limits are read from it
     pub settings: SettingsWatch,
     pub limiter: Arc<RateLimiter>,
+    pub external: ExternalAddress,
 }
 
 /// A stream that has completed the BitTorrent handshake and is ready to become a `Peer`.
@@ -460,6 +462,8 @@ pub struct TorrentSwarm {
     /// pick the lowest missing piece instead of the rarest
     sequential: bool,
     in_flight: BTreeMap<u32, InFlight>,
+    /// our public address by the votes of peers (`yourip`) and trackers
+    external: ExternalAddress,
     /// per peer, the in-flight pieces it holds a claim on: the inverse of `InFlight::claims`,
     /// so a peer's pieces are found without scanning everything in flight (once per block)
     holdings: BTreeMap<SocketAddr, BTreeSet<u32>>,
@@ -507,6 +511,7 @@ impl TorrentSwarm {
             utp,
             settings,
             limiter,
+            external,
         } = shared;
         assert_eq!(
             verified.len(),
@@ -533,6 +538,7 @@ impl TorrentSwarm {
             shutdown: announcers.clone(),
             dht: dht.clone(),
             bus: bus.clone(),
+            external: external.clone(),
         });
         bus.emit(Event::PiecesKnown {
             info_hash: torrent.info_hash,
@@ -582,6 +588,7 @@ impl TorrentSwarm {
             sequential: false,
             in_flight: BTreeMap::new(),
             holdings: BTreeMap::new(),
+            external,
             hashing: BTreeSet::new(),
             total_picks: 0,
             web_seeds,
@@ -956,6 +963,11 @@ impl TorrentSwarm {
             }
         }
         let peer = &mut self.peers[idx];
+        if let Some(ip) = peer.yourip.take()
+            && let Some(agreed) = self.external.vote(ip, &peer.remote_addr.to_string())
+        {
+            info!("peers agree our public address is {agreed}");
+        }
         let msg = match applied {
             Ok(None) => {
                 if peer.choked_us != choked_us_before {
@@ -1052,6 +1064,21 @@ impl TorrentSwarm {
                 let data = &self.torrent.raw_info[start..end];
                 if peer.send_metadata_piece(piece, total_size, data).await.is_err() {
                     self.drop_peer(idx, "send failed");
+                }
+            }
+            BtMessage::Extended(ext) if ext.ext_id == LT_DONTHAVE_ID => {
+                // BEP 54: the peer dropped a piece; it can't be given that piece any more
+                let Ok(raw) = <[u8; 4]>::try_from(&ext.payload[..]) else {
+                    return;
+                };
+                let piece = u32::from_be_bytes(raw);
+                if peer.drop_have(piece) {
+                    self.availability[piece as usize] -= 1;
+                    let addr = peer.remote_addr;
+                    if self.holdings.get(&addr).is_some_and(|held| held.contains(&piece)) {
+                        self.release_claim(piece, addr);
+                        self.schedule().await;
+                    }
                 }
             }
             BtMessage::Extended(ext) if ext.ext_id == UT_PEX_ID => {
@@ -1373,6 +1400,12 @@ impl TorrentSwarm {
         self.stat.completed = self.stat.left == 0;
         if self.stat.completed && !was_complete {
             info!("download complete, {} bytes were received twice", self.stat.wasted);
+            if self.partial_seed() {
+                // BEP 21: done with what's selected, but not a seed: tell peers we won't ask
+                let (size, private) = (self.torrent.metadata_size(), self.torrent.private);
+                self.broadcast(move |peer| Box::pin(peer.send_extended_handshake(size, private, true)))
+                    .await;
+            }
         }
         // announcers watch this to send a prompt event=completed rather than waiting for
         // their next periodic announce, which could be minutes away
@@ -1617,6 +1650,11 @@ impl TorrentSwarm {
             })
             .sum();
         (f.blocks_left() * BLOCK_SIZE) as f64 / rate.max(1.0)
+    }
+
+    /// BEP 21: everything selected is in, but not everything there is.
+    fn partial_seed(&self) -> bool {
+        self.stat.completed && !self.stat.all_verified()
     }
 
     fn racers_per_piece(&self) -> usize {
@@ -2072,7 +2110,7 @@ impl TorrentSwarm {
         peer.stats = known.stats.clone();
         let opening = async {
             if connected.remote_supports_extensions {
-                peer.send_extended_handshake(self.torrent.metadata_size(), self.torrent.private)
+                peer.send_extended_handshake(self.torrent.metadata_size(), self.torrent.private, self.partial_seed())
                     .await?;
             }
             // BEP 6: a peer that advertised Fast Extension support accepts HaveAll/HaveNone in
@@ -2443,6 +2481,7 @@ mod test {
             utp: crate::utp::none(),
             settings: settings_rx.clone(),
             limiter: Arc::new(RateLimiter::new(settings_rx)),
+            external: ExternalAddress::default(),
         };
         let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         (swarm, handle, path)
@@ -2639,6 +2678,7 @@ mod test {
             utp: crate::utp::none(),
             settings: crate::bt_client::default_settings(),
             limiter: Arc::new(RateLimiter::new(crate::bt_client::default_settings())),
+            external: ExternalAddress::default(),
         };
         let verified = bitvec![u8, Msb0; 0; 3].into_boxed_bitslice();
         let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
@@ -2660,6 +2700,10 @@ mod test {
                         if stats.borrow().completed {
                             break;
                         }
+                    }
+                    // BEP 21: done with the selection but not a seed, so upload_only goes out
+                    Some(Ok(BtMessage::Extended(ext))) if ext.ext_id == 0 => {
+                        assert!(ext.payload.windows(13).any(|w| w == b"11:upload_onl"));
                     }
                     other => panic!("unexpected {other:?}"),
                 }

@@ -132,6 +132,8 @@ pub async fn fetch(
         shutdown: announcer_shutdown.0.clone(),
         dht,
         bus: bus.clone(),
+        // trackers' word on our address before there's a client to tell; it isn't kept
+        external: Default::default(),
     });
 
     let started = tokio::time::Instant::now();

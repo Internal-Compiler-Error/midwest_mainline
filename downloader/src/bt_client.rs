@@ -3,6 +3,7 @@ use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::{Event, EventBus, PeerSource};
+use crate::external::ExternalAddress;
 use crate::limiter::RateLimiter;
 use crate::lsd::Lsd;
 use crate::peer::PeerSnapshot;
@@ -54,6 +55,8 @@ pub struct BtClient {
     lsd: Arc<Lsd>,
     /// everything that happens, for whoever listens (see `events`)
     events: EventBus,
+    /// our public address as peers and trackers see it
+    external: ExternalAddress,
 }
 
 impl BtClient {
@@ -64,6 +67,11 @@ impl BtClient {
 
     pub fn utp(&self) -> UtpWatch {
         self.utp.clone()
+    }
+
+    /// Our public address by the votes of peers and trackers (see `external`).
+    pub fn external_address(&self) -> Option<std::net::IpAddr> {
+        self.external.best()
     }
 
     pub fn port_mapping(&self) -> MappingWatch {
@@ -121,6 +129,7 @@ impl BtClient {
             utp,
             port_mapping,
             events,
+            external: ExternalAddress::default(),
         };
         tokio::spawn(Self::accept_incoming(
             client.id.clone(),
@@ -278,6 +287,7 @@ impl BtClient {
             utp: self.utp.clone(),
             settings: self.settings.clone(),
             limiter: self.limiter.clone(),
+            external: self.external.clone(),
         };
         let handle = TorrentSwarm::spawn(torrent.clone(), storage, verified, shared);
         swarms.insert(torrent.info_hash, handle);

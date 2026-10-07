@@ -5,6 +5,7 @@ pub mod config;
 mod defs;
 pub mod dht;
 pub mod events;
+pub mod external;
 mod limiter;
 pub mod logs;
 mod lsd;

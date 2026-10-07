@@ -899,6 +899,9 @@ pub struct SessionStatus {
     pub dht_nodes: Option<usize>,
     pub listen_port: u16,
     pub port_mapping: MappingState,
+    /// our public address as peers and trackers report it (BEP 10 `yourip`, BEP 24), once two
+    /// of them agree
+    pub external_ip: Option<std::net::IpAddr>,
 }
 
 /// The session's side of one torrent; the task that actually runs it holds the other side.
@@ -1304,6 +1307,7 @@ impl Session {
             dht_nodes: self.client.dht().borrow().as_ref().map(|dht| dht.node_count()),
             listen_port: self.identity.serving.port(),
             port_mapping: self.client.port_mapping().borrow().clone(),
+            external_ip: self.client.external_address(),
         }
     }
 

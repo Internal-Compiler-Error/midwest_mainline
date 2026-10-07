@@ -12,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use juicy_bencode::BencodeItemView;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -24,6 +24,8 @@ use tokio_util::codec::Framed;
 pub(crate) const UT_METADATA_ID: u8 = 1;
 /// BEP 10: same idea as `UT_METADATA_ID`, but for BEP 11 (PEX) messages.
 pub(crate) const UT_PEX_ID: u8 = 2;
+/// BEP 54: the id we take `lt_donthave` on. We never drop a piece, so we only ever receive it.
+pub(crate) const LT_DONTHAVE_ID: u8 = 3;
 
 /// What a peer's reader (or a failing writer) hands the swarm: the next message, `None` when the
 /// peer hung up, or the error that ended the connection. `conn` tells this connection apart from
@@ -59,6 +61,10 @@ pub(crate) struct Peer {
     pub their_ut_metadata_id: Option<u8>,
     /// same as `their_ut_metadata_id`, but for BEP 11 (PEX) messages
     pub their_ut_pex_id: Option<u8>,
+    /// BEP 21: the peer says it won't download anything more (a partial seed)
+    pub upload_only: bool,
+    /// BEP 10 `yourip`: our address as the peer sees it, until the swarm takes it to vote with
+    pub yourip: Option<IpAddr>,
 
     /// identifies this connection in `Incoming`
     pub conn: u64,
@@ -227,6 +233,8 @@ impl Peer {
             utp,
             their_ut_metadata_id: None,
             their_ut_pex_id: None,
+            upload_only: false,
+            yourip: None,
             conn,
             outbox,
             io_tasks: [reader.abort_handle(), writer.abort_handle()],
@@ -276,7 +284,8 @@ impl Peer {
         if self.encrypted {
             flags |= PEX_PREFERS_ENCRYPTION;
         }
-        if self.is_seed() {
+        // BEP 11: "seed/upload_only"
+        if self.is_seed() || self.upload_only {
             flags |= PEX_SEED;
         }
         if self.utp {
@@ -377,15 +386,38 @@ impl Peer {
         let Ok((_, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
             return;
         };
-        let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) else {
-            return;
+        // a later handshake updates what it mentions; an id of 0 turns an extension off
+        let id = |item: &BencodeItemView| match item {
+            BencodeItemView::Integer(id) => u8::try_from(*id).ok().filter(|id| *id != 0),
+            _ => None,
         };
-        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_metadata".as_slice()) {
-            self.their_ut_metadata_id = Some(*id as u8);
+        if let Some(BencodeItemView::Dictionary(m)) = dict.get(b"m".as_slice()) {
+            if let Some(item) = m.get(b"ut_metadata".as_slice()) {
+                self.their_ut_metadata_id = id(item);
+            }
+            if let Some(item) = m.get(b"ut_pex".as_slice()) {
+                self.their_ut_pex_id = id(item);
+            }
         }
-        if let Some(BencodeItemView::Integer(id)) = m.get(b"ut_pex".as_slice()) {
-            self.their_ut_pex_id = Some(*id as u8);
+        if let Some(BencodeItemView::Integer(flag)) = dict.get(b"upload_only".as_slice()) {
+            self.upload_only = *flag != 0;
         }
+        if let Some(BencodeItemView::ByteString(ip)) = dict.get(b"yourip".as_slice()) {
+            self.yourip = match ip.len() {
+                4 => Some(IpAddr::from(<[u8; 4]>::try_from(*ip).expect("4 bytes"))),
+                16 => Some(IpAddr::from(<[u8; 16]>::try_from(*ip).expect("16 bytes"))),
+                _ => None,
+            };
+        }
+    }
+
+    /// BEP 54: the peer no longer has `piece`. False if it never said it had it.
+    pub fn drop_have(&mut self, piece: u32) -> bool {
+        if (piece as usize) >= self.num_pieces || !self.they_have(piece) {
+            return false;
+        }
+        self.they_have[(piece / 8) as usize] &= !(0x80u8 >> (piece % 8));
+        true
     }
 
     /// Records a block that answers one of our requests. `None` if we never asked for it (or
@@ -420,8 +452,19 @@ impl Peer {
         })
     }
 
-    pub async fn send_extended_handshake(&mut self, metadata_size: u32, private: bool) -> io::Result<()> {
-        let payload = build_extended_handshake(metadata_size, private);
+    /// BEP 10, sent once on connecting and again when `upload_only` (BEP 21) turns on.
+    pub async fn send_extended_handshake(
+        &mut self,
+        metadata_size: u32,
+        private: bool,
+        upload_only: bool,
+    ) -> io::Result<()> {
+        let payload = build_extended_handshake(
+            metadata_size,
+            private,
+            upload_only,
+            self.remote_addr.ip().to_canonical(),
+        );
         self.send(BtMessage::Extended(Extended {
             ext_id: 0,
             payload: payload.into_boxed_slice(),
@@ -615,13 +658,30 @@ async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr:
 /// size. BEP 27: a private torrent's peers must come only from its trackers -- not omitting
 /// "ut_pex" here would invite a compliant peer to use PEX with us, defeating the point of the
 /// flag even if we ourselves never act on what we'd receive.
-fn build_extended_handshake(metadata_size: u32, private: bool) -> Vec<u8> {
-    let m = if private {
-        format!("d11:ut_metadatai{UT_METADATA_ID}ee")
+/// `yourip` (BEP 10) tells the peer where we see it from, which helps it learn its own public
+/// address; `v` names this client. Keys in bencode order.
+fn build_extended_handshake(metadata_size: u32, private: bool, upload_only: bool, yourip: IpAddr) -> Vec<u8> {
+    let pex = if private {
+        String::new()
     } else {
-        format!("d11:ut_metadatai{UT_METADATA_ID}e6:ut_pexi{UT_PEX_ID}ee")
+        format!("6:ut_pexi{UT_PEX_ID}e")
     };
-    format!("d1:m{m}13:metadata_sizei{metadata_size}e4:reqqi{MAX_QUEUED_UPLOADS}ee").into_bytes()
+    let m = format!("d11:lt_donthavei{LT_DONTHAVE_ID}e11:ut_metadatai{UT_METADATA_ID}e{pex}e");
+    let upload_only = if upload_only { "11:upload_onlyi1e" } else { "" };
+    let version = concat!("downloader ", env!("CARGO_PKG_VERSION"));
+    let mut out = format!(
+        "d1:m{m}13:metadata_sizei{metadata_size}e4:reqqi{MAX_QUEUED_UPLOADS}e{upload_only}1:v{}:{version}",
+        version.len()
+    )
+    .into_bytes();
+    let ip = match yourip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    out.extend_from_slice(format!("6:yourip{}:", ip.len()).as_bytes());
+    out.extend_from_slice(&ip);
+    out.push(b'e');
+    out
 }
 
 /// BEP 11 "added.f" bits: what a gossiping peer knows about the one it names.
@@ -843,9 +903,48 @@ impl PeerStatistics {
 mod test {
     use super::*;
 
+    #[tokio::test]
+    async fn their_handshake_sets_ids_upload_only_and_yourip_and_donthave_clears_a_piece() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let _other_end = listener.accept().await.unwrap();
+        let (inbox, _incoming) = mpsc::channel(8);
+        let mut peer = Peer::new(
+            PeerStream::Tcp(tcp),
+            "10.0.0.1:1".parse().unwrap(),
+            9,
+            false,
+            [0u8; 20],
+            0,
+            inbox,
+        );
+
+        let mut payload = b"d1:md11:ut_metadatai3e6:ut_pexi300ee11:upload_onlyi1e6:yourip4:".to_vec();
+        payload.extend_from_slice(&[203, 0, 113, 9]);
+        payload.push(b'e');
+        peer.handle_extended_handshake(&payload);
+        assert_eq!(peer.their_ut_metadata_id, Some(3));
+        assert_eq!(peer.their_ut_pex_id, None, "300 isn't a one-byte id");
+        assert!(peer.upload_only);
+        assert_eq!(peer.yourip, Some("203.0.113.9".parse().unwrap()));
+        peer.handle_extended_handshake(b"d1:md11:ut_metadatai0eee");
+        assert_eq!(peer.their_ut_metadata_id, None, "0 turns it off");
+        assert!(peer.upload_only, "what a later handshake doesn't mention stays");
+
+        assert!(!peer.drop_have(4), "it never had it");
+        peer.apply(BtMessage::Have(Have { checked: 4 })).unwrap();
+        assert!(peer.drop_have(4));
+        assert!(!peer.they_have(4));
+        assert!(!peer.drop_have(100), "out of range");
+    }
+
     #[test]
     fn extended_handshake_is_valid_bencode_with_expected_fields() {
-        let payload = build_extended_handshake(12345, false);
+        let payload = build_extended_handshake(12345, false, false, "203.0.113.9".parse().unwrap());
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
         assert!(
             remaining.is_empty(),
@@ -873,7 +972,7 @@ mod test {
 
     #[test]
     fn private_torrent_extended_handshake_omits_ut_pex() {
-        let payload = build_extended_handshake(12345, true);
+        let payload = build_extended_handshake(12345, true, true, "::1".parse().unwrap());
         let (remaining, dict) = juicy_bencode::parse_bencode_dict(&payload).unwrap();
         assert!(remaining.is_empty());
 
