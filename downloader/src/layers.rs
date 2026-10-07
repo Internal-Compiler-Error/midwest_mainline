@@ -246,7 +246,7 @@ impl Below {
         let pieces = torrent.pieces_of_file(file);
         let n = pieces.len();
         let (piece_level, width) = if n == 1 {
-            let leaves = merkle::file_leaves(torrent.files[file].0);
+            let leaves = merkle::file_leaves(torrent.files[file].len);
             (leaves.trailing_zeros(), leaves)
         } else {
             let base = piece_layer_base(torrent);
@@ -300,7 +300,7 @@ pub fn answer_from_data(
     let (file, level) = (below.file, below.piece_level);
     let layer = torrent.layer(file);
     let root = torrent.v2.as_ref()?.roots[file]?;
-    let len = torrent.files[file].0;
+    let len = torrent.files[file].len;
     let mut trees = BTreeMap::new();
     for piece in below.data(req) {
         let k = (piece - below.pieces.start) as usize;

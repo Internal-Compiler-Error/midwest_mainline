@@ -382,13 +382,13 @@ pub(crate) fn replace_file(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Re
 /// Flushes to disk the data of every file holding a byte of a piece in `pieces`. The files are
 /// opened afresh, which is enough: a sync flushes the file, not just one descriptor's writes.
 fn sync_pieces(torrent: &Torrent, root: &Path, pieces: &BitSlice<u8, Msb0>) -> std::io::Result<()> {
-    for (index, (_, relative)) in torrent.files.iter().enumerate() {
-        if torrent.attrs[index].virtual_file() {
+    for (index, file) in torrent.files.iter().enumerate() {
+        if file.attr.virtual_file() {
             continue;
         }
         let range = torrent.pieces_of_file(index);
         if pieces[range.start as usize..range.end as usize].any() {
-            std::fs::File::open(root.join(relative))?.sync_data()?;
+            std::fs::File::open(root.join(&file.path))?.sync_data()?;
         }
     }
     Ok(())
@@ -923,7 +923,7 @@ mod test {
         let bytes = content(4 * 16 + 5);
         let torrent = test_torrent(&bytes, 16, &["udp://a.test:1"]);
         assert_eq!(
-            torrent.files[0].1,
+            torrent.files[0].path,
             Path::new("resume-test.bin"),
             "paths are relative to the root"
         );

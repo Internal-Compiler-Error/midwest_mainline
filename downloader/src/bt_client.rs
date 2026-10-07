@@ -257,7 +257,8 @@ impl BtClient {
         }
 
         let mut files = vec![];
-        for ((size, relative), attr) in torrent.files.iter().zip(&torrent.attrs) {
+        for entry in &torrent.files {
+            let (size, relative, attr) = (&entry.len, &entry.path, &entry.attr);
             let file = root.join(relative);
             if attr.virtual_file() {
                 if let Some(target) = &attr.symlink {

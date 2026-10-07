@@ -51,32 +51,21 @@ pub(crate) struct FileRange {
 /// The files holding torrent bytes `start..start + len`, in order. Empty files hold nothing
 /// and are skipped.
 pub(crate) fn file_ranges(torrent: &Torrent, start: u64, len: u64) -> Vec<FileRange> {
-    let end = start + len;
-    let mut ranges = vec![];
-    let mut file_start = 0u64;
-    for (file, (size, _)) in torrent.files.iter().enumerate() {
-        let file_end = file_start + size;
-        let (from, to) = (start.max(file_start), end.min(file_end));
-        if from < to {
-            ranges.push(FileRange {
-                file,
-                offset: from - file_start,
-                len: to - from,
-            });
-        }
-        if file_end >= end {
-            break;
-        }
-        file_start = file_end;
-    }
-    ranges
+    torrent
+        .file_segments(start..start + len)
+        .map(|(file, within)| FileRange {
+            file,
+            offset: within.start,
+            len: within.end - within.start,
+        })
+        .collect()
 }
 
 /// BEP 19: a single-file torrent's URL names the file itself, unless it ends in '/', when
 /// the torrent's name is appended. A multi-file torrent's URL is the directory the torrent's
 /// `name` directory lives in.
 pub(crate) fn file_url(base: &str, torrent: &Torrent, file: usize) -> String {
-    let path = &torrent.raw_paths[file];
+    let path = &torrent.files[file].raw_path;
     let single_file = path.len() == 1;
     if single_file && !base.ends_with('/') {
         return base.to_string();
@@ -195,7 +184,7 @@ impl Job {
                 && let Some(range) = ranges.next()
             {
                 // BEP 47: padding is zeros, and not on the server
-                pipeline.push_back(if self.torrent.attrs[range.file].pad {
+                pipeline.push_back(if self.torrent.files[range.file].attr.pad {
                     Part::Zeros(range.len)
                 } else {
                     Part::Fetch(self.fetch(range)?)
@@ -781,7 +770,7 @@ pub(crate) mod test {
         const PIECE: usize = BLOCK_SIZE;
         let files = sorted(&[(&["a"][..], vec![1; 5000]), (&["b"][..], vec![2; 3000])]);
         let t = crate::torrent::parse_torrent(&fixtures::torrent_file("pad", &files, PIECE, true)).unwrap();
-        assert!(t.attrs[1].pad);
+        assert!(t.files[1].attr.pad);
         let base = serve(HashMap::from([
             ("/seed/pad/a".to_string(), files[0].1.clone()),
             ("/seed/pad/b".to_string(), files[1].1.clone()),

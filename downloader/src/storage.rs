@@ -115,7 +115,7 @@ mod test {
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = vec![];
         let mut offset = 0;
-        for (i, (size, path)) in torrent.files.iter_mut().enumerate() {
+        for (i, crate::TorrentFile { len: size, path, .. }) in torrent.files.iter_mut().enumerate() {
             *path = dir.join(format!("f{i}.bin"));
             std::fs::write(&*path, &content[offset..offset + *size as usize]).unwrap();
             offset += *size as usize;
@@ -174,7 +174,7 @@ mod test {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = vec![];
-        for (i, (size, path)) in torrent.files.iter_mut().enumerate() {
+        for (i, crate::TorrentFile { len: size, path, .. }) in torrent.files.iter_mut().enumerate() {
             *path = dir.join(format!("f{i}.bin"));
             let file = File::options()
                 .read(true)
@@ -208,7 +208,7 @@ mod test {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = vec![];
-        for (i, (size, path)) in torrent.files.iter_mut().enumerate() {
+        for (i, crate::TorrentFile { len: size, path, .. }) in torrent.files.iter_mut().enumerate() {
             *path = dir.join(format!("f{i}"));
             if i == 1 {
                 files.push(None);

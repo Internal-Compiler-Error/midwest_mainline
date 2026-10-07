@@ -129,7 +129,7 @@ fn lays_out_files_past_4_gib() {
     );
     let torrent = parse_torrent(&bytes).unwrap();
 
-    assert_eq!(torrent.files[1].0, big);
+    assert_eq!(torrent.files[1].len, big);
     assert_eq!(torrent.total_size, big + 2 * MIB);
     assert_eq!(torrent.pieces_of_file(0), 0..1);
     assert_eq!(torrent.pieces_of_file(1), 0..1281);
@@ -209,7 +209,7 @@ fn parses_evenly_divisible_torrent() {
     assert_eq!(torrent.last_piece_size, 5);
     assert_eq!(torrent.nth_piece_size(2u32), Some(5));
     assert_eq!(torrent.files.len(), 1);
-    assert_eq!(torrent.files[0].0, 15);
+    assert_eq!(torrent.files[0].len, 15);
     assert_eq!(torrent.primary_tracker(), Some("http://tracker.test/announce"));
 
     // raw_info must be exactly the bencoded "info" dict, byte for byte, since a peer
@@ -271,9 +271,9 @@ fn parses_url_list_as_a_string_or_a_list() {
 #[test]
 fn keeps_raw_paths_for_web_seeds() {
     let multi = parse_torrent(&multi_file_torrent_with_path(&[b"AC/DC", b"b c.txt"])).unwrap();
-    assert_eq!(multi.raw_paths[1], ["multi", "AC/DC", "b c.txt"]);
+    assert_eq!(multi.files[1].raw_path, ["multi", "AC/DC", "b c.txt"]);
     let single = parse_torrent(&single_file_torrent(15, 5)).unwrap();
-    assert_eq!(single.raw_paths, [["test.txt"]]);
+    assert_eq!(single.files[0].raw_path, ["test.txt"]);
 }
 
 #[test]
@@ -361,16 +361,16 @@ fn parses_libtorrents_v2_test_torrent() {
     assert!(t.missing_layers().is_empty(), "the .torrent carries every layer");
     assert_eq!(t.piece_size, 4 << 20);
     assert_eq!(t.num_pieces(), 371);
-    let real: Vec<usize> = (0..t.files.len()).filter(|&f| !t.attrs[f].pad).collect();
+    let real: Vec<usize> = (0..t.files.len()).filter(|&f| !t.files[f].attr.pad).collect();
     assert_eq!(real.len(), 11);
-    for f in real.iter().copied().filter(|&f| t.files[f].0 > 0) {
+    for f in real.iter().copied().filter(|&f| t.files[f].len > 0) {
         assert!(
             t.file_offset(f).is_multiple_of(t.piece_size as u64),
             "{:?}",
-            t.files[f].1
+            t.files[f].path
         );
     }
-    assert!(t.files.iter().all(|(_, p)| p.starts_with("bittorrent-v2-test")));
+    assert!(t.files.iter().all(|f| f.path.starts_with("bittorrent-v2-test")));
     assert_eq!(swarm_info_hash(&t.raw_info), t.info_hash);
     // a layer that came from peers goes back into a .torrent the same as it came
     let layers = t.piece_layers_bencoded().unwrap();
@@ -391,10 +391,10 @@ fn parses_libtorrents_hybrid_test_torrent() {
     assert_eq!(hex(t.hybrid_v2_hash().unwrap().as_bytes()), hex(&v2.info_hash[..20]));
     assert_eq!(swarm_info_hash(&t.raw_info), t.info_hash, "a hybrid goes by v1");
     assert_eq!(t.files.len(), 17);
-    assert_eq!(t.attrs.iter().filter(|a| a.pad).count(), 8);
-    assert_eq!(t.attrs.iter().filter(|a| a.executable).count(), 3);
-    for (f, attr) in t.attrs.iter().enumerate() {
-        assert_eq!(v2.roots[f].is_none(), attr.pad || t.files[f].0 == 0);
+    assert_eq!(t.files.iter().filter(|f| f.attr.pad).count(), 8);
+    assert_eq!(t.files.iter().filter(|f| f.attr.executable).count(), 3);
+    for (i, file) in t.files.iter().enumerate() {
+        assert_eq!(v2.roots[i].is_none(), file.attr.pad || file.len == 0);
     }
     // padding wants nothing; everything else is wanted
     let wanted = t.wanted_pieces(&vec![true; t.files.len()]);
@@ -439,8 +439,7 @@ fn lays_out_a_v2_torrent_with_padding() {
     let layout: Vec<(u64, String, bool)> = t
         .files
         .iter()
-        .zip(&t.attrs)
-        .map(|((len, path), attr)| (*len, path.display().to_string(), attr.pad))
+        .map(|f| (f.len, f.path.display().to_string(), f.attr.pad))
         .collect();
     assert_eq!(
         layout,
@@ -463,7 +462,7 @@ fn lays_out_a_v2_torrent_with_padding() {
         }]
     );
     assert!(t.padding_in_piece(2).is_empty());
-    assert_eq!(t.raw_paths[2], ["v2", "b", "c"]);
+    assert_eq!(t.files[2].raw_path, ["v2", "b", "c"]);
 
     let stream = stream(&files);
     for piece in 0..5u32 {
@@ -484,7 +483,8 @@ fn lays_out_a_v2_torrent_with_padding() {
 fn a_single_file_v2_torrent_is_named_by_its_tree() {
     let files = [(&["only.bin"][..], data(50_000, 3))];
     let t = parse_torrent(&fixtures::torrent_file("ignored", &files, P, false)).unwrap();
-    assert_eq!(t.files, [(50_000, PathBuf::from("only.bin"))]);
+    assert_eq!(t.files.len(), 1);
+    assert_eq!((t.files[0].len, &t.files[0].path), (50_000, &PathBuf::from("only.bin")));
     assert_eq!(t.top_level(), PathBuf::from("only.bin"));
     assert_eq!(t.num_pieces(), 2);
 }
@@ -589,7 +589,7 @@ fn a_hybrid_carries_both_hashes() {
     let t = parse_torrent(&fixtures::torrent_file("hy", &files, P, true)).unwrap();
     assert!(!t.v2_only());
     assert_eq!(t.files.len(), 4, "the v1 list's padding");
-    assert!(t.attrs[1].pad);
+    assert!(t.files[1].attr.pad);
     let v2 = t.v2.as_ref().expect("consistent");
     assert_eq!(v2.roots[0], Some(fixtures::root(&files[0].1)));
     assert_eq!(v2.roots[3], Some(fixtures::root(&files[2].1)));
@@ -685,11 +685,11 @@ fn an_inconsistent_hybrid_falls_back_to_v1() {
             attr: FileAttr::default(),
         })
         .collect();
-    let unpadded = Layout {
-        files: vec![(40_000, "x/a".into()), (70_000, "x/d".into())],
-        raw_paths: vec![vec!["x".into(), "a".into()], vec!["x".into(), "d".into()]],
-        attrs: vec![FileAttr::default(); 2],
-    };
+    let mut unpadded = Layout::default();
+    for (len, name) in [(40_000, "a"), (70_000, "d")] {
+        let raw = vec!["x".to_string(), name.to_string()];
+        unpadded.push(len, raw.iter().collect(), raw, FileAttr::default());
+    }
     let err = hybrid_roots(&unpadded, &tree, P as u64).unwrap_err();
     assert!(format!("{err}").contains("piece boundary"), "{err}");
 }
@@ -700,12 +700,12 @@ fn an_inconsistent_hybrid_falls_back_to_v1() {
 fn parses_padding_and_attributes() {
     let info = b"d5:filesld4:attr1:x6:lengthi10e4:pathl1:aeed4:attr1:p6:lengthi6eed6:lengthi10e4:pathl1:beed4:attr2:hl6:lengthi0e4:pathl4:linke12:symlink pathl1:beee4:name1:t12:piece lengthi16e6:pieces40:0123456789012345678901234567890123456789e";
     let t = parse_torrent(&crate::metadata::build_torrent_file(info, &[])).unwrap();
-    assert_eq!(t.files[1], (6, PathBuf::from("t/.pad/6")));
-    assert!(t.attrs[0].executable && !t.attrs[0].pad);
-    assert!(t.attrs[1].pad && t.attrs[1].virtual_file());
-    assert!(t.attrs[3].hidden);
-    assert_eq!(t.attrs[3].symlink, Some(PathBuf::from("b")));
-    assert!(t.attrs[3].virtual_file());
+    assert_eq!((t.files[1].len, &t.files[1].path), (6, &PathBuf::from("t/.pad/6")));
+    assert!(t.files[0].attr.executable && !t.files[0].attr.pad);
+    assert!(t.files[1].attr.pad && t.files[1].attr.virtual_file());
+    assert!(t.files[3].attr.hidden);
+    assert_eq!(t.files[3].attr.symlink, Some(PathBuf::from("b")));
+    assert!(t.files[3].attr.virtual_file());
     assert_eq!(t.padding_in_piece(0), [Range { start: 10, end: 16 }]);
     assert!(t.padding_in_piece(1).is_empty());
     // only the pieces of selected real files are wanted, never padding's
@@ -726,7 +726,7 @@ fn parses_padding_and_attributes() {
 
     let bitcomet = b"d5:filesld6:lengthi10e4:pathl1:aeed6:lengthi6e4:pathl29:_____padding_file_0_if you seeed6:lengthi10e4:pathl1:beee4:name1:t12:piece lengthi16e6:pieces40:0123456789012345678901234567890123456789e";
     let t = parse_torrent(&crate::metadata::build_torrent_file(bitcomet, &[])).unwrap();
-    assert!(t.attrs[1].pad);
+    assert!(t.files[1].attr.pad);
 
     let escaping =
         b"d5:filesld4:attr1:l6:lengthi0e4:pathl1:ae12:symlink pathl2:..eee4:name1:t12:piece lengthi16e6:pieces0:e";

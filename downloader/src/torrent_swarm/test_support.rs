@@ -66,7 +66,7 @@ pub(super) fn swarm_with_web_seeds(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("swarm.bin");
-    torrent.files[0].1 = path.clone();
+    torrent.files[0].path = path.clone();
     torrent.web_seeds = web_seeds;
     let file = std::fs::File::options()
         .read(true)

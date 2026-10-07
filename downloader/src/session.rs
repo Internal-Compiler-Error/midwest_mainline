@@ -1013,13 +1013,12 @@ impl Shown {
             files: torrent
                 .files
                 .iter()
-                .zip(&torrent.attrs)
                 .enumerate()
-                .map(|(i, ((size, path), attr))| FileInfo {
-                    path: path.display().to_string(),
-                    size: *size,
+                .map(|(i, file)| FileInfo {
+                    path: file.path.display().to_string(),
+                    size: file.len,
                     selected: selected.get(i).copied().unwrap_or(true),
-                    pad: attr.pad,
+                    pad: file.attr.pad,
                 })
                 .collect(),
             total_size: torrent.total_size,
@@ -1744,8 +1743,7 @@ fn has_data_on_disk(torrent: &Torrent, root: &Path) -> bool {
     torrent
         .files
         .iter()
-        .zip(&torrent.attrs)
-        .any(|((_, path), attr)| !attr.pad && std::fs::metadata(root.join(path)).is_ok_and(|m| m.len() > 0))
+        .any(|file| !file.attr.pad && std::fs::metadata(root.join(&file.path)).is_ok_and(|m| m.len() > 0))
 }
 
 /// An update's file selection: the predecessor's choice for a file at the same path, and
@@ -1755,12 +1753,12 @@ fn carried_selection(previous: &Torrent, selected: &[bool], torrent: &Torrent) -
         .files
         .iter()
         .zip(selected)
-        .map(|((_, path), on)| (path.as_path(), *on))
+        .map(|(file, on)| (file.path.as_path(), *on))
         .collect();
     torrent
         .files
         .iter()
-        .map(|(_, path)| before.get(path.as_path()).copied().unwrap_or(true))
+        .map(|file| before.get(file.path.as_path()).copied().unwrap_or(true))
         .collect()
 }
 
@@ -1787,9 +1785,8 @@ fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) ->
     let real = |t: &Torrent| -> HashMap<PathBuf, u64> {
         t.files
             .iter()
-            .zip(&t.attrs)
-            .filter(|(_, attr)| !attr.virtual_file())
-            .map(|((size, path), _)| (path.clone(), *size))
+            .filter(|file| !file.attr.virtual_file())
+            .map(|file| (file.path.clone(), file.len))
             .collect()
     };
     let before = real(previous);
@@ -2770,10 +2767,15 @@ mod test {
 
     #[test]
     fn an_update_keeps_its_predecessors_choice_of_files() {
-        let file = |path: &str| (1, PathBuf::from(path));
         let mut previous =
             crate::parse_torrent(&std::fs::read(write_torrent_file(&scratch("carry"))).unwrap()).unwrap();
         let mut next = previous.clone();
+        let template = previous.files[0].clone();
+        let file = |path: &str| {
+            let mut file = template.clone();
+            file.path = PathBuf::from(path);
+            file
+        };
         previous.files = vec![file("a"), file("b"), file("c")];
         next.files = vec![file("c"), file("new"), file("a")];
         assert_eq!(
@@ -2793,9 +2795,9 @@ mod test {
         };
         let old = torrent(&[(&["same"], vec![1; 10]), (&["gone"], vec![2; 5])]);
         let new = torrent(&[(&["same"], vec![1; 10]), (&["added"], vec![3; 7])]);
-        for (size, path) in &old.files {
-            std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
-            std::fs::write(dir.join(path), vec![9; *size as usize]).unwrap();
+        for file in &old.files {
+            std::fs::create_dir_all(dir.join(&file.path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(&file.path), vec![9; file.len as usize]).unwrap();
         }
 
         let root = place_update(&old, &dir, &new, 2).unwrap();

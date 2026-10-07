@@ -5,7 +5,7 @@
 //! are made safe, lengths and counts checked against each other, and a malformed file is an
 //! error, never a panic.
 
-use super::{FileAttr, Torrent, V2};
+use super::{FileAttr, Torrent, TorrentFile, V2};
 use crate::merkle::{self, Hash};
 use anyhow::{anyhow, bail};
 use bendy::decoding::Object;
@@ -98,18 +98,20 @@ fn file_len(dict: &Dict, attr: &FileAttr) -> anyhow::Result<u64> {
 /// The files of a torrent laid end to end as its piece stream, padding included.
 #[derive(Debug, Default)]
 pub(super) struct Layout {
-    /// (length, path below the download root)
-    pub files: Vec<(u64, PathBuf)>,
-    /// each path as the info dict spells it, `name` first
-    pub raw_paths: Vec<Vec<String>>,
-    pub attrs: Vec<FileAttr>,
+    pub files: Vec<TorrentFile>,
 }
 
 impl Layout {
-    fn push(&mut self, len: u64, path: PathBuf, raw: Vec<String>, attr: FileAttr) {
-        self.files.push((len, path));
-        self.raw_paths.push(raw);
-        self.attrs.push(attr);
+    /// Appends a file; its offset is the stream's length so far.
+    pub(super) fn push(&mut self, len: u64, path: PathBuf, raw_path: Vec<String>, attr: FileAttr) {
+        let offset = self.files.last().map_or(0, |last| last.offset.saturating_add(last.len));
+        self.files.push(TorrentFile {
+            len,
+            path,
+            raw_path,
+            attr,
+            offset,
+        });
     }
 
     /// Padding of `len` bytes, which a v1 list may give without a path and a v2 layout
@@ -263,23 +265,19 @@ fn v2_layout(tree: &[TreeFile], name: &str, root: &Path, piece: u64) -> anyhow::
 pub(super) fn hybrid_roots(v1: &Layout, tree: &[TreeFile], piece: u64) -> anyhow::Result<Vec<Option<Hash>>> {
     let mut roots = vec![None; v1.files.len()];
     let mut tree = tree.iter();
-    let mut offset = 0u64;
-    for (i, &(len, _)) in v1.files.iter().enumerate() {
-        if !v1.attrs[i].pad {
-            let raw = &v1.raw_paths[i];
-            let Some(file) = tree.next() else {
-                bail!("v1 lists more files than the file tree");
-            };
-            let same_path = raw.len() == 1 || raw[1..] == file.path[..];
-            if file.len != len || !same_path {
-                bail!("v1 file {raw:?} isn't the file tree's {:?}", file.path);
-            }
-            if len > 0 && !offset.is_multiple_of(piece) {
-                bail!("{raw:?} doesn't start on a piece boundary");
-            }
-            roots[i] = file.root;
+    for (i, v1_file) in v1.files.iter().enumerate().filter(|(_, f)| !f.attr.pad) {
+        let raw = &v1_file.raw_path;
+        let Some(file) = tree.next() else {
+            bail!("v1 lists more files than the file tree");
+        };
+        let same_path = raw.len() == 1 || raw[1..] == file.path[..];
+        if file.len != v1_file.len || !same_path {
+            bail!("v1 file {raw:?} isn't the file tree's {:?}", file.path);
         }
-        offset += len;
+        if file.len > 0 && !v1_file.offset.is_multiple_of(piece) {
+            bail!("{raw:?} doesn't start on a piece boundary");
+        }
+        roots[i] = file.root;
     }
     if tree.next().is_some() {
         bail!("the file tree lists more files than v1");
@@ -437,17 +435,13 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         roots,
     } = parse_info(info)?;
 
-    let Layout {
-        files,
-        raw_paths,
-        attrs,
-    } = layout;
+    let files = layout.files;
     if files.is_empty() {
         bail!("torrent has no files");
     }
     let total_size = files
         .iter()
-        .try_fold(0u64, |acc, (len, _)| acc.checked_add(*len))
+        .try_fold(0u64, |acc, file| acc.checked_add(file.len))
         .ok_or_else(|| anyhow!("total size overflows"))?;
     if total_size == 0 {
         bail!("torrent is empty");
@@ -464,14 +458,6 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     if u32::try_from(num_pieces).is_err() {
         bail!("too many pieces");
     }
-    let offsets = files
-        .iter()
-        .scan(0u64, |at, (len, _)| {
-            let start = *at;
-            *at += len;
-            Some(start)
-        })
-        .collect();
 
     let v2 = roots.map(|roots| V2 {
         info_hash: Sha256::digest(&raw_info).into(),
@@ -490,7 +476,6 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         pieces,
         total_size,
         files,
-        attrs,
         // an evenly-divisible torrent's last piece is a whole one, not an empty one
         last_piece_size: (total_size - (num_pieces - 1) * piece_len) as u32,
         name,
@@ -499,8 +484,6 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         raw_info,
         private,
         web_seeds,
-        raw_paths,
-        offsets,
         num_pieces: num_pieces as usize,
     };
     if parsed.v2.is_some()
@@ -524,13 +507,13 @@ fn take_piece_layers(torrent: &Torrent, layers: &BencodeItemView) -> anyhow::Res
         let layer = match layers.get(root.as_slice()) {
             Some(BencodeItemView::ByteString(layer)) => layer,
             None => continue,
-            Some(_) => bail!("the piece layer of {:?} needs to be a string", torrent.files[file].1),
+            Some(_) => bail!("the piece layer of {:?} needs to be a string", torrent.files[file].path),
         };
         let (hashes, rest) = layer.as_chunks::<32>();
         if !rest.is_empty() || !torrent.set_layer(file, hashes.to_vec()) {
             bail!(
                 "the piece layer of {:?} doesn't match its pieces root",
-                torrent.files[file].1
+                torrent.files[file].path
             );
         }
     }

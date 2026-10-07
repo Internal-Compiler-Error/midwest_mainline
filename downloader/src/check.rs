@@ -18,11 +18,10 @@ pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usiz
     let files: Vec<Slot> = torrent
         .files
         .iter()
-        .zip(&torrent.attrs)
-        .map(|((_, path), attr)| match attr {
+        .map(|file| match &file.attr {
             attr if attr.pad => Slot::Zeros,
             attr if attr.symlink.is_some() => Slot::Missing,
-            _ => File::open(root.join(path)).map_or(Slot::Missing, Slot::File),
+            _ => File::open(root.join(&file.path)).map_or(Slot::Missing, Slot::File),
         })
         .collect();
 

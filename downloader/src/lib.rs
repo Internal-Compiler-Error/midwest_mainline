@@ -46,7 +46,7 @@ pub use session::{
     FileInfo, PeerInfo, Progress, Session, SessionConfig, SessionStatus, TorrentId, TorrentState, TrackerInfo,
 };
 pub use telemetry::{Telemetry, TraceRecorder, TraceSnapshot, TraceSpan};
-pub use torrent::{Torrent, parse_torrent};
+pub use torrent::{Torrent, TorrentFile, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
 pub use utp::UtpWatch;
 

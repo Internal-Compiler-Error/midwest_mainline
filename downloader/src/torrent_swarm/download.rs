@@ -46,7 +46,7 @@ impl TorrentSwarm {
         match self.layers.received(&self.torrent, addr, &hashes) {
             Received::Partial => {}
             Received::Layer(file) => {
-                info!("piece layer of {:?} in from {addr}", self.torrent.files[file].1);
+                info!("piece layer of {:?} in from {addr}", self.torrent.files[file].path);
                 self.schedule();
             }
             Received::Bad => {

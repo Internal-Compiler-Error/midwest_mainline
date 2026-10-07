@@ -56,7 +56,23 @@ pub struct V2 {
     inconsistent: Arc<OnceLock<()>>,
 }
 
-/// Represents a parsed torrent metadata file
+/// One file of the piece stream.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct TorrentFile {
+    pub len: u64,
+    /// relative to the download root, starting with the torrent's top level (see
+    /// `Torrent::top_level`)
+    pub path: PathBuf,
+    /// the path exactly as the info dict spells it, `name` first, before it was made safe to
+    /// put on disk: what a web seed's URLs are built from
+    pub raw_path: Vec<String>,
+    /// BEP 47
+    pub attr: FileAttr,
+    /// where it starts in the piece stream
+    offset: u64,
+}
+
+/// A parsed .torrent.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Torrent {
     /// List of tracker tiers, where each tier contains multiple tracker URLs
@@ -70,15 +86,10 @@ pub struct Torrent {
     /// against `v2`'s Merkle trees
     pub pieces: Vec<[u8; 20]>,
 
-    /// Files in the torrent: (size in bytes, path relative to the download root), always
-    /// starting with `name` -- the single file's name, or the directory holding them all.
-    /// Laid end to end they make the piece stream; padding files (see `attrs`) are part of
-    /// it. A v2-only torrent gets padding synthesised after each file that doesn't end on a
-    /// piece boundary, which is exactly BEP 52's piece layout.
-    pub files: Vec<(u64, PathBuf)>,
-
-    /// BEP 47 attributes, one per entry of `files`
-    pub attrs: Vec<FileAttr>,
+    /// The files, which laid end to end make the piece stream, padding files included. A
+    /// v2-only torrent gets padding synthesised after each file that doesn't end on a piece
+    /// boundary, which is exactly BEP 52's piece layout.
+    pub files: Vec<TorrentFile>,
 
     /// Total size of all files combined in bytes, padding included
     pub total_size: u64,
@@ -103,20 +114,13 @@ pub struct Torrent {
     pub raw_info: Vec<u8>,
 
     /// BEP 27: if set, peers for this torrent must only come from the trackers named in this
-    /// torrent -- no DHT, no PEX. We don't implement DHT, but we do implement PEX, so this has
-    /// to actually gate something.
+    /// torrent -- no DHT, PEX or LSD.
     pub private: bool,
 
     /// BEP 19 web seeds: HTTP(S) URLs serving the torrent's files, from `url-list` (or a
     /// magnet's `ws=`)
     pub web_seeds: Vec<String>,
 
-    /// Each file's path exactly as the info dict spells it, `name` first, before
-    /// `safe_path_component` touched it: what a web seed's URLs are built from
-    pub raw_paths: Vec<Vec<String>>,
-
-    /// where each of `files` starts in the piece stream
-    offsets: Vec<u64>,
     num_pieces: usize,
 }
 
@@ -127,7 +131,7 @@ impl Torrent {
     pub fn top_level(&self) -> PathBuf {
         self.files
             .first()
-            .and_then(|(_, path)| path.components().next())
+            .and_then(|file| file.path.components().next())
             .map(|component| PathBuf::from(component.as_os_str()))
             .unwrap_or_default()
     }
@@ -138,12 +142,12 @@ impl Torrent {
 
     /// Where file `index` starts in the piece stream.
     pub fn file_offset(&self, index: usize) -> u64 {
-        self.offsets[index]
+        self.files[index].offset
     }
 
     /// The file holding stream byte `offset` (never an empty one).
     pub fn file_at(&self, offset: u64) -> usize {
-        self.offsets.partition_point(|&o| o <= offset).saturating_sub(1)
+        self.files.partition_point(|f| f.offset <= offset).saturating_sub(1)
     }
 
     /// The v2-only torrent this is: no SHA-1 piece hashes, pieces checked by Merkle trees.
@@ -214,11 +218,11 @@ impl Torrent {
         let start = piece as u64 * self.piece_size as u64;
         let file = self.file_at(start);
         let root = v2.roots[file]?;
-        let file_end = self.offsets[file] + self.files[file].0;
+        let file_end = self.files[file].offset + self.files[file].len;
         let len = (file_end - start).min(self.piece_size as u64) as usize;
         let pieces = self.pieces_of_file(file);
         if pieces.len() == 1 {
-            return Some((root, len, merkle::file_leaves(self.files[file].0)));
+            return Some((root, len, merkle::file_leaves(self.files[file].len)));
         }
         let layer = v2.layers[file].get()?;
         Some((
@@ -287,8 +291,8 @@ impl Torrent {
 
     /// The pieces holding any byte of file `index`; empty for an empty file.
     pub fn pieces_of_file(&self, index: usize) -> std::ops::Range<u32> {
-        let start = self.offsets[index];
-        let end = start + self.files[index].0;
+        let start = self.files[index].offset;
+        let end = start + self.files[index].len;
         if end == start {
             return 0..0;
         }
@@ -300,8 +304,8 @@ impl Torrent {
     /// shared by a selected and an unselected file is wanted; padding wants nothing.
     pub fn wanted_pieces(&self, selected: &[bool]) -> BitBox<u8, Msb0> {
         let mut wanted = bitvec![u8, Msb0; 0; self.num_pieces];
-        for (index, attr) in self.attrs.iter().enumerate() {
-            if !attr.pad && selected.get(index).copied().unwrap_or(true) {
+        for (index, file) in self.files.iter().enumerate() {
+            if !file.attr.pad && selected.get(index).copied().unwrap_or(true) {
                 for piece in self.pieces_of_file(index) {
                     wanted.set(piece as usize, true);
                 }
@@ -318,9 +322,9 @@ impl Torrent {
         };
         let start = piece as u64 * self.piece_size as u64;
         self.file_segments(start..start + size as u64)
-            .filter(|(file, _)| self.attrs[*file].pad)
+            .filter(|(file, _)| self.files[*file].attr.pad)
             .map(|(file, within)| {
-                let at = (self.offsets[file] + within.start - start) as usize;
+                let at = (self.files[file].offset + within.start - start) as usize;
                 at..at + (within.end - within.start) as usize
             })
             .collect()
@@ -335,7 +339,13 @@ impl Torrent {
     ) -> impl Iterator<Item = (usize, std::ops::Range<u64>)> + '_ {
         let std::ops::Range { start, end } = range;
         (self.file_at(start)..self.files.len())
-            .map(|file| (file, self.offsets[file], self.offsets[file] + self.files[file].0))
+            .map(|file| {
+                (
+                    file,
+                    self.files[file].offset,
+                    self.files[file].offset + self.files[file].len,
+                )
+            })
             .take_while(move |&(_, from, _)| from < end)
             .filter_map(move |(file, from, to)| {
                 let (a, b) = (start.max(from), end.min(to));

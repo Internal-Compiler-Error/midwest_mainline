@@ -775,7 +775,7 @@ mod test {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut handles = vec![];
-        for (size, path) in &mut torrent.files {
+        for crate::TorrentFile { len: size, path, .. } in &mut torrent.files {
             *path = dir.join(path.file_name().unwrap());
             let file = std::fs::File::options()
                 .read(true)
