@@ -754,3 +754,42 @@ fn parses_padding_and_attributes() {
         b"d5:filesld4:attr1:l6:lengthi0e4:pathl1:ae12:symlink pathl2:..eee4:name1:t12:piece lengthi16e6:pieces0:e";
     assert!(parse_torrent(&crate::metadata::build_torrent_file(escaping, &[])).is_err());
 }
+
+/// Real and hand-built torrents with a few bytes changed (digits, ends, colons, noise): each
+/// either parses into a torrent whose geometry holds up, or is an error.
+#[test]
+fn mutated_torrents_never_panic() {
+    let seeds = [
+        LIBTORRENT_HYBRID.to_vec(),
+        fixtures::torrent_file("hy", &files(), P, true),
+        fixtures::torrent_file("v2", &files(), P, false),
+    ];
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for seed in &seeds {
+        for _ in 0..1_500 {
+            let mut bytes = seed.clone();
+            for _ in 0..next() % 4 + 1 {
+                let at = next() as usize % bytes.len();
+                bytes[at] = match next() % 4 {
+                    0 => b'0' + (next() % 10) as u8,
+                    1 => b'e',
+                    2 => b':',
+                    _ => next() as u8,
+                };
+            }
+            let Ok(t) = parse_torrent(&bytes) else {
+                continue;
+            };
+            for piece in 0..t.num_pieces() as u32 {
+                let _ = (t.padding_in_piece(piece), t.can_verify(piece));
+            }
+            let _ = (t.piece_layers_bencoded(), t.wanted_pieces(&[]), t.missing_layers());
+        }
+    }
+}
