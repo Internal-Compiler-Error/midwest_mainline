@@ -129,24 +129,30 @@ pub(super) async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -
 }
 
 pub(super) async fn fake_peer_with(handle: &TorrentSwarmHandle, pretend_addr: &str, fast: bool) -> Wire {
+    let (connected, theirs) = fake_connection(pretend_addr, fast).await;
+    handle.peer_connected(connected).await;
+    theirs
+}
+
+/// One end of a localhost socket as if it had just completed a handshake with
+/// `pretend_addr`, for handing to a swarm, and the other end as the remote peer.
+pub(super) async fn fake_connection(pretend_addr: &str, fast: bool) -> (ConnectedPeer, Wire) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let ours = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (theirs, _) = listener.accept().await.unwrap();
-    handle
-        .peer_connected(ConnectedPeer {
-            stream: PeerStream::Tcp(ours),
-            dialed: false,
-            remote_addr: pretend_addr.parse().unwrap(),
-            remote_supports_extensions: false,
-            remote_supports_fast: fast,
-            remote_supports_dht: false,
-            remote_supports_v2: false,
-            peer_id: *b"-TS0001-fake-peer-id",
-        })
-        .await;
-    Framed::new(theirs, BtCodec)
+    let connected = ConnectedPeer {
+        stream: PeerStream::Tcp(ours),
+        dialed: false,
+        remote_addr: pretend_addr.parse().unwrap(),
+        remote_supports_extensions: false,
+        remote_supports_fast: fast,
+        remote_supports_dht: false,
+        remote_supports_v2: false,
+        peer_id: *b"-TS0001-fake-peer-id",
+    };
+    (connected, Framed::new(theirs, BtCodec))
 }
 
 /// The fake peer's side of the opening exchange: it expects our BitField and Interested,

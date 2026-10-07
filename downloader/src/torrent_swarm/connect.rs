@@ -18,6 +18,12 @@ use tracing::info;
 
 use super::{ConnectedPeer, SwarmEvent, TorrentSwarm, canonical};
 
+/// Dials queued or under way per swarm, past which more addresses are passed over: a peer can
+/// gossip (PEX) or introduce (holepunch) addresses as fast as it can send, and each one waiting
+/// for a `HALF_OPEN` slot is a task and an entry in `dialing`. Far more than can be dialled at
+/// once anyway.
+pub(super) const MAX_PENDING_DIALS: usize = 1024;
+
 /// See `MAX_HALF_OPEN`.
 pub(super) static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HALF_OPEN);
 
@@ -241,17 +247,13 @@ impl TorrentSwarm {
         }
         for (addr, utp_capable) in peers {
             let addr = canonical(addr);
-            if self.peers.len() + self.dialing.len() >= cap {
+            if !self.room_to_dial(cap) {
                 break;
             }
-            // trackers and PEX both hand out port 0 for peers whose port they don't know
-            if addr.port() == 0 {
+            if !self.worth_dialing(addr, now) {
                 continue;
             }
-            let worth_it = self.known.get(&addr).is_none_or(|k| k.may_dial(now));
-            if !worth_it || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
-                continue;
-            }
+            self.dialing.insert(addr);
             let known = self.known.entry(addr).or_default();
             if utp_capable {
                 known.prefers_utp = true;
@@ -262,6 +264,20 @@ impl TorrentSwarm {
             let hints = known.dial_hints();
             self.spawn_dial(addr, hints);
         }
+    }
+
+    /// Whether another dial fits under the connection cap and `MAX_PENDING_DIALS`.
+    pub(super) fn room_to_dial(&self, cap: usize) -> bool {
+        self.peers.len() + self.dialing.len() < cap && self.dialing.len() < MAX_PENDING_DIALS
+    }
+
+    /// Not connected or being dialled, not banned or backing off, and with a port: trackers
+    /// and PEX both hand out port 0 for peers whose port they don't know.
+    pub(super) fn worth_dialing(&self, addr: SocketAddr, now: Instant) -> bool {
+        addr.port() != 0
+            && self.known.get(&addr).is_none_or(|k| k.may_dial(now))
+            && self.peer_index(addr).is_none()
+            && !self.dialing.contains(&addr)
     }
 
     /// Dials `addr` in the background (one of the `MAX_HALF_OPEN` at a time); the outcome comes

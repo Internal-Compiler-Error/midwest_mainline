@@ -2,6 +2,7 @@
 
 use crate::peer::{Extension, Holepunch, HolepunchError};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use super::{TorrentSwarm, canonical, known::KnownPeer};
 
@@ -72,9 +73,19 @@ impl TorrentSwarm {
             // a relay introduced us: dial now, over uTP, while the other side dials us
             Holepunch::Connect(addr) => {
                 let addr = canonical(addr);
-                if self.utp.borrow().is_none() || self.peer_index(addr).is_some() || !self.dialing.insert(addr) {
+                let cap = self.settings.borrow().peer_cap();
+                // a dial backoff doesn't count: a peer we failed to dial is who we asked for
+                let banned = self.known.get(&addr).is_some_and(|k| k.banned(Instant::now()));
+                if self.utp.borrow().is_none()
+                    || !self.room_to_dial(cap)
+                    || banned
+                    || addr.port() == 0
+                    || self.peer_index(addr).is_some()
+                    || self.dialing.contains(&addr)
+                {
                     return;
                 }
+                self.dialing.insert(addr);
                 let mut hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
                 hints.utp_only = true;
                 tracing::debug!("{from} introduced us to {addr}, dialing (holepunch)");
@@ -87,6 +98,7 @@ impl TorrentSwarm {
 
 #[cfg(test)]
 mod test {
+    use super::super::connect::MAX_PENDING_DIALS;
     use super::super::test_support::*;
     use super::*;
 
@@ -142,6 +154,34 @@ mod test {
             tokio::time::timeout(timeout, next_holepunch(&mut a)).await.unwrap(),
             Holepunch::Error(stranger, HolepunchError::NotConnected)
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A peer can send introductions (and PEX) as fast as it likes: the dials they start stay
+    /// bounded, and a banned address isn't dialled because someone introduced it.
+    #[tokio::test]
+    async fn introductions_and_gossip_cannot_queue_unbounded_dials() {
+        let (mut swarm, _handle, path) = swarm_with("holepunch-flood", true);
+        let mut utp = crate::utp::start(0, tokio_util::sync::CancellationToken::new());
+        utp.wait_for(Option::is_some).await.unwrap();
+        swarm.utp = utp;
+        let (relay, _theirs) = fake_connection("10.0.0.1:6881", false).await;
+        swarm.add_peer(relay);
+
+        let banned: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        swarm.ban(banned);
+        swarm.on_holepunch(0, Holepunch::Connect(banned));
+        assert!(swarm.dialing.is_empty(), "a banned peer was dialled on an introduction");
+
+        let local = |n: usize| SocketAddr::from((Ipv4Addr::LOCALHOST, 10_000 + n as u16));
+        for n in 0..MAX_PENDING_DIALS {
+            swarm.on_holepunch(0, Holepunch::Connect(local(n)));
+        }
+        let gossip: Vec<_> = (MAX_PENDING_DIALS..2 * MAX_PENDING_DIALS)
+            .map(|n| (local(n), false))
+            .collect();
+        swarm.connect_to_peers(gossip, None);
+        assert_eq!(swarm.dialing.len(), MAX_PENDING_DIALS);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
