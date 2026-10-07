@@ -25,7 +25,7 @@ use rand::RngExt;
 use rand::seq::IndexedRandom;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -940,11 +940,15 @@ impl TorrentSwarm {
             BtMessage::Port(port) => {
                 // BEP 5: the peer runs a DHT node there; pinging it puts it in our routing
                 // table, which is how the table fills from a swarm rather than the routers
-                let dht = self.dht.borrow().clone();
-                if let (Some(dht), SocketAddr::V4(addr)) = (dht, peer.remote_addr) {
-                    let node = SocketAddrV4::new(*addr.ip(), port.port);
+                let client = self
+                    .dht
+                    .borrow()
+                    .as_ref()
+                    .and_then(|dht| dht.client_for(&peer.remote_addr).cloned());
+                if let Some(client) = client {
+                    let node = SocketAddr::new(peer.remote_addr.ip(), port.port);
                     tokio::spawn(async move {
-                        let _ = dht.client.ping(node).await;
+                        let _ = client.ping(node).await;
                     });
                 }
             }
@@ -1701,7 +1705,7 @@ impl TorrentSwarm {
             return;
         }
 
-        let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port);
+        let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port_for(&remote_addr));
         self.next_conn += 1;
         let mut peer = Peer::new(
             connected.stream,

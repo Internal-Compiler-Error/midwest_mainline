@@ -7,9 +7,10 @@ use midwest_mainline::{
 };
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     env,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -18,7 +19,7 @@ use tokio::{
     task::JoinSet,
     time::sleep,
 };
-use tracing::{info, instrument, level_filters::LevelFilter};
+use tracing::{info, instrument, level_filters::LevelFilter, warn};
 use tracing_subscriber::{Layer, util::SubscriberInitExt};
 use tracing_subscriber::{fmt, layer::SubscriberExt};
 
@@ -68,7 +69,11 @@ fn info_hash_param(params: &Option<serde_json::Value>) -> Option<InfoHash> {
 
 async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) -> Json<JsonRpcResponse> {
     let res = match req.method.as_str() {
-        "node_count" => serde_json::json!(s.dht.node_count()),
+        "node_count" => serde_json::json!(s.dht.node_count() + s.dht6.as_ref().map_or(0, |d| d.node_count())),
+        "node_counts" => serde_json::json!({
+            "v4": s.dht.node_count(),
+            "v6": s.dht6.as_ref().map(|d| d.node_count()),
+        }),
         "stored_swarms" => {
             let swarms: Vec<String> = s.dht.stored_swarms().iter().map(|h| hex::encode(h.0)).collect();
             serde_json::json!(swarms)
@@ -103,28 +108,33 @@ async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) 
     Json(response)
 }
 
-async fn resolve_v4(s: &str) -> anyhow::Result<SocketAddrV4> {
-    net::lookup_host(s)
-        .await?
-        .filter_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(v4),
-            _ => None,
-        })
-        .next()
-        .ok_or(anyhow!("no ipv4 address"))
-}
-
-async fn bootstrap_nodes() -> Vec<SocketAddrV4> {
+/// Every address of every router, both families; each node bootstraps from its own
+async fn bootstrap_nodes() -> Vec<SocketAddr> {
     let bootstrap = vec![
         "router.bittorrent.com:6881",
         "router.utorrent.com:6881",
         "dht.transmissionbt.com:6881",
         "dht.libtorrent.org:25401",
         "dht.aelitis.com:6881",
+        "router.silotis.us:6881",
     ];
 
-    let tasks = bootstrap.into_iter().map(resolve_v4);
-    join_all(tasks).await.into_iter().filter_map(Result::ok).collect()
+    let tasks = bootstrap.into_iter().map(net::lookup_host);
+    join_all(tasks)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .flatten()
+        .collect()
+}
+
+/// IPv6-only, so it can share the port number with the IPv4 socket
+fn bind_v6(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    UdpSocket::from_std(socket.into())
 }
 
 /// Randomly generates a node_id and send a find_node, used to populate the DHT
@@ -161,6 +171,8 @@ fn set_up_tracing() {
 #[derive(Clone)]
 struct AppState {
     pub dht: Arc<DhtSession>,
+    /// the IPv6 node (BEP 32), if an IPv6 socket could be bound
+    pub dht6: Option<Arc<DhtSession>>,
 }
 
 #[tokio::main]
@@ -169,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
 
     let dht_port: u16 = env::var("DHT_PORT").map_or(Ok(44444), |p| p.parse())?;
     let rpc_addr = env::var("RPC_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let database_url = env::var("DATABASE_URL").unwrap();
     let dht_socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], dht_port))).await?;
     // DHT_RETENTION=forever keeps every announced peer, making this node a long-term index
     let retention = match env::var("DHT_RETENTION").as_deref() {
@@ -176,22 +189,45 @@ async fn main() -> anyhow::Result<()> {
         Ok("expire") | Err(_) => Retention::Expire,
         Ok(other) => return Err(anyhow!("DHT_RETENTION must be `expire` or `forever`, not `{other}`")),
     };
-    let dht = DhtSession::with_stable_id(dht_socket, None, &env::var("DATABASE_URL").unwrap())
-        .unwrap()
-        .with_retention(retention);
+    let dht = Arc::new(
+        DhtSession::with_stable_id(dht_socket, None, &database_url)
+            .unwrap()
+            .with_retention(retention),
+    );
+    let dht6 = match bind_v6(dht_port) {
+        Ok(socket) => {
+            let dht6 = DhtSession::with_stable_id(socket, None, &database_url)
+                .unwrap()
+                .with_retention(retention);
+            dht.pair_with(&dht6);
+            Some(Arc::new(dht6))
+        }
+        Err(e) => {
+            warn!("no IPv6 DHT: couldn't bind [::]:{dht_port} ({e})");
+            None
+        }
+    };
+    let nodes: Vec<Arc<DhtSession>> = std::iter::once(dht.clone()).chain(dht6.clone()).collect();
 
     let mut event_loops = JoinSet::new();
 
-    // DHT event loop
-    let dht = Arc::new(dht);
-    let state = AppState { dht: dht.clone() };
-    let dhtt = Arc::clone(&dht);
-    event_loops.spawn(async move {
-        dhtt.run().await;
-    });
+    // DHT event loops
+    let state = AppState {
+        dht: dht.clone(),
+        dht6: dht6.clone(),
+    };
+    for node in &nodes {
+        let node = node.clone();
+        event_loops.spawn(async move {
+            node.run().await;
+        });
+    }
 
     let bootstraping = bootstrap_nodes().await;
-    dht.bootstrap(bootstraping).await?;
+    join_all(nodes.iter().map(|node| node.bootstrap(bootstraping.clone())))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
 
     let json_rpc_server = Router::new().route("/json_rpc", post(handle_rpc)).with_state(state);
 
@@ -202,14 +238,15 @@ async fn main() -> anyhow::Result<()> {
         let _ = axum::serve(listener, json_rpc_server).await;
     });
 
-    // populate the DHT routing table
-    let dhtt = Arc::clone(&dht);
-    event_loops.spawn(async move {
-        loop {
-            populate_random(&dhtt).await;
-            sleep(Duration::from_secs(7)).await;
-        }
-    });
+    // populate the DHT routing tables
+    for node in nodes {
+        event_loops.spawn(async move {
+            loop {
+                populate_random(&node).await;
+                sleep(Duration::from_secs(7)).await;
+            }
+        });
+    }
 
     event_loops.join_all().await;
 

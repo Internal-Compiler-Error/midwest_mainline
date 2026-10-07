@@ -2,17 +2,27 @@ use bendy::encoding::SingleItemEncoder;
 
 use crate::types::{InfoHash, NodeId};
 
-use super::ToKrpcBody;
+use super::{ToKrpcBody, Want};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct GetPeersQuery {
     requestor: NodeId,
     info_hash: InfoHash,
+    want: Option<Want>,
 }
 
 impl GetPeersQuery {
     pub fn new(requestor: NodeId, info_hash: InfoHash) -> Self {
-        Self { requestor, info_hash }
+        Self {
+            requestor,
+            info_hash,
+            want: None,
+        }
+    }
+
+    pub fn with_want(mut self, want: Option<Want>) -> Self {
+        self.want = want;
+        self
     }
 
     pub fn requestor(&self) -> &NodeId {
@@ -22,6 +32,10 @@ impl GetPeersQuery {
     pub fn info_hash(&self) -> &InfoHash {
         &self.info_hash
     }
+
+    pub fn want(&self) -> Option<Want> {
+        self.want
+    }
 }
 
 impl ToKrpcBody for GetPeersQuery {
@@ -29,6 +43,9 @@ impl ToKrpcBody for GetPeersQuery {
     fn encode_body(&self, enc: SingleItemEncoder) {
         enc.emit_unsorted_dict(|enc| {
             enc.emit_pair(b"id", self.requestor)?;
+            if let Some(want) = self.want {
+                enc.emit_pair_with(b"want", |e| want.encode(e))?;
+            }
             enc.emit_pair(b"info_hash", self.info_hash)
         })
         .unwrap()

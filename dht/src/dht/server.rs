@@ -5,7 +5,7 @@
 use diesel::insert_into;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::{SqliteConnection, prelude::*};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::Builder as TskBuilder;
 use tokio_stream::StreamExt;
@@ -17,11 +17,11 @@ use crate::message::error::KrpcError;
 use crate::message::find_node_get_peers_response::Builder as ResBuilder;
 use crate::message::ping_announce_peer_response::PingAnnouncePeerResponse;
 use crate::message::{
-    KrpcBody, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-    ping_query::PingQuery,
+    KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
+    get_peers_query::GetPeersQuery, ping_query::PingQuery,
 };
 use crate::schema::{peer, swarm};
-use crate::types::{InfoHash, NodeId, NodeInfo};
+use crate::types::{Family, InfoHash, NodeId, NodeInfo};
 use crate::utils::unix_timestmap_ms;
 
 #[derive(Debug, Clone)]
@@ -62,7 +62,7 @@ impl DhtServer {
     }
 
     #[tracing::instrument(skip(self))]
-    fn generate_response(&self, request: &KrpcBody, from: SocketAddrV4) -> KrpcBody {
+    fn generate_response(&self, request: &KrpcBody, from: SocketAddr) -> KrpcBody {
         assert!(request.is_query());
 
         match request {
@@ -75,54 +75,63 @@ impl DhtServer {
     }
 
     #[tracing::instrument(skip(self))]
-    fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddrV4) -> KrpcBody {
+    fn generate_ping_response(&self, ping: &PingQuery, origin: SocketAddr) -> KrpcBody {
         KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
     }
 
-    #[tracing::instrument(skip(self))]
-    fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddrV4) -> KrpcBody {
-        let table = &self.state.routing_table;
-        let closest_eight = table.find_closest(query.target_id());
-
-        // if we have an exact match, it will be the first element in the vector
-        let res = if closest_eight.first().is_some_and(|n| n.id() == query.target_id()) {
-            ResBuilder::new(self.state.our_id).with_node(closest_eight[0]).build()
-        } else {
-            ResBuilder::new(self.state.our_id).with_nodes(&closest_eight).build()
-        };
-        KrpcBody::FindNodeGetPeersResponse(res)
+    /// The closest nodes to `target` under the keys BEP 32 asks for: `nodes` and/or `nodes6`
+    /// as `want` lists them, or else the family the query arrived over. The other family's
+    /// come from the paired node, if there is one. An exact match goes alone.
+    fn with_closest(&self, mut res: ResBuilder, target: NodeId, want: Option<Want>) -> ResBuilder {
+        let want = want.unwrap_or(Want::only(self.state.family));
+        for family in [Family::V4, Family::V6] {
+            if !want.includes(family) {
+                continue;
+            }
+            let closest = self
+                .state
+                .table_of(family)
+                .map(|table| table.find_closest(target))
+                .unwrap_or_default();
+            let closest = match closest.first() {
+                Some(exact) if exact.id() == target => vec![*exact],
+                _ => closest,
+            };
+            res = res.with_nodes_of(family, &closest);
+        }
+        res
     }
 
     #[tracing::instrument(skip(self))]
-    fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddrV4) -> KrpcBody {
-        let peers = self.state.swarm_peers(query.info_hash());
-        let token_pool = &self.state.token_generator;
+    fn generate_find_node_response(&self, query: &FindNodeQuery, origin: SocketAddr) -> KrpcBody {
+        let res = self.with_closest(ResBuilder::new(self.state.our_id), query.target_id(), query.want());
+        KrpcBody::FindNodeGetPeersResponse(res.build())
+    }
 
-        let token = token_pool.token_for_ip(origin.ip());
-        if !peers.is_empty() {
-            let res = ResBuilder::new(self.state.our_id)
-                .with_token(token)
-                .with_values(&peers)
-                .build();
-            KrpcBody::FindNodeGetPeersResponse(res)
+    #[tracing::instrument(skip(self))]
+    fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddr) -> KrpcBody {
+        let peers = self.state.swarm_peers(query.info_hash(), self.state.family);
+        let token = self.state.token_generator.token_for_ip(&origin.ip());
+        let res = ResBuilder::new(self.state.our_id).with_token(token);
+
+        let res = if !peers.is_empty() {
+            res.with_values(&peers)
         } else {
             // when we don't have peer info on an info hash, respond with the closest nodes
             // we know *to that info hash* so the querier can iterate towards it
-            let target = NodeId(query.info_hash().0);
-            let closest_eight: Vec<_> = self.state.routing_table.find_closest(target).into_iter().collect();
-
-            let res = ResBuilder::new(self.state.our_id)
-                .with_token(token)
-                .with_nodes(&closest_eight)
-                .build();
-            KrpcBody::FindNodeGetPeersResponse(res)
-        }
+            self.with_closest(res, NodeId(query.info_hash().0), query.want())
+        };
+        KrpcBody::FindNodeGetPeersResponse(res.build())
     }
 
     #[tracing::instrument(skip(self))]
-    fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddrV4) -> KrpcBody {
+    fn generate_announce_peer_response(&self, announce: &AnnouncePeerQuery, origin: SocketAddr) -> KrpcBody {
         // the token must have been issued to this IP address (BEP 5)
-        if !self.state.token_generator.is_valid_token(origin.ip(), announce.token()) {
+        if !self
+            .state
+            .token_generator
+            .is_valid_token(&origin.ip(), announce.token())
+        {
             return KrpcBody::ErrorResponse(KrpcError::new_protocol());
         }
 
@@ -130,7 +139,7 @@ impl DhtServer {
         // argument is ignored if the implied port is not 0 and we use the origin port instead
         let peer_contact = {
             if !announce.implied_port() {
-                SocketAddrV4::new(*origin.ip(), announce.port())
+                SocketAddr::new(origin.ip(), announce.port())
             } else {
                 origin
             }
@@ -144,7 +153,7 @@ impl DhtServer {
 
     fn add_peers_to_db(
         info_hash: &InfoHash,
-        peer_contact: SocketAddrV4,
+        peer_contact: SocketAddr,
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
     ) -> Result<usize, diesel::result::Error> {
         conn.transaction(|conn| {
@@ -189,7 +198,7 @@ mod tests {
         let pool = memory_pool();
         let mut conn = pool.get().unwrap();
         let info_hash = InfoHash([3; 20]);
-        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6881);
+        let addr = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 6881));
 
         DhtServer::add_peers_to_db(&info_hash, addr, &mut conn).unwrap();
         diesel::update(peer::table)

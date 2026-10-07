@@ -4,10 +4,10 @@
 //! find_node and get_peers responses map to one [`FindNodeGetPeersResponse`] struct.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::our_error::OurError;
-use crate::types::{NodeInfo, Token, TransactionId};
+use crate::types::{Family, NodeInfo, Token, TransactionId};
 
 use bendy::encoding::{Encoder, SingleItemEncoder};
 use bendy::value;
@@ -31,6 +31,97 @@ pub mod find_node_query;
 pub mod get_peers_query;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
+
+/// Compact peer info: 4 (IPv4) or 16 (IPv6) address bytes, then the port, all big endian.
+pub fn compact_addr(addr: &SocketAddr) -> Vec<u8> {
+    let mut raw = match addr.ip() {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    raw.extend_from_slice(&addr.port().to_be_bytes());
+    raw
+}
+
+/// The inverse of [`compact_addr`]; `None` for any length but 6 and 18.
+pub fn parse_compact_addr(raw: &[u8]) -> Option<SocketAddr> {
+    let (ip, port) = match raw.len() {
+        6 => (
+            IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&raw[..4]).ok()?)),
+            &raw[4..],
+        ),
+        18 => (
+            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&raw[..16]).ok()?)),
+            &raw[16..],
+        ),
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, u16::from_be_bytes([port[0], port[1]])))
+}
+
+/// Compact node info's length: the 20-byte id, then the compact address
+pub(crate) fn compact_node_len(family: Family) -> usize {
+    match family {
+        Family::V4 => 26,
+        Family::V6 => 38,
+    }
+}
+
+/// BEP 32's `want`: which families' nodes a find_node or get_peers querier would like back
+/// (`n4` → `nodes`, `n6` → `nodes6`). Absent, the answer carries the family the query
+/// arrived over.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
+pub struct Want {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+impl Want {
+    pub const BOTH: Want = Want { v4: true, v6: true };
+
+    pub fn only(family: Family) -> Want {
+        Want {
+            v4: family == Family::V4,
+            v6: family == Family::V6,
+        }
+    }
+
+    pub fn includes(&self, family: Family) -> bool {
+        match family {
+            Family::V4 => self.v4,
+            Family::V6 => self.v6,
+        }
+    }
+
+    pub(crate) fn encode(&self, enc: SingleItemEncoder) -> Result<(), bendy::encoding::Error> {
+        let mut wanted: Vec<&[u8]> = vec![];
+        if self.v4 {
+            wanted.push(b"n4");
+        }
+        if self.v6 {
+            wanted.push(b"n6");
+        }
+        enc.emit_list(|e| wanted.iter().try_for_each(|w| e.emit_bytes(w)))
+    }
+}
+
+/// Unknown entries are ignored, as BEP 32 asks, so later families can be added.
+fn extract_want(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Want>, OurError> {
+    let Some(want) = arguments.remove(&b"want".as_slice()) else {
+        return Ok(None);
+    };
+    let BencodeItemView::List(want) = want else {
+        return Err(OurError::DecodeError(eyre!("'want' key is not a list")));
+    };
+    let mut wanted = Want::default();
+    for item in want {
+        match item {
+            BencodeItemView::ByteString(b"n4") => wanted.v4 = true,
+            BencodeItemView::ByteString(b"n6") => wanted.v6 = true,
+            _ => {}
+        }
+    }
+    Ok(Some(wanted))
+}
 
 pub trait ToKrpcBody {
     fn encode_body(&self, enc: SingleItemEncoder);
@@ -106,7 +197,7 @@ fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
     };
 
     let target = NodeId::try_from_bytes(target).ok_or(OurError::DecodeError(eyre!("'target' key is not 20 bytes")))?;
-    let find_node_request = FindNodeQuery::new(querier, target);
+    let find_node_request = FindNodeQuery::new(querier, target).with_want(extract_want(arguments)?);
 
     report_unused_keys(arguments, "Find_node query body has unused keys");
     Ok(find_node_request)
@@ -125,7 +216,7 @@ fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
 
     let info_hash =
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
-    let get_peers = GetPeersQuery::new(querier, info_hash);
+    let get_peers = GetPeersQuery::new(querier, info_hash).with_want(extract_want(arguments)?);
 
     report_unused_keys(arguments, "Get_peers query body has unused keys");
     Ok(get_peers)
@@ -171,37 +262,42 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
     Ok(announce_peer)
 }
 
-fn extract_nodes(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<NodeInfo>>, OurError> {
-    let compact_nodes = response.remove(&b"nodes".as_slice());
-
-    let Some(compact_nodes) = compact_nodes else {
+/// `nodes` (IPv4, 26 bytes a node) or `nodes6` (IPv6, 38 bytes a node, BEP 32)
+fn extract_nodes(
+    response: &mut BTreeMap<&[u8], BencodeItemView>,
+    family: Family,
+) -> Result<Option<Vec<NodeInfo>>, OurError> {
+    let key: &[u8] = match family {
+        Family::V4 => b"nodes",
+        Family::V6 => b"nodes6",
+    };
+    let Some(compact_nodes) = response.remove(key) else {
         return Ok(None);
     };
 
     let BencodeItemView::ByteString(nodes) = compact_nodes else {
-        return Err(OurError::DecodeError(eyre!("'nodes' key is not a binary string")));
+        return Err(OurError::DecodeError(eyre!(
+            "'{}' key is not a binary string",
+            String::from_utf8_lossy(key)
+        )));
     };
 
+    let len = compact_node_len(family);
+    if nodes.len() % len != 0 {
+        info!(
+            "`{}` string length {} is not a multiple of {len}",
+            String::from_utf8_lossy(key),
+            nodes.len()
+        );
+    }
     let contacts: Vec<_> = nodes
-        .chunks(26)
+        .chunks_exact(len)
         .filter_map(|info| {
-            if info.len() != 26 {
-                info!("`nodes` string length is not a product of 26, {}", nodes.len());
+            let node_id = NodeId::try_from_bytes(&info[..20])?;
+            let contact = parse_compact_addr(&info[20..])?;
+            if contact.ip().is_unspecified() || contact.port() == 0 {
                 return None;
             }
-
-            let node_id = &info[0..20];
-            let contact = &info[20..26];
-
-            let node_id = NodeId::from_bytes(node_id);
-
-            let ip = Ipv4Addr::new(contact[0], contact[1], contact[2], contact[3]);
-            let port = u16::from_be_bytes([contact[4], contact[5]]);
-            if ip.is_unspecified() || port == 0 {
-                return None;
-            }
-            let contact = SocketAddrV4::new(ip, port);
-
             Some(NodeInfo::new(node_id, contact))
         })
         .collect();
@@ -209,7 +305,8 @@ fn extract_nodes(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
     Ok(Some(contacts))
 }
 
-fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<SocketAddrV4>>, OurError> {
+/// Peers come as 6-byte (IPv4) or 18-byte (IPv6) strings; BEP 32 lets a list mix them.
+fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<SocketAddr>>, OurError> {
     let values = response.remove(&b"values".as_slice());
     let Some(values) = values else {
         return Ok(None);
@@ -219,7 +316,7 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
         return Err(OurError::DecodeError(eyre!("'values' key is not a list")));
     };
 
-    let contacts: Vec<SocketAddrV4> = values
+    let contacts: Vec<SocketAddr> = values
         .iter()
         .filter_map(|x| match x {
             BencodeItemView::ByteString(s) => Some(s),
@@ -229,18 +326,14 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
             }
         })
         .filter_map(|sock_addr| {
-            if sock_addr.len() != 6 {
-                info!("Encoutered one string in `values` list that isn't 6 bytes long");
+            let Some(addr) = parse_compact_addr(sock_addr) else {
+                info!("Encoutered one string in `values` list that is neither 6 nor 18 bytes long");
+                return None;
+            };
+            if addr.ip().is_unspecified() || addr.port() == 0 {
                 return None;
             }
-
-            let ip = Ipv4Addr::new(sock_addr[0], sock_addr[1], sock_addr[2], sock_addr[3]);
-            let port = u16::from_be_bytes([sock_addr[4], sock_addr[5]]);
-            if ip.is_unspecified() || port == 0 {
-                return None;
-            }
-
-            Some(SocketAddrV4::new(ip, port))
+            Some(addr)
         })
         .collect();
 
@@ -347,14 +440,12 @@ impl ParseKrpc for &[u8] {
             let target_id = NodeId::try_from_bytes(target_id)
                 .ok_or(OurError::DecodeError(eyre!("response 'id' key is not 20 bytes")))?;
 
-            // if the message contains a "nodes", then try to parse it out
-            let nodes = extract_nodes(&mut response)?;
-            // if the message contains a "values" key, then try to parse it out
+            let nodes = extract_nodes(&mut response, Family::V4)?;
+            let nodes6 = extract_nodes(&mut response, Family::V6)?;
             let values = extract_peers(&mut response)?;
-            // if the message contains a "token" key, then try to parse it out
             let token = extract_token(&mut response)?;
 
-            if nodes.is_none() && values.is_none() && token.is_none() {
+            if nodes.is_none() && nodes6.is_none() && values.is_none() && token.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
                 KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id))
             } else {
@@ -371,6 +462,11 @@ impl ParseKrpc for &[u8] {
                     None => builder,
                 };
 
+                let builder = match nodes6 {
+                    Some(nodes6) => builder.with_nodes6(&nodes6),
+                    None => builder,
+                };
+
                 let builder = match values {
                     Some(values) => builder.with_values(&values),
                     None => builder,
@@ -384,12 +480,8 @@ impl ParseKrpc for &[u8] {
             return Err(OurError::DecodeError(eyre!("Unknown message type: {message_type}")));
         };
 
-        // ipv6 nodes send 18 bytes here; there's nothing to do with those
         let ip = match parsed.remove(b"ip".as_slice()) {
-            Some(BencodeItemView::ByteString(raw)) if raw.len() == 6 => Some(SocketAddrV4::new(
-                Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]),
-                u16::from_be_bytes([raw[4], raw[5]]),
-            )),
+            Some(BencodeItemView::ByteString(raw)) => parse_compact_addr(raw),
             _ => None,
         };
         let _ = parsed.remove(b"v".as_slice()); // user agent string
@@ -412,7 +504,7 @@ pub struct Krpc {
     pub body: KrpcBody,
     /// BEP 42: the sender's view of the recipient's external address. In a message we
     /// received it's what that node sees of us; in a response we send it's the querier.
-    pub ip: Option<SocketAddrV4>,
+    pub ip: Option<SocketAddr>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -522,10 +614,7 @@ impl Krpc {
             }
 
             if let Some(ip) = self.ip {
-                let mut raw = [0u8; 6];
-                raw[..4].copy_from_slice(&ip.ip().octets());
-                raw[4..].copy_from_slice(&ip.port().to_be_bytes());
-                enc.emit_pair_with(b"ip", |enc| enc.emit_bytes(&raw))?;
+                enc.emit_pair_with(b"ip", |enc| enc.emit_bytes(&compact_addr(&ip)))?;
             }
 
             for (k, v) in additional.iter() {
@@ -798,7 +887,7 @@ mod test {
             txn_id,
             body,
             // the responder's view of the querier's address, `434545f1c8d6` in the fixture
-            ip: Some(SocketAddrV4::new(Ipv4Addr::new(67, 69, 69, 241), 51414)),
+            ip: Some(SocketAddrV4::new(Ipv4Addr::new(67, 69, 69, 241), 51414).into()),
         };
 
         assert_eq!(decoded, expected);
@@ -833,15 +922,165 @@ mod test {
         let message = b"d2:ip6:\x05\x06\x07\x08\x1a\xe11:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
         let decoded = message.parse().unwrap();
         let seen = SocketAddrV4::new(Ipv4Addr::new(5, 6, 7, 8), 6881);
-        assert_eq!(decoded.ip, Some(seen));
+        assert_eq!(decoded.ip, Some(seen.into()));
         assert!(matches!(decoded.body, KrpcBody::PingAnnouncePeerResponse(_)));
 
         let again = decoded.encode();
         assert_eq!(again.as_ref().parse().unwrap(), decoded);
 
-        // an ipv6 node reports 18 bytes, which we have no use for
-        let message = b"d2:ip18:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1a\xe11:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
+        // an ipv6 node reports 18 bytes
+        let message = b"d2:ip18:\x20\x01\x04\x70\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x05\x1a\xe11:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
+        let decoded = message.parse().unwrap();
+        assert_eq!(decoded.ip, Some("[2001:470:1:2::5]:6881".parse().unwrap()));
+        assert_eq!(decoded.encode().as_ref().parse().unwrap(), decoded);
+
+        // and anything else is nothing
+        let message = b"d2:ip5:\x05\x06\x07\x08\x1a1:rd2:id20:0123456789abcdefghije1:t2:aa1:y1:re" as &[u8];
         assert_eq!(message.parse().unwrap().ip, None);
+    }
+
+    fn v6(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn nodes6_and_ipv6_values_round_trip() {
+        use find_node_get_peers_response::Builder;
+        let body = Builder::new(NodeId::from_bytes(b"0123456789abcdefghij"))
+            .with_token(Token::from_bytes(b"tok"))
+            .with_nodes(&[NodeInfo::new(
+                NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
+                v6("1.2.3.4:6881"),
+            )])
+            .with_nodes6(&[
+                NodeInfo::new(
+                    NodeId::from_bytes(b"abcdefghijklmnopqrst"),
+                    v6("[2001:470:1:2::5]:6881"),
+                ),
+                NodeInfo::new(NodeId::from_bytes(b"ABCDEFGHIJKLMNOPQRST"), v6("[2a02:752::1]:25401")),
+            ])
+            .with_values(&[v6("[2001:470:1:2::9]:51413"), v6("5.6.7.8:1")])
+            .build();
+        let msg = Krpc::new_with_body(
+            TransactionId::from_bytes(b"aa"),
+            KrpcBody::FindNodeGetPeersResponse(body),
+        );
+        let encoded = msg.encode();
+
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(text.contains("6:nodes676:"), "two 38-byte nodes: {text}");
+        assert!(text.contains("5:nodes26:"), "one 26-byte node: {text}");
+        assert!(text.contains("6:valuesl18:"), "an 18-byte value: {text}");
+
+        let decoded = encoded.as_ref().parse().unwrap();
+        assert_eq!(decoded, msg);
+        let KrpcBody::FindNodeGetPeersResponse(res) = decoded.body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.nodes6()[1].end_point(), v6("[2a02:752::1]:25401"));
+        assert_eq!(res.nodes_of(Family::V4).len(), 1);
+    }
+
+    #[test]
+    fn an_answer_with_only_nodes6_is_a_find_node_answer() {
+        let mut message = b"d1:rd2:id20:0123456789abcdefghij6:nodes638:".to_vec();
+        message.extend_from_slice(b"mnopqrstuvwxyz123456");
+        message.extend_from_slice(&[0x20, 0x01, 0x04, 0x70, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0x1a, 0xe1]);
+        message.extend_from_slice(b"e1:t2:aa1:y1:re");
+        let decoded = message.as_slice().parse().unwrap();
+        let KrpcBody::FindNodeGetPeersResponse(res) = decoded.body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert!(res.nodes().is_empty());
+        assert_eq!(
+            res.nodes6(),
+            &[NodeInfo::new(
+                NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
+                v6("[2001:470:1:2::5]:6881")
+            )]
+        );
+    }
+
+    #[test]
+    fn want_round_trips_and_ignores_what_it_does_not_know() {
+        let query = FindNodeQuery::new(
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
+        )
+        .with_want(Some(Want::BOTH));
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::FindNodeQuery(query));
+        let encoded = msg.encode();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            "d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz1234564:wantl2:n42:n6ee1:q9:find_node1:t2:aa1:y1:qe"
+        );
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let query = GetPeersQuery::new(
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
+        )
+        .with_want(Some(Want::only(Family::V6)));
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::GetPeersQuery(query));
+        assert_eq!(msg.encode().as_ref().parse().unwrap(), msg);
+
+        // BEP 32: unknown entries are ignored
+        let msg = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234564:wantl2:n62:n9i3eee1:q9:get_peers1:t2:aa1:y1:qe" as &[u8];
+        let KrpcBody::GetPeersQuery(query) = msg.parse().unwrap().body else {
+            panic!("expected a get_peers query")
+        };
+        assert_eq!(query.want(), Some(Want::only(Family::V6)));
+    }
+
+    #[test]
+    fn malformed_ipv6_wire_data_is_skipped_or_a_decode_error_not_a_panic() {
+        // `want` that isn't a list
+        let msg =
+            b"d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz1234564:want2:n6e1:q9:find_node1:t2:aa1:y1:qe"
+                as &[u8];
+        assert!(msg.parse().is_err());
+
+        // `nodes6` that isn't a string
+        let msg = b"d1:rd2:id20:0123456789abcdefghij6:nodes6i5ee1:t2:aa1:y1:re" as &[u8];
+        assert!(msg.parse().is_err());
+
+        // `nodes6` cut short: the whole nodes are kept, the stub dropped
+        let mut msg = b"d1:rd2:id20:0123456789abcdefghij6:nodes650:".to_vec();
+        msg.extend_from_slice(b"mnopqrstuvwxyz123456");
+        msg.extend_from_slice(&[0x20, 0x01, 0x04, 0x70, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0x1a, 0xe1]);
+        msg.extend_from_slice(b"twelve bytes");
+        msg.extend_from_slice(b"e1:t2:aa1:y1:re");
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.as_slice().parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.nodes6().len(), 1);
+
+        // `nodes6` shorter than one node, `nodes` holding a 38-byte (IPv6) node: nothing usable
+        let msg = b"d1:rd2:id20:0123456789abcdefghij6:nodes63:abc5:nodes38:abcdefghijklmnopqrstabcdefghijklmnopqre1:t2:aa1:y1:re" as &[u8];
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert!(res.nodes6().is_empty());
+        assert_eq!(
+            res.nodes().len(),
+            1,
+            "the first 26 bytes make a node; the rest is dropped"
+        );
+
+        // values of 17 and 19 bytes among an IPv6 one, and an IPv6 node at :: or on port 0
+        let mut msg = b"d1:rd2:id20:0123456789abcdefghij5:token2:aa6:valuesl17:".to_vec();
+        msg.extend_from_slice(&[1; 17]);
+        msg.extend_from_slice(b"19:");
+        msg.extend_from_slice(&[1; 19]);
+        msg.extend_from_slice(b"18:");
+        msg.extend_from_slice(&[0x20, 0x01, 0x04, 0x70, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0x1a, 0xe1]);
+        msg.extend_from_slice(b"18:");
+        msg.extend_from_slice(&[0; 18]);
+        msg.extend_from_slice(b"ee1:t2:aa1:y1:re");
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.as_slice().parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.values(), &[v6("[2001:470:1:2::5]:6881")]);
     }
 
     #[test]
@@ -903,7 +1142,7 @@ mod test {
         };
         assert_eq!(
             resp.values(),
-            &vec![SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506)]
+            &[SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506).into()]
         );
     }
 

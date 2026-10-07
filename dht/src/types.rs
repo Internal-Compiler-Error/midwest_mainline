@@ -9,8 +9,8 @@ use num::traits::ops::bytes;
 use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
-    fmt::Debug,
-    net::{Ipv4Addr, SocketAddrV4},
+    fmt::{Debug, Display},
+    net::{IpAddr, SocketAddr},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -155,28 +155,80 @@ impl ToBencode for Token {
     }
 }
 
+/// Which of the two DHTs: BEP 32 runs IPv4 and IPv6 as independent networks, each with its
+/// own routing table, sharing only the wire format.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    pub fn of(addr: &SocketAddr) -> Family {
+        Self::of_ip(&addr.ip())
+    }
+
+    pub fn of_ip(ip: &IpAddr) -> Family {
+        match ip {
+            IpAddr::V4(_) => Family::V4,
+            IpAddr::V6(_) => Family::V6,
+        }
+    }
+
+    pub fn other(self) -> Family {
+        match self {
+            Family::V4 => Family::V6,
+            Family::V6 => Family::V4,
+        }
+    }
+
+    /// how the `node` table's `family` column spells it
+    pub(crate) fn db(self) -> i32 {
+        match self {
+            Family::V4 => 4,
+            Family::V6 => 6,
+        }
+    }
+}
+
+impl Display for Family {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Family::V4 => "v4",
+            Family::V6 => "v6",
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct NodeInfo {
     id: NodeId,
-    end_point: SocketAddrV4,
+    end_point: SocketAddr,
 }
 
 impl NodeInfo {
-    pub fn new(id: NodeId, end_point: SocketAddrV4) -> NodeInfo {
-        NodeInfo { id, end_point }
+    pub fn new(id: NodeId, end_point: impl Into<SocketAddr>) -> NodeInfo {
+        NodeInfo {
+            id,
+            end_point: end_point.into(),
+        }
     }
 
     pub fn id(&self) -> NodeId {
         self.id
     }
 
-    pub fn end_point(&self) -> SocketAddrV4 {
+    pub fn end_point(&self) -> SocketAddr {
         self.end_point
+    }
+
+    pub fn family(&self) -> Family {
+        Family::of(&self.end_point)
     }
 }
 
 impl Routable for NodeInfo {
-    fn endpoint(&self) -> SocketAddrV4 {
+    fn endpoint(&self) -> SocketAddr {
         self.end_point()
     }
 }
@@ -184,11 +236,11 @@ impl Routable for NodeInfo {
 impl From<NodeNoMetaInfo> for NodeInfo {
     fn from(value: NodeNoMetaInfo) -> Self {
         let idd = NodeId::from_bytes(&value.id);
-        // TODO: add err msg
-        let ip: Ipv4Addr = value.ip_addr.parse().unwrap();
-        let portt = value.port;
-        let endpoint = SocketAddrV4::new(ip, portt as u16);
-        NodeInfo::new(idd, endpoint)
+        let ip: IpAddr = value
+            .ip_addr
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid ip address in the node table: {}", value.ip_addr));
+        NodeInfo::new(idd, SocketAddr::new(ip, value.port as u16))
     }
 }
 

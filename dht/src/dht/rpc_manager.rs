@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -23,16 +23,16 @@ use tracing::{info, instrument, trace, warn};
 use crate::{
     message::{Krpc, KrpcBody, ParseKrpc},
     our_error::{OurError, naur},
-    types::{NodeInfo, TransactionId},
+    types::{Family, NodeInfo, TransactionId},
     utils::{db_put, unix_timestmap_ms},
 };
 
-use super::{OBSERVED_IP_KEY, TxnIdGenerator, external_ip::ExternalIp, routing_table::update_last_sent};
+use super::{TxnIdGenerator, external_ip::ExternalIp, misc_key, routing_table::update_last_sent};
 
 /// A message and who sent it
-pub type Inbound = (Krpc, SocketAddrV4);
+pub type Inbound = (Krpc, SocketAddr);
 /// Who a query went to, and who is waiting for the answer
-type Pending = (SocketAddrV4, oneshot::Sender<Inbound>);
+type Pending = (SocketAddr, oneshot::Sender<Inbound>);
 
 /// A message broker keeps reading Krpc messages from a queue and place them either into the
 /// server response queue when we haven't seen this transaction id before, or into a oneshot channel
@@ -44,6 +44,8 @@ pub struct RpcManager {
     pending_responses: Arc<Mutex<HashMap<TransactionId, Pending>>>,
 
     socket: Arc<UdpSocket>,
+    /// the socket's address family, which is the family of everything this broker talks to
+    family: Family,
     txn_id_generator: Arc<TxnIdGenerator>,
 
     /// a SPMC-esque queue, each readers can progress indepednelty
@@ -53,26 +55,41 @@ pub struct RpcManager {
 }
 
 pub trait Routable {
-    fn endpoint(&self) -> SocketAddrV4;
+    fn endpoint(&self) -> SocketAddr;
 }
 
-impl Routable for SocketAddrV4 {
-    fn endpoint(&self) -> SocketAddrV4 {
+impl Routable for SocketAddr {
+    fn endpoint(&self) -> SocketAddr {
         *self
     }
 }
 
+impl Routable for SocketAddrV4 {
+    fn endpoint(&self) -> SocketAddr {
+        (*self).into()
+    }
+}
+
+impl Routable for SocketAddrV6 {
+    fn endpoint(&self) -> SocketAddr {
+        (*self).into()
+    }
+}
+
 impl RpcManager {
-    /// `external_ip` is the address other nodes reported for us last time, if any
+    /// `external_ip` is the address other nodes reported for us last time, if any. The
+    /// socket's family (IPv4, or IPv6 — bound IPv6-only) is the family of the DHT it serves.
     pub fn new(
         socket: UdpSocket,
         db: Pool<ConnectionManager<SqliteConnection>>,
         txn_id_generator: Arc<TxnIdGenerator>,
-        external_ip: Option<Ipv4Addr>,
+        external_ip: Option<IpAddr>,
     ) -> RpcManager {
+        let family = Family::of(&socket.local_addr().expect("the socket should be bound already"));
         Self {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             socket: Arc::new(socket),
+            family,
             inbound_subscribers: Arc::new(Mutex::new(vec![])),
             db,
             txn_id_generator,
@@ -80,7 +97,15 @@ impl RpcManager {
         }
     }
 
-    #[instrument(skip_all)]
+    pub fn family(&self) -> Family {
+        self.family
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    #[instrument(skip_all, fields(family = %self.family))]
     pub async fn run(&self) -> io::Result<JoinHandle<()>> {
         let socket = self.socket.clone();
         let pending_responses = self.pending_responses.clone();
@@ -104,15 +129,6 @@ impl RpcManager {
                 match (&buf[..amount]).parse() {
                     Ok(msg) => {
                         trace!("{} sent {:?}", socket_addr, msg);
-                        let socket_addr = {
-                            match socket_addr {
-                                SocketAddr::V4(addr) => addr,
-                                _ => {
-                                    info!("Non Ipv4 UDP packet received, should not be possible");
-                                    continue;
-                                }
-                            }
-                        };
 
                         let id = msg.transaction_id();
                         trace!(
@@ -145,7 +161,7 @@ impl RpcManager {
                                     // only answers to our own queries get a say in what our
                                     // external address is; anyone can send a query
                                     if let Some(seen) = msg.ip {
-                                        this.record_external_ip(*socket_addr.ip(), *seen.ip());
+                                        this.record_external_ip(socket_addr.ip(), seen.ip());
                                     }
                                     // failing means the receiver has dropped, meaning they are no
                                     // longer interested in the message, not a bug
@@ -162,10 +178,8 @@ impl RpcManager {
                     }
                     Err(OurError::UnsupportedQuery(txn)) => {
                         // BEP 5: unknown query methods get a 204 Method Unknown error reply
-                        if let SocketAddr::V4(addr) = socket_addr {
-                            let response = Krpc::new_unsupported_error(txn);
-                            this.send_msg_background(&response, addr);
-                        }
+                        let response = Krpc::new_unsupported_error(txn);
+                        this.send_msg_background(&response, socket_addr);
                     }
                     Err(e) => {
                         tracing::debug!("ignoring an unparseable packet from {socket_addr}: {e}")
@@ -174,15 +188,13 @@ impl RpcManager {
             }
         };
         use tokio::task::Builder;
-        Builder::new().name("Message broker").spawn(event_loop)
+        Builder::new()
+            .name(&format!("Message broker ({})", self.family))
+            .spawn(event_loop)
     }
 
     /// Subscribe to the reply with the provided transaction_id, expected from `endpoint`
-    pub fn subscribe_one(
-        &self,
-        transaction_id: TransactionId,
-        endpoint: SocketAddrV4,
-    ) -> oneshot::Receiver<(Krpc, SocketAddrV4)> {
+    pub fn subscribe_one(&self, transaction_id: TransactionId, endpoint: SocketAddr) -> oneshot::Receiver<Inbound> {
         let (tx, rx) = oneshot::channel();
 
         let mut guard = self.pending_responses.lock().unwrap();
@@ -194,12 +206,16 @@ impl RpcManager {
 
     /// A node answering our query told us the address it sees us at (BEP 42). Once enough
     /// agree, the address is stored for the next start to derive the node id from.
-    fn record_external_ip(&self, voter: Ipv4Addr, seen: Ipv4Addr) {
+    fn record_external_ip(&self, voter: IpAddr, seen: IpAddr) {
+        if Family::of_ip(&seen) != self.family {
+            return;
+        }
         let Some(agreed) = self.external_ip.vote(voter, seen) else {
             return;
         };
         info!("other nodes see us at {agreed}; the node id follows it at the next start");
         let db = self.db.clone();
+        let key = misc_key(super::OBSERVED_IP_KEY, self.family);
         tokio::task::spawn_blocking(move || {
             let mut conn = match db.get() {
                 Ok(conn) => conn,
@@ -209,26 +225,29 @@ impl RpcManager {
                 }
             };
             // db_put logs its own failures
-            let _ = db_put(OBSERVED_IP_KEY.to_string(), agreed.to_string(), &mut conn);
+            let _ = db_put(key, agreed.to_string(), &mut conn);
         });
     }
 
-    /// Send a message, fires up a new stask in background
-    fn send_msg_background(&self, msg: &Krpc, peer: SocketAddrV4) {
-        let socket = self.socket.clone();
-
+    fn encode_for(msg: &Krpc, peer: SocketAddr) -> Box<[u8]> {
         let mut additional = HashMap::new();
         // BEP 5: every message should carry our client version
         additional.insert(&b"v"[..], value::Value::Bytes(Cow::Borrowed(&b"MW01"[..])));
 
-        let buf = if msg.body.is_query() {
+        if msg.body.is_query() {
             msg.encode_with_additional(&additional)
         } else {
             // BEP 42: a response tells the querier the external address we see for it
             let mut msg = msg.clone();
             msg.ip = Some(peer);
             msg.encode_with_additional(&additional)
-        };
+        }
+    }
+
+    /// Send a message, fires up a new stask in background
+    fn send_msg_background(&self, msg: &Krpc, peer: SocketAddr) {
+        let socket = self.socket.clone();
+        let buf = Self::encode_for(msg, peer);
 
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&buf, peer).await {
@@ -237,14 +256,15 @@ impl RpcManager {
         });
     }
 
-    /// Send a message out and await for a response.
-    async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddrV4) -> Result<Krpc, OurError> {
+    /// Send a message out and await for a response. A send that fails outright (no route
+    /// to the address, typically IPv6 on a host without it) is an [`OurError::IoError`] at
+    /// once, rather than a timeout later.
+    async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddr) -> Result<Krpc, OurError> {
         let sent_time = unix_timestmap_ms();
-        let rx = {
-            let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
-            self.send_msg_background(&message, endpoint);
-            rx
-        };
+        let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
+        self.socket
+            .send_to(&Self::encode_for(&message, endpoint), endpoint)
+            .await?;
         let (response, _addr) = rx
             .await
             .map_err(|_| naur!("pending request superseded or dropped before a response arrived"))?;
@@ -257,27 +277,27 @@ impl RpcManager {
             .get()
             .map_err(|e| naur!("could not check out a db connection: {e}"))?;
         // it's a double update but that's issue for another day
-        update_last_sent(&response_node_id, sent_time, &mut conn);
+        update_last_sent(&response_node_id, self.family, sent_time, &mut conn);
         Ok(response)
     }
 
     async fn send_and_wait_timeout(
         &self,
         message: Krpc,
-        endpoint: SocketAddrV4,
+        endpoint: SocketAddr,
         time_out: Duration,
     ) -> Result<Krpc, OurError> {
         let txn_id = message.transaction_id().clone();
         let result = timeout(time_out, self.send_and_wait(message, endpoint)).await;
-        if result.is_err() {
-            // timed out: free the pending slot so dead endpoints don't leak entries forever
+        if !matches!(result, Ok(Ok(_))) {
+            // timed out or failed: free the pending slot so dead endpoints don't leak entries
             self.pending_responses.lock().unwrap().remove(&txn_id);
         }
         let response = result??;
         Ok(response)
     }
 
-    pub fn subscribe_inbound(&self) -> mpsc::Receiver<(Krpc, SocketAddrV4)> {
+    pub fn subscribe_inbound(&self) -> mpsc::Receiver<Inbound> {
         // TODO: make this configurable
         let (tx, rx) = mpsc::channel(1024);
         let mut subscribers = self.inbound_subscribers.lock().unwrap();
@@ -339,8 +359,23 @@ mod tests {
         let body = KrpcBody::PingQuery(PingQuery::new(NodeId([1u8; 20])));
         let dead = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
 
-        let result = broker.query(body, &dead, Duration::from_millis(50)).await;
+        let result = broker.query(body.clone(), &dead, Duration::from_millis(50)).await;
         assert!(result.is_err());
+        assert!(
+            broker.pending_responses.lock().unwrap().is_empty(),
+            "a timed-out query must not leak its pending_requests entry"
+        );
+
+        // an IPv6 address on an IPv4 socket can't be sent to at all: an error at once, no
+        // waiting out the timeout
+        let unroutable: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            broker.query(body, &unroutable, Duration::from_secs(30)),
+        )
+        .await
+        .expect("a failed send must not wait for the timeout");
+        assert!(matches!(result, Err(OurError::IoError(_))));
         assert!(
             broker.pending_responses.lock().unwrap().is_empty(),
             "a timed-out query must not leak its pending_requests entry"
@@ -389,9 +424,7 @@ mod tests {
         let legit = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let SocketAddr::V4(legit_addr) = legit.local_addr().unwrap() else {
-            unreachable!("bound to an ipv4 address");
-        };
+        let legit_addr = legit.local_addr().unwrap();
         let spoofer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();

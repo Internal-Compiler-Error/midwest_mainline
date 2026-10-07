@@ -8,11 +8,13 @@ diesel::table! {
 }
 
 diesel::table! {
-    node (id) {
+    node (family, id) {
         id -> Binary,
+        family -> Integer,
         bucket -> Integer,
         last_contacted -> BigInt,
         ip_addr -> Text,
+        ip_group -> Nullable<Text>,
         port -> Integer,
         failed_requests -> Integer,
         removed -> Bool,

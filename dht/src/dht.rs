@@ -14,6 +14,11 @@
 //! [`DhtSession::with_retention`].
 //!
 //! Both halves share one `SharedState`; nothing is owned twice.
+//!
+//! A session is one address family: its socket's. BEP 32 runs IPv4 and IPv6 as two
+//! independent DHTs, so a dual-stack host runs two sessions, one per socket, over the same
+//! database (the routing tables are kept apart by family, the announced peers are shared),
+//! and pairs them with [`DhtSession::pair_with`] so each can seed and answer for the other.
 
 pub mod client;
 mod external_ip;
@@ -27,8 +32,9 @@ use crate::{
     dht::client::DhtClient,
     dht::server::DhtServer,
     dht::state::SharedState,
+    message::KrpcBody,
     our_error::{OurError, naur},
-    types::{InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
+    types::{Family, InfoHash, NODE_ID_LEN, NodeId, NodeInfo},
     utils::{base64_dec, base64_enc, db_get, db_put},
 };
 use diesel::{
@@ -44,7 +50,7 @@ use rand::{Rng, RngExt};
 use routing_table::RoutingTable;
 use rpc_manager::RpcManager;
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 use tokio::{net::UdpSocket, task::JoinSet, time::interval};
@@ -52,7 +58,7 @@ use txn_id_generator::TxnIdGenerator;
 
 pub use state::{PEER_LIFETIME, Retention, StoredPeer};
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migrations");
+pub(crate) const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migrations");
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -64,7 +70,7 @@ pub struct DhtSession {
     routing_table: RoutingTable,
     state: Arc<SharedState>,
     retention: Retention,
-    addr: SocketAddrV4,
+    addr: SocketAddr,
 }
 
 #[derive(Debug)]
@@ -110,22 +116,16 @@ define_sql_function! {
     fn xor(x: sql_types::Binary, y: sql_types::Binary) -> sql_types::Binary;
 }
 
-/// A BEP 42 node id for our external IP: the top 21 bits are the CRC32C of the masked IP
-/// (so the id is verifiably tied to the IP and hard to choose freely), the rest is random
-/// except the last byte, which repeats the random `rand` mixed into the CRC input.
-fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
+/// A BEP 42 node id: the top 21 bits are the CRC32C of the masked IP (so the id is verifiably
+/// tied to the IP and hard to choose freely), the rest is random except the last byte, which
+/// repeats the random `rand` mixed into the CRC input.
+fn bep42_id(masked_ip: &mut [u8], rand: u8) -> NodeId {
     let mut rng = rand::rng();
     let r = rand & 0x07;
     let mut id = [0u8; 20];
-    let mut ip = external_ip.octets();
-    let mask = [0x03, 0x0f, 0x3f, 0xff];
 
-    for (ip, mask) in ip.iter_mut().zip(mask.iter()) {
-        *ip &= mask;
-    }
-
-    ip[0] |= r << 5;
-    let crc = crc32c::crc32c(&ip);
+    masked_ip[0] |= r << 5;
+    let crc = crc32c::crc32c(masked_ip);
 
     id[0] = (crc >> 24) as u8;
     id[1] = (crc >> 16) as u8;
@@ -138,92 +138,119 @@ fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
     NodeId(id)
 }
 
+/// A BEP 42 node id for our external IPv4 address
+fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> NodeId {
+    let mut ip = external_ip.octets();
+    for (ip, mask) in ip.iter_mut().zip([0x03, 0x0f, 0x3f, 0xff]) {
+        *ip &= mask;
+    }
+    bep42_id(&mut ip, rand)
+}
+
+/// A BEP 42 node id for our external IPv6 address: the CRC covers its first 64 bits, under
+/// IPv6's own mask
+fn random_idv6(external_ip: &Ipv6Addr, rand: u8) -> NodeId {
+    let mut ip: [u8; 8] = external_ip.octets()[..8].try_into().unwrap();
+    for (ip, mask) in ip.iter_mut().zip([0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff]) {
+        *ip &= mask;
+    }
+    bep42_id(&mut ip, rand)
+}
+
+/// The node id for `public_ip`: BEP 42's when the address is known; an IPv6 node that doesn't
+/// know its address yet gets a random one (an IPv4 one gets 0.0.0.0's, as it always has).
+fn mint_id(public_ip: IpAddr) -> NodeId {
+    let rand = rand::rng().random::<u8>();
+    match public_ip {
+        IpAddr::V4(ip) => random_idv4(&ip, rand),
+        IpAddr::V6(ip) if ip.is_unspecified() => NodeId(rand::rng().random()),
+        IpAddr::V6(ip) => random_idv6(&ip, rand),
+    }
+}
+
 /// `misc` row the vote in `external_ip` is stored under
 pub(crate) const OBSERVED_IP_KEY: &str = "observed_ip";
 
-/// Reuse last session's identity if our public IP is unchanged; otherwise mint a new
-/// one. BEP 42 binds the id to the IP, so keeping the old id across an IP change would
-/// make us present an id other nodes consider invalid — and every stored bucket index
+/// The `misc` key for a per-family value: IPv4 keeps the original names, IPv6 adds a 6
+pub(crate) fn misc_key(base: &str, family: Family) -> String {
+    match family {
+        Family::V4 => base.to_string(),
+        Family::V6 => format!("{base}6"),
+    }
+}
+
+/// Reuse last session's identity for this family if our public IP is unchanged; otherwise
+/// mint a new one. BEP 42 binds the id to the IP, so keeping the old id across an IP change
+/// would make us present an id other nodes consider invalid — and every stored bucket index
 /// was computed against the old id anyway.
-fn resume_identity(conn: &mut SqliteConnection, public_ip: Ipv4Addr) -> Result<NodeId, diesel::result::Error> {
+fn resume_identity(conn: &mut SqliteConnection, public_ip: IpAddr) -> Result<NodeId, diesel::result::Error> {
+    let family = Family::of_ip(&public_ip);
+    let ip_key = misc_key("public_ip", family);
+    let id_key = misc_key("id", family);
     conn.transaction(|conn| {
-        let prev_ip = db_get("public_ip", conn)?;
-        let prev_id = db_get("id", conn)?;
+        let prev_ip = db_get(&ip_key, conn)?.and_then(|ip| ip.parse::<IpAddr>().ok());
+        let prev_id = db_get(&id_key, conn)?.and_then(|id| NodeId::try_from_bytes(&base64_dec(id)));
 
-        let Some(prev_ip) = prev_ip else {
-            // No previous IP, so store the current one and generate a new ID
-            return new_identity(public_ip, conn);
-        };
-
-        let prev_ip: Ipv4Addr = prev_ip.parse().unwrap();
-        if prev_ip == public_ip {
-            // IP matches, reuse ID
-            let id_in_base64 =
-                prev_id.expect("if the public ip of last session matches this session, id should have been set");
-            let id = base64_dec(id_in_base64);
-            Ok(NodeId::from_bytes(&id))
-        } else {
-            // IP changed, generate new ID
-            let id = random_idv4(&public_ip, rand::rng().random::<u8>());
-            db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
-            db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
-            // every stored bucket was computed against the previous id; recompute
-            recompute_buckets(&id, conn)?;
-            Ok(id)
+        if let (Some(prev_ip), Some(prev_id)) = (prev_ip, prev_id)
+            && prev_ip == public_ip
+        {
+            return Ok(prev_id);
         }
+
+        let id = mint_id(public_ip);
+        db_put(ip_key.clone(), public_ip.to_string(), conn)?;
+        db_put(id_key.clone(), base64_enc(id.as_bytes()), conn)?;
+        if prev_id.is_some() {
+            // every stored bucket was computed against the previous id; recompute
+            recompute_buckets(&id, family, conn)?;
+        }
+        Ok(id)
     })
 }
 
 /// Recompute every node's bucket against a new identity (bucket assignments are derived
 /// from xor distance to our own id, so they go stale when the id changes).
-fn recompute_buckets(our_id: &NodeId, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+fn recompute_buckets(our_id: &NodeId, fam: Family, conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
     use crate::schema::node::dsl::*;
 
-    let rows: Vec<Vec<u8>> = node.select(id).load(conn)?;
+    let rows: Vec<Vec<u8>> = node.filter(family.eq(fam.db())).select(id).load(conn)?;
     for raw in rows {
         let Some(node_id) = NodeId::try_from_bytes(&raw) else {
             continue;
         };
         let b = routing_table::bucket_index(our_id, &node_id);
-        diesel::update(node.filter(id.eq(&raw)))
+        diesel::update(node.filter(family.eq(fam.db())).filter(id.eq(&raw)))
             .set(bucket.eq(b))
             .execute(conn)?;
     }
     Ok(())
 }
 
-/// The address other nodes saw us at last time, if enough of them agreed
-fn known_external_ip(conn: &mut SqliteConnection) -> Result<Option<Ipv4Addr>, diesel::result::Error> {
-    Ok(db_get(OBSERVED_IP_KEY, conn)?.and_then(|ip| ip.parse().ok()))
-}
-
-fn new_identity(public_ip: Ipv4Addr, conn: &mut SqliteConnection) -> Result<NodeId, diesel::result::Error> {
-    db_put("public_ip".to_string(), public_ip.to_string(), conn)?;
-    let id = random_idv4(&public_ip, rand::rng().random::<u8>());
-    db_put("id".to_string(), base64_enc(id.as_bytes()), conn)?;
-    Ok(id)
+/// The address of `family` other nodes saw us at last time, if enough of them agreed
+fn known_external_ip(conn: &mut SqliteConnection, family: Family) -> Result<Option<IpAddr>, diesel::result::Error> {
+    Ok(db_get(&misc_key(OBSERVED_IP_KEY, family), conn)?
+        .and_then(|ip| ip.parse().ok())
+        .filter(|ip| Family::of_ip(ip) == family))
 }
 
 impl DhtSession {
     /// Create a node whose BEP 42 id is derived from our external address and kept across
     /// starts while that address stays the same. Pass `None` to derive it from what other
     /// nodes reported the address to be last time (see `external_ip`); a caller that knows
-    /// better passes the address. A first start with nothing known gets an id for 0.0.0.0,
-    /// and the next start fixes that.
+    /// better passes the address. A first start with nothing known gets an id for 0.0.0.0
+    /// (IPv4) or a random one (IPv6), and the next start fixes that.
     ///
-    /// The UdpSocket must be already binded to an ipv4 address
+    /// The node is of the socket's address family. An IPv6 socket should be IPv6-only
+    /// (`IPV6_V6ONLY`): IPv4 belongs to the other DHT.
     pub fn with_stable_id(
         listen_socket: UdpSocket,
-        external_addr: Option<Ipv4Addr>,
+        external_addr: Option<IpAddr>,
         database_url: &str,
     ) -> Result<Self, OurError> {
-        let local_addr = match listen_socket
+        let local_addr = listen_socket
             .local_addr()
-            .expect("listen socket should already be binded per doc")
-        {
-            SocketAddr::V4(v4) => v4,
-            _ => panic!("listen socket must be binded to ipv4"),
-        };
+            .expect("listen socket should already be binded per doc");
+        let family = Family::of(&local_addr);
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         let db = Pool::builder()
@@ -242,18 +269,30 @@ impl DhtSession {
             .map_err(|e| naur!("could not migrate the database: {e}"))?;
         match routing_table::purge_shared_ips(&mut conn) {
             Ok(0) => {}
-            Ok(n) => info!("dropped {n} routing table nodes sharing an IP with another"),
-            Err(e) => warn!("couldn't apply one node per IP to the routing table: {e}"),
+            Ok(n) => info!("dropped {n} routing table nodes sharing an address with another"),
+            Err(e) => warn!("couldn't apply one node per address to the routing table: {e}"),
         }
-        let observed = known_external_ip(&mut conn)?;
+        let observed = known_external_ip(&mut conn, family)?;
+        let external_addr = external_addr.filter(|ip| {
+            let ours = Family::of_ip(ip) == family;
+            if !ours {
+                warn!("ignoring external address {ip} for the {family} node");
+            }
+            ours
+        });
         let external_addr = match external_addr.or(observed) {
             Some(ip) => {
                 info!("BEP 42 node id for external address {ip}");
                 ip
             }
             None => {
-                warn!("external address not known yet: the node id is not BEP 42 compliant until the next start");
-                Ipv4Addr::UNSPECIFIED
+                warn!(
+                    "external {family} address not known yet: the node id is not BEP 42 compliant until the next start"
+                );
+                match family {
+                    Family::V4 => Ipv4Addr::UNSPECIFIED.into(),
+                    Family::V6 => Ipv6Addr::UNSPECIFIED.into(),
+                }
             }
         };
         let our_id = resume_identity(&mut conn, external_addr)?;
@@ -289,10 +328,31 @@ impl DhtSession {
         self
     }
 
-    pub async fn bootstrap(&self, known_nodes: Vec<SocketAddrV4>) -> Result<(), OurError> {
+    /// Makes `self` and `other`, nodes of the two address families on this host, aware of each
+    /// other (BEP 32): each answers a `want` for the other's family from the other's table, and
+    /// while one has few nodes, the other's lookups ask for its family too and hand it what
+    /// comes back. Panics if both are of the same family; a second pairing is ignored.
+    pub fn pair_with(&self, other: &DhtSession) {
+        assert_ne!(self.family(), other.family(), "a pair is one node per address family");
+        let _ = self.state.sibling.set(Arc::downgrade(&other.state));
+        let _ = other.state.sibling.set(Arc::downgrade(&self.state));
+    }
+
+    /// The address family of this node, its socket's
+    pub fn family(&self) -> Family {
+        self.state.family
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Bootstraps from those of `known_nodes` in this node's address family; the rest are
+    /// skipped.
+    pub async fn bootstrap(&self, known_nodes: Vec<SocketAddr>) -> Result<(), OurError> {
         let mut bootstrap_join_set = JoinSet::new();
 
-        for contact in known_nodes {
+        for contact in known_nodes.into_iter().filter(|c| Family::of(c) == self.family()) {
             bootstrap_join_set
                 .build_task()
                 .name(&format!("bootstrap with {contact}"))
@@ -302,11 +362,16 @@ impl DhtSession {
 
         bootstrap_join_set.join_all().await;
 
-        info!("DHT bootstrapped, routing table has {} nodes", self.node_count());
+        info!(
+            "{} DHT bootstrapped, routing table has {} nodes",
+            self.family(),
+            self.node_count()
+        );
 
         Ok(())
     }
 
+    /// Nodes in this family's routing table
     pub fn node_count(&self) -> usize {
         self.routing_table.node_count()
     }
@@ -353,6 +418,31 @@ impl DhtSession {
             .spawn(async move { routing_table.run(router_inbox).await })
             .unwrap();
 
+        // nodes of the other family that answers carry (asked for with `want`) go to the
+        // paired node's table
+        let state = self.state.clone();
+        let mut inbox = self.rpc_manager.subscribe_inbound();
+        join_set
+            .build_task()
+            .name("cross-family seeding")
+            .spawn(async move {
+                let other = state.family.other();
+                while let Some((msg, _)) = inbox.recv().await {
+                    let KrpcBody::FindNodeGetPeersResponse(res) = &msg.body else {
+                        continue;
+                    };
+                    let nodes = res.nodes_of(other);
+                    if nodes.is_empty() {
+                        continue;
+                    }
+                    let Some(sibling) = state.sibling() else { continue };
+                    for node in nodes {
+                        sibling.routing_table.add(node.id(), node.end_point());
+                    }
+                }
+            })
+            .unwrap();
+
         let server = self.server.clone();
         join_set
             .build_task()
@@ -386,7 +476,7 @@ impl DhtSession {
     ///
     /// This is subject to change in the future.
     #[tracing::instrument(skip_all)]
-    async fn bootstrap_from(dht: DhtClient, endpoint: SocketAddrV4) -> Result<(), OurError> {
+    async fn bootstrap_from(dht: DhtClient, endpoint: SocketAddr) -> Result<(), OurError> {
         let our_id = dht.our_id();
 
         info!("bootstrapping with {endpoint}");
@@ -493,15 +583,54 @@ mod tests {
 
 #[cfg(test)]
 mod recompute_tests {
-    use super::resume_identity;
-    use super::{OBSERVED_IP_KEY, known_external_ip};
+    use super::{OBSERVED_IP_KEY, known_external_ip, misc_key, random_idv4, random_idv6, resume_identity};
     use crate::dht::routing_table::bucket_index;
     use crate::schema::node::dsl as node_dsl;
     use crate::test_support::memory_pool;
-    use crate::types::NodeId;
+    use crate::types::{Family, NodeId};
     use crate::utils::{base64_enc, db_put};
     use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// BEP 42's check: the top 21 bits are the CRC32C of the masked address with the id's
+    /// last byte's low 3 bits mixed in
+    fn bep42_valid(id: &NodeId, ip: IpAddr) -> bool {
+        let mut masked = match ip {
+            IpAddr::V4(ip) => ip
+                .octets()
+                .iter()
+                .zip([0x03, 0x0f, 0x3f, 0xff])
+                .map(|(b, m)| b & m)
+                .collect(),
+            IpAddr::V6(ip) => ip.octets()[..8]
+                .iter()
+                .zip([0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff])
+                .map(|(b, m)| b & m)
+                .collect::<Vec<u8>>(),
+        };
+        masked[0] |= (id.0[19] & 0x07) << 5;
+        let crc = crc32c::crc32c(&masked);
+        id.0[0] == (crc >> 24) as u8 && id.0[1] == (crc >> 16) as u8 && (id.0[2] & 0xf8) == ((crc >> 8) as u8 & 0xf8)
+    }
+
+    #[test]
+    fn node_ids_follow_bep_42_for_both_families() {
+        // BEP 42's own test vector: 124.31.75.21 with rand 1 starts 5f bf bf
+        let id = random_idv4(&Ipv4Addr::new(124, 31, 75, 21), 1);
+        assert_eq!(&id.0[..2], &[0x5f, 0xbf]);
+        assert_eq!(id.0[2] & 0xf8, 0xb8);
+        assert_eq!(id.0[19], 1);
+
+        let v6: Ipv6Addr = "2001:470:1:2::5".parse().unwrap();
+        for rand in [0u8, 7, 86, 255] {
+            let id = random_idv6(&v6, rand);
+            assert!(bep42_valid(&id, v6.into()));
+            assert_eq!(id.0[19], rand);
+        }
+        // the same /64 makes the same prefix; the interface id doesn't count
+        let other: Ipv6Addr = "2001:470:1:2:ffff::9".parse().unwrap();
+        assert!(bep42_valid(&random_idv6(&v6, 86), other.into()));
+    }
 
     #[test]
     fn identity_change_recomputes_buckets() {
@@ -517,9 +646,11 @@ mod recompute_tests {
         diesel::insert_into(node_dsl::node)
             .values(crate::models::NodeRow {
                 id: peer_node.0.to_vec(),
+                family: Family::V4.db(),
                 bucket: bucket_index(&NodeId([0; 20]), &peer_node),
                 last_contacted: 0,
                 ip_addr: "10.0.0.1".to_string(),
+                ip_group: None,
                 port: 6881,
                 failed_requests: 0,
                 removed: false,
@@ -528,8 +659,10 @@ mod recompute_tests {
             .unwrap();
 
         // our IP changed: a new identity must be adopted and buckets recomputed against it
-        let new_id = resume_identity(&mut conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
+        let new_ip = IpAddr::from([5, 6, 7, 8]);
+        let new_id = resume_identity(&mut conn, new_ip).unwrap();
         assert_ne!(new_id, NodeId([0; 20]), "a new identity must be adopted");
+        assert!(bep42_valid(&new_id, new_ip));
 
         let stored: i32 = node_dsl::node
             .filter(node_dsl::id.eq(peer_node.0.to_vec()))
@@ -539,33 +672,195 @@ mod recompute_tests {
         assert_eq!(stored, bucket_index(&new_id, &peer_node));
 
         // the new address is remembered with the id, so the next start keeps this identity
-        let again = resume_identity(&mut conn, Ipv4Addr::new(5, 6, 7, 8)).unwrap();
+        let again = resume_identity(&mut conn, new_ip).unwrap();
         assert_eq!(again, new_id);
+    }
+
+    #[test]
+    fn each_family_keeps_its_own_identity() {
+        let pool = memory_pool();
+        let mut conn = pool.get().unwrap();
+        let v4 = resume_identity(&mut conn, IpAddr::from([5, 6, 7, 8])).unwrap();
+
+        // not knowing our IPv6 address yet: a random id, kept while that stays so
+        let unknown = IpAddr::from(Ipv6Addr::UNSPECIFIED);
+        let v6 = resume_identity(&mut conn, unknown).unwrap();
+        assert_ne!(v4, v6);
+        assert_eq!(resume_identity(&mut conn, unknown).unwrap(), v6);
+
+        // learning it: a BEP 42 id, and the IPv4 identity is untouched
+        let known: IpAddr = "2001:470:1:2::5".parse().unwrap();
+        let v6_known = resume_identity(&mut conn, known).unwrap();
+        assert_ne!(v6_known, v6);
+        assert!(bep42_valid(&v6_known, known));
+        assert_eq!(resume_identity(&mut conn, IpAddr::from([5, 6, 7, 8])).unwrap(), v4);
     }
 
     #[test]
     fn what_other_nodes_saw_last_time_is_used_when_the_caller_knows_nothing() {
         let pool = memory_pool();
         let mut conn = pool.get().unwrap();
-        assert_eq!(known_external_ip(&mut conn).unwrap(), None);
+        assert_eq!(known_external_ip(&mut conn, Family::V4).unwrap(), None);
 
         db_put(OBSERVED_IP_KEY.to_string(), "5.6.7.8".to_string(), &mut conn).unwrap();
-        assert_eq!(known_external_ip(&mut conn).unwrap(), Some(Ipv4Addr::new(5, 6, 7, 8)));
+        db_put(
+            misc_key(OBSERVED_IP_KEY, Family::V6),
+            "2001:470:1:2::5".to_string(),
+            &mut conn,
+        )
+        .unwrap();
+        assert_eq!(
+            known_external_ip(&mut conn, Family::V4).unwrap(),
+            Some(IpAddr::from([5, 6, 7, 8]))
+        );
+        assert_eq!(
+            known_external_ip(&mut conn, Family::V6).unwrap(),
+            Some("2001:470:1:2::5".parse().unwrap())
+        );
     }
 }
 
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    use diesel_migrations::MigrationHarness;
+
+    fn scratch_db(name: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("midwest-mainline-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("dht.db").to_str().unwrap().to_string();
+        (dir, db)
+    }
 
     #[tokio::test]
     async fn a_fresh_database_file_gets_its_schema() {
-        let dir = std::env::temp_dir().join(format!("midwest-mainline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("dht.db");
+        let (dir, db) = scratch_db("fresh");
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let dht = DhtSession::with_stable_id(socket, Some(Ipv4Addr::new(1, 2, 3, 4)), db.to_str().unwrap()).unwrap();
+        let dht = DhtSession::with_stable_id(socket, Some(IpAddr::from([1, 2, 3, 4])), &db).unwrap();
         assert_eq!(dht.node_count(), 0, "the node table exists and is empty");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_ipv4_only_routing_table_becomes_the_ipv4_family() {
+        let (dir, db) = scratch_db("upgrade");
+        let mut conn = SqliteConnection::establish(&db).unwrap();
+        // the schema as it was before IPv6
+        for _ in 0..3 {
+            conn.run_next_migration(MIGRATIONS).unwrap();
+        }
+        conn.batch_execute(
+            "insert into node (id, bucket, last_contacted, ip_addr, port, failed_requests)
+             values (x'0101010101010101010101010101010101010101', 7, 1, '8.8.8.8', 6881, 0)",
+        )
+        .unwrap();
+        conn.run_pending_migrations(MIGRATIONS).unwrap();
+
+        use crate::schema::node::dsl::*;
+        let row: (i32, i32, Option<String>) = node.select((family, bucket, ip_group)).first(&mut conn).unwrap();
+        assert_eq!(row, (4, 7, Some("8.8.8.8".to_string())));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Node {
+        session: Arc<DhtSession>,
+        _run: tokio::task::JoinHandle<()>,
+    }
+
+    async fn node(dir: &std::path::Path, name: &str, bind: SocketAddr) -> Node {
+        let socket = UdpSocket::bind(bind).await.unwrap();
+        let db = dir.join(format!("{name}.db"));
+        let session = Arc::new(DhtSession::with_stable_id(socket, None, db.to_str().unwrap()).unwrap());
+        let run = tokio::spawn({
+            let session = session.clone();
+            async move { session.run().await }
+        });
+        Node { session, _run: run }
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("midwest-mainline-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const V6_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+    const V4_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lookup_and_an_announce_over_ipv6() {
+        let dir = scratch_dir("v6-lookup");
+        let b = node(&dir, "b", V6_LOOPBACK).await;
+        let a = node(&dir, "a", V6_LOOPBACK).await;
+        let c = node(&dir, "c", V6_LOOPBACK).await;
+        assert_eq!(a.session.family(), Family::V6);
+
+        let b_addr = b.session.local_addr();
+        a.session.bootstrap(vec![b_addr]).await.unwrap();
+        assert_eq!(a.session.node_count(), 1, "A knows B");
+
+        // A looks the hash up at B, gets a token, and announces itself there
+        let info_hash = InfoHash([0x42; 20]);
+        let found = a.session.get_peers(info_hash).await.unwrap();
+        assert!(found.peers.is_empty());
+        let (_, token) = found
+            .announce_candidates
+            .into_iter()
+            .find(|(n, _)| n.end_point() == b_addr)
+            .expect("B hands out a token");
+        a.session
+            .handle()
+            .announce_peers(b_addr, info_hash, Some(1234), token)
+            .await
+            .unwrap();
+
+        // C, knowing only B, finds A's announce: an 18-byte IPv6 value
+        c.session.bootstrap(vec![b_addr]).await.unwrap();
+        let found = c.session.get_peers(info_hash).await.unwrap();
+        assert_eq!(found.peers, vec![SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 1234)]);
+        // B learned of both, in its IPv6 table
+        assert_eq!(b.session.node_count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_paired_ipv4_node_seeds_the_ipv6_table() {
+        let dir = scratch_dir("v6-seed");
+        // a dual-stack remote: its IPv6 table knows one node, X
+        let remote4 = node(&dir, "remote", V4_LOOPBACK).await;
+        let remote6 = node(&dir, "remote", V6_LOOPBACK).await;
+        remote4.session.pair_with(&remote6.session);
+        let x = node(&dir, "x", V6_LOOPBACK).await;
+        x.session.bootstrap(vec![remote6.session.local_addr()]).await.unwrap();
+        assert_eq!(remote6.session.node_count(), 1);
+
+        // and us, dual-stack too, bootstrapping over IPv4 only
+        let us4 = node(&dir, "us", V4_LOOPBACK).await;
+        let us6 = node(&dir, "us", V6_LOOPBACK).await;
+        us4.session.pair_with(&us6.session);
+        us4.session.bootstrap(vec![remote4.session.local_addr()]).await.unwrap();
+
+        // our IPv4 lookups asked for nodes6 too, and they went to the IPv6 table
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while us6.session.node_count() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let x_id = x.session.handle().our_id();
+        let seeded = us6
+            .session
+            .routing_table
+            .find_exact(&x_id)
+            .expect("X came in as nodes6");
+        assert_eq!(seeded.end_point(), x.session.local_addr());
+        assert_eq!(us4.session.routing_table.find_exact(&x_id), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -189,6 +189,7 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
 /// BEP 5 as a peer source: every DHT_ANNOUNCE_INTERVAL (sooner while lookups come back empty,
 /// see DHT_RETRY), look the info hash up, hand whatever
 /// peers come back to the swarm, and announce our port to the nodes that issued tokens.
+/// With an IPv6 node too (BEP 32), both DHTs are looked up at once and their peers merged.
 /// Waits for the node to come up first, and does nothing at all if it never does.
 async fn dht_announcer(
     info_hash: InfoHash,
@@ -213,96 +214,106 @@ async fn dht_announcer(
 
     loop {
         let started = Instant::now();
-        // peers go to the swarm as nodes return them; waiting for the lookup to converge
-        // would leave them idle for the seconds that takes
-        let early = events.clone();
-        let streamed = handle.client.get_peers_with(info_hash, move |peers| {
-            if let Some(events) = early.upgrade() {
-                let peers = peers.iter().copied().map(SocketAddr::V4).collect();
-                let _ = events.try_send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht));
+        let lookups = handle.clients().into_iter().map(|client| {
+            // peers go to the swarm as nodes return them; waiting for the lookup to converge
+            // would leave them idle for the seconds that takes
+            let early = events.clone();
+            let span = tracing::info_span!(
+                "dht.lookup",
+                info_hash = %info_hash,
+                family = %client.family(),
+                peers = tracing::field::Empty,
+                announce_to = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
+            async move {
+                let streamed = client.get_peers_with(info_hash, move |peers| {
+                    if let Some(events) = early.upgrade() {
+                        let _ = events.try_send(SwarmEvent::PeersDiscovered(peers.to_vec(), PeerSource::Dht));
+                    }
+                });
+                let lookup = streamed.instrument(span.clone()).await;
+                match &lookup {
+                    Ok(result) => {
+                        span.record("peers", result.peers.len());
+                        span.record("announce_to", result.announce_candidates.len());
+                    }
+                    Err(e) => {
+                        span.record("error", format!("{e:#}"));
+                    }
+                }
+                (client, lookup)
             }
         });
-        let span = tracing::info_span!(
-            "dht.lookup",
-            info_hash = %info_hash,
-            peers = tracing::field::Empty,
-            announce_to = tracing::field::Empty,
-            error = tracing::field::Empty,
-        );
-        let lookup = tokio::select! {
+        let lookups = tokio::select! {
             _ = shutdown.cancelled() => return,
-            lookup = streamed.instrument(span.clone()) => lookup,
+            lookups = futures::future::join_all(lookups) => lookups,
         };
-        match &lookup {
-            Ok(result) => {
-                span.record("peers", result.peers.len());
-                span.record("announce_to", result.announce_candidates.len());
-            }
-            Err(e) => {
-                span.record("error", format!("{e:#}"));
+        let mut peers: Vec<SocketAddr> = vec![];
+        let mut announces = vec![];
+        let mut errors = vec![];
+        for (client, lookup) in lookups {
+            match lookup {
+                Ok(result) => {
+                    info!(
+                        "{} DHT lookup found {} peers, {} nodes accept our announce",
+                        client.family(),
+                        result.peers.len(),
+                        result.announce_candidates.len()
+                    );
+                    peers.extend(result.peers);
+                    announces.extend(result.announce_candidates.into_iter().map(|c| (client.clone(), c)));
+                }
+                Err(e) => {
+                    warn!("{} DHT lookup for {info_hash:?} failed: {e:#}", client.family());
+                    errors.push(format!("{e:#}"));
+                }
             }
         }
-        drop(span);
-        let wait = match &lookup {
-            Ok(result) if !result.peers.is_empty() => {
-                retry = DHT_RETRY;
-                DHT_ANNOUNCE_INTERVAL
-            }
-            _ => {
-                let wait = retry;
-                retry = (retry * 2).min(DHT_ANNOUNCE_INTERVAL);
-                wait
-            }
+        let failed = peers.is_empty() && announces.is_empty() && !errors.is_empty();
+        let wait = if !peers.is_empty() {
+            retry = DHT_RETRY;
+            DHT_ANNOUNCE_INTERVAL
+        } else {
+            let wait = retry;
+            retry = (retry * 2).min(DHT_ANNOUNCE_INTERVAL);
+            wait
         };
-        match lookup {
-            Ok(result) => {
-                info!(
-                    "DHT lookup found {} peers, {} nodes accept our announce",
-                    result.peers.len(),
-                    result.announce_candidates.len()
-                );
-                bus.emit(BusEvent::DhtLookup {
-                    info_hash,
-                    peers: result.peers.len(),
-                    took_ms: started.elapsed().as_millis() as u64,
-                });
-                report(&board, slot, |row| {
-                    row.state = TrackerState::Working;
-                    row.peers = result.peers.len();
-                    row.next_announce = Some(Instant::now() + wait);
-                });
-                // the whole set again, in case a batch above found the queue full; the swarm
-                // and the metadata fetch both skip addresses they already have
-                let Some(events) = events.upgrade() else { return };
-                let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
-                if events
-                    .send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                // all at once and in the background: one at a time, each dead node held the next
-                // lookup back by a full request timeout
-                let client = handle.client.clone();
-                tokio::spawn(futures::future::join_all(result.announce_candidates.into_iter().map(
-                    move |(node, token)| {
-                        let client = client.clone();
-                        async move {
-                            if let Err(e) = client.announce_peers(node.end_point(), info_hash, port, token).await {
-                                tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
-                            }
-                        }
-                    },
-                )));
+        if failed {
+            report(&board, slot, |row| {
+                row.state = TrackerState::Failed(errors.join("; "));
+                row.next_announce = Some(Instant::now() + wait);
+            });
+        } else {
+            bus.emit(BusEvent::DhtLookup {
+                info_hash,
+                peers: peers.len(),
+                took_ms: started.elapsed().as_millis() as u64,
+            });
+            report(&board, slot, |row| {
+                row.state = TrackerState::Working;
+                row.peers = peers.len();
+                row.next_announce = Some(Instant::now() + wait);
+            });
+            // the whole set again, in case a batch above found the queue full; the swarm
+            // and the metadata fetch both skip addresses they already have
+            let Some(events) = events.upgrade() else { return };
+            if events
+                .send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht))
+                .await
+                .is_err()
+            {
+                return;
             }
-            Err(e) => {
-                warn!("DHT lookup for {info_hash:?} failed: {e:#}");
-                report(&board, slot, |row| {
-                    row.state = TrackerState::Failed(format!("{e:#}"));
-                    row.next_announce = Some(Instant::now() + wait);
-                });
-            }
+            // all at once and in the background: one at a time, each dead node held the next
+            // lookup back by a full request timeout
+            tokio::spawn(futures::future::join_all(announces.into_iter().map(
+                move |(client, (node, token))| async move {
+                    if let Err(e) = client.announce_peers(node.end_point(), info_hash, port, token).await {
+                        tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
+                    }
+                },
+            )));
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,

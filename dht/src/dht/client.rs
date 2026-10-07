@@ -6,21 +6,21 @@ use futures::StreamExt;
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::dht::routing_table::one_node_per_ip;
+use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
-    KrpcBody, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery,
-    ping_query::PingQuery,
+    KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
+    get_peers_query::GetPeersQuery, ping_query::PingQuery,
 };
 use crate::our_error::{OurError, naur};
-use crate::types::{InfoHash, NodeId, NodeInfo, Token, cmp_resp};
+use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 
 /// What one node answers a `get_peers` with: a write token, closer nodes, and peers
-type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddrV4>);
+type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddr>);
 
 const ROUNDS_LIMIT: i32 = 8;
 /// Queries in flight at once in a lookup. BEP 5 suggests 3; more costs little on UDP and finishes
@@ -35,12 +35,15 @@ const LOOKUP_SEEDS: u16 = 32;
 /// Bounds on one get_peers lookup, for a routing table so sparse or stale it never converges.
 const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Below this many nodes, the paired node of the other family is still bootstrapping, and
+/// our lookups ask for its family's nodes too.
+const SEED_SIBLING_BELOW: usize = 500;
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
 #[derive(Debug)]
 pub struct GetPeersResult {
     /// every peer contact found for the info hash
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
     /// nodes that issued us a token and will accept an announce_peer from us
     pub announce_candidates: Vec<(NodeInfo, Token)>,
 }
@@ -59,13 +62,29 @@ impl DhtClient {
         self.state.our_id
     }
 
+    /// The address family of the DHT this client looks things up in
+    pub fn family(&self) -> Family {
+        self.state.family
+    }
+
+    /// BEP 32: while the paired node of the other family has few nodes, ask for both
+    /// families' nodes and hand it the other family's (see `DhtSession::pair_with`); after
+    /// that, only our own (the default, so no `want` at all).
+    fn want(&self) -> Option<Want> {
+        let sibling = self.state.sibling()?;
+        (sibling.routing_table.node_count() < SEED_SIBLING_BELOW).then_some(Want::BOTH)
+    }
+
     #[tracing::instrument(skip(self))]
-    pub async fn ping(&self, peer: SocketAddrV4) -> Result<NodeId, OurError> {
+    pub async fn ping(&self, peer: SocketAddr) -> Result<NodeId, OurError> {
         let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.state.our_id));
 
         let response = self.state.rpc_manager.query(ping_msg, &peer, REQ_TIMEOUT).await?;
 
         return if let KrpcBody::PingAnnouncePeerResponse(response) = response.body {
+            // the routing table learns of it from the broker too, but in its own time; a
+            // lookup right after the ping (bootstrapping) needs it there now
+            self.state.routing_table.add(*response.target_id(), peer);
             Ok(*response.target_id())
         } else {
             warn!("Unexpected response to ping: {:?}", response);
@@ -86,6 +105,7 @@ impl DhtClient {
 
         // find the closest nodes that we know
         let mut closest = self.state.routing_table.find_closest(target);
+        let want = self.want();
         // ids we've already sent a query to; consulted and updated every round
         let mut queried: HashSet<NodeId> = HashSet::new();
         let mut querying: Vec<NodeInfo> = vec![];
@@ -120,7 +140,12 @@ impl DhtClient {
 
             let round_results = querying
                 .iter()
-                .map(|node| async move { (node.id(), self.send_find_nodes_rpc(node.end_point(), target).await) })
+                .map(|node| async move {
+                    (
+                        node.id(),
+                        self.send_find_nodes_rpc(node.end_point(), target, want).await,
+                    )
+                })
                 .collect::<Vec<_>>();
             let round_results = join_all(round_results).await;
 
@@ -128,11 +153,16 @@ impl DhtClient {
             for (node_id, result) in round_results {
                 match result {
                     Ok(nodes) => returned_nodes.extend(nodes),
+                    Err(OurError::IoError(_)) => {}
                     // timeouts and the like: record the failure so repeated ones get the
                     // node evicted
                     Err(_) => self.state.routing_table.mark_failed(&node_id),
                 }
             }
+
+            // a node that just heard from us lists us; looking ourselves up (bootstrapping)
+            // must not stop there
+            returned_nodes.retain(|n| n.id() != self.state.our_id);
 
             // the node we reached to might be dead already, which will return as a timeout
             if returned_nodes.is_empty() {
@@ -160,16 +190,21 @@ impl DhtClient {
 
     // attempt to find the target node via a peer on this address
     #[tracing::instrument(skip(self))]
-    async fn send_find_nodes_rpc(&self, dest: SocketAddrV4, target: NodeId) -> Result<Vec<NodeInfo>, OurError> {
+    async fn send_find_nodes_rpc(
+        &self,
+        dest: SocketAddr,
+        target: NodeId,
+        want: Option<Want>,
+    ) -> Result<Vec<NodeInfo>, OurError> {
         // construct the message to query our friends
-        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.state.our_id, target));
+        let query = KrpcBody::FindNodeQuery(FindNodeQuery::new(self.state.our_id, target).with_want(want));
 
         // send the message and await for a response
         let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
         let body = response.body;
 
         if let KrpcBody::FindNodeGetPeersResponse(find_node_response) = body {
-            let mut nodes: Vec<_> = find_node_response.nodes().clone();
+            let mut nodes: Vec<_> = find_node_response.nodes_of(self.state.family).to_vec();
 
             // some clients will return duplicate nodes, so we remove them
             nodes.sort_unstable();
@@ -192,10 +227,10 @@ impl DhtClient {
     pub async fn get_peers_with(
         &self,
         info_hash: InfoHash,
-        mut found: impl FnMut(&[SocketAddrV4]) + Send,
+        mut found: impl FnMut(&[SocketAddr]) + Send,
     ) -> Result<GetPeersResult, OurError> {
         // peers others announced *to us* are served from the local store immediately
-        let known_peers = self.state.swarm_peers(&info_hash);
+        let known_peers = self.state.swarm_peers(&info_hash, self.state.family);
         if !known_peers.is_empty() {
             found(&known_peers);
             return Ok(GetPeersResult {
@@ -212,12 +247,12 @@ impl DhtClient {
         let by_distance = |l: &NodeInfo, r: &NodeInfo| cmp_resp(&l.id(), &r.id(), &target);
         // one node per public IP (see `RoutingTable::ip_taken`), here too: a Sybil's many ids
         // around the target would otherwise fill every slot of the lookup
-        let mut seen: HashSet<NodeId> = HashSet::new();
-        let mut seen_ips: HashSet<Ipv4Addr> = HashSet::new();
+        let mut seen: HashSet<NodeId> = HashSet::from([self.state.our_id]);
+        let mut seen_ips: HashSet<IpAddr> = HashSet::new();
         let mut fresh_node = move |n: &NodeInfo| {
-            let ip = *n.end_point().ip();
-            seen.insert(n.id()) && (!one_node_per_ip(&ip) || seen_ips.insert(ip))
+            seen.insert(n.id()) && sybil_group(&n.end_point().ip()).is_none_or(|group| seen_ips.insert(group))
         };
+        let want = self.want();
         let mut known = self.state.routing_table.find_closest_n(target, LOOKUP_SEEDS);
         known.sort_unstable_by(by_distance);
         known.retain(|n| fresh_node(n));
@@ -225,7 +260,7 @@ impl DhtClient {
         // nodes that answered usefully, closest first; the lookup is done when nothing
         // unqueried is closer than the LOOKUP_K-th of these
         let mut answered: Vec<NodeInfo> = vec![];
-        let mut peers: Vec<SocketAddrV4> = vec![];
+        let mut peers: Vec<SocketAddr> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
         let mut in_flight = FuturesUnordered::new();
         let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
@@ -241,7 +276,7 @@ impl DhtClient {
                     break;
                 }
                 queried.insert(node.id());
-                in_flight.push(async move { (node, self.send_get_peers_rpc(node.end_point(), info_hash).await) });
+                in_flight.push(async move { (node, self.send_get_peers_rpc(node.end_point(), info_hash, want).await) });
             }
             let Ok(Some((node, result))) = tokio::time::timeout_at(deadline, in_flight.next()).await else {
                 break;
@@ -281,6 +316,8 @@ impl DhtClient {
                         known.sort_unstable_by(by_distance);
                     }
                 }
+                // our own network can't reach the node (no IPv6 route, say): not its fault
+                Err(OurError::IoError(_)) => {}
                 Err(_) => self.state.routing_table.mark_failed(&node.id()),
             }
         }
@@ -297,7 +334,7 @@ impl DhtClient {
     #[tracing::instrument(skip(self))]
     pub async fn announce_peers(
         &self,
-        recipient: SocketAddrV4,
+        recipient: SocketAddr,
         info_hash: InfoHash,
         port: Option<u16>,
         token: Token,
@@ -323,9 +360,14 @@ impl DhtClient {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn send_get_peers_rpc(&self, dest: SocketAddrV4, info_hash: InfoHash) -> Result<GetPeersReply, OurError> {
+    async fn send_get_peers_rpc(
+        &self,
+        dest: SocketAddr,
+        info_hash: InfoHash,
+        want: Option<Want>,
+    ) -> Result<GetPeersReply, OurError> {
         // construct the message to query our friends
-        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash));
+        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash).with_want(want));
 
         // send the message and await for a response
         let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
@@ -338,11 +380,11 @@ impl DhtClient {
             KrpcBody::FindNodeGetPeersResponse(response) => {
                 let token = response.token().cloned();
 
-                let mut nodes = response.nodes().clone();
+                let mut nodes = response.nodes_of(self.state.family).to_vec();
                 nodes.sort_unstable_by_key(|node| node.end_point());
                 nodes.dedup();
 
-                let mut values = response.values().clone();
+                let mut values = response.values().to_vec();
                 values.sort_unstable();
                 values.dedup();
 
@@ -385,15 +427,13 @@ mod tests {
     #[tokio::test]
     async fn get_peers_iterates_referrals_and_captures_tokens() {
         // node B has the goods: a peer contact and a token
-        let socket_b = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let socket_b = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let SocketAddr::V4(addr_b) = socket_b.local_addr().unwrap() else {
             unreachable!("bound to an ipv4 address");
         };
         let node_b = NodeInfo::new(NodeId([0xBB; 20]), addr_b);
         let token_b = Token::from_bytes(b"tok_b");
-        let peer_x: SocketAddrV4 = "10.9.8.7:6881".parse().unwrap();
+        let peer_x: SocketAddr = "10.9.8.7:6881".parse().unwrap();
         let body_b = KrpcBody::FindNodeGetPeersResponse(
             ResBuilder::new(NodeId([0xBB; 20]))
                 .with_token(token_b.clone())
@@ -403,9 +443,7 @@ mod tests {
         tokio::spawn(fake_dht_node(socket_b, body_b));
 
         // node A only refers us to B (with its own token)
-        let socket_a = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let socket_a = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let SocketAddr::V4(addr_a) = socket_a.local_addr().unwrap() else {
             unreachable!("bound to an ipv4 address");
         };
@@ -423,13 +461,11 @@ mod tests {
         let swarm_pool = memory_pool();
 
         let our_id = NodeId([0x01; 20]);
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let broker = RpcManager::new(socket, router_pool.clone(), Arc::new(TxnIdGenerator::new()), None);
         broker.run().await.unwrap();
         let routing_table = RoutingTable::new(our_id, broker.clone(), router_pool);
-        routing_table.add(NodeId([0xAA; 20]), addr_a);
+        routing_table.add(NodeId([0xAA; 20]), addr_a.into());
 
         let state = Arc::new(SharedState::new(our_id, routing_table, broker, swarm_pool));
         let client = DhtClient::new(state);

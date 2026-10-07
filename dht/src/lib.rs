@@ -44,6 +44,11 @@
 //! - [`dht::DhtSession`] wires it all together: resumes or mints a BEP 42 node id from
 //!   the database, then `run()` drives the broker, the routing table, and the server.
 //!
+//! IPv6 is BEP 32: a session is one address family (its socket's), with its own routing
+//! table and node id; a dual-stack host runs one of each over the same database and pairs
+//! them ([`dht::DhtSession::pair_with`]), so `want`/`nodes6` let each seed and answer for
+//! the other.
+//!
 //! Two deliberate deviations from BEP 5: the routing table is 160 flat buckets of 1024
 //! nodes instead of k = 8 with bucket splitting (eviction keeps it fresh; see the note on
 //! [`dht::routing_table::RoutingTable`]), and all diesel calls are synchronous — fine for
@@ -57,6 +62,7 @@
 //! - [x] ping
 //! - [x] security extension [BEP-42](https://www.bittorrent.org/beps/bep_0042.html)
 //! - [x] announce
+//! - [x] IPv6 [BEP-32](https://www.bittorrent.org/beps/bep_0032.html)
 //! - [x] respond to ping
 //! - [x] respond to get peers
 //! - [x] respond to announce

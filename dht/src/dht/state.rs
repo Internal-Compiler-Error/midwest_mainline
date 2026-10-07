@@ -5,14 +5,15 @@
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{SqliteConnection, prelude::*};
 use rand::RngExt;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 
 use crate::dht::routing_table::RoutingTable;
 use crate::dht::rpc_manager::RpcManager;
 use crate::schema::{peer, swarm};
 use crate::token_generator::TokenGenerator;
-use crate::types::{InfoHash, NodeId};
+use crate::types::{Family, InfoHash, NodeId};
 use crate::utils::unix_timestmap_ms;
 
 // TODO: make these configurable some day
@@ -39,7 +40,7 @@ pub enum Retention {
 /// A peer announced to us, as the store remembers it. Timestamps are unix milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredPeer {
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
     pub first_announced: i64,
     pub last_announced: i64,
 }
@@ -48,21 +49,26 @@ fn lifetime_cutoff() -> i64 {
     unix_timestmap_ms() - PEER_LIFETIME.as_millis() as i64
 }
 
-fn parse_addr(ip: &str, port: i32) -> SocketAddrV4 {
+fn parse_addr(ip: &str, port: i32) -> SocketAddr {
     assert!(port >= 0 && port <= u16::MAX.into(), "port should fit inside an u16");
-    let ip: Ipv4Addr = ip
+    let ip: IpAddr = ip
         .parse()
         .unwrap_or_else(|_| panic!("invalid ip string representation got into the database: {}", ip));
-    SocketAddrV4::new(ip, port as u16)
+    SocketAddr::new(ip, port as u16)
 }
 
 #[derive(Debug)]
 pub(crate) struct SharedState {
     pub(crate) our_id: NodeId,
+    pub(crate) family: Family,
     pub(crate) routing_table: RoutingTable,
     pub(crate) conn: Pool<ConnectionManager<SqliteConnection>>,
     pub(crate) token_generator: TokenGenerator,
     pub(crate) rpc_manager: RpcManager,
+    /// the node of the other address family on this host, if any (see
+    /// [`DhtSession::pair_with`](crate::dht::DhtSession::pair_with)); weak, as each points at
+    /// the other
+    pub(crate) sibling: OnceLock<Weak<SharedState>>,
 }
 
 impl SharedState {
@@ -74,24 +80,46 @@ impl SharedState {
     ) -> Self {
         Self {
             our_id,
+            family: rpc_manager.family(),
             routing_table,
             conn,
             token_generator: TokenGenerator::new(rand::rng().random()),
             rpc_manager,
+            sibling: OnceLock::new(),
         }
     }
 
-    /// Peers for `info_hash` that were announced *to us* within [`PEER_LIFETIME`], freshest
-    /// first, capped so a get_peers response fits a datagram.
-    pub(crate) fn swarm_peers(&self, info_hash: &InfoHash) -> Vec<SocketAddrV4> {
+    pub(crate) fn sibling(&self) -> Option<std::sync::Arc<SharedState>> {
+        self.sibling.get()?.upgrade()
+    }
+
+    /// The routing table holding `family`'s nodes: ours, or the sibling's
+    pub(crate) fn table_of(&self, family: Family) -> Option<RoutingTable> {
+        if family == self.family {
+            Some(self.routing_table.clone())
+        } else {
+            self.sibling().map(|s| s.routing_table.clone())
+        }
+    }
+
+    /// Peers of `family` for `info_hash` that were announced *to us* within
+    /// [`PEER_LIFETIME`], freshest first, capped so a get_peers response fits BEP 32's 1024
+    /// bytes. A get_peers answer only carries the family it was asked over (BEP 32).
+    pub(crate) fn swarm_peers(&self, info_hash: &InfoHash, family: Family) -> Vec<SocketAddr> {
         let mut conn = self.conn.get().expect("failed to get one connection from pool");
 
-        peer::table
+        let query = peer::table
             .filter(peer::swarm.eq(&info_hash.0))
             .filter(peer::last_announced.ge(lifetime_cutoff()))
             .order(peer::last_announced.desc())
             .select((peer::ip_addr, peer::port))
-            .limit(50)
+            .into_boxed();
+        // an IPv6 address in text always has a colon, an IPv4 one never does
+        let query = match family {
+            Family::V4 => query.filter(peer::ip_addr.not_like("%:%")).limit(50),
+            Family::V6 => query.filter(peer::ip_addr.like("%:%")).limit(25),
+        };
+        query
             .load::<(String, i32)>(&mut conn)
             .unwrap()
             .into_iter()
@@ -154,6 +182,7 @@ mod tests {
     use crate::dht::rpc_manager::RpcManager;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::test_support::memory_pool;
+    use std::net::Ipv4Addr;
     use std::sync::Arc;
     use tokio::net::UdpSocket;
 
@@ -165,7 +194,7 @@ mod tests {
         SharedState::new(id, RoutingTable::new(id, rpc.clone(), pool.clone()), rpc, pool)
     }
 
-    fn announce(state: &SharedState, info_hash: &InfoHash, port: u16, first: i64, last: i64) {
+    fn announce(state: &SharedState, info_hash: &InfoHash, ip: &str, port: u16, first: i64, last: i64) {
         let mut conn = state.conn.get().unwrap();
         diesel::insert_into(swarm::table)
             .values(swarm::info_hash.eq(info_hash.0.to_vec()))
@@ -174,7 +203,7 @@ mod tests {
             .unwrap();
         diesel::insert_into(peer::table)
             .values((
-                peer::ip_addr.eq("10.0.0.1"),
+                peer::ip_addr.eq(ip),
                 peer::port.eq(port as i32),
                 peer::swarm.eq(info_hash.0.to_vec()),
                 peer::first_announced.eq(first),
@@ -191,13 +220,13 @@ mod tests {
         let stale_hash = InfoHash([2; 20]);
         let now = unix_timestmap_ms();
         let two_hours_ago = now - 2 * 60 * 60 * 1000;
-        announce(&state, &fresh_hash, 1000, two_hours_ago, now);
-        announce(&state, &fresh_hash, 1001, two_hours_ago, two_hours_ago);
-        announce(&state, &stale_hash, 1002, two_hours_ago, two_hours_ago);
+        announce(&state, &fresh_hash, "10.0.0.1", 1000, two_hours_ago, now);
+        announce(&state, &fresh_hash, "10.0.0.1", 1001, two_hours_ago, two_hours_ago);
+        announce(&state, &stale_hash, "10.0.0.1", 1002, two_hours_ago, two_hours_ago);
 
-        let fresh = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1000);
-        assert_eq!(state.swarm_peers(&fresh_hash), vec![fresh]);
-        assert!(state.swarm_peers(&stale_hash).is_empty());
+        let fresh: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        assert_eq!(state.swarm_peers(&fresh_hash, Family::V4), vec![fresh]);
+        assert!(state.swarm_peers(&stale_hash, Family::V4).is_empty());
         assert_eq!(state.stored_swarms().len(), 2, "kept until something expires them");
         assert_eq!(state.stored_peers(&fresh_hash).len(), 2);
 
@@ -214,5 +243,24 @@ mod tests {
         let mut conn = state.conn.get().unwrap();
         let swarms: i64 = swarm::table.count().get_result(&mut conn).unwrap();
         assert_eq!(swarms, 1, "a swarm with no peers left goes too");
+    }
+
+    #[tokio::test]
+    async fn peers_are_served_to_their_own_family() {
+        let state = state().await;
+        let hash = InfoHash([1; 20]);
+        let now = unix_timestmap_ms();
+        announce(&state, &hash, "10.0.0.1", 1000, now, now);
+        announce(&state, &hash, "2001:470:1:2::1", 1001, now, now);
+
+        assert_eq!(
+            state.swarm_peers(&hash, Family::V4),
+            vec!["10.0.0.1:1000".parse().unwrap()]
+        );
+        assert_eq!(
+            state.swarm_peers(&hash, Family::V6),
+            vec!["[2001:470:1:2::1]:1001".parse().unwrap()]
+        );
+        assert_eq!(state.stored_peers(&hash).len(), 2);
     }
 }

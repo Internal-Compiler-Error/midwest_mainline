@@ -1,28 +1,33 @@
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 use bendy::encoding::SingleItemEncoder;
 
-use crate::types::{NodeId, NodeInfo, Token};
+use crate::types::{Family, NodeId, NodeInfo, Token};
 
-use super::ToKrpcBody;
+use super::{ToKrpcBody, compact_addr};
 
 /// KRPC responses are not tagged with the query they answer, so find_node and get_peers
-/// responses share one struct: `nodes` covers find_node (and the get_peers fallback),
+/// responses share one struct: `nodes`/`nodes6` cover find_node (and the get_peers fallback),
 /// `values` + `token` cover get_peers.
+///
+/// `nodes` and `nodes6` are `None` when the key is absent, which is not the same as present
+/// and empty: an answer without peers must carry at least one of them.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     queried: NodeId,
     token: Option<Token>,
-    values: Vec<SocketAddrV4>,
-    nodes: Vec<NodeInfo>,
+    values: Vec<SocketAddr>,
+    nodes: Option<Vec<NodeInfo>>,
+    nodes6: Option<Vec<NodeInfo>>,
 }
 
 #[derive(Debug, Hash, Clone)]
 pub struct Builder {
     queried: NodeId,
     token: Option<Token>,
-    values: Vec<SocketAddrV4>,
-    nodes: Vec<NodeInfo>,
+    values: Vec<SocketAddr>,
+    nodes: Option<Vec<NodeInfo>>,
+    nodes6: Option<Vec<NodeInfo>>,
 }
 
 impl Builder {
@@ -31,7 +36,8 @@ impl Builder {
             queried: peer_id,
             token: None,
             values: vec![],
-            nodes: vec![],
+            nodes: None,
+            nodes6: None,
         }
     }
 
@@ -40,32 +46,58 @@ impl Builder {
         self
     }
 
+    /// An IPv4 node goes to `nodes`, an IPv6 one to `nodes6`
     pub fn with_node(mut self, node: NodeInfo) -> Self {
-        self.nodes.push(node);
+        let list = match node.family() {
+            Family::V4 => &mut self.nodes,
+            Family::V6 => &mut self.nodes6,
+        };
+        list.get_or_insert_default().push(node);
         self
     }
 
+    /// The `nodes` key, present even if `nodes` is empty
     pub fn with_nodes(mut self, nodes: &[NodeInfo]) -> Self {
-        self.nodes.extend_from_slice(nodes);
+        self.nodes.get_or_insert_default().extend_from_slice(nodes);
         self
     }
 
-    pub fn with_value(mut self, value: SocketAddrV4) -> Self {
-        self.values.push(value);
+    /// The `nodes6` key, present even if `nodes` is empty
+    pub fn with_nodes6(mut self, nodes: &[NodeInfo]) -> Self {
+        self.nodes6.get_or_insert_default().extend_from_slice(nodes);
         self
     }
 
-    pub fn with_values(mut self, values: &[SocketAddrV4]) -> Self {
+    /// `with_nodes` or `with_nodes6`, by family
+    pub fn with_nodes_of(self, family: Family, nodes: &[NodeInfo]) -> Self {
+        match family {
+            Family::V4 => self.with_nodes(nodes),
+            Family::V6 => self.with_nodes6(nodes),
+        }
+    }
+
+    pub fn with_value(mut self, value: impl Into<SocketAddr>) -> Self {
+        self.values.push(value.into());
+        self
+    }
+
+    pub fn with_values(mut self, values: &[SocketAddr]) -> Self {
         self.values.extend_from_slice(values);
         self
     }
 
+    /// A response with neither peers nor any nodes key gets an empty `nodes`
     pub fn build(self) -> FindNodeGetPeersResponse {
+        let nodes = match (&self.nodes, &self.nodes6) {
+            (None, None) if self.values.is_empty() => Some(vec![]),
+            _ => self.nodes,
+        };
         FindNodeGetPeersResponse {
             queried: self.queried,
             token: self.token,
             values: self.values,
-            nodes: self.nodes,
+            nodes,
+            nodes6: self.nodes6,
         }
     }
 }
@@ -83,13 +115,38 @@ impl FindNodeGetPeersResponse {
         self.token.as_ref()
     }
 
-    pub fn values(&self) -> &Vec<SocketAddrV4> {
+    pub fn values(&self) -> &[SocketAddr] {
         &self.values
     }
 
-    pub fn nodes(&self) -> &Vec<NodeInfo> {
-        &self.nodes
+    /// IPv4 nodes, the `nodes` key
+    pub fn nodes(&self) -> &[NodeInfo] {
+        self.nodes.as_deref().unwrap_or_default()
     }
+
+    /// IPv6 nodes, the `nodes6` key (BEP 32)
+    pub fn nodes6(&self) -> &[NodeInfo] {
+        self.nodes6.as_deref().unwrap_or_default()
+    }
+
+    pub fn nodes_of(&self, family: Family) -> &[NodeInfo] {
+        match family {
+            Family::V4 => self.nodes(),
+            Family::V6 => self.nodes6(),
+        }
+    }
+}
+
+/// Compact node info: the 20-byte id, then the compact address, back to back
+fn compact_nodes(nodes: &[NodeInfo]) -> Vec<u8> {
+    nodes
+        .iter()
+        .flat_map(|node| {
+            let mut raw = node.id().0.to_vec();
+            raw.extend(compact_addr(&node.end_point()));
+            raw
+        })
+        .collect()
 }
 
 impl ToKrpcBody for FindNodeGetPeersResponse {
@@ -106,61 +163,22 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
             }
 
             if !self.values.is_empty() {
-                // values is a list of compact peer contacts, which are a 4 byte ipv4 address and a 2 byte port
-                // number. Unfortunately, the bittorrent people are insane and decided to encode this as a string
-                // using ascii in network/big endian.
+                // values is a list of compact peer contacts: the address and the port as a
+                // string in network byte order, 6 bytes for IPv4 and 18 for IPv6
                 enc.emit_pair_with(b"values", |e| {
-                    let combined = self.values.iter().map(|peer| {
-                        let octets = peer.ip().octets();
-                        let port_in_be = peer.port().to_be_bytes();
-
-                        let mut arr = [0u8; 6];
-                        let ip = &mut arr[0..4];
-                        ip.copy_from_slice(&octets);
-
-                        let port = &mut arr[4..6];
-                        port.copy_from_slice(&port_in_be);
-
-                        Value::Bytes(Cow::Owned(arr.as_slice().to_vec()))
-                    });
-
+                    let combined = self
+                        .values
+                        .iter()
+                        .map(|peer| Value::Bytes(Cow::Owned(compact_addr(peer))));
                     e.emit_unchecked_list(combined)
                 });
             }
 
-            // a get_peers answer with values needs no nodes; anything else (find_node
-            // answer, get_peers fallback, empty table) must still carry the key, even
-            // as an empty string
-            if !self.nodes.is_empty() || self.values.is_empty() {
-                // nodes is a giant binary string, its length is some product of 26, each
-                // 26 byte is compromised of 20 bytes of node id, 4 bytes of ip address and
-                // 2 bytes of port number
-                enc.emit_pair_with(b"nodes", |e| {
-                    let combined: Vec<u8> = self
-                        .nodes
-                        .iter()
-                        .flat_map(|peer| {
-                            let node_id = &peer.id();
-
-                            let octets = peer.end_point().ip().octets();
-                            let port_in_be = peer.end_point().port().to_be_bytes();
-
-                            let mut arr = [0u8; 26];
-                            let id = &mut arr[0..20];
-                            id.copy_from_slice(&node_id.0);
-
-                            let ip = &mut arr[20..24];
-                            ip.copy_from_slice(&octets);
-
-                            let port = &mut arr[24..26];
-                            port.copy_from_slice(&port_in_be);
-
-                            arr
-                        })
-                        .collect();
-
-                    e.emit_bytes(&combined)
-                });
+            if let Some(nodes) = &self.nodes {
+                enc.emit_pair_with(b"nodes", |e| e.emit_bytes(&compact_nodes(nodes)));
+            }
+            if let Some(nodes6) = &self.nodes6 {
+                enc.emit_pair_with(b"nodes6", |e| e.emit_bytes(&compact_nodes(nodes6)));
             }
             Ok(())
         })
