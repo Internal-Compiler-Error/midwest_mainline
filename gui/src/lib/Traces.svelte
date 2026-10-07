@@ -4,7 +4,7 @@
   // Open spans grow up to now. Clicking a span pins its fields and events on the right.
   import * as echarts from 'echarts'
   import { Button } from '$lib/components/ui/button'
-  import { echart, base, type Interactive } from './echart'
+  import { echart, base, type Chart } from './echart'
   import { duration, humanBytes } from './format'
   import SpanDetail from './SpanDetail.svelte'
   import { field, fieldValue, involves, type Traces } from './spans.svelte'
@@ -86,7 +86,7 @@
 
   let bars = $derived(layout(visible, now, pinned))
 
-  let chart = $derived.by((): Interactive => ({
+  let chart = $derived.by((): Chart => ({
     option: base({
       animation: false,
       grid: { left: 70, right: 12, top: 8, bottom: 24 },

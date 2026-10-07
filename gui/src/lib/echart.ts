@@ -6,14 +6,17 @@ import type { Action } from 'svelte/action'
 
 export type Option = echarts.EChartsOption
 
-/** An option plus a click handler, for a chart whose items do something when clicked. */
-export interface Interactive {
+/** An option and how to apply it: a click handler for a chart whose items do something, and
+ * `replace` for one whose series come and go. A plain merge keeps every series ever given;
+ * with `replace`, series are matched by `id` (so a kept one still animates) and the rest dropped. */
+export interface Chart {
   option: Option
-  onclick: (params: echarts.ECElementEvent) => void
+  onclick?: (params: echarts.ECElementEvent) => void
+  replace?: boolean
 }
 
-function split(arg: Option | Interactive): [Option, Interactive['onclick'] | undefined] {
-  return 'onclick' in arg && 'option' in arg ? [arg.option as Option, arg.onclick as Interactive['onclick']] : [arg as Option, undefined]
+function split(arg: Option | Chart): Chart {
+  return 'option' in arg ? (arg as Chart) : { option: arg as Option }
 }
 
 function isDark(): boolean {
@@ -32,11 +35,12 @@ export function base(option: Option): Option {
   }
 }
 
-export const echart: Action<HTMLElement, Option | Interactive> = (node, arg) => {
-  let [current, onclick] = split(arg)
+export const echart: Action<HTMLElement, Option | Chart> = (node, arg) => {
+  let current = split(arg)
   let chart = echarts.init(node, isDark() ? 'dark' : undefined, { renderer: 'canvas' })
-  const listen = () => chart.on('click', (params) => onclick?.(params))
-  const apply = () => chart.setOption({ backgroundColor: 'transparent', ...current })
+  const listen = () => chart.on('click', (params) => current.onclick?.(params))
+  const apply = () =>
+    chart.setOption({ backgroundColor: 'transparent', ...current.option }, current.replace ? { replaceMerge: ['series'] } : undefined)
   listen()
   apply()
 
@@ -53,8 +57,8 @@ export const echart: Action<HTMLElement, Option | Interactive> = (node, arg) => 
   theme.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 
   return {
-    update(next: Option | Interactive) {
-      ;[current, onclick] = split(next)
+    update(next: Option | Chart) {
+      current = split(next)
       apply()
     },
     destroy() {

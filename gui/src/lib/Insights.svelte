@@ -3,7 +3,7 @@
   // chart is an ECharts option derived from the store; ECharts animates the changes.
   import { Button } from '$lib/components/ui/button'
   import { humanBytes, timeOfDay } from './format'
-  import { base, type Option } from './echart'
+  import { base, type Chart, type Option } from './echart'
   import type { Insights, PeerRecord } from './bus.svelte'
   import type { Kind, Stamped } from './events'
   import Panel from './Panel.svelte'
@@ -116,21 +116,25 @@
   })
 
   // -- the fastest peers' rate over the last minute
-  let history = $derived.by((): Option => {
+  let history = $derived.by((): Chart => {
     const top = byRate.slice(0, 8)
-    return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
-      legend: { top: 0, right: 0, icon: 'circle', textStyle: { fontSize: 9 } },
-      xAxis: { type: 'category', data: [...Array(60).keys()].map((i) => `${i - 59}s`), axisLabel: { interval: 19 } },
-      yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
-      series: top.map((p) => ({
-        name: short(p.addr),
-        type: 'line',
-        smooth: true,
-        showSymbol: false,
-        data: [...Array(60 - p.history.length).fill(null), ...p.history],
-      })),
-    })
+    return {
+      replace: true,
+      option: base({
+        tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
+        legend: { top: 0, right: 0, icon: 'circle', textStyle: { fontSize: 9 } },
+        xAxis: { type: 'category', data: [...Array(60).keys()].map((i) => `${i - 59}s`), axisLabel: { interval: 19 } },
+        yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
+        series: top.map((p) => ({
+          id: p.addr,
+          name: short(p.addr),
+          type: 'line',
+          smooth: true,
+          showSymbol: false,
+          data: [...Array(60 - p.history.length).fill(null), ...p.history],
+        })),
+      }),
+    }
   })
 
   // -- how peers were found, and who they turned out to be

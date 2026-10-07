@@ -3,7 +3,7 @@
   // whatever `children` draws.
   import type { Snippet } from 'svelte'
   import type { ClassValue } from 'svelte/elements'
-  import { echart, type Option } from './echart'
+  import { echart, type Chart, type Option } from './echart'
 
   let {
     title = '',
@@ -17,7 +17,7 @@
     title?: string
     /** quieter words after the title */
     note?: string
-    chart?: Option
+    chart?: Option | Chart
     /** the chart's height, as a Tailwind class */
     height?: string
     class?: ClassValue
