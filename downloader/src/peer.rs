@@ -247,6 +247,9 @@ pub(crate) struct Peer {
     pub listen_port: Option<u16>,
     /// BEP 10 `reqq`: how many requests the peer queues; past it, it rejects or drops them
     pub their_reqq: Option<usize>,
+    /// how deep its queue turned out to be when it rejected a request; grows back by one per
+    /// block it delivers, since a reject can have other causes than a full queue
+    learned_reqq: Option<usize>,
     /// we dialed it, so `remote_addr` is where it listens
     pub dialed: bool,
     /// BEP 16: what super-seeding has shown this peer; `None` when it saw our real bitfield
@@ -440,6 +443,7 @@ impl Peer {
             dht_port: None,
             listen_port: None,
             their_reqq: None,
+            learned_reqq: None,
             dialed,
             super_seed: None,
             conn,
@@ -509,10 +513,19 @@ impl Peer {
     }
 
     /// Requests to keep outstanding: what the measured rate calls for, within what the peer
-    /// says it will queue.
+    /// says it will queue and what its rejects showed it would.
     pub fn request_window(&self) -> usize {
-        let ours = self.stats.request_window();
-        self.their_reqq.map_or(ours, |reqq| ours.min(reqq.max(1)))
+        [self.their_reqq, self.learned_reqq]
+            .into_iter()
+            .flatten()
+            .fold(self.stats.request_window(), |window, cap| window.min(cap.max(1)))
+    }
+
+    /// The peer rejected one of our requests: take its queue to be as deep as what it still
+    /// holds of ours.
+    pub fn request_rejected(&mut self) {
+        let held = self.requested.len().max(1);
+        self.learned_reqq = Some(self.learned_reqq.map_or(held, |reqq| reqq.min(held)));
     }
 
     pub fn snapshot(&self) -> PeerSnapshot {
@@ -673,6 +686,7 @@ impl Peer {
     pub fn block_received(&mut self, piece: &Piece) -> Option<()> {
         self.requested.remove(&piece.block())?;
         self.stats.block_received(piece.len() as usize, Instant::now());
+        self.learned_reqq = self.learned_reqq.map(|reqq| reqq + 1);
         self.last_progress = Instant::now();
         Some(())
     }
@@ -1200,6 +1214,33 @@ mod test {
         ] {
             assert_eq!(Holepunch::decode(junk), None, "{junk:?}");
         }
+    }
+
+    /// A reject caps the request window at what the peer held then; each block it delivers
+    /// widens it again, and an advertised `reqq` caps it regardless.
+    #[tokio::test]
+    async fn a_rejects_cap_on_the_window_grows_back() {
+        let (mut peer, _other_end, _incoming) = test_peer(9).await;
+        let block = |begin: u32| BlockRef {
+            index: 0,
+            begin,
+            length: 16_384,
+        };
+        for i in 0..3 {
+            peer.request_block(block(i * 16_384)).unwrap();
+        }
+        peer.requested.remove(&block(0));
+        peer.request_rejected();
+        assert_eq!(peer.request_window(), 2, "it held two when it rejected");
+        let delivered = Piece {
+            index: 0,
+            begin: 16_384,
+            data: vec![0; 16_384].into(),
+        };
+        peer.block_received(&delivered).unwrap();
+        assert_eq!(peer.request_window(), 3, "a delivery widens it again");
+        peer.handle_extended_handshake(b"d4:reqqi1ee");
+        assert_eq!(peer.request_window(), 1, "what it advertises still caps it");
     }
 
     #[tokio::test]

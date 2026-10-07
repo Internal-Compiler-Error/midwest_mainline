@@ -149,9 +149,7 @@ impl TorrentSwarm {
         if peer.requested.remove(&req).is_none() {
             return;
         }
-        // what it still holds of ours is as deep as its queue goes
-        let held = peer.requested.len().max(1);
-        peer.their_reqq = Some(peer.their_reqq.map_or(held, |reqq| reqq.min(held)));
+        peer.request_rejected();
         let addr = peer.remote_addr;
         match self.in_flight.rejected(addr, req) {
             Rejected::Retry => tracing::debug!("{addr} rejected {req:?}, asking again later"),
