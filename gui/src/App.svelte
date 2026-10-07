@@ -15,6 +15,7 @@
   import { subscribe as subscribeEvents } from './lib/events'
   import { Logs } from './lib/logs.svelte'
   import { Traces } from './lib/spans.svelte'
+  import { every } from './lib/poll'
   import ConsolePane from './lib/Console.svelte'
   import Details from './lib/Details.svelte'
   import InsightsPane from './lib/Insights.svelte'
@@ -100,8 +101,7 @@
   }
 
   async function refresh() {
-    torrents = await api.torrents()
-    status = await api.status()
+    ;[torrents, status] = await Promise.all([api.torrents(), api.status()])
     notifyCompletions()
     // torrents that were there at startup (resumed, or given on the command line) get the
     // details panel too, without a click
@@ -128,8 +128,7 @@
         .then((granted) => (granted ? 'granted' : requestPermission()))
         .then((state) => (notifyReady = state === 'granted'))
     })
-    refresh()
-    const timer = setInterval(refresh, 250)
+    const stopPolling = every(250, refresh)
     // the library's event bus feeds the insights panel, whether or not it's showing
     const unlistenEvents = subscribeEvents((batch) => insights.ingest(batch))
     // .torrent files dropped on the window are added to the default download dir
@@ -139,7 +138,7 @@
       }
     })
     return () => {
-      clearInterval(timer)
+      stopPolling()
       unlisten.then((stop) => stop())
       unlistenEvents.then((stop) => stop())
     }
