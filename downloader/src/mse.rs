@@ -8,10 +8,10 @@
 //!
 //! Spec: <https://wiki.vuze.com/w/Message_Stream_Encryption>.
 
-use std::collections::VecDeque;
 use midwest_mainline::types::InfoHash;
 use num_bigint::BigUint;
 use sha1::{Digest, Sha1};
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -226,7 +226,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Encrypted<S> {
         if !this.leftover.is_empty() {
             let n = this.leftover.len().min(buf.remaining());
             let (first, _second) = this.leftover.as_slices();
-            assert!(_second.is_empty(), "leftover is not written after the handshake, so it should never wrap");
+            assert!(
+                _second.is_empty(),
+                "leftover is not written after the handshake, so it should never wrap"
+            );
             buf.put_slice(&first[..n]);
             this.leftover.drain(..n);
             return Poll::Ready(Ok(()));
