@@ -23,28 +23,29 @@ impl ExternalAddress {
         if !is_public(&ip) {
             return None;
         }
-        let before = self.best();
-        {
-            let mut votes = self.votes.lock().unwrap();
-            let voters = votes.entry(ip).or_default();
-            if voters.len() < VOTERS_PER_ADDRESS {
-                voters.insert(voter.to_string());
-            }
+        let mut votes = self.votes.lock().unwrap();
+        let before = best(&votes);
+        let voters = votes.entry(ip).or_default();
+        if voters.len() < VOTERS_PER_ADDRESS {
+            voters.insert(voter.to_string());
         }
-        let after = self.best();
+        let after = best(&votes);
         (after != before).then_some(after).flatten()
     }
 
     /// The address most voters agree on, IPv4 before IPv6 (an IPv6 address is usually our
     /// own interface's anyway); `None` until two have agreed.
     pub fn best(&self) -> Option<IpAddr> {
-        let votes = self.votes.lock().unwrap();
-        votes
-            .iter()
-            .filter(|(_, voters)| voters.len() >= 2)
-            .max_by_key(|(ip, voters)| (ip.is_ipv4(), voters.len()))
-            .map(|(ip, _)| *ip)
+        best(&self.votes.lock().unwrap())
     }
+}
+
+fn best(votes: &BTreeMap<IpAddr, BTreeSet<String>>) -> Option<IpAddr> {
+    votes
+        .iter()
+        .filter(|(_, voters)| voters.len() >= 2)
+        .max_by_key(|(ip, voters)| (ip.is_ipv4(), voters.len()))
+        .map(|(ip, _)| *ip)
 }
 
 fn is_public(ip: &IpAddr) -> bool {

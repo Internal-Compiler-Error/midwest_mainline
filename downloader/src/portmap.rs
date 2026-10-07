@@ -73,6 +73,22 @@ enum Protocol {
     Udp,
 }
 
+impl Protocol {
+    fn igd(self) -> PortMappingProtocol {
+        match self {
+            Protocol::Tcp => PortMappingProtocol::TCP,
+            Protocol::Udp => PortMappingProtocol::UDP,
+        }
+    }
+
+    fn pmp(self) -> InternetProtocol {
+        match self {
+            Protocol::Tcp => InternetProtocol::Tcp,
+            Protocol::Udp => InternetProtocol::Udp,
+        }
+    }
+}
+
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -96,34 +112,35 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken, bus: EventBus) ->
     tokio::spawn(async move {
         loop {
             state(MappingState::Searching);
-            let Some((gateway, local_ip)) = gateway() else {
-                debug!("no gateway to map ports on");
-                state(MappingState::Unavailable);
-                wait_or_stop(RETRY, &shutdown).await;
-                if shutdown.is_cancelled() {
-                    return;
+            let mapper = match gateway() {
+                Some((gateway, local_ip)) => {
+                    let mapper = Mapper::open(gateway, local_ip, ports).await;
+                    if mapper.is_none() {
+                        info!("no port mapping: the gateway at {gateway} answers neither NAT-PMP nor UPnP");
+                    }
+                    mapper
                 }
-                continue;
+                None => {
+                    debug!("no gateway to map ports on");
+                    None
+                }
             };
-            match Mapper::open(gateway, local_ip, ports).await {
+            let stopped = match mapper {
                 Some(mut mapper) => {
                     state(MappingState::Mapped {
                         external_ip: mapper.external_ip().await,
                     });
                     let stopped = mapper.keep_alive(&shutdown).await;
                     mapper.close().await;
-                    if stopped {
-                        return;
-                    }
+                    stopped
                 }
                 None => {
-                    info!("no port mapping: the gateway at {gateway} answers neither NAT-PMP nor UPnP");
                     state(MappingState::Unavailable);
-                    wait_or_stop(RETRY, &shutdown).await;
-                    if shutdown.is_cancelled() {
-                        return;
-                    }
+                    stopped_waiting(RETRY, &shutdown).await
                 }
+            };
+            if stopped {
+                return;
             }
         }
     });
@@ -148,10 +165,11 @@ fn gateway() -> Option<(IpAddr, IpAddr)> {
     })
 }
 
-async fn wait_or_stop(d: Duration, shutdown: &CancellationToken) {
+/// Waits `d`, or until shutdown; true for the latter.
+async fn stopped_waiting(d: Duration, shutdown: &CancellationToken) -> bool {
     tokio::select! {
-        _ = sleep(d) => {}
-        _ = shutdown.cancelled() => {}
+        _ = sleep(d) => false,
+        _ = shutdown.cancelled() => true,
     }
 }
 
@@ -185,14 +203,10 @@ impl Mapper {
                 lifetime_seconds: Some(LEASE.as_secs() as u32),
                 timeout_config: None,
             };
-            let ip_protocol = match protocol {
-                Protocol::Tcp => InternetProtocol::Tcp,
-                Protocol::Udp => InternetProtocol::Udp,
-            };
             let Some(internal_port) = NonZeroU16::new(port) else {
                 continue;
             };
-            match PortMapping::new(gateway, local_ip, ip_protocol, internal_port, options).await {
+            match PortMapping::new(gateway, local_ip, protocol.pmp(), internal_port, options).await {
                 Ok(mapping) => {
                     info!(
                         "mapped {protocol} {} -> {port} on the gateway with {} ({}s lease)",
@@ -274,13 +288,9 @@ impl Mapper {
         };
         let mut any = false;
         for (protocol, port) in ports.wanted() {
-            let proto = match protocol {
-                Protocol::Tcp => PortMappingProtocol::TCP,
-                Protocol::Udp => PortMappingProtocol::UDP,
-            };
             let local = SocketAddr::new(*local_ip, port);
             match gateway
-                .add_port(proto, port, local, lease.as_secs() as u32, DESCRIPTION)
+                .add_port(protocol.igd(), port, local, lease.as_secs() as u32, DESCRIPTION)
                 .await
             {
                 Ok(()) => {
@@ -307,8 +317,7 @@ impl Mapper {
                     .unwrap_or(LEASE),
                 Mapper::Upnp { lease, .. } => *lease,
             };
-            wait_or_stop(lease.max(MIN_LEASE) / 2, shutdown).await;
-            if shutdown.is_cancelled() {
+            if stopped_waiting(lease.max(MIN_LEASE) / 2, shutdown).await {
                 return true;
             }
             let renewed = match self {
@@ -342,11 +351,7 @@ impl Mapper {
             }
             Mapper::Upnp { gateway, ports, .. } => {
                 for (protocol, port) in ports.wanted() {
-                    let proto = match protocol {
-                        Protocol::Tcp => PortMappingProtocol::TCP,
-                        Protocol::Udp => PortMappingProtocol::UDP,
-                    };
-                    if let Err(e) = gateway.remove_port(proto, port).await {
+                    if let Err(e) = gateway.remove_port(protocol.igd(), port).await {
                         debug!("removing the UPnP mapping of {protocol} {port} failed: {e}");
                     }
                 }
