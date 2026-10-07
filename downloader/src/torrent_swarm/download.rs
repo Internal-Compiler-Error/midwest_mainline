@@ -3,7 +3,7 @@
 
 use crate::events::Event;
 use crate::layers::Received;
-use crate::wire::{BtMessage, Hashes, Piece, Request};
+use crate::wire::{BtMessage, Hashes, Piece};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -62,10 +62,10 @@ impl TorrentSwarm {
         let from = peer.remote_addr;
         if peer.block_received(&block).is_none() {
             tracing::debug!("{from} sent a block we weren't waiting for, ignoring");
-            self.wasted(from, block.length, "unexpected");
+            self.wasted(from, block.len(), "unexpected");
             return;
         }
-        self.stat.downloaded += block.length as u64;
+        self.stat.downloaded += block.len() as u64;
         self.store_block(from, block);
     }
 
@@ -95,7 +95,7 @@ impl TorrentSwarm {
                 self.release_claim(piece, from);
             }
             Stored::Duplicate => {
-                self.wasted(from, block.length, "lost race");
+                self.wasted(from, block.len(), "lost race");
                 if let Some(idx) = self.peer_index(from) {
                     self.refill(idx);
                 }
@@ -253,7 +253,7 @@ impl TorrentSwarm {
     /// A block of a raced piece just arrived from `from`: any other racer that asked for the
     /// same block is told not to bother.
     fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
-        let req = Request::from(block);
+        let req = block.block();
         let Some(in_flight) = self.in_flight.get(block.index) else {
             return;
         };
@@ -346,7 +346,6 @@ mod test {
                         let garbage = Piece {
                             index: req.index,
                             begin: req.begin,
-                            length: req.length,
                             data: vec![0u8; req.length as usize].into(),
                         };
                         if liar.send(BtMessage::Piece(garbage)).await.is_err() {

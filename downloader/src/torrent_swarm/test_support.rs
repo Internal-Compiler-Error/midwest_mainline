@@ -11,7 +11,7 @@ pub(super) use crate::settings::{CHOKING_ROUND_INTERVAL, MIN_REQUEST_WINDOW};
 pub(super) use crate::storage::TorrentStorage;
 pub(super) use crate::stream::PeerStream;
 pub(super) use crate::torrent::parse_torrent;
-pub(super) use crate::wire::{BitField, BtCodec, BtMessage, Piece, Request};
+pub(super) use crate::wire::{BitField, BlockRef, BtCodec, BtMessage, Piece};
 pub(super) use bitvec::prelude::*;
 pub(super) use futures::SinkExt;
 pub(super) use futures::StreamExt;
@@ -216,12 +216,11 @@ pub(super) async fn open_with(peer: &mut Wire, bitfield: u8) {
     peer.send(BtMessage::Unchoke(crate::wire::Unchoke)).await.unwrap();
 }
 
-pub(super) fn block(req: Request) -> BtMessage {
+pub(super) fn block(req: BlockRef) -> BtMessage {
     let start = req.index as usize * PIECE + req.begin as usize;
     BtMessage::Piece(Piece {
         index: req.index,
         begin: req.begin,
-        length: req.length,
         data: Box::from(&content()[start..start + req.length as usize]),
     })
 }

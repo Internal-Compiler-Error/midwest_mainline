@@ -3,7 +3,7 @@
 
 use crate::settings::BLOCK_SIZE;
 use crate::torrent::Torrent;
-use crate::wire::{Piece, Request};
+use crate::wire::{BlockRef, Piece};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::net::SocketAddr;
@@ -132,9 +132,9 @@ impl InFlight {
         Some((piece_offset + (first * BLOCK_SIZE) as u64, piece_offset + end as u64))
     }
 
-    fn request(&self, piece: u32, block: usize) -> Request {
+    fn request(&self, piece: u32, block: usize) -> BlockRef {
         let begin = block * BLOCK_SIZE;
-        Request {
+        BlockRef {
             index: piece,
             begin: begin as u32,
             length: self.wire_len.saturating_sub(begin).min(BLOCK_SIZE) as u32,
@@ -143,7 +143,7 @@ impl InFlight {
 
     /// The next block `claimant` should ask for: the first one past its cursor that hasn't
     /// arrived from anyone yet.
-    fn next_request(&mut self, piece: u32, claimant: SocketAddr) -> Option<Request> {
+    fn next_request(&mut self, piece: u32, claimant: SocketAddr) -> Option<BlockRef> {
         let claim = self.claims.get_mut(&claimant)?;
         while let Some(block) = claim.retry.pop() {
             if self.received[block].is_none() {
@@ -208,7 +208,7 @@ impl InFlight {
     pub(super) fn store(&mut self, from: SocketAddr, block: &Piece) -> Stored {
         let begin = block.begin as usize;
         let end = begin + block.data.len();
-        if block.data.len() != block.length as usize || end > self.buf.len() || !begin.is_multiple_of(BLOCK_SIZE) {
+        if end > self.buf.len() || !begin.is_multiple_of(BLOCK_SIZE) {
             return Stored::Malformed;
         }
         let slot = &mut self.received[begin / BLOCK_SIZE];
@@ -318,7 +318,7 @@ impl InFlightPieces {
     }
 
     /// The next block `claimant` should ask for, from the first of its pieces that has one.
-    pub(super) fn next_request(&mut self, claimant: SocketAddr) -> Option<Request> {
+    pub(super) fn next_request(&mut self, claimant: SocketAddr) -> Option<BlockRef> {
         let held = self.holdings.get(&claimant)?;
         held.iter()
             .find_map(|&piece| self.pieces.get_mut(&piece)?.next_request(piece, claimant))
@@ -326,7 +326,7 @@ impl InFlightPieces {
 
     /// `claimant` rejected `request`: the block is asked for again later, unless it has
     /// rejected this piece too often, when the claim should be released.
-    pub(super) fn rejected(&mut self, claimant: SocketAddr, request: Request) -> Rejected {
+    pub(super) fn rejected(&mut self, claimant: SocketAddr, request: BlockRef) -> Rejected {
         match self.pieces.get_mut(&request.index) {
             Some(f) => f.rejected(claimant, request.begin),
             None => Rejected::GiveUp,
@@ -386,7 +386,6 @@ mod test {
         Piece {
             index: piece,
             begin: begin as u32,
-            length: len as u32,
             data: vec![7; len].into(),
         }
     }
@@ -432,10 +431,6 @@ mod test {
             Stored::Malformed,
             "past the end"
         );
-        let mut short = block(0, 0, BLOCK_SIZE);
-        short.length += 1;
-        assert_eq!(f.store(addr(1), &short), Stored::Malformed, "length and data disagree");
-
         assert_eq!(
             f.store(addr(1), &block(0, 0, BLOCK_SIZE)),
             Stored::Added { blocks_left: 2 }

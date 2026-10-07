@@ -16,7 +16,7 @@ use crate::stream::PeerStream;
 use crate::torrent::Torrent;
 use crate::utp::UtpWatch;
 use crate::webseed::{Failure, WebSeed};
-use crate::wire::{BtMessage, Piece, Request, V2Support};
+use crate::wire::{BlockRef, BtMessage, Piece, V2Support};
 use bitvec::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -229,7 +229,7 @@ pub(crate) enum SwarmEvent {
     /// a block a peer asked for has been read off disk (or couldn't be), see `serve_request`
     BlockRead {
         to: SocketAddr,
-        block: Result<Piece, Request>,
+        block: Result<Piece, BlockRef>,
     },
     /// A completed piece was hashed and, if it was good, written (see `piece_assembled`).
     PieceDone {

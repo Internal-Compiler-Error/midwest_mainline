@@ -4,8 +4,8 @@ use crate::settings::{
 };
 use crate::stream::PeerStream;
 use crate::wire::{
-    BitField, BtCodec, BtMessage, Cancel, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece, Port,
-    RejectRequest, Request, Unchoke,
+    BitField, BlockRef, BtCodec, BtMessage, Choke, Extended, Have, HaveAll, HaveNone, Interested, KeepAlive, Piece,
+    Port, Unchoke,
 };
 use bitvec::prelude::*;
 use futures::stream::{SplitSink, SplitStream};
@@ -218,10 +218,10 @@ pub(crate) struct Peer {
     pub interested_us: bool,
 
     /// blocks we've asked this peer for and haven't received yet, with when we asked
-    pub requested: BTreeMap<Request, Instant>,
+    pub requested: BTreeMap<BlockRef, Instant>,
     /// blocks the peer asked us for that we've accepted and not sent yet; a Cancel takes one
     /// out, and a block read for a request no longer here isn't sent
-    uploads: BTreeSet<Request>,
+    uploads: BTreeSet<BlockRef>,
     /// the bytes `uploads` asks for
     upload_bytes: usize,
     /// bytes of blocks queued for the writer and not yet written
@@ -487,7 +487,7 @@ impl Peer {
         match msg {
             BtMessage::KeepAlive(_) => {}
             BtMessage::Cancel(cancel) => {
-                self.take_upload(&Request::from(cancel));
+                self.take_upload(&cancel);
             }
             BtMessage::Choke(_) => self.choked_us = true,
             BtMessage::Unchoke(_) => self.choked_us = false,
@@ -612,14 +612,14 @@ impl Peer {
     /// Records a block that answers one of our requests. `None` if we never asked for it (or
     /// gave up waiting), in which case the caller should ignore the data.
     pub fn block_received(&mut self, piece: &Piece) -> Option<()> {
-        self.requested.remove(&Request::from(piece))?;
-        self.stats.block_received(piece.length as usize, Instant::now());
+        self.requested.remove(&piece.block())?;
+        self.stats.block_received(piece.len() as usize, Instant::now());
         self.last_progress = Instant::now();
         Some(())
     }
 
     /// Takes on serving `req`; false if it's been asked for already.
-    pub fn accept_upload(&mut self, req: Request) -> bool {
+    pub fn accept_upload(&mut self, req: BlockRef) -> bool {
         let new = self.uploads.insert(req);
         if new {
             self.upload_bytes += req.length as usize;
@@ -628,12 +628,12 @@ impl Peer {
     }
 
     /// Whether `req` is still to be served: accepted, and neither cancelled nor sent.
-    pub fn wants_upload(&self, req: &Request) -> bool {
+    pub fn wants_upload(&self, req: &BlockRef) -> bool {
         self.uploads.contains(req)
     }
 
     /// Stops serving `req`; false if it wasn't being served.
-    pub fn take_upload(&mut self, req: &Request) -> bool {
+    pub fn take_upload(&mut self, req: &BlockRef) -> bool {
         let had = self.uploads.remove(req);
         if had {
             self.upload_bytes -= req.length as usize;
@@ -696,7 +696,7 @@ impl Peer {
         self.send(BtMessage::KeepAlive(KeepAlive))
     }
 
-    pub fn request_block(&mut self, req: Request) -> io::Result<()> {
+    pub fn request_block(&mut self, req: BlockRef) -> io::Result<()> {
         self.stats.block_requested();
         if self.requested.is_empty() {
             self.last_progress = Instant::now();
@@ -746,8 +746,14 @@ impl Peer {
 
     /// Forgets every outstanding request for `piece`; the caller decides whether to tell the
     /// peer (`send_cancel`) or whether the peer already knows (it choked or rejected us).
-    pub fn forget_piece(&mut self, piece: u32) -> Vec<Request> {
-        let dropped: Vec<Request> = self.requested.keys().filter(|r| r.index == piece).copied().collect();
+    pub fn forget_piece(&mut self, piece: u32) -> Vec<BlockRef> {
+        let first = BlockRef {
+            index: piece,
+            ..BlockRef::default()
+        };
+        let dropped: Vec<BlockRef> = (self.requested.range(first..).map(|(r, _)| *r))
+            .take_while(|r| r.index == piece)
+            .collect();
         for req in &dropped {
             self.requested.remove(req);
         }
@@ -759,30 +765,22 @@ impl Peer {
         self.send(BtMessage::Port(Port { port }))
     }
 
-    pub fn send_cancel(&mut self, req: Request) -> io::Result<()> {
-        self.send(BtMessage::Cancel(Cancel {
-            index: req.index,
-            begin: req.begin,
-            length: req.length,
-        }))
+    pub fn send_cancel(&mut self, req: BlockRef) -> io::Result<()> {
+        self.send(BtMessage::Cancel(req))
     }
 
     /// BEP 6: decline a `Request`. A silent no-op if the peer never advertised Fast Extension
     /// support: the classic protocol has no "I'm declining this" message, and a plain drop
     /// is exactly what such a peer already expects.
-    pub fn send_reject(&mut self, req: Request) -> io::Result<()> {
+    pub fn send_reject(&mut self, req: BlockRef) -> io::Result<()> {
         if !self.remote_supports_fast {
             return Ok(());
         }
-        self.send(BtMessage::RejectRequest(RejectRequest {
-            index: req.index,
-            begin: req.begin,
-            length: req.length,
-        }))
+        self.send(BtMessage::RejectRequest(req))
     }
 
     pub fn send_block(&mut self, piece: Piece) -> io::Result<()> {
-        let length = piece.length as usize;
+        let length = piece.len() as usize;
         self.unsent.fetch_add(length, Ordering::Relaxed);
         self.send(BtMessage::Piece(piece))?;
         self.stats.block_sent(length);
@@ -906,37 +904,6 @@ fn build_extended_handshake(
     out.extend_from_slice(&ip);
     out.push(b'e');
     out
-}
-
-// The block a Piece, Cancel or RejectRequest is about, as the Request that asked for it.
-impl From<&Piece> for Request {
-    fn from(piece: &Piece) -> Self {
-        Request {
-            index: piece.index,
-            begin: piece.begin,
-            length: piece.length,
-        }
-    }
-}
-
-impl From<Cancel> for Request {
-    fn from(cancel: Cancel) -> Self {
-        Request {
-            index: cancel.index,
-            begin: cancel.begin,
-            length: cancel.length,
-        }
-    }
-}
-
-impl From<RejectRequest> for Request {
-    fn from(reject: RejectRequest) -> Self {
-        Request {
-            index: reject.index,
-            begin: reject.begin,
-            length: reject.length,
-        }
-    }
 }
 
 /// BEP 11 "added.f" bits: what a gossiping peer knows about the one it names.
@@ -1517,12 +1484,12 @@ mod test {
         let limit = Duration::from_millis(50);
 
         assert!(!peer.stalled(limit), "nothing outstanding, nothing to stall");
-        let first = Request {
+        let first = BlockRef {
             index: 0,
             begin: 0,
             length: 4,
         };
-        let second = Request {
+        let second = BlockRef {
             index: 0,
             begin: 4,
             length: 4,
@@ -1536,7 +1503,6 @@ mod test {
         peer.block_received(&Piece {
             index: 0,
             begin: 0,
-            length: 4,
             data: Box::new([0; 4]),
         })
         .unwrap();

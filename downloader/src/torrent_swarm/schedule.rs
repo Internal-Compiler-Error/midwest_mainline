@@ -444,13 +444,7 @@ mod test {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // a hands a piece back; without subsampling the untried c would get it
-        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
-            index: first.index,
-            begin: first.begin,
-            length: first.length,
-        }))
-        .await
-        .unwrap();
+        a.send(BtMessage::RejectRequest(first)).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(300), c.next())
                 .await
@@ -560,13 +554,7 @@ mod test {
         let Some(Ok(BtMessage::Request(first))) = a.next().await else {
             panic!("expected a request");
         };
-        a.send(BtMessage::RejectRequest(crate::wire::RejectRequest {
-            index: first.index,
-            begin: first.begin,
-            length: first.length,
-        }))
-        .await
-        .unwrap();
+        a.send(BtMessage::RejectRequest(first)).await.unwrap();
         // it serves everything else, which drains its queue
         let again = async {
             loop {
@@ -607,13 +595,7 @@ mod test {
 
         // a rejects every request for that piece, as one that won't serve it would; one
         // reject is taken for a full queue and retried, a few mean the piece goes elsewhere
-        let reject = |req: Request| {
-            BtMessage::RejectRequest(crate::wire::RejectRequest {
-                index: req.index,
-                begin: req.begin,
-                length: req.length,
-            })
-        };
+        let reject = |req: BlockRef| BtMessage::RejectRequest(req);
         a.send(reject(rejected)).await.unwrap();
         tokio::spawn(async move {
             while let Some(Ok(msg)) = a.next().await {

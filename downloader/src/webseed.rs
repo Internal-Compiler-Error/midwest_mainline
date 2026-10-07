@@ -416,7 +416,6 @@ impl<'t> Blocks<'t> {
                 out.push(Piece {
                     index: (self.at / piece_size) as u32,
                     begin: (self.at % piece_size) as u32,
-                    length,
                     data,
                 });
                 self.at += length as u64;
@@ -687,7 +686,7 @@ pub(crate) mod test {
         let mut rebuilt = vec![];
         for b in &got {
             assert_eq!(b.index as u64 * PIECE as u64 + b.begin as u64, rebuilt.len() as u64);
-            assert!(b.length as usize <= BLOCK_SIZE);
+            assert!(b.data.len() <= BLOCK_SIZE);
             rebuilt.extend_from_slice(&b.data);
         }
         assert_eq!(rebuilt, content);

@@ -215,15 +215,15 @@ impl TorrentSwarm {
 
     pub(super) fn web_block_arrived(&mut self, seed: usize, job: u64, block: Piece) {
         let w = &mut self.web_seeds[seed];
-        w.stats.block_received(block.length as usize, Instant::now());
-        self.stat.downloaded += block.length as u64;
+        w.stats.block_received(block.len() as usize, Instant::now());
+        self.stat.downloaded += block.len() as u64;
         let addr = w.addr;
         if self.in_flight.holds(addr, block.index) {
             self.store_block(addr, block);
             return;
         }
         // finished by a racer, or released after a hash failure
-        self.wasted(addr, block.length, "lost race");
+        self.wasted(addr, block.len(), "lost race");
         let rest_unwanted = self.web_seeds[seed]
             .jobs
             .get(&job)

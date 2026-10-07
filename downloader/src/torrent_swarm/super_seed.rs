@@ -154,7 +154,7 @@ mod test {
             .await
             .expect("never unchoked");
         let hidden = (0..3).find(|p| ![first, second].contains(p)).unwrap();
-        let ask = |index| Request {
+        let ask = |index| BlockRef {
             index,
             begin: 0,
             length: 16,

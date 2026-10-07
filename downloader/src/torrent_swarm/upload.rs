@@ -7,7 +7,7 @@ use crate::peer::parse_ut_metadata_request;
 use crate::settings::{
     MAX_QUEUED_UPLOADS, MAX_SERVED_BLOCK, MAX_UNCHOKED_PEERS, METADATA_PIECE_SIZE, OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS,
 };
-use crate::wire::{BtMessage, HashRequest, Piece, Request};
+use crate::wire::{BlockRef, BtMessage, HashRequest, Piece};
 use rand::seq::IndexedRandom;
 use std::net::SocketAddr;
 use tracing::warn;
@@ -88,18 +88,18 @@ impl TorrentSwarm {
     /// until it's sent, and is handed back if the upload limit says not yet.
     fn deliver(&mut self, idx: usize, block: Piece) -> Option<Piece> {
         let peer = &mut self.peers[idx];
-        let request = Request::from(&block);
+        let request = block.block();
         if !peer.wants_upload(&request) {
             return None;
         }
-        if !peer.choked_them && !self.limiter.take_upload(block.length as usize) {
+        if !peer.choked_them && !self.limiter.take_upload(block.len() as usize) {
             return Some(block);
         }
         peer.take_upload(&request);
         let sent = if peer.choked_them {
             peer.send_reject(request)
         } else {
-            self.stat.uploaded += block.length as u64;
+            self.stat.uploaded += block.len() as u64;
             peer.send_block(block)
         };
         if sent.is_err() {
@@ -111,7 +111,7 @@ impl TorrentSwarm {
     /// BEP 3: a choked peer isn't entitled to any data, full stop. BEP 6 turns "ignore it"
     /// into "must say so": once Fast Extension is negotiated a declined request needs an
     /// explicit RejectRequest, which `send_reject` no-ops on its own if it isn't.
-    pub(super) fn serve_request(&mut self, idx: usize, request: Request) {
+    pub(super) fn serve_request(&mut self, idx: usize, request: BlockRef) {
         let peer = &mut self.peers[idx];
         if peer.choked_them {
             if peer.send_reject(request).is_err() {
@@ -154,7 +154,6 @@ impl TorrentSwarm {
                 .map(|data| Piece {
                     index: request.index,
                     begin: request.begin,
-                    length: request.length,
                     data,
                 })
                 .map_err(|e| {
@@ -202,7 +201,7 @@ impl TorrentSwarm {
 
     /// Second half of `serve_request`: the bytes are in hand (or the read failed, in which
     /// case the request is declined). The peer may have been choked or dropped meanwhile.
-    pub(super) fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
+    pub(super) fn send_block(&mut self, to: SocketAddr, block: Result<Piece, BlockRef>) {
         let Some(idx) = self.peer_index(to) else {
             return;
         };
@@ -309,7 +308,7 @@ mod test {
             panic!("expected Interested");
         };
         leech
-            .send(BtMessage::Request(Request {
+            .send(BtMessage::Request(BlockRef {
                 index: 0,
                 begin: 0,
                 length: 16,
@@ -349,12 +348,12 @@ mod test {
             }
         }
         let (first, second) = (
-            Request {
+            BlockRef {
                 index: 0,
                 begin: 0,
                 length: 16_000,
             },
-            Request {
+            BlockRef {
                 index: 1,
                 begin: 0,
                 length: 16_000,
@@ -369,14 +368,7 @@ mod test {
             .unwrap();
         let held = if piece.index == 0 { second } else { first };
         tokio::time::sleep(Duration::from_millis(200)).await;
-        leech
-            .send(BtMessage::Cancel(crate::wire::Cancel {
-                index: held.index,
-                begin: held.begin,
-                length: held.length,
-            }))
-            .await
-            .unwrap();
+        leech.send(BtMessage::Cancel(held)).await.unwrap();
         let late = tokio::time::timeout(Duration::from_millis(2500), next_piece(&mut leech)).await;
         assert!(late.is_err(), "the cancelled block was sent");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -401,7 +393,7 @@ mod test {
         const ASKED: u32 = 1000;
         const LEN: u32 = 16_000;
         for n in 0..ASKED {
-            let request = Request {
+            let request = BlockRef {
                 index: n % 2,
                 begin: n / 2,
                 length: LEN,
@@ -463,12 +455,12 @@ mod test {
             .await
             .expect("never unchoked");
 
-        let good = Request {
+        let good = BlockRef {
             index: 2,
             begin: 4_000,
             length: 16_000, // the last piece is 20_000 bytes
         };
-        let past_the_end = Request {
+        let past_the_end = BlockRef {
             index: 2,
             begin: 4_001,
             length: 16_000,
@@ -482,7 +474,7 @@ mod test {
             while !(got_block && got_reject) {
                 match leech.next().await {
                     Some(Ok(BtMessage::Piece(piece))) => {
-                        assert_eq!((piece.index, piece.begin, piece.length), (2, 4_000, 16_000));
+                        assert_eq!((piece.index, piece.begin, piece.len()), (2, 4_000, 16_000));
                         assert_eq!(&*piece.data, &content()[2 * PIECE + 4_000..2 * PIECE + 20_000]);
                         got_block = true;
                     }

@@ -4,7 +4,7 @@
 use super::in_flight::Rejected;
 use crate::events::Event;
 use crate::peer::{Extension, Holepunch, ProtocolViolation};
-use crate::wire::{BtMessage, Extended, RejectRequest, Request};
+use crate::wire::{BlockRef, BtMessage, Extended};
 use std::net::SocketAddr;
 use tracing::{info, warn};
 
@@ -143,8 +143,8 @@ impl TorrentSwarm {
     /// block is asked for again as its queue drains, and what the piece has already stays; a
     /// peer that keeps rejecting the piece gives it up, and it goes back on the pile rather
     /// than idling out BLOCK_REQUEST_TIMEOUT.
-    fn request_rejected(&mut self, idx: usize, reject: RejectRequest) {
-        let req = Request::from(reject);
+    fn request_rejected(&mut self, idx: usize, reject: BlockRef) {
+        let req = reject;
         let peer = &mut self.peers[idx];
         if peer.requested.remove(&req).is_none() {
             return;

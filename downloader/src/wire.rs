@@ -35,28 +35,37 @@ pub struct BitField {
     pub has: Box<[u8]>,
 }
 
+/// `length` bytes of piece `index` from `begin`: what a `Request` asks for, and what a `Cancel`
+/// or (BEP 6) a `RejectRequest` is about. Ordered by piece first, so a piece's blocks are a
+/// range of a sorted collection.
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
-pub struct Request {
+pub struct BlockRef {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
 }
 
-/// A block. On the wire it's `<index><begin><data>`; `length` is `data`'s, for symmetry with
-/// `Request`.
+/// A block. On the wire it's `<index><begin><data>`.
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
-    pub length: u32,
     pub data: Box<[u8]>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
-pub struct Cancel {
-    pub index: u32,
-    pub begin: u32,
-    pub length: u32,
+impl Piece {
+    pub fn len(&self) -> u32 {
+        self.data.len() as u32
+    }
+
+    /// Which block this is, as a request for it names it.
+    pub fn block(&self) -> BlockRef {
+        BlockRef {
+            index: self.index,
+            begin: self.begin,
+            length: self.len(),
+        }
+    }
 }
 
 /// BEP 6 (Fast Extension): an advisory hint that the sender suggests downloading this piece.
@@ -81,16 +90,6 @@ pub struct Port {
 /// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has no pieces at all.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct HaveNone;
-
-/// BEP 6 (Fast Extension): once the fast extension is enabled for a connection, a peer MUST
-/// send this for any `Request` it declines to service, instead of the classic protocol's
-/// silent drop -- lets the requester stop waiting immediately rather than idling out a timeout.
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
-pub struct RejectRequest {
-    pub index: u32,
-    pub begin: u32,
-    pub length: u32,
-}
 
 /// BEP 6 (Fast Extension): a hint that the receiver may request this piece even while choked.
 /// Purely advisory -- acting on it is optional for the receiver.
@@ -159,13 +158,16 @@ pub(crate) enum BtMessage {
     NotInterested(NotInterested),
     Have(Have),
     BitField(BitField),
-    Request(Request),
+    Request(BlockRef),
     Piece(Piece),
-    Cancel(Cancel),
+    Cancel(BlockRef),
     SuggestPiece(SuggestPiece),
     HaveAll(HaveAll),
     HaveNone(HaveNone),
-    RejectRequest(RejectRequest),
+    /// BEP 6 (Fast Extension): once the fast extension is enabled for a connection, a peer
+    /// MUST send this for any `Request` it declines to serve, instead of the classic protocol's
+    /// silent drop, so the requester stops waiting at once rather than timing out
+    RejectRequest(BlockRef),
     AllowedFast(AllowedFast),
     Extended(Extended),
     Port(Port),
@@ -228,11 +230,6 @@ impl BtMessage {
 
     /// Appends everything after the id.
     fn put_payload(&self, dst: &mut BytesMut) {
-        let block = |dst: &mut BytesMut, index, begin, length| {
-            dst.put_u32(index);
-            dst.put_u32(begin);
-            dst.put_u32(length);
-        };
         match self {
             BtMessage::KeepAlive(_)
             | BtMessage::Choke(_)
@@ -245,9 +242,11 @@ impl BtMessage {
             | BtMessage::SuggestPiece(SuggestPiece { piece })
             | BtMessage::AllowedFast(AllowedFast { piece }) => dst.put_u32(*piece),
             BtMessage::BitField(bits) => dst.put_slice(&bits.has),
-            BtMessage::Request(r) => block(dst, r.index, r.begin, r.length),
-            BtMessage::Cancel(c) => block(dst, c.index, c.begin, c.length),
-            BtMessage::RejectRequest(r) => block(dst, r.index, r.begin, r.length),
+            BtMessage::Request(r) | BtMessage::Cancel(r) | BtMessage::RejectRequest(r) => {
+                dst.put_u32(r.index);
+                dst.put_u32(r.begin);
+                dst.put_u32(r.length);
+            }
             BtMessage::Piece(piece) => {
                 dst.put_u32(piece.index);
                 dst.put_u32(piece.begin);
@@ -343,7 +342,13 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
         }
     };
     let piece = || exact(4).map(|()| be_u32(buf, 0));
-    let block = || exact(12).map(|()| (be_u32(buf, 0), be_u32(buf, 4), be_u32(buf, 8)));
+    let block = || {
+        exact(12).map(|()| BlockRef {
+            index: be_u32(buf, 0),
+            begin: be_u32(buf, 4),
+            length: be_u32(buf, 8),
+        })
+    };
     Ok(match id {
         id::CHOKE => BtMessage::Choke(Choke),
         id::UNCHOKE => BtMessage::Unchoke(Unchoke),
@@ -351,10 +356,7 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
         id::NOT_INTERESTED => BtMessage::NotInterested(NotInterested),
         id::HAVE => BtMessage::Have(Have { checked: piece()? }),
         id::BITFIELD => BtMessage::BitField(BitField { has: Box::from(buf) }),
-        id::REQUEST => {
-            let (index, begin, length) = block()?;
-            BtMessage::Request(Request { index, begin, length })
-        }
+        id::REQUEST => BtMessage::Request(block()?),
         id::PIECE => {
             let Some((head, data)) = buf.split_first_chunk::<8>() else {
                 return Err(invalid("piece message without index and offset"));
@@ -362,24 +364,17 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
             BtMessage::Piece(Piece {
                 index: be_u32(head, 0),
                 begin: be_u32(head, 4),
-                length: data.len() as u32,
                 data: Box::from(data),
             })
         }
-        id::CANCEL => {
-            let (index, begin, length) = block()?;
-            BtMessage::Cancel(Cancel { index, begin, length })
-        }
+        id::CANCEL => BtMessage::Cancel(block()?),
         id::PORT if buf.len() == 2 => BtMessage::Port(Port {
             port: u16::from_be_bytes([buf[0], buf[1]]),
         }),
         id::SUGGEST_PIECE => BtMessage::SuggestPiece(SuggestPiece { piece: piece()? }),
         id::HAVE_ALL => BtMessage::HaveAll(HaveAll),
         id::HAVE_NONE => BtMessage::HaveNone(HaveNone),
-        id::REJECT_REQUEST => {
-            let (index, begin, length) = block()?;
-            BtMessage::RejectRequest(RejectRequest { index, begin, length })
-        }
+        id::REJECT_REQUEST => BtMessage::RejectRequest(block()?),
         id::ALLOWED_FAST => BtMessage::AllowedFast(AllowedFast { piece: piece()? }),
         id::EXTENDED => {
             let Some((&ext_id, payload)) = buf.split_first() else {
@@ -717,17 +712,17 @@ mod test {
             BtMessage::BitField(BitField {
                 has: Box::from([0xffu8, 0x00, 0xa5]),
             }),
-            BtMessage::Request(Request {
+            BtMessage::Request(BlockRef {
                 index: 1,
                 begin: 2,
                 length: 3,
             }),
-            BtMessage::Cancel(Cancel {
+            BtMessage::Cancel(BlockRef {
                 index: 1,
                 begin: 2,
                 length: 3,
             }),
-            BtMessage::RejectRequest(RejectRequest {
+            BtMessage::RejectRequest(BlockRef {
                 index: 1,
                 begin: 2,
                 length: 3,
@@ -735,7 +730,6 @@ mod test {
             BtMessage::Piece(Piece {
                 index: 7,
                 begin: 16384,
-                length: 4,
                 data: Box::from([1u8, 2, 3, 4]),
             }),
             BtMessage::Extended(Extended {
@@ -814,7 +808,6 @@ mod test {
                 BtMessage::Piece(Piece {
                     index: 1,
                     begin: 2,
-                    length: 3,
                     data: Box::from([9u8, 8, 7]),
                 }),
                 &mut buf,
@@ -848,7 +841,7 @@ mod test {
         let mut buf = BytesMut::new();
         BtCodec
             .encode(
-                BtMessage::RejectRequest(RejectRequest {
+                BtMessage::RejectRequest(BlockRef {
                     index: 1,
                     begin: 2,
                     length: 3,

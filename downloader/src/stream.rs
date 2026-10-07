@@ -466,7 +466,7 @@ mod test {
     /// this burst instead of milliseconds.
     #[tokio::test]
     async fn small_messages_over_utp_do_not_wait_for_acks() {
-        use crate::wire::{BtCodec, BtMessage, Request};
+        use crate::wire::{BlockRef, BtCodec, BtMessage};
         use futures::{SinkExt, StreamExt};
         use tokio_util::codec::Framed;
 
@@ -491,7 +491,7 @@ mod test {
         let started = std::time::Instant::now();
         for i in 0..BURST {
             framed
-                .send(BtMessage::Request(Request {
+                .send(BtMessage::Request(BlockRef {
                     index: 0,
                     begin: i * 16384,
                     length: 16384,
