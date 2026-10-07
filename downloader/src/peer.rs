@@ -243,6 +243,17 @@ impl Peer {
         (self.they_have[index as usize] & flag) != 0
     }
 
+    /// The pieces this peer has, as far as its bitfield and Have messages say.
+    pub fn pieces(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.num_pieces as u32).filter(|&p| self.they_have(p))
+    }
+
+    /// The peer has sent us data on this connection or an earlier one, so it's a known
+    /// quantity rather than an arm still to be explored.
+    pub fn proven(&self) -> bool {
+        self.stats.received > 0
+    }
+
     /// Every piece, as far as its bitfield and Have messages say.
     pub fn is_seed(&self) -> bool {
         let have: usize = self.they_have.iter().map(|b| b.count_ones() as usize).sum();

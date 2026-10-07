@@ -21,6 +21,7 @@ use crate::utp::UtpWatch;
 use crate::wire::{BitField, BtMessage, Piece, Request};
 use anyhow::Context;
 use bitvec::prelude::*;
+use rand::RngExt;
 use rand::seq::IndexedRandom;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -399,16 +400,19 @@ pub struct TorrentSwarm {
     /// back on; weak so they can't keep the swarm alive, only a `TorrentSwarmHandle` can
     events_tx: mpsc::WeakSender<SwarmEvent>,
 
-    /// The peers UCB chooses between. Bayati et al., "The Unreasonable Effectiveness of
-    /// Greedy Algorithms in Multi-Armed Bandit with Many Arms": when there are more arms
-    /// than about sqrt(horizon), UCB over all of them is provably sub-optimal because trying
-    /// each once already costs order-k regret, and running it on a random subsample of
-    /// sqrt(horizon) arms is rate-optimal. The horizon here is piece assignments, and a
-    /// swarm offers hundreds of peers for a few hundred pieces. Peers are admitted in the
-    /// order they become ready until the set is full, which for a swarm is as good as
-    /// uniform, and a member's slot only frees when it disconnects.
-    subsample: BTreeSet<SocketAddr>,
-    subsample_size: usize,
+    /// Peers that haven't sent us anything yet and are being given pieces to find out how
+    /// they do. Bayati et al., "The Unreasonable Effectiveness of Greedy Algorithms in
+    /// Multi-Armed Bandit with Many Arms": with more arms than about sqrt(horizon), trying
+    /// each one already costs order-k regret, and sampling sqrt(horizon) of them is
+    /// rate-optimal. Unlike the bandit, a swarm can play every good arm at once, so the bound
+    /// applies to exploration only: a peer that has delivered is always eligible, and at most
+    /// `explore_slots` unproven ones are on trial at a time. A trial ends when the peer
+    /// delivers (it graduates), chokes us, or goes away.
+    exploring: BTreeSet<SocketAddr>,
+    explore_slots: usize,
+    /// per piece, how many connected peers have it; rarest-first reads this instead of
+    /// scanning every peer's bitfield for every pick
+    availability: Vec<u32>,
 
     /// pieces neither verified nor in flight
     missing: Vec<u32>,
@@ -461,7 +465,7 @@ impl TorrentSwarm {
             "verified bitfield must have one bit per piece"
         );
         let missing: Vec<u32> = verified.iter_zeros().map(|p| p as u32).collect();
-        let subsample_size = (missing.len() as f64).sqrt().ceil() as usize;
+        let explore_slots = ((missing.len() as f64).sqrt().ceil() as usize).max(1);
         let wanted = bitvec![u8, Msb0; 1; torrent.pieces.len()].into_boxed_bitslice();
         let stat = TorrentSwarmStats::for_verified(&torrent, verified, wanted);
         let (stat_tx, stat_rx) = watch::channel(stat.clone());
@@ -502,8 +506,9 @@ impl TorrentSwarm {
             peers: vec![],
             dialing: BTreeSet::new(),
             known: BTreeMap::new(),
-            subsample: BTreeSet::new(),
-            subsample_size,
+            exploring: BTreeSet::new(),
+            explore_slots,
+            availability: vec![0; torrent.pieces.len()],
             inbox,
             incoming,
             next_conn: 0,
@@ -747,7 +752,10 @@ impl TorrentSwarm {
             uploaded: peer.stats.sent as u64,
             reason,
         });
-        self.subsample.remove(&peer.remote_addr);
+        self.exploring.remove(&peer.remote_addr);
+        for piece in peer.pieces() {
+            self.availability[piece as usize] -= 1;
+        }
         self.known
             .entry(peer.remote_addr)
             .or_default()
@@ -797,7 +805,30 @@ impl TorrentSwarm {
         let choked = matches!(msg, BtMessage::Choke(_));
         let choked_us_before = peer.choked_us;
         let became_interested = matches!(msg, BtMessage::Interested(_)) && !peer.interested_us;
-        let msg = match peer.apply(msg) {
+        let new_piece = match &msg {
+            BtMessage::Have(have) if (have.checked as usize) < self.availability.len() && !peer.they_have(have.checked) => {
+                Some(have.checked)
+            }
+            _ => None,
+        };
+        // a whole bitfield replaces whatever the peer claimed before, so its old pieces stop
+        // counting towards availability and the new ones start
+        let replaces_bitfield = matches!(msg, BtMessage::BitField(_) | BtMessage::HaveAll(_) | BtMessage::HaveNone(_));
+        if replaces_bitfield {
+            for piece in peer.pieces() {
+                self.availability[piece as usize] -= 1;
+            }
+        }
+        let peer = &mut self.peers[idx];
+        let applied = peer.apply(msg);
+        if replaces_bitfield {
+            // on a violation the old bitfield stands, and dropping the peer takes it off again
+            for piece in self.peers[idx].pieces() {
+                self.availability[piece as usize] += 1;
+            }
+        }
+        let peer = &mut self.peers[idx];
+        let msg = match applied {
             Ok(None) => {
                 if peer.choked_us != choked_us_before {
                     self.bus.emit(Event::ChokeChanged {
@@ -807,21 +838,24 @@ impl TorrentSwarm {
                         by_us: false,
                     });
                 }
-                if choked {
+                if let Some(piece) = new_piece {
+                    self.availability[piece as usize] += 1;
+                    self.schedule_peer(idx).await;
+                } else if choked {
                     // BEP 3: a choke discards our outstanding requests, and nothing more
                     // will be asked of the peer until it unchokes, so its pieces go back
-                    // on the pile now rather than after a stall timeout
+                    // on the pile now for others rather than after a stall timeout
                     let addr = peer.remote_addr;
                     for piece in self.pieces_held_by(addr) {
                         self.release_claim(piece, addr);
                     }
-                }
-                if became_interested {
+                    self.schedule().await;
+                } else if became_interested {
                     self.unchoke_if_slot_free(idx).await;
-                    return;
+                } else if replaces_bitfield || peer.choked_us != choked_us_before {
+                    // an unchoke or a bitfield may have made pieces requestable
+                    self.schedule().await;
                 }
-                // a Have/BitField/Unchoke may have just made a piece requestable
-                self.schedule().await;
                 return;
             }
             Ok(Some(msg)) => msg,
@@ -1037,7 +1071,7 @@ impl TorrentSwarm {
         *slot = Some(from);
         in_flight.buf[begin..end].copy_from_slice(&block.data);
         if in_flight.blocks_left() > 0 {
-            self.refill(idx).await;
+            self.schedule_peer(idx).await;
             return;
         }
 
@@ -1126,29 +1160,8 @@ impl TorrentSwarm {
     /// ENDGAME_MAX_RACED_FRACTION of the torrent at once; the first to finish wins and the
     /// rest are cancelled (`cancel_losers`).
     async fn schedule(&mut self) {
-        self.admit_to_subsample();
-        loop {
-            let in_flight: usize = self.in_flight.values().map(|f| f.buf.len()).sum();
-            if in_flight >= MAX_INFLIGHT_BYTES {
-                break;
-            }
-            let Some(piece) = self.next_piece() else {
-                break;
-            };
-            let Some(idx) = self.best_peer(piece) else {
-                break;
-            };
-
-            let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
-            self.missing.retain(|p| *p != piece);
-            let addr = self.peers[idx].remote_addr;
-            self.emit_pick(idx, piece);
-            self.in_flight.insert(piece, InFlight::new(size, addr));
-            info!(
-                "requesting piece {piece} from {addr} (window {})",
-                self.peers[idx].request_window()
-            );
-        }
+        self.admit_to_exploring();
+        self.assign_pieces(None);
         if self.missing.is_empty() {
             self.race_the_last_pieces();
         }
@@ -1157,7 +1170,131 @@ impl TorrentSwarm {
         }
     }
 
+    /// `schedule` for one peer that just got room (a block arrived) or something new to offer
+    /// (a Have): cheap enough to run per message, unlike a full pass.
+    async fn schedule_peer(&mut self, idx: usize) {
+        if self.missing.is_empty() {
+            // the endgame is a whole-swarm decision
+            self.schedule().await;
+            return;
+        }
+        // usually the pieces it already holds have blocks left to ask for, and that's all
+        let addr = self.peers[idx].remote_addr;
+        self.refill(idx).await;
+        let Some(idx) = self.peer_index(addr) else {
+            return;
+        };
+        let peer = &self.peers[idx];
+        if peer.requested.len() < peer.request_window() {
+            self.assign_pieces(Some(idx));
+            self.refill(idx).await;
+        }
+    }
+
+    fn eligible(&self, peer: &Peer) -> bool {
+        peer.ready() && (peer.proven() || self.exploring.contains(&peer.remote_addr))
+    }
+
+    /// Unrequested blocks per peer across the pieces it holds: work it already has queued.
+    fn backlogs(&self) -> BTreeMap<SocketAddr, usize> {
+        let mut backlog: BTreeMap<SocketAddr, usize> = BTreeMap::new();
+        for f in self.in_flight.values() {
+            for &addr in f.claims.keys() {
+                *backlog.entry(addr).or_default() += f.unrequested_blocks(addr);
+            }
+        }
+        backlog
+    }
+
+    /// Hands out missing pieces to eligible peers with room in their window, best UCB score
+    /// first, each taking the rarest piece it has (lowest, when sequential). Peers go round
+    /// by round so the in-flight budget is shared out rather than taken by the first peer.
+    /// `only` limits this to one peer.
+    fn assign_pieces(&mut self, only: Option<usize>) {
+        let mut in_flight_bytes: usize = self.in_flight.values().map(|f| f.buf.len()).sum();
+        let rate_scale = self.rate_scale();
+        let mut backlog = self.backlogs();
+        let has_room = |p: &Peer, backlog: &BTreeMap<SocketAddr, usize>| {
+            p.requested.len() + backlog.get(&p.remote_addr).copied().unwrap_or(0) < p.request_window()
+        };
+        let mut order: Vec<(usize, f64)> = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|&(idx, p)| only.is_none_or(|o| o == idx) && self.eligible(p) && has_room(p, &backlog))
+            .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
+            .collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        loop {
+            let mut assigned = false;
+            for &(idx, _) in &order {
+                if in_flight_bytes >= MAX_INFLIGHT_BYTES {
+                    return;
+                }
+                if !has_room(&self.peers[idx], &backlog) {
+                    continue;
+                }
+                let Some(pos) = self.pick_piece_for(idx) else {
+                    continue;
+                };
+                let piece = self.missing.swap_remove(pos);
+                let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
+                let addr = self.peers[idx].remote_addr;
+                self.emit_pick(idx, piece, rate_scale);
+                let in_flight = InFlight::new(size, addr);
+                *backlog.entry(addr).or_default() += in_flight.received.len();
+                self.in_flight.insert(piece, in_flight);
+                in_flight_bytes += size;
+                assigned = true;
+                tracing::debug!(
+                    "requesting piece {piece} from {addr} (window {})",
+                    self.peers[idx].request_window()
+                );
+            }
+            if !assigned {
+                return;
+            }
+        }
+    }
+
+    /// Where in `missing` the piece for this peer is: the rarest one it has, ties broken at
+    /// random so peers starting together spread out; the lowest one when sequential.
+    fn pick_piece_for(&self, idx: usize) -> Option<usize> {
+        let peer = &self.peers[idx];
+        let mut rng = rand::rng();
+        let mut best: Option<(usize, u32)> = None;
+        let mut ties = 0u32;
+        for (pos, &piece) in self.missing.iter().enumerate() {
+            if !peer.they_have(piece) {
+                continue;
+            }
+            let rank = if self.sequential { piece } else { self.availability[piece as usize] };
+            match best {
+                Some((_, best_rank)) if rank > best_rank => {}
+                Some((_, best_rank)) if rank == best_rank => {
+                    ties += 1;
+                    if rng.random_range(0..ties) == 0 {
+                        best = Some((pos, rank));
+                    }
+                }
+                _ => {
+                    best = Some((pos, rank));
+                    ties = 1;
+                }
+            }
+        }
+        best.map(|(pos, _)| pos)
+    }
+
+    /// The fastest rate in the swarm, what UCB scales rates by (see `PeerStatistics::ucb_terms`).
+    fn rate_scale(&self) -> f64 {
+        self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max)
+    }
+
     fn race_the_last_pieces(&mut self) {
+        let rate_scale = self.rate_scale();
+        let mut backlog = self.backlogs();
         let mut raced_bytes: usize = self
             .in_flight
             .values()
@@ -1185,12 +1322,14 @@ impl TorrentSwarm {
                 continue;
             }
             while self.in_flight[&piece].claims.len() < ENDGAME_RACERS {
-                let Some(idx) = self.best_peer(piece) else {
+                let Some(idx) = self.best_peer(piece, &backlog, rate_scale) else {
                     break;
                 };
                 let addr = self.peers[idx].remote_addr;
-                self.emit_pick(idx, piece);
-                self.in_flight.get_mut(&piece).expect("just looked up").add_racer(addr);
+                self.emit_pick(idx, piece, rate_scale);
+                let in_flight = self.in_flight.get_mut(&piece).expect("just looked up");
+                in_flight.add_racer(addr);
+                *backlog.entry(addr).or_default() += in_flight.unrequested_blocks(addr);
                 info!("endgame: also requesting piece {piece} from {addr}");
             }
             if !already_raced && self.in_flight[&piece].claims.len() > 1 {
@@ -1232,44 +1371,32 @@ impl TorrentSwarm {
         }
     }
 
-    /// The next piece to fetch. Rarest first: among the missing pieces, the one held by the
-    /// fewest connected peers (ties broken randomly, so many peers starting at once don't all
-    /// pile onto the same single rarest piece). Sequential: the lowest one anyone has. `None`
-    /// if no connected peer has any of them.
-    fn next_piece(&self) -> Option<u32> {
-        let availability = |piece: u32| self.peers.iter().filter(|p| p.they_have(piece)).count();
-        if self.sequential {
-            return self.missing.iter().copied().filter(|&p| availability(p) > 0).min();
+    /// Ends the trials that are over (the peer delivered, choked us, or left) and starts new
+    /// ones in the free slots, picking at random among the unproven peers that are ready.
+    fn admit_to_exploring(&mut self) {
+        let peers = &self.peers;
+        self.exploring.retain(|addr| {
+            peers
+                .binary_search_by_key(addr, |p| p.remote_addr)
+                .is_ok_and(|idx| peers[idx].ready() && !peers[idx].proven())
+        });
+        let free = self.explore_slots.saturating_sub(self.exploring.len());
+        if free == 0 {
+            return;
         }
-
-        let mut by_availability: Vec<(u32, usize)> = self
-            .missing
+        let candidates: Vec<SocketAddr> = self
+            .peers
             .iter()
-            .map(|&p| (p, availability(p)))
-            .filter(|&(_, count)| count > 0)
+            .filter(|p| p.ready() && !p.proven() && !self.exploring.contains(&p.remote_addr))
+            .map(|p| p.remote_addr)
             .collect();
-        let rarest_count = by_availability.iter().map(|&(_, count)| count).min()?;
-        by_availability.retain(|&(_, count)| count == rarest_count);
-
-        by_availability.choose(&mut rand::rng()).map(|&(piece, _)| piece)
-    }
-
-    /// Fills free slots in the subsample (see the field) with peers that are ready to serve
-    /// us, in peer order.
-    fn admit_to_subsample(&mut self) {
-        for peer in &self.peers {
-            if self.subsample.len() >= self.subsample_size {
-                break;
-            }
-            if peer.ready() {
-                self.subsample.insert(peer.remote_addr);
-            }
+        for addr in candidates.sample(&mut rand::rng(), free) {
+            self.exploring.insert(*addr);
         }
     }
 
     /// The pick just made, with the two halves of the score that decided it.
-    fn emit_pick(&self, idx: usize, piece: u32) {
-        let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
+    fn emit_pick(&self, idx: usize, piece: u32, rate_scale: f64) {
         let peer = &self.peers[idx];
         let (exploit, explore) = if self.total_picks == 0 || peer.stats.picked_count == 0 {
             (0.0, None)
@@ -1288,17 +1415,10 @@ impl TorrentSwarm {
         });
     }
 
-    /// UCB peer selection: of the subsample members that have `piece`, aren't choking us,
+    /// UCB peer selection for an endgame racer: of the eligible peers that have `piece`,
     /// aren't already on it, and have room in their request window for more work, the one
     /// with the highest upper confidence bound on its download speed.
-    fn best_peer(&self, piece: u32) -> Option<usize> {
-        let rate_scale = self.peers.iter().map(|p| p.stats.rx_rate).fold(1.0, f64::max);
-        let mut backlog: BTreeMap<SocketAddr, usize> = BTreeMap::new();
-        for f in self.in_flight.values() {
-            for &addr in f.claims.keys() {
-                *backlog.entry(addr).or_default() += f.unrequested_blocks(addr);
-            }
-        }
+    fn best_peer(&self, piece: u32, backlog: &BTreeMap<SocketAddr, usize>, rate_scale: f64) -> Option<usize> {
         let already_on_it = |p: &Peer| {
             self.in_flight
                 .get(&piece)
@@ -1309,13 +1429,7 @@ impl TorrentSwarm {
         self.peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                self.subsample.contains(&p.remote_addr)
-                    && p.ready()
-                    && p.they_have(piece)
-                    && has_room(p)
-                    && !already_on_it(p)
-            })
+            .filter(|(_, p)| self.eligible(p) && p.they_have(piece) && has_room(p) && !already_on_it(p))
             .map(|(idx, p)| (idx, p.stats.score(self.total_picks, rate_scale)))
             .max_by(|(_, l), (_, r)| l.total_cmp(r))
             .map(|(idx, _)| idx)
@@ -2130,7 +2244,7 @@ mod test {
     #[tokio::test]
     async fn only_the_subsample_is_asked_for_pieces() {
         let (swarm, handle, path) = swarm("subsample");
-        assert_eq!(swarm.subsample_size, 2);
+        assert_eq!(swarm.explore_slots, 2);
         tokio::spawn(swarm.work_loop());
 
         let mut a = fake_peer(&handle, "10.0.0.1:6881").await;
