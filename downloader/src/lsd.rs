@@ -2,7 +2,7 @@
 //! `BT-SEARCH` messages naming the torrents they serve. One task per client sends one
 //! message naming every torrent every LSD_INTERVAL (and right after a torrent is added),
 //! and listens for everyone else's; a message naming a torrent we have turns its sender
-//! into a `PeersDiscovered` for that swarm.
+//! into a `PeersDiscovered` for that swarm. Private torrents (BEP 27) take no part.
 
 use crate::events::PeerSource;
 use crate::magnet::decode_hex;
@@ -58,8 +58,8 @@ async fn run(swarms: Swarms, tcp_port: u16, announce_now: Arc<Notify>, shutdown:
 
     let announce = async {
         loop {
-            let hashes: Vec<InfoHash> = match swarms.upgrade() {
-                Some(swarms) => swarms.lock().unwrap().keys().copied().collect(),
+            let hashes = match swarms.upgrade() {
+                Some(swarms) => announced(&swarms.lock().unwrap()),
                 None => return,
             };
             for chunk in hashes.chunks(HASHES_PER_MESSAGE) {
@@ -94,14 +94,7 @@ async fn run(swarms: Swarms, tcp_port: u16, announce_now: Arc<Notify>, shutdown:
             }
             let Some(swarms) = swarms.upgrade() else { return };
             let peer = SocketAddr::new(from.ip(), search.port);
-            let handles: Vec<TorrentSwarmHandle> = {
-                let swarms = swarms.lock().unwrap();
-                search
-                    .info_hashes
-                    .iter()
-                    .filter_map(|h| swarms.get(h).cloned())
-                    .collect()
-            };
+            let handles = searched(&swarms.lock().unwrap(), &search);
             for handle in handles {
                 debug!("LSD: {peer} has one of our torrents");
                 handle.peers_discovered(vec![peer], PeerSource::Lsd).await;
@@ -113,6 +106,37 @@ async fn run(swarms: Swarms, tcp_port: u16, announce_now: Arc<Notify>, shutdown:
         _ = announce => {}
         _ = listen => {}
     }
+}
+
+/// What a swarm is to discovery: something that may or may not take part.
+trait Discoverable: Clone {
+    fn private(&self) -> bool;
+}
+
+impl Discoverable for TorrentSwarmHandle {
+    fn private(&self) -> bool {
+        self.private
+    }
+}
+
+/// The torrents our announces name.
+fn announced<S: Discoverable>(swarms: &HashMap<InfoHash, S>) -> Vec<InfoHash> {
+    swarms
+        .iter()
+        .filter(|(_, swarm)| !swarm.private())
+        .map(|(hash, _)| *hash)
+        .collect()
+}
+
+/// The swarms `search` names that take its sender as a peer.
+fn searched<S: Discoverable>(swarms: &HashMap<InfoHash, S>, search: &BtSearch) -> Vec<S> {
+    search
+        .info_hashes
+        .iter()
+        .filter_map(|hash| swarms.get(hash))
+        .filter(|swarm| !swarm.private())
+        .cloned()
+        .collect()
 }
 
 fn bt_search(tcp_port: u16, hashes: &[InfoHash], cookie: &str) -> String {
@@ -217,6 +241,27 @@ mod test {
         assert!(parse_bt_search(multibyte.as_bytes()).is_none());
         let signed = b"BT-SEARCH * HTTP/1.1\r\nPort: 1\r\nInfohash: +1+2030405060708090A0B0C0D0E0F1011121314\r\n\r\n";
         assert!(parse_bt_search(signed).is_none(), "not hex");
+    }
+
+    impl Discoverable for bool {
+        fn private(&self) -> bool {
+            *self
+        }
+    }
+
+    /// BEP 27: a private torrent is neither named in our announces nor given the peers that
+    /// others' announces name.
+    #[test]
+    fn private_torrents_take_no_part() {
+        let (public, private) = (InfoHash::from_bytes(&[1; 20]), InfoHash::from_bytes(&[2; 20]));
+        let swarms = HashMap::from([(public, false), (private, true)]);
+        assert_eq!(announced(&swarms), [public]);
+        let search = BtSearch {
+            port: 6881,
+            info_hashes: vec![public, private],
+            cookie: None,
+        };
+        assert_eq!(searched(&swarms, &search), [false]);
     }
 
     #[test]

@@ -130,6 +130,8 @@ pub struct TorrentSwarmHandle {
     trackers: watch::Receiver<Vec<TrackerStatus>>,
     /// what handshakes for this torrent say about BEP 52, for the inbound listener's answer
     pub(crate) v2: V2Support,
+    /// BEP 27: kept out of local service discovery
+    pub(crate) private: bool,
 }
 
 impl TorrentSwarmHandle {
@@ -417,6 +419,7 @@ impl TorrentSwarm {
             peers: peers_rx,
             trackers,
             v2: torrent.v2_support(),
+            private: torrent.private,
         };
         let events_tx = events_tx_weak;
 
