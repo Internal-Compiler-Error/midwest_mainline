@@ -1,21 +1,18 @@
 <script lang="ts">
   // The connected peers: click a header to sort by it (again to flip), drag a header's right
-  // edge to resize the column. Rows are sampled on the shared clock, like the figures in
-  // them, so a sort by rate doesn't reshuffle the list on every poll.
+  // edge to resize the column. The figures are live; the order is only re-sorted on the
+  // shared slow beat (see clock.svelte.ts), so a sort by rate doesn't reshuffle the list
+  // under the pointer on every poll.
   import { untrack } from 'svelte'
   import * as Table from '$lib/components/ui/table'
   import type { Peer } from './api'
-  import { humanBytes, kibPerSecond, peerFlags } from './api'
+  import { humanBytes, rate, peerFlags } from './api'
   import { clock } from './clock.svelte'
   import Num from './Num.svelte'
 
   let { peers: live }: { peers: Peer[] } = $props()
 
-  let peers = $state<Peer[]>(untrack(() => live))
-  $effect(() => {
-    clock.tick
-    peers = untrack(() => live)
-  })
+  let peers = $derived(live)
 
   type Column = {
     key: string
@@ -54,15 +51,30 @@
     }
   }
 
-  let rows = $derived.by(() => {
+  /// row order by address, re-sorted on the beat or when the sort changes
+  let order = $state<string[]>([])
+  $effect(() => {
+    clock.tick
     const col = columns.find((c) => c.key === sortKey)
-    if (!col) return peers
-    const sorted = [...peers].sort((a, b) => {
+    const current = untrack(() => live)
+    if (!col) {
+      order = current.map((p) => p.addr)
+      return
+    }
+    const sorted = [...current].sort((a, b) => {
       const x = col.value(a)
       const y = col.value(b)
       return typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))
     })
-    return descending ? sorted.reverse() : sorted
+    order = (descending ? sorted.reverse() : sorted).map((p) => p.addr)
+  })
+
+  /// live peers in the beat's order; ones that connected since go at the end until the next
+  let rows = $derived.by(() => {
+    const byAddr = new Map(peers.map((p) => [p.addr, p]))
+    const placed = order.flatMap((addr) => byAddr.get(addr) ?? [])
+    const placedSet = new Set(order)
+    return placed.concat(peers.filter((p) => !placedSet.has(p.addr)))
   })
 
   let resizing = $state<string | null>(null)
@@ -117,10 +129,10 @@
         <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
         <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>
         <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.downloaded)} in total">
-          <Num value={peer.download_bps} format={kibPerSecond} />
+          <Num value={peer.download_bps} format={rate} />
         </Table.Cell>
         <Table.Cell class="text-right tabular-nums" title="{humanBytes(peer.uploaded)} in total">
-          <Num value={peer.upload_bps} format={kibPerSecond} />
+          <Num value={peer.upload_bps} format={rate} />
         </Table.Cell>
         <Table.Cell class="font-mono">{peerFlags(peer)}</Table.Cell>
       </Table.Row>

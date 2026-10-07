@@ -68,7 +68,13 @@ impl Transport {
         match self {
             Transport::Tcp => Ok(PeerStream::Tcp(crate::wire::connect(addr).await?)),
             Transport::Utp(utp) => {
-                let stream = tokio::time::timeout(crate::settings::CONNECT_TIMEOUT, utp.connect(addr))
+                // librqbit-utp parents the connection's long-lived span on whatever span is
+                // current when it connects, which would keep our dial's span open for as long as
+                // the connection lasts; a root span of its own (always enabled, kept out of the
+                // traces by its target) cuts that link
+                let root = tracing::error_span!(target: "librqbit_utp", parent: None, "utp_connect", %addr);
+                let connect = tracing::Instrument::instrument(utp.connect(addr), root);
+                let stream = tokio::time::timeout(crate::settings::CONNECT_TIMEOUT, connect)
                     .await
                     .map_err(|_| io::Error::new(ErrorKind::TimedOut, "uTP connect timed out"))?
                     .map_err(io::Error::other)?;

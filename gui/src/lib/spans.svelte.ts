@@ -5,7 +5,7 @@ import { traces, type TraceSpan } from './api'
 
 /** How far back finished spans are kept on this side; the recorder keeps more. */
 const KEEP_MS = 30 * 60 * 1000
-const POLL_MS = 500
+const POLL_MS = 250
 
 export class Traces {
   finished = $state.raw<TraceSpan[]>([])

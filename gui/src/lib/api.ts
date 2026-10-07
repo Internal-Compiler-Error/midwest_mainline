@@ -173,7 +173,20 @@ export function humanBytesLike(bytes: number, like: number): string {
 }
 
 /** Rates are always in KiB/s, so a moving figure never changes unit. */
-export const kibPerSecond = (bytes: number) => `${(bytes / 1024).toFixed(1)} KiB/s`
+/** A transfer rate to about three significant figures, so only digits that mean something move;
+ * the unit comes from `like` (the value being animated towards) so it doesn't flip mid-glide. */
+export function rate(bps: number, like: number = bps): string {
+  const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s']
+  let unit = 0
+  let scale = 1
+  while (unit < units.length - 1 && Math.abs(like) >= scale * 1024) {
+    scale *= 1024
+    unit++
+  }
+  const v = Math.max(bps, 0) / scale
+  const digits = unit === 0 || v >= 100 ? 0 : v >= 10 ? 1 : 2
+  return `${v.toFixed(digits)} ${units[unit]}`
+}
 
 /** One span of a torrent's work (see downloader::telemetry), open or finished. */
 export interface TraceSpan {

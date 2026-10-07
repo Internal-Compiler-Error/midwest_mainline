@@ -6,7 +6,7 @@
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
-  import { fraction, humanBytes, humanBytesLike, isMagnetUri, kibPerSecond, trackerStatus } from './api'
+  import { fraction, humanBytes, humanBytesLike, isMagnetUri, rate, trackerStatus } from './api'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import PeerTable from './PeerTable.svelte'
@@ -58,9 +58,9 @@
       <dt class="font-medium">Location</dt>
       <dd>{torrent.root}</dd>
       <dt class="font-medium">Downloaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={kibPerSecond} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.downloaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.download_bps} format={rate} />)</dd>
       <dt class="font-medium">Uploaded</dt>
-      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={kibPerSecond} />)</dd>
+      <dd class="tabular-nums"><Num value={torrent.uploaded} format={humanBytesLike} />&nbsp;&nbsp;(<Num value={torrent.upload_bps} format={rate} />)</dd>
       <dt class="font-medium">Ratio</dt>
       <dd class="tabular-nums"><Num value={torrent.total_size ? torrent.uploaded / torrent.total_size : 0} format={(n) => n.toFixed(2)} /></dd>
       <dt class="font-medium">Wasted</dt>

@@ -1,24 +1,16 @@
 <script lang="ts">
-  // A number that changes only on the shared 3-second tick, and rolls to its new value over
-  // a second rather than jumping. `format` turns the in-between values into text and also
-  // gets the destination, so a unit (KiB, MiB) can be taken from where the number is going
-  // rather than flicker as the tween crosses a boundary.
-  import { untrack } from 'svelte'
-  import { Tween } from 'svelte/motion'
-  import { cubicOut } from 'svelte/easing'
-  import { clock } from './clock.svelte'
+  // A number that follows its value continuously: each poll's value pulls a critically
+  // damped spring, so the figure glides rather than jumps and settles without overshoot.
+  // `format` gets the in-between value and the destination, so a unit (KiB, MiB) can be taken
+  // from where the number is going rather than flicker as the spring crosses a boundary.
+  import { Spring } from 'svelte/motion'
 
   let {
     value,
     format = (n: number) => String(Math.round(n)),
   }: { value: number; format?: (n: number, target: number) => string } = $props()
 
-  let target = $state(untrack(() => value))
-  $effect(() => {
-    clock.tick
-    target = untrack(() => value)
-  })
-  const tween = Tween.of(() => target, { duration: 1000, easing: cubicOut })
+  const spring = Spring.of(() => value, { stiffness: 0.12, damping: 1 })
 </script>
 
-<span class="tabular-nums">{format(tween.current, target)}</span>
+<span class="tabular-nums">{format(spring.current, value)}</span>
