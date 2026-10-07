@@ -1397,13 +1397,14 @@ impl Session {
     }
 
     /// Saves and applies new settings. The connection cap and rate limits take effect at
-    /// once; the listen port and the DHT switch need a restart, which is the caller's to
-    /// arrange.
-    pub fn update_settings(&mut self, settings: Settings) -> anyhow::Result<()> {
+    /// once; others (the listen port, the DHT switch) at the next start, which is the caller's
+    /// to arrange: returns whether any of those changed (see `Settings::restart_needed`).
+    pub fn update_settings(&mut self, settings: Settings) -> anyhow::Result<bool> {
         settings.save(&self.data_dir)?;
+        let restart = settings.restart_needed(&self.settings.borrow());
         self.slots.set_limit(slot_count(&settings));
         let _ = self.settings.send(settings);
-        Ok(())
+        Ok(restart)
     }
 
     /// BEP 46: points `signing`'s DHT item under `salt` at `version`, so whoever follows the

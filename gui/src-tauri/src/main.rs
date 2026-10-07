@@ -66,7 +66,7 @@ fn add_torrent(app: State<App>, source: String, root: String) -> TorrentId {
     app.session().add(source, root)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resume_torrent(app: State<App>, path: String) -> TorrentId {
     app.session().resume(path)
 }
@@ -106,7 +106,7 @@ fn set_super_seed(app: State<App>, id: TorrentId, on: bool) {
     app.session().set_super_seed(id, on);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resumable(app: State<App>) -> Vec<ResumeSummary> {
     app.session().resumable()
 }
@@ -145,19 +145,11 @@ fn settings(app: State<App>) -> Settings {
     app.session().settings()
 }
 
-/// Returns whether a restart is needed for everything to take effect.
-#[tauri::command]
+/// Returns whether a restart is needed for everything to take effect. Off the main thread,
+/// like the other commands that touch files: a plain command runs on the UI's event loop.
+#[tauri::command(async)]
 fn update_settings(app: State<App>, settings: Settings) -> Result<bool, String> {
-    let mut session = app.session();
-    let before = session.settings();
-    let restart = settings.listen_port != before.listen_port
-        || settings.dht != before.dht
-        || settings.dht_read_only != before.dht_read_only
-        || settings.encryption != before.encryption
-        || settings.utp != before.utp
-        || settings.port_mapping != before.port_mapping;
-    session.update_settings(settings).map_err(|e| format!("{e:#}"))?;
-    Ok(restart)
+    app.session().update_settings(settings).map_err(|e| format!("{e:#}"))
 }
 
 /// How long to gather library events before handing them to the webview as one batch: a

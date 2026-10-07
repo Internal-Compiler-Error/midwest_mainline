@@ -85,6 +85,17 @@ impl Settings {
         }
     }
 
+    /// Whether going from `before` to these changes something that only a restart applies
+    /// (the ones documented "next start").
+    pub fn restart_needed(&self, before: &Settings) -> bool {
+        self.listen_port != before.listen_port
+            || self.dht != before.dht
+            || self.dht_read_only != before.dht_read_only
+            || self.encryption != before.encryption
+            || self.utp != before.utp
+            || self.port_mapping != before.port_mapping
+    }
+
     /// `max_peers_per_torrent` with 0 read as no limit
     pub fn peer_cap(&self) -> usize {
         match self.max_peers_per_torrent {
@@ -134,6 +145,28 @@ pub type SettingsWatch = watch::Receiver<Settings>;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn only_next_start_settings_need_a_restart() {
+        let before = Settings::default();
+        let live = Settings {
+            upload_limit: 1,
+            seed_ratio_limit: 2.0,
+            max_active_downloads: 3,
+            ..before.clone()
+        };
+        assert!(!live.restart_needed(&before));
+        let port = Settings {
+            listen_port: 7000,
+            ..before.clone()
+        };
+        assert!(port.restart_needed(&before));
+        let read_only = Settings {
+            dht_read_only: true,
+            ..before.clone()
+        };
+        assert!(read_only.restart_needed(&before));
+    }
 
     #[test]
     fn missing_file_is_defaults_and_a_partial_file_fills_in() {
