@@ -212,6 +212,20 @@ impl Resolved {
         }
     }
 
+    /// Takes a switch flipped before the torrent was known. A file selection can only fit by
+    /// chance, since the files weren't known either.
+    fn switch(&mut self, switch: Switch) {
+        match switch {
+            Switch::Files(selected) => {
+                if selected.len() == self.selected.len() {
+                    self.selected = selected;
+                }
+            }
+            Switch::Sequential(on) => self.modes.sequential = on,
+            Switch::SuperSeed(on) => self.modes.super_seed = on,
+        }
+    }
+
     /// Picks a torrent back up from its resume file. Blocking.
     fn read(path: &Path) -> anyhow::Result<Self> {
         let data = ResumeData::read(path)?;
@@ -464,11 +478,10 @@ impl TorrentTask {
             }
         }
         let mut resolve = std::pin::pin!(resolve(self.controls.cancel.clone()));
-        // a pause or unpause asked for while still resolving applies once resolved, over what the
-        // resume file says
+        // a pause or unpause asked for while still resolving, and the switches flipped, apply
+        // once resolved, over what the resume file says
         let mut pause_asked = None;
-        // a switch flipped while resolving wins over what the resume file says
-        let (mut sequential_asked, mut super_seed_asked) = (None, None);
+        let mut switched = vec![];
         let resolved = loop {
             tokio::select! {
                 resolved = &mut resolve => break resolved,
@@ -488,17 +501,15 @@ impl TorrentTask {
                     Command::Act(Action::Remove { .. } | Action::Shutdown) => return,
                     Command::Act(Action::Pause) => pause_asked = Some(true),
                     Command::Act(Action::Unpause) => pause_asked = Some(false),
-                    Command::Set(Switch::Sequential(on)) => sequential_asked = Some(on),
-                    Command::Set(Switch::SuperSeed(on)) => super_seed_asked = Some(on),
-                    // the files aren't known yet, and there's nothing on disk to check
-                    Command::Set(Switch::Files(_)) | Command::Act(Action::Recheck) => {}
+                    Command::Set(switch) => switched.push(switch),
+                    // there's nothing on disk to check yet
+                    Command::Act(Action::Recheck) => {}
                 },
             }
         };
         let mut resolved = resolved.map(|mut resolved| {
             resolved.paused = pause_asked.unwrap_or(resolved.paused);
-            resolved.modes.sequential = sequential_asked.unwrap_or(resolved.modes.sequential);
-            resolved.modes.super_seed = super_seed_asked.unwrap_or(resolved.modes.super_seed);
+            switched.into_iter().for_each(|switch| resolved.switch(switch));
             resolved
         });
 
