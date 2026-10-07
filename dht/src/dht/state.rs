@@ -6,7 +6,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{SqliteConnection, prelude::*};
 use rand::RngExt;
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::dht::routing_table::RoutingTable;
@@ -114,6 +114,16 @@ impl SharedState {
         } else {
             self.sibling().map(|s| s.routing_table.clone())
         }
+    }
+
+    /// `f` of the state, on the blocking pool: what reads or writes the store, called from
+    /// async code. `None` if it panicked.
+    pub(crate) async fn blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&SharedState) -> T + Send + 'static,
+    ) -> Option<T> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || f(&this)).await.ok()
     }
 
     /// Runs `f` on a connection of the pool

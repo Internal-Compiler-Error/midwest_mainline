@@ -364,7 +364,12 @@ impl DhtClient {
         info_hash: InfoHash,
         mut found: impl FnMut(&[SocketAddr]) + Send,
     ) -> GetPeersResult {
-        let ours = self.state.swarm_peers(&info_hash, self.family());
+        let family = self.family();
+        let ours = self
+            .state
+            .blocking(move |state| state.swarm_peers(&info_hash, family))
+            .await
+            .unwrap_or_default();
         if !ours.is_empty() {
             found(&ours);
         }
@@ -384,13 +389,18 @@ impl DhtClient {
     pub async fn scrape(&self, info_hash: InfoHash) -> SwarmEstimate {
         let (_, filters) = self.lookup_peers(info_hash, true, |_| {}).await;
         let answered = filters.len();
-        let both = filters.into_iter().chain(self.state.scrape_filters(&info_hash)).fold(
-            ScrapeFilters::default(),
-            |acc, f| ScrapeFilters {
+        let ours = self
+            .state
+            .blocking(move |state| state.scrape_filters(&info_hash))
+            .await
+            .flatten();
+        let both = filters
+            .into_iter()
+            .chain(ours)
+            .fold(ScrapeFilters::default(), |acc, f| ScrapeFilters {
                 seeds: acc.seeds.union(&f.seeds),
                 peers: acc.peers.union(&f.peers),
-            },
-        );
+            });
         SwarmEstimate {
             seeds: both.seeds.estimate().round() as u64,
             peers: both.peers.estimate().round() as u64,
@@ -449,7 +459,12 @@ impl DhtClient {
     #[tracing::instrument(skip(self))]
     pub async fn get_immutable(&self, target: NodeId) -> Option<Vec<u8>> {
         let genuine = |item: &Item| item::immutable_target(&item.value) == target;
-        if let Some(item) = self.state.stored_item(&target, None).filter(genuine) {
+        let ours = self
+            .state
+            .blocking(move |state| state.stored_item(&target, None))
+            .await
+            .flatten();
+        if let Some(item) = ours.filter(genuine) {
             return Some(item.value);
         }
         let (_, items) = self.lookup_items(target, None, genuine).await;
@@ -462,9 +477,14 @@ impl DhtClient {
     pub async fn get_mutable(&self, key: [u8; 32], salt: &[u8], newer_than: Option<i64>) -> Option<MutableItem> {
         let target = item::mutable_target(&key, salt);
         let (_, items) = self.lookup_items(target, newer_than, |_| false).await;
+        let ours = self
+            .state
+            .blocking(move |state| state.stored_item(&target, newer_than))
+            .await
+            .flatten();
         items
             .iter()
-            .chain(self.state.stored_item(&target, newer_than).as_ref())
+            .chain(ours.as_ref())
             .filter_map(|item| MutableItem::verified(item, &key, salt))
             .max_by_key(|item| item.seq)
     }

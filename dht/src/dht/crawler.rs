@@ -115,11 +115,13 @@ impl Crawler {
                     self.stats.answered.fetch_add(1, Relaxed);
                     self.stats.samples.fetch_add(sampled.samples.len() as u64, Relaxed);
                     rest_until.insert(host(&node), Instant::now() + sampled.interval.max(MIN_REVISIT));
-                    match self.state.record_samples(&sampled.samples) {
-                        Ok(new) => {
+                    let samples = sampled.samples.clone();
+                    match self.state.blocking(move |state| state.record_samples(&samples)).await {
+                        Some(Ok(new)) => {
                             self.stats.new_info_hashes.fetch_add(new as u64, Relaxed);
                         }
-                        Err(e) => warn!("couldn't store sampled info hashes: {e}"),
+                        Some(Err(e)) => warn!("couldn't store sampled info hashes: {e}"),
+                        None => {}
                     }
                     debug!(
                         "{} stores {} info hashes, sampled {}, gave {} nodes",
