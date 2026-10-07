@@ -10,8 +10,8 @@
 use crate::announcer::{TrackerState, TrackerStatus};
 use crate::config::{Settings, SettingsWatch};
 use crate::defs::Identity;
-use crate::dht::Dht;
-use crate::events::{Event, EventBus, Events, info_hash_hex};
+use crate::dht::{Dht, DhtWatch};
+use crate::events::{Event, EventBus, Events};
 use crate::feed::{Feed, FeedKey, Found};
 use crate::peer::PeerSnapshot;
 use crate::portmap::MappingState;
@@ -20,7 +20,8 @@ use crate::resume::{
 };
 use crate::torrent::Torrent;
 use crate::torrent_swarm::TorrentSwarmStats;
-use crate::{BtClient, load_source};
+use crate::utp::UtpWatch;
+use crate::{BtClient, Loaded, load_source};
 use anyhow::Context;
 use bitvec::prelude::*;
 use midwest_mainline::types::InfoHash;
@@ -170,7 +171,8 @@ struct Resolved {
     torrent: Torrent,
     root: PathBuf,
     verified: BitBox<u8, Msb0>,
-    /// the files are expected to exist already (checked, not created)
+    /// it comes from a resume file: its files are expected to exist already (checked, not
+    /// created), and it has been away a while, so a key it follows is polled soon
     resumed: bool,
     /// start paused rather than downloading
     paused: bool,
@@ -183,10 +185,136 @@ struct Resolved {
     modes: Modes,
     /// BEP 46: the key it follows
     feed: Option<Feed>,
-    /// hash the files before starting (an update that reuses its predecessor's)
-    check_first: bool,
-    /// it has been away a while (resumed), so its key is polled soon rather than in an hour
-    poll_soon: bool,
+}
+
+impl Resolved {
+    /// A torrent new to the session: nothing verified, every file selected.
+    fn new(loaded: Loaded, root: PathBuf) -> Self {
+        let Loaded { torrent, peers } = loaded;
+        Self {
+            verified: bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice(),
+            selected: vec![true; torrent.files.len()],
+            torrent,
+            root,
+            resumed: false,
+            paused: false,
+            peers,
+            uploaded: 0,
+            modes: Modes::default(),
+            feed: None,
+        }
+    }
+
+    /// Picks a torrent back up from its resume file. Blocking.
+    fn read(path: &Path) -> anyhow::Result<Self> {
+        let data = ResumeData::read(path)?;
+        let torrent = data.to_torrent()?;
+        Ok(Self {
+            selected: data.selected(torrent.files.len()),
+            torrent,
+            root: data.root,
+            verified: data.verified,
+            resumed: true,
+            paused: data.paused,
+            peers: vec![],
+            uploaded: data.uploaded,
+            modes: data.modes,
+            feed: data.feed,
+        })
+    }
+}
+
+/// What resolving a source needs from the session, for a torrent's task to take along.
+#[derive(Clone)]
+struct Loader {
+    identity: Arc<Identity>,
+    dht: DhtWatch,
+    utp: UtpWatch,
+    bus: EventBus,
+}
+
+impl Loader {
+    async fn load(&self, source: &str, cancel: CancellationToken) -> anyhow::Result<Loaded> {
+        let Self {
+            identity,
+            dht,
+            utp,
+            bus,
+        } = self.clone();
+        load_source(source, identity, cancel, dht, utp, bus).await
+    }
+}
+
+/// What changes what a torrent is doing; the user's, except `Shutdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Pause,
+    Unpause,
+    Recheck,
+    Remove { delete_files: bool },
+    Shutdown,
+}
+
+/// A per-torrent choice that holds whatever the torrent is doing.
+enum Switch {
+    Files(Vec<bool>),
+    Sequential(bool),
+    SuperSeed(bool),
+}
+
+/// What a front end can do to a torrent; the torrent's task carries it out.
+enum Command {
+    Act(Action),
+    Set(Switch),
+}
+
+/// A torrent's task's side of the user: the commands its entry sends, the switches they
+/// set, and the session's shutdown.
+struct Controls {
+    commands: mpsc::UnboundedReceiver<Command>,
+    cancel: CancellationToken,
+    /// the file selection, read by the resume saver and shown in the phase
+    selected: watch::Sender<Vec<bool>>,
+    modes: watch::Sender<Modes>,
+}
+
+impl Controls {
+    /// The next command; `Shutdown` once the session is going away.
+    async fn recv(&mut self) -> Command {
+        tokio::select! {
+            _ = self.cancel.cancelled() => Command::Act(Action::Shutdown),
+            command = self.commands.recv() => command.unwrap_or(Command::Act(Action::Shutdown)),
+        }
+    }
+
+    /// The next action. A switch that comes first is recorded, and passed on to the swarm
+    /// `running` names, if any; that returns `None`, for a caller that shows the switches.
+    async fn next(&mut self, running: Option<(&BtClient, &InfoHash)>) -> Option<Action> {
+        match self.recv().await {
+            Command::Act(action) => Some(action),
+            Command::Set(switch) => {
+                self.set(switch, running);
+                None
+            }
+        }
+    }
+
+    fn set(&self, switch: Switch, running: Option<(&BtClient, &InfoHash)>) {
+        if let Some((client, info_hash)) = running {
+            match &switch {
+                Switch::Files(selected) => client.select_files(info_hash, selected.clone()),
+                Switch::Sequential(on) => client.set_sequential(info_hash, *on),
+                Switch::SuperSeed(on) => client.set_super_seed(info_hash, *on),
+            }
+        }
+        match switch {
+            Switch::Files(selected) => {
+                self.selected.send_replace(selected);
+            }
+            Switch::Sequential(on) => self.modes.send_modify(|m| m.sequential = on),
+            Switch::SuperSeed(on) => self.modes.send_modify(|m| m.super_seed = on),
+        }
+    }
 }
 
 /// The task that owns one torrent for its whole life in the session: resolves the source,
@@ -198,13 +326,8 @@ struct TorrentTask {
     /// what the user gave, for naming a torrent that failed before it was known
     source: String,
     resume_dir: PathBuf,
-    cancel: CancellationToken,
     phase: watch::Sender<Phase>,
-    commands: mpsc::UnboundedReceiver<Command>,
-    /// the file selection, read by the resume saver and shown in the phase
-    selected: watch::Sender<Vec<bool>>,
-    /// same for the per-torrent switches
-    modes: watch::Sender<Modes>,
+    controls: Controls,
     /// the session's active-download slots, see `Settings::max_active_downloads`
     slots: Arc<Slots>,
     /// known before resolving for a magnet or a resume file; names the resume file to
@@ -277,15 +400,6 @@ enum Owned {
     Unresolved,
 }
 
-/// What ended a running or paused stretch of a torrent's life.
-enum Stop {
-    Pause,
-    Unpause,
-    Recheck,
-    Remove { delete_files: bool },
-    Shutdown,
-}
-
 impl TorrentTask {
     async fn run<F, Fut>(mut self, resolve: F)
     where
@@ -303,7 +417,7 @@ impl TorrentTask {
                 return;
             }
         }
-        let mut resolve = std::pin::pin!(resolve(self.cancel.clone()));
+        let mut resolve = std::pin::pin!(resolve(self.controls.cancel.clone()));
         // a pause asked for while still resolving applies once resolved
         let mut pause_asked = false;
         // a switch flipped while resolving wins over what the resume file says
@@ -311,16 +425,15 @@ impl TorrentTask {
         let resolved = loop {
             tokio::select! {
                 resolved = &mut resolve => break resolved,
-                _ = self.cancel.cancelled() => return,
-                command = self.commands.recv() => match command {
+                command = self.controls.recv() => match command {
                     // removed while still resolving: nothing was written yet
-                    Some(Command::Remove { .. }) | None => return,
-                    Some(Command::Pause) => pause_asked = true,
-                    Some(Command::Unpause) => pause_asked = false,
-                    Some(Command::Sequential(on)) => sequential_asked = Some(on),
-                    Some(Command::SuperSeed(on)) => super_seed_asked = Some(on),
+                    Command::Act(Action::Remove { .. } | Action::Shutdown) => return,
+                    Command::Act(Action::Pause) => pause_asked = true,
+                    Command::Act(Action::Unpause) => pause_asked = false,
+                    Command::Set(Switch::Sequential(on)) => sequential_asked = Some(on),
+                    Command::Set(Switch::SuperSeed(on)) => super_seed_asked = Some(on),
                     // the files aren't known yet, and there's nothing on disk to check
-                    Some(Command::SelectFiles(_) | Command::Recheck) => {}
+                    Command::Set(Switch::Files(_)) | Command::Act(Action::Recheck) => {}
                 },
             }
         };
@@ -331,7 +444,7 @@ impl TorrentTask {
             resolved
         });
 
-        let mut recheck_first = resolved.as_ref().is_ok_and(|r| r.check_first);
+        let mut recheck_first = false;
         loop {
             let (error, owned) = match resolved {
                 Err(e) => (format!("{e:#}"), Owned::Unresolved),
@@ -365,29 +478,9 @@ impl TorrentTask {
             started: Instant::now(),
         });
         tracing::info!("retrying {}", path.display());
-        let read = tokio::task::spawn_blocking(move || {
-            let data = ResumeData::read(&path)?;
-            let torrent = data.to_torrent()?;
-            anyhow::Ok((data, torrent))
-        });
-        let (data, torrent) = read.await??;
-        Ok(Resolved {
-            selected: data.selected(torrent.files.len()),
-            torrent,
-            root: data.root,
-            verified: data.verified,
-            resumed: true,
-            paused: recheck && data.paused,
-            peers: vec![],
-            uploaded: data.uploaded,
-            modes: Modes {
-                sequential: data.sequential,
-                super_seed: data.super_seed,
-            },
-            feed: data.feed,
-            check_first: false,
-            poll_soon: true,
-        })
+        let mut resolved = tokio::task::spawn_blocking(move || Resolved::read(&path)).await??;
+        resolved.paused &= recheck;
+        Ok(resolved)
     }
 
     /// Runs a resolved torrent until it's removed or the session shuts down, or until it
@@ -404,12 +497,10 @@ impl TorrentTask {
             uploaded,
             modes,
             feed,
-            check_first: _,
-            poll_soon,
         } = resolved;
         let torrent = Arc::new(torrent);
         self.feed.send_replace(feed);
-        let _follower = self.follow(&torrent, &root, poll_soon);
+        let _follower = self.follow(&torrent, &root, resumed);
         self.persisted = match resumed {
             true => verified.clone(),
             false => bitvec![u8, Msb0; 0; verified.len()].into_boxed_bitslice(),
@@ -422,47 +513,53 @@ impl TorrentTask {
             piece_size: torrent.piece_size,
             files: torrent.files.len(),
         });
-        self.selected.send_replace(selected);
-        self.modes.send_replace(modes);
+        self.controls.selected.send_replace(selected);
+        self.controls.modes.send_replace(modes);
         self.uploaded_before = uploaded;
 
+        // the counters of the last running stretch, for the paused snapshot
         let mut last_stats = None;
-        // a newly added torrent whose files are already there (its creator seeding it, or a
-        // download moved over from another client) starts with a check, not from nothing
-        let mut next =
-            (recheck_first || (!resumed && has_data_on_disk(&torrent, &root))).then_some(Ok((Stop::Recheck, None)));
-        let stop = loop {
-            let stop = if let Some(stop) = next.take() {
-                stop
+        // a newly added torrent whose files are already there (its creator seeding it, a
+        // download moved over from another client, an update starting from its
+        // predecessor's) starts with a check, not from nothing
+        let mut check = recheck_first || (!resumed && has_data_on_disk(&torrent, &root));
+        let action = loop {
+            let action = if std::mem::take(&mut check) {
+                // back to whichever of running or paused it was in, with what the disk holds
+                match self.check(&torrent, &root, &mut verified).await {
+                    Ok(pause_asked) => {
+                        resumed = true;
+                        paused = pause_asked.unwrap_or(paused);
+                        continue;
+                    }
+                    Err(action) => action,
+                }
             } else if paused {
                 self.wait_while_paused(&torrent, &root, &verified, last_stats.take())
                     .await
             } else {
-                self.run_until_stopped(&torrent, &root, &mut verified, &mut resumed, &mut peers)
+                match self
+                    .run_until_stopped(&torrent, &root, &mut verified, &mut resumed, &mut peers)
                     .await
-            };
-            match stop {
-                Ok((Stop::Pause, stats)) => {
-                    paused = true;
-                    last_stats = stats;
-                }
-                Ok((Stop::Unpause, _)) => paused = false,
-                // back to whichever of the two it was in, with what the disk really holds
-                Ok((Stop::Recheck, _)) => match self.check(&torrent, &root, &mut verified).await {
-                    Ok(pause_asked) => {
-                        resumed = true;
-                        if let Some(pause) = pause_asked {
-                            paused = pause;
+                {
+                    Ok((action, stats)) => {
+                        if action == Action::Pause {
+                            last_stats = stats;
                         }
+                        action
                     }
-                    Err(stop) => break stop,
-                },
-                Ok((stop, _)) => break stop,
-                Err(e) => return Some((format!("{e:#}"), Owned::Torrent { torrent, root })),
+                    Err(e) => return Some((format!("{e:#}"), Owned::Torrent { torrent, root })),
+                }
+            };
+            match action {
+                Action::Pause => paused = true,
+                Action::Unpause => paused = false,
+                Action::Recheck => check = true,
+                Action::Remove { .. } | Action::Shutdown => break action,
             }
         };
 
-        if let Stop::Remove { delete_files } = stop {
+        if let Action::Remove { delete_files } = action {
             self.remove_files(&torrent, &root, delete_files);
             self.bus.emit(Event::TorrentRemoved {
                 info_hash: torrent.info_hash,
@@ -472,16 +569,38 @@ impl TorrentTask {
         None
     }
 
+    /// What the session shows of a known torrent whatever it's doing.
+    fn shown(&self, torrent: &Arc<Torrent>, root: &Path) -> Shown {
+        Shown {
+            torrent: torrent.clone(),
+            root: root.to_path_buf(),
+            selected: self.controls.selected.subscribe(),
+            modes: self.controls.modes.subscribe(),
+            feed: self.feed.subscribe(),
+            uploaded_before: self.uploaded_before,
+        }
+    }
+
+    fn resume_inputs(&self) -> ResumeInputs {
+        ResumeInputs {
+            selected: self.controls.selected.subscribe(),
+            modes: self.controls.modes.subscribe(),
+            uploaded_before: self.uploaded_before,
+            persisted: self.persisted.clone(),
+            feed: self.feed.subscribe(),
+        }
+    }
+
     /// Re-hashes the files off the runtime, publishing progress meanwhile. Only removal and
     /// shutdown interrupt it; the hashing itself runs to its end regardless. A pause or
     /// unpause asked for meanwhile is returned for the caller to apply afterwards; the
-    /// selection switches take effect at once, for when the torrent restarts.
+    /// switches are recorded for when the torrent restarts.
     async fn check(
         &mut self,
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &mut BitBox<u8, Msb0>,
-    ) -> Result<Option<bool>, Stop> {
+    ) -> Result<Option<bool>, Action> {
         let (progress, checked) = watch::channel(0);
         let _ = self.phase.send(Phase::Checking {
             torrent: torrent.clone(),
@@ -518,22 +637,11 @@ impl TorrentTask {
                     }
                     return Ok(pause_asked);
                 }
-                _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
-                command = self.commands.recv() => match command {
-                    Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
-                    None => return Err(Stop::Shutdown),
-                    Some(Command::Pause) => pause_asked = Some(true),
-                    Some(Command::Unpause) => pause_asked = Some(false),
-                    Some(Command::SelectFiles(selected)) => {
-                        self.selected.send_replace(selected);
-                    }
-                    Some(Command::Sequential(on)) => {
-                        self.modes.send_modify(|m| m.sequential = on);
-                    }
-                    Some(Command::SuperSeed(on)) => {
-                        self.modes.send_modify(|m| m.super_seed = on);
-                    }
-                    Some(Command::Recheck) => {}
+                action = self.controls.next(None) => match action {
+                    Some(Action::Pause) => pause_asked = Some(true),
+                    Some(Action::Unpause) => pause_asked = Some(false),
+                    Some(Action::Recheck) | None => {}
+                    Some(action) => return Err(action),
                 },
             }
         }
@@ -561,25 +669,22 @@ impl TorrentTask {
             }),
         };
         loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => return None,
-                command = self.commands.recv() => match command {
-                    Some(Command::Remove { delete_files }) => {
-                        match owned {
-                            Owned::Nothing => {}
-                            Owned::Torrent { torrent, root } => self.remove_files(torrent, root, delete_files),
-                            Owned::Unresolved => self.remove_unresolved(),
-                        }
-                        return None;
+            match self.controls.next(None).await {
+                Some(Action::Remove { delete_files }) => {
+                    match owned {
+                        Owned::Nothing => {}
+                        Owned::Torrent { torrent, root } => self.remove_files(torrent, root, delete_files),
+                        Owned::Unresolved => self.remove_unresolved(),
                     }
-                    None => return None,
-                    Some(command @ (Command::Unpause | Command::Recheck)) => {
-                        if let Some(path) = retry_from.as_ref().filter(|path| path.exists()) {
-                            return Some((path.clone(), matches!(command, Command::Recheck)));
-                        }
+                    return None;
+                }
+                Some(Action::Shutdown) => return None,
+                Some(action @ (Action::Unpause | Action::Recheck)) => {
+                    if let Some(path) = retry_from.as_ref().filter(|path| path.exists()) {
+                        return Some((path.clone(), action == Action::Recheck));
                     }
-                    Some(_) => {}
-                },
+                }
+                Some(Action::Pause) | None => {}
             }
         }
     }
@@ -616,6 +721,7 @@ impl TorrentTask {
 
     /// Puts the torrent in the client and keeps its resume file current until something
     /// stops it, then takes it out again. `verified` is updated to what's on disk by then.
+    /// Returns the last stats of the stretch, if it got as far as running.
     async fn run_until_stopped(
         &mut self,
         torrent: &Arc<Torrent>,
@@ -623,13 +729,13 @@ impl TorrentTask {
         verified: &mut BitBox<u8, Msb0>,
         resumed: &mut bool,
         peers: &mut Vec<std::net::SocketAddr>,
-    ) -> anyhow::Result<(Stop, Option<TorrentSwarmStats>)> {
+    ) -> anyhow::Result<(Action, Option<TorrentSwarmStats>)> {
         // held while downloading; released on completion so seeding never counts
         let mut slot = match verified.all() {
             true => None,
             false => match self.wait_for_slot(torrent, root, verified).await {
                 Ok(permit) => Some(permit),
-                Err(stop) => return Ok((stop, None)),
+                Err(action) => return Ok((action, None)),
             },
         };
         if *resumed {
@@ -640,20 +746,21 @@ impl TorrentTask {
         }
         // whatever happens next, the files exist
         *resumed = true;
-        self.client.add_peers(&torrent.info_hash, std::mem::take(peers));
-        if self.selected.borrow().iter().any(|s| !s) {
-            self.client
-                .select_files(&torrent.info_hash, self.selected.borrow().clone());
+        let info_hash = &torrent.info_hash;
+        self.client.add_peers(info_hash, std::mem::take(peers));
+        let selected = self.controls.selected.borrow().clone();
+        if selected.iter().any(|s| !s) {
+            self.client.select_files(info_hash, selected);
         }
-        let modes = *self.modes.borrow();
+        let modes = *self.controls.modes.borrow();
         if modes.sequential {
-            self.client.set_sequential(&torrent.info_hash, true);
+            self.client.set_sequential(info_hash, true);
         }
         if modes.super_seed {
-            self.client.set_super_seed(&torrent.info_hash, true);
+            self.client.set_super_seed(info_hash, true);
         }
         let Some(stats) = self.client.stats(torrent) else {
-            self.client.remove_torrent(&torrent.info_hash);
+            self.client.remove_torrent(info_hash);
             anyhow::bail!("torrent was added but reported no stats");
         };
         let peers = self.client.peers(torrent).unwrap_or_else(|| watch::channel(vec![]).1);
@@ -661,33 +768,23 @@ impl TorrentTask {
             .client
             .trackers(torrent)
             .unwrap_or_else(|| watch::channel(vec![]).1);
-        let stop_saving = self.cancel.child_token();
+        let stop_saving = self.controls.cancel.child_token();
         let saver = tokio::spawn(keep_saving(
             torrent.clone(),
             root.to_path_buf(),
             stats.clone(),
-            ResumeInputs {
-                selected: self.selected.subscribe(),
-                modes: self.modes.subscribe(),
-                uploaded_before: self.uploaded_before,
-                persisted: self.persisted.clone(),
-                feed: self.feed.subscribe(),
-            },
+            self.resume_inputs(),
             self.resume_dir.clone(),
             stop_saving.clone(),
         ));
         let _ = self.phase.send(Phase::Downloading {
-            torrent: torrent.clone(),
-            root: root.to_path_buf(),
+            shown: self.shown(torrent, root),
             stats: stats.clone(),
             peers,
             trackers,
-            selected: self.selected.subscribe(),
-            modes: self.modes.subscribe(),
-            uploaded_before: self.uploaded_before,
         });
         self.bus.emit(Event::TorrentStarted {
-            info_hash: torrent.info_hash,
+            info_hash: *info_hash,
             verified: verified.count_ones(),
             pieces: verified.len(),
         });
@@ -695,7 +792,7 @@ impl TorrentTask {
         let mut ratio_stats = stats.clone();
         // one that starts complete finished some other time
         let mut completion_told = ratio_stats.borrow().completed;
-        let stop = loop {
+        let action = loop {
             // the swarm stopped itself: Unpause retries once the disk has room again
             if let Some(e) = ratio_stats.borrow().storage_error.clone() {
                 break Err(anyhow::anyhow!("couldn't write the files: {e}"));
@@ -704,61 +801,43 @@ impl TorrentTask {
                 drop(slot.take());
                 if !completion_told {
                     completion_told = true;
-                    self.bus.emit(Event::TorrentCompleted {
-                        info_hash: torrent.info_hash,
-                    });
+                    self.bus.emit(Event::TorrentCompleted { info_hash: *info_hash });
                 }
             }
             // a torrent that comes back already over its ratio stops before waiting for
             // anything to change
             if self.seeded_enough(torrent, &ratio_stats.borrow_and_update()) {
-                break Ok(Stop::Pause);
+                break Ok(Action::Pause);
             }
             tokio::select! {
-                _ = self.cancel.cancelled() => break Ok(Stop::Shutdown),
-                command = self.commands.recv() => match command {
-                    Some(Command::Pause) => break Ok(Stop::Pause),
-                    Some(Command::Recheck) => break Ok(Stop::Recheck),
-                    Some(Command::Remove { delete_files }) => break Ok(Stop::Remove { delete_files }),
-                    Some(Command::SelectFiles(selected)) => {
-                        self.client.select_files(&torrent.info_hash, selected.clone());
-                        self.selected.send_replace(selected);
-                    }
-                    Some(Command::Sequential(on)) => {
-                        self.client.set_sequential(&torrent.info_hash, on);
-                        self.modes.send_modify(|m| m.sequential = on);
-                    }
-                    Some(Command::SuperSeed(on)) => {
-                        self.client.set_super_seed(&torrent.info_hash, on);
-                        self.modes.send_modify(|m| m.super_seed = on);
-                    }
-                    Some(Command::Unpause) => {}
-                    None => break Ok(Stop::Shutdown),
+                action = self.controls.next(Some((&self.client, info_hash))) => match action {
+                    Some(Action::Unpause) | None => {}
+                    Some(action) => break Ok(action),
                 },
                 // the stats change on every verified piece and uploaded block, the settings
                 // when the user edits the limit; either can be what tips the ratio over
                 changed = ratio_stats.changed() => {
                     // the swarm's end closes its stats; one the session didn't stop died
                     if changed.is_err() {
-                        break match self.cancel.is_cancelled() {
-                            true => Ok(Stop::Shutdown),
+                        break match self.controls.cancel.is_cancelled() {
+                            true => Ok(Action::Shutdown),
                             false => Err(anyhow::anyhow!("the torrent stopped running unexpectedly")),
                         };
                     }
                     if self.seeded_enough(torrent, &ratio_stats.borrow()) {
-                        break Ok(Stop::Pause);
+                        break Ok(Action::Pause);
                     }
                 }
                 _ = self.settings.changed() => {
                     if self.seeded_enough(torrent, &stats.borrow()) {
-                        break Ok(Stop::Pause);
+                        break Ok(Action::Pause);
                     }
                 }
             }
         };
         // the torrent leaves the client; the saver gets its final write in before anything
         // is deleted, or the deletion would race it
-        self.client.remove_torrent(&torrent.info_hash);
+        self.client.remove_torrent(info_hash);
         stop_saving.cancel();
         if let Ok(persisted) = saver.await {
             self.persisted = persisted;
@@ -766,17 +845,16 @@ impl TorrentTask {
         let last = stats.borrow().clone();
         *verified = last.verified.clone();
         self.uploaded_before += last.uploaded;
-        Ok((stop?, Some(last)))
+        Ok((action?, Some(last)))
     }
 
-    /// Waits for an active-download slot, showing the torrent as queued meanwhile and still
-    /// taking the commands that make sense for one that isn't running.
+    /// Waits for an active-download slot, showing the torrent as queued meanwhile.
     async fn wait_for_slot(
         &mut self,
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &BitBox<u8, Msb0>,
-    ) -> Result<SlotPermit, Stop> {
+    ) -> Result<SlotPermit, Action> {
         let slots = self.slots.clone();
         let acquire = slots.acquire();
         tokio::pin!(acquire);
@@ -784,34 +862,17 @@ impl TorrentTask {
             info_hash: torrent.info_hash,
         });
         loop {
-            // published on entry and again after a selection change, like the paused phase
-            let wanted = torrent.wanted_pieces(&self.selected.borrow());
+            // again after a selection change, which changes what's wanted
+            let wanted = torrent.wanted_pieces(&self.controls.selected.borrow());
             let _ = self.phase.send(Phase::Queued {
-                torrent: torrent.clone(),
-                root: root.to_path_buf(),
+                shown: self.shown(torrent, root),
                 stats: TorrentSwarmStats::for_verified(torrent, verified.clone(), wanted),
-                selected: self.selected.subscribe(),
-                modes: self.modes.subscribe(),
-                uploaded_before: self.uploaded_before,
             });
             tokio::select! {
                 permit = &mut acquire => return Ok(permit),
-                _ = self.cancel.cancelled() => return Err(Stop::Shutdown),
-                command = self.commands.recv() => match command {
-                    Some(Command::Pause) => return Err(Stop::Pause),
-                    Some(Command::Recheck) => return Err(Stop::Recheck),
-                    Some(Command::Remove { delete_files }) => return Err(Stop::Remove { delete_files }),
-                    Some(Command::SelectFiles(selected)) => {
-                        self.selected.send_replace(selected);
-                    }
-                    Some(Command::Sequential(on)) => {
-                        self.modes.send_modify(|m| m.sequential = on);
-                    }
-                    Some(Command::SuperSeed(on)) => {
-                        self.modes.send_modify(|m| m.super_seed = on);
-                    }
-                    Some(Command::Unpause) => {}
-                    None => return Err(Stop::Shutdown),
+                action = self.controls.next(None) => match action {
+                    Some(Action::Unpause) | None => {}
+                    Some(action) => return Err(action),
                 },
             }
         }
@@ -830,7 +891,7 @@ impl TorrentTask {
             self.bus.clone(),
         );
         let (torrent, root) = (torrent.clone(), root.to_path_buf());
-        let (selected, modes) = (self.selected.subscribe(), self.modes.subscribe());
+        let (selected, modes) = (self.controls.selected.subscribe(), self.controls.modes.subscribe());
         let follow = async move {
             let set = {
                 let feed_tx = feed_tx.clone();
@@ -881,82 +942,95 @@ impl TorrentTask {
         reached
     }
 
-    /// Marks the resume file paused, so a restart brings the torrent back paused, and waits
-    /// to be unpaused or removed.
+    /// Shows the torrent paused, with the counters of the stretch that just ended if there
+    /// was one, and keeps its resume file marked paused (so a restart brings it back paused)
+    /// and up to date with the switches, until another action comes.
     async fn wait_while_paused(
         &mut self,
         torrent: &Arc<Torrent>,
         root: &Path,
         verified: &BitBox<u8, Msb0>,
         last_stats: Option<TorrentSwarmStats>,
-    ) -> anyhow::Result<(Stop, Option<TorrentSwarmStats>)> {
-        // the counters of the stretch that just ended, if there was one; a torrent that
-        // started paused has none
-        // the uploaded count of a stretch that just ended is already folded into
-        // `uploaded_before`, so the snapshot shown while paused must not add it again
+    ) -> Action {
         let mut stats = last_stats.unwrap_or_else(|| {
-            let wanted = torrent.wanted_pieces(&self.selected.borrow());
+            let wanted = torrent.wanted_pieces(&self.controls.selected.borrow());
             TorrentSwarmStats::for_verified(torrent, verified.clone(), wanted)
         });
+        // already folded into `uploaded_before`
         stats.uploaded = 0;
-        let _ = self.phase.send(Phase::Paused {
-            torrent: torrent.clone(),
-            root: root.to_path_buf(),
-            stats: stats.clone(),
-            selected: self.selected.subscribe(),
-            modes: self.modes.subscribe(),
-            uploaded_before: self.uploaded_before,
-        });
         self.bus.emit(Event::TorrentPaused {
             info_hash: torrent.info_hash,
         });
-        let mut data = ResumeData::from_torrent(torrent, root, verified);
-        data.paused = true;
-        data.skip = crate::resume::skipped(&self.selected.borrow());
-        let modes = *self.modes.borrow();
-        data.sequential = modes.sequential;
-        data.super_seed = modes.super_seed;
-        data.uploaded = self.uploaded_before;
-        data.feed = self.feed.borrow().clone();
         let mut feed = self.feed.subscribe();
-        let written = {
-            let (torrent, persisted) = (torrent.clone(), self.persisted.clone());
-            let path = self.resume_dir.join(ResumeData::file_name(&torrent.info_hash));
-            tokio::task::spawn_blocking(move || crate::resume::save_durably(&torrent, &path, data, &persisted)).await
-        };
-        match written {
-            Ok(Ok(persisted)) => self.persisted = persisted,
-            Ok(Err(e)) => tracing::warn!("couldn't mark {} paused in its resume file: {e:#}", torrent.name),
-            Err(e) => tracing::warn!("marking {} paused in its resume file failed: {e}", torrent.name),
-        }
-        let stop = loop {
+        loop {
+            let _ = self.phase.send(Phase::Paused {
+                shown: self.shown(torrent, root),
+                stats: stats.clone(),
+            });
+            self.persisted =
+                crate::resume::save_paused(torrent, root, &self.resume_dir, self.resume_inputs(), verified).await;
             tokio::select! {
-                _ = self.cancel.cancelled() => break Stop::Shutdown,
-                command = self.commands.recv() => match command {
-                    Some(Command::Unpause) => break Stop::Unpause,
-                    Some(Command::Recheck) => break Stop::Recheck,
-                    Some(Command::Remove { delete_files }) => break Stop::Remove { delete_files },
-                    Some(Command::SelectFiles(selected)) => {
-                        self.selected.send_replace(selected);
-                        // the paused resume file and the phase should say so too
-                        break Stop::Pause;
-                    }
-                    Some(Command::Sequential(on)) => {
-                        self.modes.send_modify(|m| m.sequential = on);
-                        break Stop::Pause;
-                    }
-                    Some(Command::SuperSeed(on)) => {
-                        self.modes.send_modify(|m| m.super_seed = on);
-                        break Stop::Pause;
-                    }
-                    Some(Command::Pause) => {}
-                    None => break Stop::Shutdown,
+                action = self.controls.next(None) => match action {
+                    Some(Action::Pause) | None => {}
+                    Some(action) => return action,
                 },
-                // the key moved on while paused: the resume file should say so
-                Ok(()) = feed.changed() => break Stop::Pause,
+                // the key moved on while paused
+                Ok(()) = feed.changed() => {}
             }
-        };
-        Ok((stop, Some(stats)))
+        }
+    }
+}
+
+/// What the session shows of a known torrent whatever it's doing. The receivers follow the
+/// user's switches as they flip.
+#[derive(Clone)]
+struct Shown {
+    torrent: Arc<Torrent>,
+    root: PathBuf,
+    selected: watch::Receiver<Vec<bool>>,
+    modes: watch::Receiver<Modes>,
+    feed: watch::Receiver<Option<Feed>>,
+    /// see `TorrentTask::uploaded_before`
+    uploaded_before: u64,
+}
+
+impl Shown {
+    fn progress(&self, stats: &TorrentSwarmStats, rates: &Rates) -> Progress {
+        let torrent = &self.torrent;
+        let selected = self.selected.borrow();
+        let modes = *self.modes.borrow();
+        Progress {
+            info_hash: torrent.info_hash.to_string(),
+            name: torrent.name.clone(),
+            root: self.root.display().to_string(),
+            files: torrent
+                .files
+                .iter()
+                .zip(&torrent.attrs)
+                .enumerate()
+                .map(|(i, ((size, path), attr))| FileInfo {
+                    path: path.display().to_string(),
+                    size: *size,
+                    selected: selected.get(i).copied().unwrap_or(true),
+                    pad: attr.pad,
+                })
+                .collect(),
+            total_size: torrent.total_size,
+            downloaded: stats.downloaded,
+            wasted: stats.wasted,
+            uploaded: self.uploaded_before + stats.uploaded,
+            left: stats.left as u64,
+            verified_pieces: stats.verified_cnt(),
+            total_pieces: stats.total_pieces(),
+            completed: stats.completed,
+            download_bps: rates.download_bps,
+            upload_bps: rates.upload_bps,
+            peers: vec![],
+            sequential: modes.sequential,
+            super_seed: modes.super_seed,
+            trackers: vec![],
+            feed: self.feed.borrow().clone(),
+        }
     }
 }
 
@@ -967,31 +1041,19 @@ enum Phase {
         started: Instant,
     },
     Downloading {
-        torrent: Arc<Torrent>,
-        root: PathBuf,
+        shown: Shown,
         stats: watch::Receiver<TorrentSwarmStats>,
         peers: watch::Receiver<Vec<PeerSnapshot>>,
         trackers: watch::Receiver<Vec<TrackerStatus>>,
-        selected: watch::Receiver<Vec<bool>>,
-        modes: watch::Receiver<Modes>,
-        uploaded_before: u64,
     },
     Paused {
-        torrent: Arc<Torrent>,
-        root: PathBuf,
+        shown: Shown,
         /// the last stats before the swarm was stopped
         stats: TorrentSwarmStats,
-        selected: watch::Receiver<Vec<bool>>,
-        modes: watch::Receiver<Modes>,
-        uploaded_before: u64,
     },
     Queued {
-        torrent: Arc<Torrent>,
-        root: PathBuf,
+        shown: Shown,
         stats: TorrentSwarmStats,
-        selected: watch::Receiver<Vec<bool>>,
-        modes: watch::Receiver<Modes>,
-        uploaded_before: u64,
     },
     Checking {
         torrent: Arc<Torrent>,
@@ -1003,15 +1065,16 @@ enum Phase {
     },
 }
 
-/// What a front end can do to a torrent once it's running; the torrent's task carries it out.
-enum Command {
-    Pause,
-    Unpause,
-    Remove { delete_files: bool },
-    SelectFiles(Vec<bool>),
-    Recheck,
-    Sequential(bool),
-    SuperSeed(bool),
+impl Phase {
+    fn torrent(&self) -> Option<&Arc<Torrent>> {
+        match self {
+            Phase::Downloading { shown, .. } | Phase::Paused { shown, .. } | Phase::Queued { shown, .. } => {
+                Some(&shown.torrent)
+            }
+            Phase::Checking { torrent, .. } => Some(torrent),
+            Phase::Resolving { .. } | Phase::Failed { .. } => None,
+        }
+    }
 }
 
 /// The whole session at a glance, for a status bar.
@@ -1040,7 +1103,6 @@ struct Entry {
     rates: Rates,
     /// per-peer rate samples, dropped for peers that went away
     peer_rates: HashMap<std::net::SocketAddr, Rates>,
-    feed: watch::Receiver<Option<Feed>>,
 }
 
 pub struct Session {
@@ -1259,72 +1321,42 @@ impl Session {
     pub fn add(&mut self, source: impl Into<String>, root: impl Into<PathBuf>) -> TorrentId {
         let source = source.into();
         let root = root.into();
-        let identity = self.identity.clone();
-        let dht = self.client.dht();
-        let utp = self.client.utp();
-        let bus = self.events.clone();
         if let Ok(Some(key)) = crate::magnet::parse_feed(&source) {
             return self.add_feed(source, key, root);
         }
         let magnet = crate::magnet::parse_magnet(&source).ok();
         let info_hash = magnet.as_ref().map(|m| m.info_hash);
+        let loader = self.loader();
         self.launch(source.clone(), info_hash, None, |cancel| async move {
-            let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
-            let nothing = bitvec![u8, Msb0; 0; loaded.torrent.num_pieces()].into_boxed_bitslice();
-            let files = loaded.torrent.files.len();
-            Ok(Resolved {
-                selected: magnet.map_or_else(|| vec![true; files], |m| m.selection(files)),
-                torrent: loaded.torrent,
-                root,
-                verified: nothing,
-                resumed: false,
-                paused: false,
-                peers: loaded.peers,
-                uploaded: 0,
-                modes: Modes::default(),
-                feed: None,
-                check_first: false,
-                poll_soon: false,
-            })
+            let mut resolved = Resolved::new(loader.load(&source, cancel).await?, root);
+            if let Some(magnet) = magnet {
+                resolved.selected = magnet.selection(resolved.torrent.files.len());
+            }
+            Ok(resolved)
         })
     }
 
     /// `add` for a BEP 46 magnet: the torrent is whatever the key's DHT item names (or the
     /// magnet's own `xt` while the DHT has nothing), and it follows the key from then on.
     fn add_feed(&mut self, source: String, key: FeedKey, root: PathBuf) -> TorrentId {
-        let identity = self.identity.clone();
-        let dht = self.client.dht();
-        let utp = self.client.utp();
-        let bus = self.events.clone();
         let fallback = crate::magnet::parse_magnet(&source).ok().map(|m| crate::feed::Version {
             info_hash: m.info_hash,
             info_hash_v2: m.info_hash_v2,
         });
+        let loader = self.loader();
         // the key decides which torrent this is, so nothing is claimed before it has
         self.launch(source.clone(), None, None, move |cancel| async move {
-            let (found, version) = crate::feed::resolve(dht.clone(), &key, fallback, cancel.clone()).await?;
+            let (found, version) = crate::feed::resolve(loader.dht.clone(), &key, fallback, cancel.clone()).await?;
             let magnet_uri = crate::magnet::with_version(&source, &version);
             let magnet = crate::magnet::parse_magnet(&magnet_uri)?;
-            let loaded = load_source(&magnet_uri, identity, cancel, dht, utp, bus).await?;
-            let files = loaded.torrent.files.len();
-            Ok(Resolved {
-                selected: magnet.selection(files),
-                verified: bitvec![u8, Msb0; 0; loaded.torrent.num_pieces()].into_boxed_bitslice(),
-                torrent: loaded.torrent,
-                root,
-                resumed: false,
-                paused: false,
-                peers: loaded.peers,
-                uploaded: 0,
-                modes: Modes::default(),
-                feed: Some(Feed {
-                    key,
-                    seq: found.map(|f| f.seq),
-                    superseded: None,
-                }),
-                check_first: false,
-                poll_soon: false,
-            })
+            let mut resolved = Resolved::new(loader.load(&magnet_uri, cancel).await?, root);
+            resolved.selected = magnet.selection(resolved.torrent.files.len());
+            resolved.feed = Some(Feed {
+                key,
+                seq: found.map(|f| f.seq),
+                superseded: None,
+            });
+            Ok(resolved)
         })
     }
 
@@ -1360,39 +1392,29 @@ impl Session {
             Some(&previous.name),
             &previous.all_trackers(),
         );
-        let identity = self.identity.clone();
-        let dht = self.client.dht();
-        let utp = self.client.utp();
-        let bus = self.events.clone();
         let feed = Feed {
             key,
             seq: Some(found.seq),
             superseded: None,
         };
+        let loader = self.loader();
         Some(
             self.launch(source.clone(), Some(info_hash), None, move |cancel| async move {
-                let loaded = load_source(&source, identity, cancel, dht, utp, bus).await?;
-                let torrent = loaded.torrent;
+                let Loaded { torrent, peers } = loader.load(&source, cancel).await?;
                 let seq = found.seq;
-                let (torrent, root, reused, previous) = tokio::task::spawn_blocking(move || {
-                    let (root, reused) = place_update(&previous, &root, &torrent, seq)?;
-                    anyhow::Ok((torrent, root, reused, previous))
+                // the files it shares with its predecessor are found by the check that a
+                // torrent with data on disk starts with
+                let (torrent, root, previous) = tokio::task::spawn_blocking(move || {
+                    let root = place_update(&previous, &root, &torrent, seq)?;
+                    anyhow::Ok((torrent, root, previous))
                 })
                 .await??;
                 supersede(seq);
                 Ok(Resolved {
                     selected: carried_selection(&previous, &selected, &torrent),
-                    verified: bitvec![u8, Msb0; 0; torrent.num_pieces()].into_boxed_bitslice(),
-                    torrent,
-                    root,
-                    resumed: reused,
-                    paused: false,
-                    peers: loaded.peers,
-                    uploaded: 0,
                     modes,
                     feed: Some(feed),
-                    check_first: reused,
-                    poll_soon: false,
+                    ..Resolved::new(Loaded { torrent, peers }, root)
                 })
             }),
         )
@@ -1409,32 +1431,17 @@ impl Session {
             path.display().to_string(),
             info_hash,
             Some(path.clone()),
-            |_cancel| async move {
-                let data = tokio::task::spawn_blocking({
-                    let path = path.clone();
-                    move || ResumeData::read(&path)
-                })
-                .await??;
-                let torrent = data.to_torrent()?;
-                Ok(Resolved {
-                    selected: data.selected(torrent.files.len()),
-                    torrent,
-                    root: data.root,
-                    verified: data.verified,
-                    resumed: true,
-                    paused: data.paused,
-                    peers: vec![],
-                    uploaded: data.uploaded,
-                    modes: Modes {
-                        sequential: data.sequential,
-                        super_seed: data.super_seed,
-                    },
-                    feed: data.feed,
-                    check_first: false,
-                    poll_soon: true,
-                })
-            },
+            |_cancel| async move { tokio::task::spawn_blocking(move || Resolved::read(&path)).await? },
         )
+    }
+
+    fn loader(&self) -> Loader {
+        Loader {
+            identity: self.identity.clone(),
+            dht: self.client.dht(),
+            utp: self.client.utp(),
+            bus: self.events.clone(),
+        }
     }
 
     /// Resumes every torrent that has a resume file in this session's resume dir and isn't
@@ -1464,29 +1471,29 @@ impl Session {
     /// Stops a torrent's connections and announces, keeping its files and progress. Only a
     /// torrent that's downloading or seeding can be paused; anything else is left alone.
     pub fn pause(&mut self, id: TorrentId) {
-        self.command(id, Command::Pause);
+        self.command(id, Command::Act(Action::Pause));
     }
 
     pub fn unpause(&mut self, id: TorrentId) {
-        self.command(id, Command::Unpause);
+        self.command(id, Command::Act(Action::Unpause));
     }
 
     /// Re-hashes the torrent's files and continues from what's actually on disk, in the
     /// state (downloading or paused) it was in. For when the resume data can't be trusted.
     pub fn recheck(&mut self, id: TorrentId) {
-        self.command(id, Command::Recheck);
+        self.command(id, Command::Act(Action::Recheck));
     }
 
     /// Downloads only the selected files from now on: one flag per file in the order
     /// `Progress::files` lists them. Pieces shared with a selected file are still fetched.
     pub fn select_files(&mut self, id: TorrentId, selected: Vec<bool>) {
-        self.command(id, Command::SelectFiles(selected));
+        self.command(id, Command::Set(Switch::Files(selected)));
     }
 
     /// Fetches pieces in order rather than rarest first, so a file can be played while it
     /// downloads. Remembered across restarts.
     pub fn set_sequential(&mut self, id: TorrentId, on: bool) {
-        self.command(id, Command::Sequential(on));
+        self.command(id, Command::Set(Switch::Sequential(on)));
     }
 
     /// BEP 16 super-seeding: once the torrent is complete, each newly connected peer is shown
@@ -1494,7 +1501,7 @@ impl Session {
     /// seeder of a torrent, it spreads the pieces with less of its own upload. Unknown ids are
     /// ignored.
     pub fn set_super_seed(&mut self, id: TorrentId, on: bool) {
-        self.command(id, Command::SuperSeed(on));
+        self.command(id, Command::Set(Switch::SuperSeed(on)));
     }
 
     /// Removes a torrent: its connections close and its resume file is deleted, and with
@@ -1503,7 +1510,7 @@ impl Session {
     /// Unknown ids are ignored.
     pub fn remove(&mut self, id: TorrentId, delete_files: bool) {
         if let Some(entry) = self.torrents.remove(&id) {
-            let _ = entry.commands.send(Command::Remove { delete_files });
+            let _ = entry.commands.send(Command::Act(Action::Remove { delete_files }));
         }
     }
 
@@ -1530,12 +1537,10 @@ impl Session {
         let id = self.next_id;
         self.next_id += 1;
 
-        let cancel = self.shutdown.child_token();
         let (phase_tx, phase_rx) = watch::channel(Phase::Resolving {
             started: Instant::now(),
         });
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let feed = watch::channel(None).0;
         self.torrents.insert(
             id,
             Entry {
@@ -1545,7 +1550,6 @@ impl Session {
                 commands: commands_tx,
                 rates: Rates::new(),
                 peer_rates: HashMap::new(),
-                feed: feed.subscribe(),
             },
         );
 
@@ -1554,11 +1558,13 @@ impl Session {
             bus: self.events.clone(),
             source,
             resume_dir: self.resume_dir.clone(),
-            cancel,
             phase: phase_tx,
-            commands: commands_rx,
-            selected: watch::channel(vec![]).0,
-            modes: watch::channel(Modes::default()).0,
+            controls: Controls {
+                commands: commands_rx,
+                cancel: self.shutdown.child_token(),
+                selected: watch::channel(vec![]).0,
+                modes: watch::channel(Modes::default()).0,
+            },
             slots: self.slots.clone(),
             info_hash,
             resume_path,
@@ -1566,7 +1572,7 @@ impl Session {
             settings: self.settings.subscribe(),
             uploaded_before: 0,
             persisted: BitBox::default(),
-            feed,
+            feed: watch::channel(None).0,
             updates: self.updates.0.clone(),
         };
         // a session that runs for weeks sees many torrents come and go
@@ -1647,18 +1653,12 @@ impl Drop for Session {
 impl Entry {
     /// Known up front for a magnet or a resume file, and for anything else once it's running.
     fn info_hash(&self) -> Option<InfoHash> {
-        self.info_hash.or_else(|| match &*self.phase.borrow() {
-            Phase::Downloading { torrent, .. }
-            | Phase::Paused { torrent, .. }
-            | Phase::Queued { torrent, .. }
-            | Phase::Checking { torrent, .. } => Some(torrent.info_hash),
-            _ => None,
-        })
+        self.info_hash
+            .or_else(|| self.phase.borrow().torrent().map(|t| t.info_hash))
     }
 
     fn state(&mut self) -> TorrentState {
         let phase = self.phase.borrow_and_update().clone();
-        let queued = matches!(phase, Phase::Queued { .. });
         match phase {
             Phase::Failed { error } => TorrentState::Failed {
                 source: self.source.clone(),
@@ -1674,66 +1674,28 @@ impl Entry {
                 total_pieces: torrent.num_pieces(),
             },
             Phase::Downloading {
-                torrent,
-                root,
+                shown,
                 stats,
                 peers,
                 trackers,
-                selected,
-                modes,
-                uploaded_before,
             } => {
                 let stats = stats.borrow().clone();
                 self.rates.update(stats.downloaded, stats.uploaded);
-                let mut progress = progress(
-                    &torrent,
-                    &root,
-                    &stats,
-                    &selected.borrow(),
-                    *modes.borrow(),
-                    &self.rates,
-                );
-                progress.uploaded += uploaded_before;
+                let mut progress = shown.progress(&stats, &self.rates);
                 progress.peers = self.peers(&peers.borrow());
                 progress.trackers = trackers.borrow().iter().map(tracker_info).collect();
-                progress.feed = self.feed.borrow().clone();
                 TorrentState::Downloading(progress)
             }
-            Phase::Paused {
-                torrent,
-                root,
-                stats,
-                selected,
-                modes,
-                uploaded_before,
-            }
-            | Phase::Queued {
-                torrent,
-                root,
-                stats,
-                selected,
-                modes,
-                uploaded_before,
-            } => {
-                self.rates = Rates::new();
-                self.peer_rates.clear();
-                let mut progress = progress(
-                    &torrent,
-                    &root,
-                    &stats,
-                    &selected.borrow(),
-                    *modes.borrow(),
-                    &self.rates,
-                );
-                progress.uploaded += uploaded_before;
-                progress.feed = self.feed.borrow().clone();
-                if queued {
-                    TorrentState::Queued(progress)
-                } else {
-                    TorrentState::Paused(progress)
-                }
-            }
+            Phase::Paused { shown, stats } => TorrentState::Paused(self.idle(&shown, &stats)),
+            Phase::Queued { shown, stats } => TorrentState::Queued(self.idle(&shown, &stats)),
         }
+    }
+
+    /// The progress of a torrent that isn't running, which moves nothing.
+    fn idle(&mut self, shown: &Shown, stats: &TorrentSwarmStats) -> Progress {
+        self.rates = Rates::new();
+        self.peer_rates.clear();
+        shown.progress(stats, &self.rates)
     }
 
     fn peers(&mut self, snapshots: &[PeerSnapshot]) -> Vec<PeerInfo> {
@@ -1772,54 +1734,6 @@ fn has_data_on_disk(torrent: &Torrent, root: &Path) -> bool {
         .any(|((_, path), attr)| !attr.pad && std::fs::metadata(root.join(path)).is_ok_and(|m| m.len() > 0))
 }
 
-fn progress(
-    torrent: &Torrent,
-    root: &Path,
-    stats: &TorrentSwarmStats,
-    selected: &[bool],
-    modes: Modes,
-    rates: &Rates,
-) -> Progress {
-    Progress {
-        info_hash: info_hash_hex(&torrent.info_hash),
-        name: torrent.name.clone(),
-        root: root.display().to_string(),
-        files: torrent
-            .files
-            .iter()
-            .enumerate()
-            .map(|(i, (size, p))| FileInfo {
-                path: p.display().to_string(),
-                size: *size,
-                selected: selected.get(i).copied().unwrap_or(true),
-                pad: torrent.attrs[i].pad,
-            })
-            .collect(),
-        total_size: torrent.total_size,
-        downloaded: stats.downloaded,
-        wasted: stats.wasted,
-        uploaded: stats.uploaded,
-        left: stats.left as u64,
-        verified_pieces: stats.verified_cnt(),
-        total_pieces: stats.total_pieces(),
-        completed: stats.completed,
-        download_bps: rates.download_bps,
-        upload_bps: rates.upload_bps,
-        peers: vec![],
-        sequential: modes.sequential,
-        super_seed: modes.super_seed,
-        trackers: vec![],
-        feed: None,
-    }
-}
-
-/// Where a BEP 46 update of `previous` (whose files are under `root`) goes: `root` too, unless
-/// that already holds something by its name (its predecessor's files, most likely, which the
-/// update would write its own pieces over while they seed). Then a directory of its own
-/// beside them, `<name> (seq
-/// N)`. The predecessor's files the update has too, same path and size, are copied over
-/// (a clone on APFS and the like) and the rest laid down empty, for a check to sort out what
-/// is still good; returns whether any were.
 /// An update's file selection: the predecessor's choice for a file at the same path, and
 /// selected for one it didn't have.
 fn carried_selection(previous: &Torrent, selected: &[bool], torrent: &Torrent) -> Vec<bool> {
@@ -1836,7 +1750,13 @@ fn carried_selection(previous: &Torrent, selected: &[bool], torrent: &Torrent) -
         .collect()
 }
 
-fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) -> std::io::Result<(PathBuf, bool)> {
+/// Where a BEP 46 update of `previous` (whose files are under `root`) goes: `root` too, unless
+/// that already holds something by its name (its predecessor's files, most likely, which the
+/// update would write its own pieces over while they seed). Then a directory of its own
+/// beside them, `<name> (seq N)`. The predecessor's files the update has too, same path and
+/// size, are copied over (a clone on APFS and the like) and, if there were any, the rest laid
+/// down empty, for a check to sort out what is still good.
+fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) -> std::io::Result<PathBuf> {
     let top = torrent.top_level();
     let mut new_root = root.to_path_buf();
     let mut attempt = 1;
@@ -1889,7 +1809,7 @@ fn place_update(previous: &Torrent, root: &Path, torrent: &Torrent, seq: i64) ->
             new_root.display()
         );
     }
-    Ok((new_root, reused))
+    Ok(new_root)
 }
 
 fn tracker_info(status: &TrackerStatus) -> TrackerInfo {
@@ -2574,6 +2494,35 @@ mod test {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Switches flipped while paused show at once and reach the resume file, which stays
+    /// marked paused.
+    #[test]
+    fn switches_flipped_while_paused_are_saved() {
+        let dir = scratch("paused-switches");
+        let torrent_file = write_torrent_file(&dir);
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), dir.join("downloads"));
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+
+        session.set_sequential(id, true);
+        session.select_files(id, vec![false]);
+        wait_for(
+            &mut session,
+            id,
+            |s| matches!(s, Some(TorrentState::Paused(p)) if p.sequential && !p.files[0].selected),
+        );
+        let path = list_resume_files(&dir.join("resume"))[0].path.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ResumeData::read(&path).is_ok_and(|d| d.paused && d.modes.sequential && d.skip == [0]) {
+            assert!(Instant::now() < deadline, "{:?}", ResumeData::read(&path));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The DHT key a torrent follows (BEP 46) is in its resume file, and still is after a
     /// restart, a pause, and a shutdown; Progress shows it.
     #[test]
@@ -2740,8 +2689,8 @@ mod test {
             std::fs::write(dir.join(path), vec![9; *size as usize]).unwrap();
         }
 
-        let (root, reused) = place_update(&old, &dir, &new, 2).unwrap();
-        assert!(reused);
+        let root = place_update(&old, &dir, &new, 2).unwrap();
+        assert!(has_data_on_disk(&new, &root), "so it starts with a check");
         assert_eq!(root, dir.join("pkg (seq 2)"));
         assert_eq!(
             std::fs::read(root.join("pkg/same")).unwrap(),
@@ -2756,7 +2705,7 @@ mod test {
             "the old one untouched"
         );
 
-        let (again, _) = place_update(&old, &dir, &new, 2).unwrap();
+        let again = place_update(&old, &dir, &new, 2).unwrap();
         assert_eq!(again, dir.join("pkg (seq 2, 2)"), "never on top of anything");
 
         let unrelated = crate::parse_torrent(&crate::metadata::build_torrent_file(
@@ -2764,7 +2713,8 @@ mod test {
             &[],
         ))
         .unwrap();
-        assert_eq!(place_update(&old, &dir, &unrelated, 3).unwrap(), (dir.clone(), false));
+        assert_eq!(place_update(&old, &dir, &unrelated, 3).unwrap(), dir);
+        assert!(!has_data_on_disk(&unrelated, &dir), "nothing laid down for it");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

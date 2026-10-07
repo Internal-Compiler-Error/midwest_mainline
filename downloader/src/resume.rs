@@ -1,8 +1,9 @@
 //! Resume files: enough to pick a download back up after the process exits.
 //!
 //! One file per torrent, `<info hash, hex>.resume`, holding the raw info dict, the tracker
-//! list, the download root, and the verified-piece bitfield. The info dict is stored verbatim so a torrent that
-//! came from a magnet link resumes without going back to the network for metadata.
+//! list, the download root, and the verified-piece bitfield. The info dict is stored verbatim
+//! so a torrent that came from a magnet link resumes without going back to the network for
+//! metadata.
 //!
 //! The library owns the format and does the reading and writing; where the files live, and
 //! finding them again, is the caller's job. See [`ResumeData::write`] and
@@ -20,6 +21,7 @@ use anyhow::{Context, bail};
 use bitvec::prelude::*;
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 use midwest_mainline::types::InfoHash;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,10 +46,7 @@ pub struct ResumeData {
     pub skip: Vec<u32>,
     /// bytes uploaded over the torrent's whole life, for the seeding ratio
     pub uploaded: u64,
-    /// pieces are fetched in order rather than rarest first
-    pub sequential: bool,
-    /// BEP 16: seeding shows peers a piece at a time
-    pub super_seed: bool,
+    pub modes: Modes,
     /// BEP 19 web seeds; a magnet's `ws=` ones exist nowhere else
     pub web_seeds: Vec<String>,
     /// BEP 52 piece layers (a bencoded dict), which the info dict doesn't hold
@@ -59,7 +58,9 @@ pub struct ResumeData {
 /// The per-torrent switches the user flips, which live in the resume file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modes {
+    /// pieces are fetched in order rather than rarest first
     pub sequential: bool,
+    /// BEP 16: seeding shows peers a piece at a time
     pub super_seed: bool,
 }
 
@@ -73,8 +74,7 @@ impl ResumeData {
             root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
             verified: verified.to_bitvec().into_boxed_bitslice(),
             paused: false,
-            sequential: false,
-            super_seed: false,
+            modes: Modes::default(),
             skip: vec![],
             uploaded: 0,
             web_seeds: torrent.web_seeds.clone(),
@@ -94,8 +94,7 @@ impl ResumeData {
 
     /// The file name a resume file for this torrent is written under.
     pub fn file_name(info_hash: &InfoHash) -> String {
-        let hex: String = info_hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        format!("{hex}.{EXTENSION}")
+        format!("{info_hash}.{EXTENSION}")
     }
 
     pub fn to_torrent(&self) -> anyhow::Result<Torrent> {
@@ -109,85 +108,42 @@ impl ResumeData {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        fn bstr(bytes: &[u8]) -> Vec<u8> {
-            let mut out = format!("{}:", bytes.len()).into_bytes();
-            out.extend_from_slice(bytes);
-            out
-        }
-
-        // keys in ascending order, as bencode requires
-        let mut out = vec![b'd'];
+        let mut dict = DictWriter::new();
         if let Some(feed) = &self.feed {
-            out.extend_from_slice(&bstr(b"btpk"));
-            out.push(b'd');
-            out.extend_from_slice(&bstr(b"k"));
-            out.extend_from_slice(&bstr(&feed.key.public));
+            let mut btpk = DictWriter::new();
+            btpk.bytes(b"k", &feed.key.public);
             if !feed.key.salt.is_empty() {
-                out.extend_from_slice(&bstr(b"s"));
-                out.extend_from_slice(&bstr(&feed.key.salt));
+                btpk.bytes(b"s", &feed.key.salt);
             }
             if let Some(seq) = feed.seq {
-                out.extend_from_slice(&bstr(b"seq"));
-                out.extend_from_slice(format!("i{seq}e").as_bytes());
+                btpk.int(b"seq", seq);
             }
             if let Some(seq) = feed.superseded {
-                out.extend_from_slice(&bstr(b"superseded"));
-                out.extend_from_slice(format!("i{seq}e").as_bytes());
+                btpk.int(b"superseded", seq);
             }
-            out.push(b'e');
+            dict.raw(b"btpk", &btpk.finish());
         }
-        out.extend_from_slice(&bstr(b"info"));
-        out.extend_from_slice(&self.raw_info);
-        if self.paused {
-            out.extend_from_slice(&bstr(b"paused"));
-            out.extend_from_slice(b"i1e");
-        }
+        dict.raw(b"info", &self.raw_info);
+        dict.flag(b"paused", self.paused);
         if let Some(layers) = &self.piece_layers {
-            out.extend_from_slice(&bstr(b"piece layers"));
-            out.extend_from_slice(layers);
+            dict.raw(b"piece layers", layers);
         }
-        out.extend_from_slice(&bstr(b"root"));
-        out.extend_from_slice(&bstr(self.root.as_os_str().as_encoded_bytes()));
-        if self.sequential {
-            out.extend_from_slice(&bstr(b"sequential"));
-            out.extend_from_slice(b"i1e");
-        }
+        dict.bytes(b"root", self.root.as_os_str().as_encoded_bytes());
+        dict.flag(b"sequential", self.modes.sequential);
         if !self.skip.is_empty() {
-            out.extend_from_slice(&bstr(b"skip"));
-            out.push(b'l');
-            for i in &self.skip {
-                out.extend_from_slice(format!("i{i}e").as_bytes());
-            }
-            out.push(b'e');
+            dict.int_list(b"skip", self.skip.iter().map(|&i| i64::from(i)));
         }
-        if self.super_seed {
-            out.extend_from_slice(&bstr(b"super seed"));
-            out.extend_from_slice(b"i1e");
-        }
-        out.extend_from_slice(&bstr(b"trackers"));
-        out.push(b'l');
-        for t in &self.trackers {
-            out.extend_from_slice(&bstr(t.as_bytes()));
-        }
-        out.push(b'e');
+        dict.flag(b"super seed", self.modes.super_seed);
+        dict.bytes_list(b"trackers", self.trackers.iter().map(String::as_bytes));
         if self.uploaded > 0 {
-            out.extend_from_slice(&bstr(b"uploaded"));
-            out.extend_from_slice(format!("i{}e", self.uploaded).as_bytes());
+            dict.int(b"uploaded", self.uploaded);
         }
         if !self.web_seeds.is_empty() {
-            out.extend_from_slice(&bstr(b"url-list"));
-            out.push(b'l');
-            for url in &self.web_seeds {
-                out.extend_from_slice(&bstr(url.as_bytes()));
-            }
-            out.push(b'e');
+            dict.bytes_list(b"url-list", self.web_seeds.iter().map(String::as_bytes));
         }
-        out.extend_from_slice(&bstr(b"verified"));
-        out.extend_from_slice(&bstr(self.verified.as_raw_slice()));
-        out.extend_from_slice(&bstr(b"version"));
-        out.extend_from_slice(format!("i{VERSION}e").as_bytes());
-        out.push(b'e');
-        out
+        dict.bytes(b"verified", self.verified.as_raw_slice());
+        dict.int(b"version", VERSION);
+        dict.finish()
     }
 
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
@@ -216,9 +172,12 @@ impl ResumeData {
             bail!("missing 'root' path");
         };
         let root = PathBuf::from(String::from_utf8(root.to_vec()).context("'root' is not utf-8")?);
-        let paused = matches!(dict.remove(b"paused".as_slice()), Some(BencodeItemView::Integer(1)));
-        let sequential = matches!(dict.remove(b"sequential".as_slice()), Some(BencodeItemView::Integer(1)));
-        let super_seed = matches!(dict.remove(b"super seed".as_slice()), Some(BencodeItemView::Integer(1)));
+        let mut flag = |key: &[u8]| matches!(dict.remove(key), Some(BencodeItemView::Integer(1)));
+        let paused = flag(b"paused");
+        let modes = Modes {
+            sequential: flag(b"sequential"),
+            super_seed: flag(b"super seed"),
+        };
         let uploaded = match dict.remove(b"uploaded".as_slice()) {
             Some(BencodeItemView::Integer(n)) => u64::try_from(n).unwrap_or(0),
             _ => 0,
@@ -275,8 +234,7 @@ impl ResumeData {
             paused,
             skip,
             uploaded,
-            sequential,
-            super_seed,
+            modes,
             web_seeds,
             piece_layers,
             feed,
@@ -300,7 +258,82 @@ impl ResumeData {
     }
 }
 
-fn decode_feed(dict: &std::collections::BTreeMap<&[u8], BencodeItemView>) -> anyhow::Result<Feed> {
+/// Writes a bencoded dict. Keys must come in ascending order, as bencode requires.
+struct DictWriter {
+    out: Vec<u8>,
+    last_key: Vec<u8>,
+}
+
+impl DictWriter {
+    fn new() -> Self {
+        Self {
+            out: vec![b'd'],
+            last_key: vec![],
+        }
+    }
+
+    fn key(&mut self, key: &[u8]) {
+        debug_assert!(
+            self.out.len() == 1 || key > self.last_key.as_slice(),
+            "keys out of order"
+        );
+        self.last_key = key.to_vec();
+        self.string(key);
+    }
+
+    fn string(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(format!("{}:", bytes.len()).as_bytes());
+        self.out.extend_from_slice(bytes);
+    }
+
+    fn integer(&mut self, n: impl std::fmt::Display) {
+        self.out.extend_from_slice(format!("i{n}e").as_bytes());
+    }
+
+    fn bytes(&mut self, key: &[u8], value: &[u8]) {
+        self.key(key);
+        self.string(value);
+    }
+
+    fn int(&mut self, key: &[u8], value: impl std::fmt::Display) {
+        self.key(key);
+        self.integer(value);
+    }
+
+    /// `1` when set; left out when not, which reads back as unset
+    fn flag(&mut self, key: &[u8], on: bool) {
+        if on {
+            self.int(key, 1);
+        }
+    }
+
+    /// A value that is bencoded already.
+    fn raw(&mut self, key: &[u8], value: &[u8]) {
+        self.key(key);
+        self.out.extend_from_slice(value);
+    }
+
+    fn bytes_list<'a>(&mut self, key: &[u8], items: impl IntoIterator<Item = &'a [u8]>) {
+        self.key(key);
+        self.out.push(b'l');
+        items.into_iter().for_each(|item| self.string(item));
+        self.out.push(b'e');
+    }
+
+    fn int_list(&mut self, key: &[u8], items: impl IntoIterator<Item = i64>) {
+        self.key(key);
+        self.out.push(b'l');
+        items.into_iter().for_each(|item| self.integer(item));
+        self.out.push(b'e');
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.out.push(b'e');
+        self.out
+    }
+}
+
+fn decode_feed(dict: &BTreeMap<&[u8], BencodeItemView>) -> anyhow::Result<Feed> {
     let Some(BencodeItemView::ByteString(public)) = dict.get(b"k".as_slice()) else {
         bail!("'btpk' has no key");
     };
@@ -348,7 +381,7 @@ pub(crate) fn replace_file(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Re
 
 /// Flushes to disk the data of every file holding a byte of a piece in `pieces`. The files are
 /// opened afresh, which is enough: a sync flushes the file, not just one descriptor's writes.
-pub fn sync_pieces(torrent: &Torrent, root: &Path, pieces: &BitSlice<u8, Msb0>) -> std::io::Result<()> {
+fn sync_pieces(torrent: &Torrent, root: &Path, pieces: &BitSlice<u8, Msb0>) -> std::io::Result<()> {
     for (index, (_, relative)) in torrent.files.iter().enumerate() {
         if torrent.attrs[index].virtual_file() {
             continue;
@@ -396,8 +429,28 @@ pub fn save_durably(
     Ok(data.verified)
 }
 
+/// `save_durably` on the blocking pool. Returns the bitfield the file holds afterwards:
+/// `persisted` still if the write failed, which is logged.
+async fn save_in_background(
+    torrent: &Arc<Torrent>,
+    path: &Path,
+    data: ResumeData,
+    persisted: BitBox<u8, Msb0>,
+) -> BitBox<u8, Msb0> {
+    let written = {
+        let (torrent, path, had) = (torrent.clone(), path.to_path_buf(), persisted.clone());
+        tokio::task::spawn_blocking(move || save_durably(&torrent, &path, data, &had)).await
+    };
+    match written {
+        Ok(Ok(now)) => return now,
+        Ok(Err(e)) => tracing::warn!("couldn't write resume file {}: {e:#}", path.display()),
+        Err(e) => tracing::warn!("writing resume file {} failed: {e}", path.display()),
+    }
+    persisted
+}
+
 /// The file indices a selection leaves out, as the resume file stores them.
-pub fn skipped(selected: &[bool]) -> Vec<u32> {
+fn skipped(selected: &[bool]) -> Vec<u32> {
     selected
         .iter()
         .enumerate()
@@ -407,7 +460,7 @@ pub fn skipped(selected: &[bool]) -> Vec<u32> {
 }
 
 /// Keeps `dir/<info hash>.resume` up to date with `stats` until `shutdown` fires, then writes
-/// it one last time. Meant to be spawned alongside `BtClient::work`.
+/// it one last time. Meant to be spawned alongside the torrent's swarm.
 ///
 /// The first write happens immediately, before any piece is verified: for a magnet-sourced
 /// torrent that's what makes the metadata survive a restart. After that a change to the
@@ -415,7 +468,7 @@ pub fn skipped(selected: &[bool]) -> Vec<u32> {
 /// the upload counter, which moves all the time on a seeding torrent, only makes it into the
 /// file every `COUNTERS`. The files are written off the async workers, and durably (see
 /// `save_durably`). Returns the bitfield the file holds at the end.
-pub async fn keep_saving(
+pub(crate) async fn keep_saving(
     torrent: Arc<Torrent>,
     root: PathBuf,
     stats: watch::Receiver<TorrentSwarmStats>,
@@ -426,6 +479,21 @@ pub async fn keep_saving(
     const SETTLE: Duration = Duration::from_secs(5);
     const COUNTERS: Duration = Duration::from_secs(60);
     save_every(torrent, root, stats, inputs, dir, shutdown, (SETTLE, COUNTERS)).await
+}
+
+/// Writes `dir/<info hash>.resume` once, marked paused, for a torrent stopped at `verified`.
+/// Returns the bitfield the file holds afterwards.
+pub(crate) async fn save_paused(
+    torrent: &Arc<Torrent>,
+    root: &Path,
+    dir: &Path,
+    inputs: ResumeInputs,
+    verified: &BitSlice<u8, Msb0>,
+) -> BitBox<u8, Msb0> {
+    let mut data = inputs.snapshot(verified, 0).to_data(torrent, root);
+    data.paused = true;
+    let path = dir.join(ResumeData::file_name(&torrent.info_hash));
+    save_in_background(torrent, &path, data, inputs.persisted).await
 }
 
 /// What a resume file holds that changes while the torrent runs.
@@ -443,68 +511,45 @@ impl Saved {
     fn differs_beyond_counters(&self, other: &Saved) -> bool {
         (&self.verified, &self.skip, self.modes, &self.feed) != (&other.verified, &other.skip, other.modes, &other.feed)
     }
+
+    fn to_data(&self, torrent: &Torrent, root: &Path) -> ResumeData {
+        ResumeData {
+            skip: self.skip.clone(),
+            modes: self.modes,
+            uploaded: self.uploaded,
+            feed: self.feed.clone(),
+            ..ResumeData::from_torrent(torrent, root, &self.verified)
+        }
+    }
 }
 
 async fn save_every(
     torrent: Arc<Torrent>,
     root: PathBuf,
     mut stats: watch::Receiver<TorrentSwarmStats>,
-    inputs: ResumeInputs,
+    mut inputs: ResumeInputs,
     dir: PathBuf,
     shutdown: CancellationToken,
     (settle, counters): (Duration, Duration),
 ) -> BitBox<u8, Msb0> {
-    let ResumeInputs {
-        mut selected,
-        mut modes,
-        uploaded_before,
-        mut persisted,
-        mut feed,
-    } = inputs;
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
-    let snapshot = |stats: &watch::Receiver<TorrentSwarmStats>,
-                    selected: &watch::Receiver<Vec<bool>>,
-                    modes: &watch::Receiver<Modes>,
-                    feed: &watch::Receiver<Option<Feed>>| {
+    let snapshot = |stats: &watch::Receiver<TorrentSwarmStats>, inputs: &ResumeInputs| {
         let stats = stats.borrow();
-        Saved {
-            verified: stats.verified.clone(),
-            skip: skipped(&selected.borrow()),
-            modes: *modes.borrow(),
-            uploaded: uploaded_before + stats.uploaded,
-            feed: feed.borrow().clone(),
-        }
+        inputs.snapshot(&stats.verified, stats.uploaded)
     };
-    let save = async |saved: &Saved, persisted: &mut BitBox<u8, Msb0>| {
-        let mut data = ResumeData::from_torrent(&torrent, &root, &saved.verified);
-        data.skip = saved.skip.clone();
-        data.sequential = saved.modes.sequential;
-        data.super_seed = saved.modes.super_seed;
-        data.uploaded = saved.uploaded;
-        data.feed = saved.feed.clone();
-        let written = {
-            let (torrent, path, had) = (torrent.clone(), path.clone(), persisted.clone());
-            tokio::task::spawn_blocking(move || save_durably(&torrent, &path, data, &had)).await
-        };
-        match written {
-            Ok(Ok(now)) => *persisted = now,
-            Ok(Err(e)) => tracing::warn!("couldn't write resume file {}: {e:#}", path.display()),
-            Err(e) => tracing::warn!("writing resume file {} failed: {e}", path.display()),
-        }
-    };
-
-    let mut last = snapshot(&stats, &selected, &modes, &feed);
-    save(&last, &mut persisted).await;
+    let mut persisted = inputs.persisted.clone();
+    let mut last = snapshot(&stats, &inputs);
+    persisted = save_in_background(&torrent, &path, last.to_data(&torrent, &root), persisted).await;
     let mut last_write = tokio::time::Instant::now();
     // set while only the counters have changed since the last write
     let mut counters_due: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             changed = stats.changed() => if changed.is_err() { break },
-            changed = selected.changed() => if changed.is_err() { break },
-            changed = modes.changed() => if changed.is_err() { break },
+            changed = inputs.selected.changed() => if changed.is_err() { break },
+            changed = inputs.modes.changed() => if changed.is_err() { break },
             // a feed nobody can change any more is just one that stays put
-            Ok(()) = feed.changed() => {}
+            Ok(()) = inputs.feed.changed() => {}
             _ = tokio::time::sleep_until(counters_due.unwrap_or_else(tokio::time::Instant::now)),
                 if counters_due.is_some() => {}
             _ = shutdown.cancelled() => break,
@@ -515,12 +560,12 @@ async fn save_every(
             _ = shutdown.cancelled() => break,
         }
         stats.mark_unchanged();
-        selected.mark_unchanged();
-        modes.mark_unchanged();
-        feed.mark_unchanged();
-        let now = snapshot(&stats, &selected, &modes, &feed);
+        inputs.selected.mark_unchanged();
+        inputs.modes.mark_unchanged();
+        inputs.feed.mark_unchanged();
+        let now = snapshot(&stats, &inputs);
         if now.differs_beyond_counters(&last) || (now.uploaded != last.uploaded && last_write.elapsed() >= counters) {
-            save(&now, &mut persisted).await;
+            persisted = save_in_background(&torrent, &path, now.to_data(&torrent, &root), persisted).await;
             last = now;
             last_write = tokio::time::Instant::now();
             counters_due = None;
@@ -528,16 +573,16 @@ async fn save_every(
             counters_due = Some(last_write + counters);
         }
     }
-    let now = snapshot(&stats, &selected, &modes, &feed);
+    let now = snapshot(&stats, &inputs);
     if now != last {
-        save(&now, &mut persisted).await;
+        persisted = save_in_background(&torrent, &path, now.to_data(&torrent, &root), persisted).await;
     }
     persisted
 }
 
 /// What goes into the resume file besides the torrent and its progress: the user's choices,
 /// read live, the upload count from before this run, and the bitfield the file already holds.
-pub struct ResumeInputs {
+pub(crate) struct ResumeInputs {
     pub selected: watch::Receiver<Vec<bool>>,
     pub modes: watch::Receiver<Modes>,
     pub uploaded_before: u64,
@@ -548,6 +593,18 @@ pub struct ResumeInputs {
     pub feed: watch::Receiver<Option<Feed>>,
 }
 
+impl ResumeInputs {
+    /// The file's contents now, with `uploaded` this run's upload count.
+    fn snapshot(&self, verified: &BitSlice<u8, Msb0>, uploaded: u64) -> Saved {
+        Saved {
+            verified: verified.to_bitvec().into_boxed_bitslice(),
+            skip: skipped(&self.selected.borrow()),
+            modes: *self.modes.borrow(),
+            uploaded: self.uploaded_before + uploaded,
+            feed: self.feed.borrow().clone(),
+        }
+    }
+}
 /// What a front end needs to list a resume file without loading the whole thing into a client.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeSummary {
