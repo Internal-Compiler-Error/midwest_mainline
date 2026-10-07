@@ -30,6 +30,7 @@ export type Event =
   | { kind: 'torrent_completed'; info_hash: string }
   | { kind: 'torrent_failed'; source: string; error: string }
   | { kind: 'torrent_removed'; info_hash: string; deleted_files: boolean }
+  | { kind: 'torrent_update_found'; info_hash: string; update: string; seq: number }
   | { kind: 'peers_discovered'; info_hash: string; source: PeerSource; count: number }
   | { kind: 'dial_failed'; info_hash: string; addr: string }
   | { kind: 'peer_connected'; info_hash: string; addr: string; client: string; dialed: boolean; encrypted: boolean; utp: boolean }

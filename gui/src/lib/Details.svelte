@@ -6,7 +6,7 @@
   import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
   import type { TorrentRow } from './api'
-  import { fraction, humanBytes, humanBytesLike, isMagnetUri, rate, trackerStatus } from './api'
+  import { fraction, humanBytes, humanBytesLike, isFeedUri, isMagnetUri, rate, trackerStatus } from './api'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import PeerTable from './PeerTable.svelte'
@@ -55,7 +55,7 @@
   {#if torrent.kind === 'resolving'}
     <div class="flex items-center gap-2">
       <LoaderCircle class="size-4 animate-spin text-primary" />
-      <span>{isMagnetUri(torrent.source) ? 'Fetching metadata from peers…' : 'Loading…'}</span>
+      <span>{isFeedUri(torrent.source) ? 'Looking up its DHT key, then fetching metadata…' : isMagnetUri(torrent.source) ? 'Fetching metadata from peers…' : 'Loading…'}</span>
       <span class="text-muted-foreground">{Math.round(torrent.elapsed_ms / 1000)}s</span>
     </div>
     {#if isMagnetUri(torrent.source) && torrent.elapsed_ms > 20_000}
@@ -93,6 +93,13 @@
       <dd class="tabular-nums"><Num value={torrent.left} format={humanBytesLike} /></dd>
       <dt class="font-medium">Total size</dt>
       <dd class="tabular-nums">{humanBytes(torrent.total_size)}</dd>
+      {#if torrent.feed}
+        <dt class="font-medium">Updates</dt>
+        <dd class="tabular-nums select-text" title="BEP 46: the torrent named by this ed25519 key's DHT item, polled hourly; key {torrent.feed.key}{torrent.feed.salt ? `, salt ` + torrent.feed.salt : ''}">
+          via DHT key {torrent.feed.key.slice(0, 8)}…{#if torrent.feed.seq !== null}, seq {torrent.feed.seq}{/if}{#if torrent.feed.superseded !== null}
+            · <span class="text-muted-foreground">superseded by seq {torrent.feed.superseded}, seeding until removed</span>{/if}
+        </dd>
+      {/if}
       {#if swarm}
         <dt class="font-medium">Swarm</dt>
         <dd class="tabular-nums" title="the largest count any tracker reports">

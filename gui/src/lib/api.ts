@@ -26,6 +26,19 @@ export interface Progress {
   super_seed: boolean
   /** the trackers and the DHT; empty while paused */
   trackers: Tracker[]
+  /** BEP 46: the DHT key it updates through */
+  feed: Feed | null
+}
+
+export interface Feed {
+  /** the public key, 64 hex digits */
+  key: string
+  /** hex, empty for none */
+  salt: string
+  /** the item seq that named this torrent; null when it came from the magnet before the DHT had one */
+  seq: number | null
+  /** a newer version, at this seq, was added as a torrent of its own */
+  superseded: number | null
 }
 
 export interface Tracker {
@@ -157,6 +170,9 @@ export const settings = () => invoke<Settings>('settings')
 export const updateSettings = (settings: Settings) => invoke<boolean>('update_settings', { settings })
 
 export const isMagnetUri = (s: string) => s.trim().toLowerCase().startsWith('magnet:?')
+
+/** a BEP 46 magnet, which names a DHT key the torrent updates through */
+export const isFeedUri = (s: string) => isMagnetUri(s) && /[?&]xs=urn(:|%3A)btpk(:|%3A)/i.test(s)
 
 export function fraction(verified: number, total: number): number {
   if (total === 0) return 0

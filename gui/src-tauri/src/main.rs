@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use downloader::feed::Feed;
 use downloader::{
     Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
     Telemetry, TorrentId, TorrentState, TraceSnapshot, TrackerInfo, TrackerState, data_dir, random_peer_id,
@@ -79,6 +80,28 @@ struct ProgressDto {
     sequential: bool,
     super_seed: bool,
     trackers: Vec<TrackerDto>,
+    feed: Option<FeedDto>,
+}
+
+/// BEP 46's key, in hex
+#[derive(Serialize)]
+struct FeedDto {
+    key: String,
+    salt: String,
+    seq: Option<i64>,
+    superseded: Option<i64>,
+}
+
+impl From<Feed> for FeedDto {
+    fn from(f: Feed) -> Self {
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Self {
+            key: hex(&f.key.public),
+            salt: hex(&f.key.salt),
+            seq: f.seq,
+            superseded: f.superseded,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -192,6 +215,7 @@ impl From<Progress> for ProgressDto {
             sequential: p.sequential,
             super_seed: p.super_seed,
             trackers: p.trackers.into_iter().map(TrackerDto::from).collect(),
+            feed: p.feed.map(FeedDto::from),
         }
     }
 }
