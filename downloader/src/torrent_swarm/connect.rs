@@ -241,6 +241,9 @@ impl TorrentSwarm {
             let Ok(_permit) = HALF_OPEN.acquire().await else {
                 return;
             };
+            if events.upgrade().is_none() {
+                return;
+            }
             // from here, not from the queueing above: a dial waiting for a slot isn't dialling
             let span = tracing::info_span!(
                 "dial",
@@ -282,6 +285,23 @@ static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX
 mod test {
     use super::super::test_support::*;
     use super::*;
+
+    /// Dials still waiting for a half-open slot when the torrent goes away are called off,
+    /// rather than connecting for nobody and holding slots other torrents' dials wait for.
+    #[tokio::test]
+    async fn a_stopped_swarms_queued_dials_are_not_made() {
+        let (swarm, handle, path) = swarm("stopped-dials");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        swarm.spawn_dial(listener.local_addr().unwrap(), DialHints::default());
+        drop(handle);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_err(),
+            "the dial was made"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     /// BEP 40 at the connection cap: a newcomer that outranks an idle peer takes its place;
     /// one that doesn't is turned away.
