@@ -17,7 +17,13 @@
     torrent,
     onselectfiles,
     onsequential,
-  }: { torrent: TorrentRow; onselectfiles: (selected: boolean[]) => void; onsequential: (on: boolean) => void } = $props()
+    onpeer,
+  }: {
+    torrent: TorrentRow
+    onselectfiles: (selected: boolean[]) => void
+    onsequential: (on: boolean) => void
+    onpeer?: (addr: string) => void
+  } = $props()
 
   function toggleFile(index: number, checked: boolean) {
     if (torrent.kind !== 'downloading' && torrent.kind !== 'paused' && torrent.kind !== 'queued') return
@@ -120,7 +126,7 @@
         </Table.Root>
         </Tabs.Content>
         <Tabs.Content value="peers" class="max-h-64 overflow-auto rounded-md border">
-          <PeerTable peers={torrent.peers} />
+          <PeerTable peers={torrent.peers} {onpeer} />
         </Tabs.Content>
       </Tabs.Root>
     {/if}

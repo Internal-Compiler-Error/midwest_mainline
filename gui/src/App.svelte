@@ -226,6 +226,10 @@
             torrent={selectedTorrent}
             onselectfiles={(files) => selected !== null && api.selectFiles(selected, files)}
             onsequential={(on) => selected !== null && api.setSequential(selected, on)}
+            onpeer={(addr) => {
+              traces.focus = addr
+              pane = 'traces'
+            }}
           />
         {/if}
 

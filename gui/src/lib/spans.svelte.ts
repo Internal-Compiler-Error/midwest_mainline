@@ -12,6 +12,8 @@ export class Traces {
   open = $state.raw<TraceSpan[]>([])
   /** wall clock of the last poll, what "now" is for spans still open */
   now = $state(Date.now())
+  /** a peer address (as `peer` fields carry it) to narrow the view to, or null for all */
+  focus = $state<string | null>(null)
   #infoHash: string | null = null
   #seq = 0
   #timer: ReturnType<typeof setInterval> | null = null
@@ -19,6 +21,7 @@ export class Traces {
   /** Starts following `infoHash`'s spans, or stops with null. */
   follow(infoHash: string | null) {
     if (infoHash === this.#infoHash) return
+    if (this.#infoHash !== null) this.focus = null
     this.#infoHash = infoHash
     this.#seq = 0
     this.finished = []
@@ -59,4 +62,10 @@ export class Traces {
 
 export function field(span: TraceSpan, name: string): string | undefined {
   return span.fields.find(([n]) => n === name)?.[1]
+}
+
+/** Whether `span` is about `peer`: its own `peer` field, or an event inside it naming the peer
+ * (a racer joining a piece, a claim released). */
+export function involves(span: TraceSpan, peer: string): boolean {
+  return field(span, 'peer') === peer || span.events.some((e) => e.message.includes(`peer=${peer}`))
 }

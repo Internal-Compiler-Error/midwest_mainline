@@ -10,7 +10,7 @@
   import { clock } from './clock.svelte'
   import Num from './Num.svelte'
 
-  let { peers: live }: { peers: Peer[] } = $props()
+  let { peers: live, onpeer }: { peers: Peer[]; onpeer?: (addr: string) => void } = $props()
 
   let peers = $derived(live)
 
@@ -124,7 +124,11 @@
   </Table.Header>
   <Table.Body>
     {#each rows as peer (peer.addr)}
-      <Table.Row>
+      <Table.Row
+        class={onpeer && 'cursor-pointer'}
+        title={onpeer && 'show this peer in Traces'}
+        onclick={() => onpeer?.(peer.addr)}
+      >
         <Table.Cell class="truncate font-mono select-text" title={peer.addr}>{peer.addr}</Table.Cell>
         <Table.Cell class="truncate" title={peer.client}>{peer.client}</Table.Cell>
         <Table.Cell class="text-right tabular-nums"><Num value={peer.progress * 100} format={(n) => `${Math.round(n)}%`} /></Table.Cell>

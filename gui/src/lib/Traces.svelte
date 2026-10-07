@@ -6,7 +6,7 @@
   import { Button } from '$lib/components/ui/button'
   import { humanBytes, type TraceSpan } from './api'
   import { echart, type Interactive } from './echart'
-  import { field, type Traces } from './spans.svelte'
+  import { field, involves, type Traces } from './spans.svelte'
 
   let { traces }: { traces: Traces } = $props()
 
@@ -58,9 +58,13 @@
   })
   let now = $derived(following ? frameNow : frozenAt)
   let viewEnd = $derived(now)
-  let firstStart = $derived(
-    Math.min(...traces.finished.map((s) => s.start_ms), ...traces.open.map((s) => s.start_ms), viewEnd - 10_000),
-  )
+  /** every span, or with a peer in focus only the ones about it */
+  let pool = $derived.by(() => {
+    const all = [...traces.finished, ...traces.open]
+    const peer = traces.focus
+    return peer === null ? all : all.filter((s) => involves(s, peer))
+  })
+  let firstStart = $derived(Math.min(...pool.map((s) => s.start_ms), viewEnd - 10_000))
   let viewStart = $derived(
     windowMs > 0 ? viewEnd - windowMs : Math.max(firstStart - (viewEnd - firstStart) * 0.02, viewEnd - 1_800_000),
   )
@@ -110,24 +114,56 @@
     })
   })()
 
-  let visible = $derived(
-    [...traces.finished, ...traces.open].filter((s) => s.start_ms <= viewEnd && (s.end_ms ?? now) >= viewStart),
-  )
+  let visible = $derived(pool.filter((s) => s.start_ms <= viewEnd && (s.end_ms ?? now) >= viewStart))
+
+  /** The focused peer's story in numbers. Its connection span records bytes only when it
+   * closes, so while it's open the pieces it delivered stand in. */
+  let focusSummary = $derived.by(() => {
+    if (traces.focus === null) return null
+    const conns = pool.filter((s) => s.name === 'peer')
+    const latest = conns.at(-1)
+    const pieces = pool.filter((s) => s.name === 'piece' && s.end_ms !== null)
+    const verified = pieces.filter((s) => field(s, 'outcome') === 'verified' && field(s, 'peer') === traces.focus)
+    const released = pieces.filter((s) => field(s, 'outcome') === 'released').length
+    const failed = pieces.filter((s) => field(s, 'outcome') !== 'verified' && field(s, 'outcome') !== 'released').length
+    const times = verified.map((s) => (s.end_ms ?? 0) - s.start_ms).sort((a, b) => a - b)
+    const bytes = verified.reduce((sum, s) => sum + Number(field(s, 'size') ?? 0), 0)
+    return {
+      client: latest ? field(latest, 'client') : undefined,
+      transport: latest ? field(latest, 'transport') : undefined,
+      connected: latest?.end_ms === null,
+      connections: conns.length,
+      dials: pool.filter((s) => s.name === 'dial').length,
+      verified: verified.length,
+      released,
+      failed,
+      bytes,
+      median: times.length ? times[Math.floor(times.length / 2)] : null,
+    }
+  })
 
   /** The bars: per lane, first-fit into rows, and when every row is busy into the one
-   * that frees soonest (a lane that's always full overlaps rather than growing). */
+   * that frees soonest (a lane that's always full overlaps rather than growing). A lane uses
+   * only as many rows as it needs, so a few spans (one peer in focus, early on) draw thick. */
   let bars = $derived.by(() => {
     const out: { value: number[]; itemStyle: { color: string; opacity: number }; span: TraceSpan }[] = []
-    for (const { lane, y0, rowHeight } of bands) {
+    for (const { lane, y0, y1 } of bands) {
       const spans = visible.filter((s) => lane.names.includes(s.name)).sort((a, b) => a.start_ms - b.start_ms)
-      const rowEnds = new Array<number>(lane.rows).fill(-Infinity)
+      const rowEnds: number[] = []
+      const placed: [TraceSpan, number][] = []
       for (const span of spans) {
         const end = span.end_ms ?? now
         let row = rowEnds.findIndex((e) => e <= span.start_ms)
+        if (row < 0 && rowEnds.length < lane.rows) row = rowEnds.push(-Infinity) - 1
         if (row < 0) row = rowEnds.indexOf(Math.min(...rowEnds))
         rowEnds[row] = end
+        placed.push([span, row])
+      }
+      // at least a few rows' worth of height per row, so one span isn't a slab
+      const rowHeight = (y1 - y0) / Math.max(rowEnds.length, Math.min(lane.rows, 4))
+      for (const [span, row] of placed) {
         out.push({
-          value: [span.id, span.start_ms, end, y0 + row * rowHeight, rowHeight],
+          value: [span.id, span.start_ms, span.end_ms ?? now, y0 + row * rowHeight, rowHeight],
           itemStyle: { color: colour(span), opacity: span.id === pinned ? 1 : span.end_ms === null ? 0.45 : 0.85 },
           span,
         })
@@ -171,7 +207,8 @@
             const height = (api.size?.([0, api.value(4)]) as number[])[1]
             const sys = params.coordSys as unknown as { x: number; y: number; width: number; height: number }
             const shape = echarts.graphic.clipRectByRect(
-              { x: start[0], y: start[1] + height * 0.1, width: Math.max(end[0] - start[0], 1.5), height: Math.max(height * 0.8, 1) },
+              // a pixel short at the end, so back-to-back spans in a row read as separate
+              { x: start[0], y: start[1] + height * 0.1, width: Math.max(end[0] - start[0] - 1, 1.5), height: Math.max(height * 0.8, 1) },
               { x: sys.x, y: sys.y, width: sys.width, height: sys.height },
             )
             return shape && { type: 'rect', shape: { ...shape, r: Math.min(2, shape.height / 2) }, style: api.style() }
@@ -262,6 +299,24 @@
       >
     </span>
   </div>
+  {#if traces.focus !== null && focusSummary}
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b bg-muted/40 px-3 py-1 text-xs tabular-nums">
+      <span class="font-mono font-medium">{traces.focus}</span>
+      {#if focusSummary.client}<span>{focusSummary.client}</span>{/if}
+      {#if focusSummary.transport}<span class="text-muted-foreground">{focusSummary.transport}</span>{/if}
+      <span class={focusSummary.connected ? 'text-emerald-500' : 'text-muted-foreground'}>
+        {focusSummary.connected ? 'connected' : 'not connected'}{focusSummary.connections > 1 ? ` (${focusSummary.connections} connections)` : ''}
+      </span>
+      <span class="text-muted-foreground">
+        {focusSummary.dials} dial{focusSummary.dials === 1 ? '' : 's'} ·
+        <span class="text-emerald-500">{focusSummary.verified} pieces verified</span> ({humanBytes(focusSummary.bytes)})
+        {#if focusSummary.released}· <span class="text-amber-500">{focusSummary.released} released</span>{/if}
+        {#if focusSummary.failed}· <span class="text-red-500">{focusSummary.failed} failed</span>{/if}
+        {#if focusSummary.median !== null}· median piece {ms(focusSummary.median)}{/if}
+      </span>
+      <Button class="ml-auto" variant="ghost" size="xs" onclick={() => (traces.focus = null)}>✕ all peers</Button>
+    </div>
+  {/if}
   <div class="flex min-h-0 flex-1">
     <div class="min-w-0 flex-1" use:echart={chart}></div>
     {#if detail}
@@ -294,6 +349,11 @@
               <li><span class="text-muted-foreground tabular-nums">+{ms(event.at_ms - detail.start_ms)}</span> {event.message}</li>
             {/each}
           </ol>
+        {/if}
+        {#if field(detail, 'peer') && field(detail, 'peer') !== traces.focus}
+          <Button class="mt-3 mr-1" variant="outline" size="xs" onclick={() => (traces.focus = field(detail, 'peer') ?? null)}>
+            focus this peer
+          </Button>
         {/if}
         {#if detail.parent !== null && traces.byId(detail.parent)}
           <Button class="mt-3" variant="outline" size="xs" onclick={() => (pinned = detail.parent)}>↑ parent</Button>
