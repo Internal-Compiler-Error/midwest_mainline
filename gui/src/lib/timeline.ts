@@ -108,17 +108,32 @@ export interface Bar {
   span: TraceSpan
 }
 
-/** The bars: per lane, first-fit into rows, and when every row is busy into the one that
- * frees soonest (a lane that's always full overlaps rather than growing). A lane uses only as
- * many rows as it needs, so a few spans (one peer in focus, early on) draw thick. Open spans
- * end at `now`. */
-export function layout(spans: TraceSpan[], now: number, pinned: number | null): Bar[] {
+const LANE_OF = new Map(LANES.flatMap((lane, i) => lane.names.map((name) => [name, i] as const)))
+
+/** The spans of each lane, in `BANDS` order, sorted by start: the part of the layout that only
+ * changes when the spans do, not with every frame. */
+export function byLane(spans: TraceSpan[]): TraceSpan[][] {
+  const lanes = BANDS.map((): TraceSpan[] => [])
+  for (const span of spans) {
+    const lane = LANE_OF.get(span.name)
+    if (lane !== undefined) lanes[lane].push(span)
+  }
+  for (const lane of lanes) lane.sort((a, b) => a.start_ms - b.start_ms)
+  return lanes
+}
+
+/** The bars of the spans that show between `from` and `now`: per lane, first-fit into rows,
+ * and when every row is busy into the one that frees soonest (a lane that's always full
+ * overlaps rather than growing). A lane uses only as many rows as it needs, so a few spans
+ * (one peer in focus, early on) draw thick. Open spans end at `now`. */
+export function layout(lanes: TraceSpan[][], from: number, now: number, pinned: number | null): Bar[] {
   const out: Bar[] = []
-  for (const { lane, y0, y1 } of BANDS) {
-    const inLane = spans.filter((s) => lane.names.includes(s.name)).sort((a, b) => a.start_ms - b.start_ms)
+  BANDS.forEach(({ lane, y0, y1 }, i) => {
     const rowEnds: number[] = []
     const placed: [TraceSpan, number][] = []
-    for (const span of inLane) {
+    for (const span of lanes[i]) {
+      if (span.start_ms > now) break
+      if ((span.end_ms ?? now) < from) continue
       let row = rowEnds.findIndex((e) => e <= span.start_ms)
       if (row < 0 && rowEnds.length < lane.rows) row = rowEnds.push(-Infinity) - 1
       if (row < 0) row = rowEnds.indexOf(Math.min(...rowEnds))
@@ -135,6 +150,6 @@ export function layout(spans: TraceSpan[], now: number, pinned: number | null): 
         span,
       })
     }
-  }
+  })
   return out
 }

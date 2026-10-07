@@ -8,7 +8,7 @@
   import { duration, humanBytes } from './format'
   import SpanDetail from './SpanDetail.svelte'
   import { field, fieldValue, involves, type Traces } from './spans.svelte'
-  import { BANDS, LEGEND, layout, pieceOutcome } from './timeline'
+  import { BANDS, LEGEND, byLane, layout, pieceOutcome } from './timeline'
 
   let { traces }: { traces: Traces } = $props()
 
@@ -51,12 +51,13 @@
     const peer = traces.focus
     return peer === null ? all : all.filter((s) => involves(s, peer))
   })
-  let firstStart = $derived(pool.reduce((min, s) => Math.min(min, s.start_ms), now - 10_000))
+  let earliest = $derived(pool.reduce((min, s) => Math.min(min, s.start_ms), Infinity))
+  let firstStart = $derived(Math.min(earliest, now - 10_000))
   let viewStart = $derived(
     windowMs > 0 ? now - windowMs : Math.max(firstStart - (now - firstStart) * 0.02, now - 1_800_000),
   )
 
-  let visible = $derived(pool.filter((s) => s.start_ms <= now && (s.end_ms ?? now) >= viewStart))
+  let lanes = $derived(byLane(pool))
 
   /** The focused peer's story in numbers. Its connection span records bytes only when it
    * closes, so while it's open the pieces it delivered stand in. */
@@ -84,7 +85,7 @@
     }
   })
 
-  let bars = $derived(layout(visible, now, pinned))
+  let bars = $derived(layout(lanes, viewStart, now, pinned))
 
   let chart = $derived.by((): Chart => ({
     option: base({
