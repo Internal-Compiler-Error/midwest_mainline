@@ -14,6 +14,12 @@ use tracing::warn;
 
 use super::{SwarmEvent, TorrentSwarm};
 
+/// Bytes a peer may have accepted from us and not yet taken off the socket: read off disk,
+/// held by the upload limit, or queued for its writer. Requests past it are rejected, or a peer
+/// that asks for much and reads little would have us hold blocks in memory for it. As deep as
+/// the queue our `reqq` advertises, at the usual block size.
+pub(super) const MAX_UPLOAD_BACKLOG: usize = MAX_QUEUED_UPLOADS * crate::settings::BLOCK_SIZE;
+
 /// Regular (non-optimistic) upload slots for `interested` peers. A handful of slots reciprocates
 /// with only a handful of a big swarm's leechers, and the rest have no reason to send us
 /// anything, so the count grows with the square root of the demand.
@@ -83,13 +89,13 @@ impl TorrentSwarm {
     fn deliver(&mut self, idx: usize, block: Piece) -> Option<Piece> {
         let peer = &mut self.peers[idx];
         let request = Request::from(&block);
-        if !peer.uploads.contains(&request) {
+        if !peer.wants_upload(&request) {
             return None;
         }
         if !peer.choked_them && !self.limiter.take_upload(block.length as usize) {
             return Some(block);
         }
-        peer.uploads.remove(&request);
+        peer.take_upload(&request);
         let sent = if peer.choked_them {
             peer.send_reject(request)
         } else {
@@ -123,14 +129,16 @@ impl TorrentSwarm {
                 .as_ref()
                 .is_none_or(|view| view.offered.contains(&request.index));
         let sane = request.length > 0 && request.length <= MAX_SERVED_BLOCK;
-        if !verified || !sane || peer.uploads.len() >= MAX_QUEUED_UPLOADS {
+        let room = peer.queued_uploads() < MAX_QUEUED_UPLOADS
+            && peer.upload_backlog() + request.length as usize <= MAX_UPLOAD_BACKLOG;
+        if !verified || !sane || !room {
             if peer.send_reject(request).is_err() {
                 self.drop_peer(idx, "send failed");
             }
             return;
         }
 
-        if !peer.uploads.insert(request) {
+        if !peer.accept_upload(request) {
             // asked twice; the first one is already on its way
             return;
         }
@@ -206,7 +214,7 @@ impl TorrentSwarm {
             }
             Err(request) => {
                 let peer = &mut self.peers[idx];
-                if peer.uploads.remove(&request) && peer.send_reject(request).is_err() {
+                if peer.take_upload(&request) && peer.send_reject(request).is_err() {
                     self.drop_peer(idx, "send failed");
                 }
             }
@@ -284,6 +292,7 @@ impl TorrentSwarm {
 #[cfg(test)]
 mod test {
     use super::super::test_support::*;
+    use super::MAX_UPLOAD_BACKLOG;
 
     /// BEP 3: a choked peer gets no data. Without Fast Extension there's nothing to send back
     /// either -- the request is simply dropped.
@@ -370,6 +379,54 @@ mod test {
             .unwrap();
         let late = tokio::time::timeout(Duration::from_millis(2500), next_piece(&mut leech)).await;
         assert!(late.is_err(), "the cancelled block was sent");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A peer that asks for far more than it reads gets rejects past MAX_UPLOAD_BACKLOG, rather
+    /// than having every block it asked for read off disk and queued in memory for it.
+    #[tokio::test]
+    async fn a_peer_that_does_not_read_cannot_queue_unbounded_uploads() {
+        let (swarm, handle, path) = swarm_with("backlog", true);
+        tokio::spawn(swarm.work_loop());
+        let mut leech = fake_peer_with(&handle, "10.0.0.4:6881", true).await;
+        leech
+            .send(BtMessage::Interested(crate::wire::Interested))
+            .await
+            .unwrap();
+        loop {
+            if let Some(Ok(BtMessage::Unchoke(_))) = leech.next().await {
+                break;
+            }
+        }
+        const ASKED: u32 = 1000;
+        const LEN: u32 = 16_000;
+        for n in 0..ASKED {
+            let request = Request {
+                index: n % 2,
+                begin: n / 2,
+                length: LEN,
+            };
+            leech.send(BtMessage::Request(request)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (mut served, mut rejected) = (0, 0);
+        let answers = async {
+            while served + rejected < ASKED {
+                match leech.next().await {
+                    Some(Ok(BtMessage::Piece(_))) => served += 1,
+                    Some(Ok(BtMessage::RejectRequest(_))) => rejected += 1,
+                    Some(Ok(_)) => {}
+                    other => panic!("connection ended: {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), answers).await.unwrap();
+        assert!(rejected > 0, "all {served} blocks were queued");
+        assert!(
+            (served * LEN) as usize <= MAX_UPLOAD_BACKLOG + 4 * 1024 * 1024,
+            "{served} blocks were queued, past what the socket buffers explain"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

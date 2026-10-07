@@ -15,6 +15,8 @@ use midwest_mainline::message::{compact_addr, parse_compact_addr};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -217,7 +219,11 @@ pub(crate) struct Peer {
     pub requested: BTreeMap<Request, Instant>,
     /// blocks the peer asked us for that we've accepted and not sent yet; a Cancel takes one
     /// out, and a block read for a request no longer here isn't sent
-    pub uploads: BTreeSet<Request>,
+    uploads: BTreeSet<Request>,
+    /// the bytes `uploads` asks for
+    upload_bytes: usize,
+    /// bytes of blocks queued for the writer and not yet written
+    unsent: Arc<AtomicUsize>,
     /// the last time this peer delivered a block, or was first asked for one after being idle;
     /// what "stalled" is measured from (see `stalled`)
     last_progress: Instant,
@@ -350,7 +356,15 @@ impl Peer {
         // room for a whole block and then some, so a 16 KiB Piece doesn't grow the buffer
         let (sink, source) = Framed::with_capacity(stream, BtCodec, 64 * 1024).split();
         let (outbox, queued) = mpsc::channel(PEER_OUTBOX);
-        let writer = tokio::spawn(write_loop(sink, queued, remote_addr, conn, inbox.clone()));
+        let unsent = Arc::new(AtomicUsize::new(0));
+        let writer = tokio::spawn(write_loop(
+            sink,
+            queued,
+            unsent.clone(),
+            remote_addr,
+            conn,
+            inbox.clone(),
+        ));
         let reader = tokio::spawn(read_loop(source, remote_addr, conn, inbox));
         Self {
             peer_id,
@@ -378,6 +392,8 @@ impl Peer {
             interested_us: false,
             requested: BTreeMap::new(),
             uploads: BTreeSet::new(),
+            upload_bytes: 0,
+            unsent,
             last_progress: Instant::now(),
             last_received: Instant::now(),
             stats: PeerStatistics::default(),
@@ -468,7 +484,7 @@ impl Peer {
         match msg {
             BtMessage::KeepAlive(_) => {}
             BtMessage::Cancel(cancel) => {
-                self.uploads.remove(&Request::from(cancel));
+                self.take_upload(&Request::from(cancel));
             }
             BtMessage::Choke(_) => self.choked_us = true,
             BtMessage::Unchoke(_) => self.choked_us = false,
@@ -591,6 +607,40 @@ impl Peer {
         self.stats.block_received(piece.length as usize, Instant::now());
         self.last_progress = Instant::now();
         Some(())
+    }
+
+    /// Takes on serving `req`; false if it's been asked for already.
+    pub fn accept_upload(&mut self, req: Request) -> bool {
+        let new = self.uploads.insert(req);
+        if new {
+            self.upload_bytes += req.length as usize;
+        }
+        new
+    }
+
+    /// Whether `req` is still to be served: accepted, and neither cancelled nor sent.
+    pub fn wants_upload(&self, req: &Request) -> bool {
+        self.uploads.contains(req)
+    }
+
+    /// Stops serving `req`; false if it wasn't being served.
+    pub fn take_upload(&mut self, req: &Request) -> bool {
+        let had = self.uploads.remove(req);
+        if had {
+            self.upload_bytes -= req.length as usize;
+        }
+        had
+    }
+
+    /// How many blocks it has asked of us that aren't sent yet.
+    pub fn queued_uploads(&self) -> usize {
+        self.uploads.len()
+    }
+
+    /// The bytes of what it asked of us that haven't gone out on the socket yet: blocks being
+    /// read or held back, and blocks queued for the writer.
+    pub fn upload_backlog(&self) -> usize {
+        self.upload_bytes + self.unsent.load(Ordering::Relaxed)
     }
 
     /// Whether this peer owes us blocks and hasn't delivered any for `limit`. Measured from
@@ -724,6 +774,7 @@ impl Peer {
 
     pub fn send_block(&mut self, piece: Piece) -> io::Result<()> {
         let length = piece.length as usize;
+        self.unsent.fetch_add(length, Ordering::Relaxed);
         self.send(BtMessage::Piece(piece))?;
         self.stats.block_sent(length);
         Ok(())
@@ -765,19 +816,35 @@ async fn read_loop(mut source: Source, addr: SocketAddr, conn: u64, inbox: Inbox
 /// Writes everything queued, then flushes once: a burst of Requests or Haves goes out in one
 /// syscall rather than one each. A batch that can't be written within `WRITE_TIMEOUT` ends the
 /// connection, reported to the swarm like a read error.
-async fn write_loop(mut sink: Sink, mut queued: mpsc::Receiver<BtMessage>, addr: SocketAddr, conn: u64, inbox: Inbox) {
+async fn write_loop(
+    mut sink: Sink,
+    mut queued: mpsc::Receiver<BtMessage>,
+    unsent: Arc<AtomicUsize>,
+    addr: SocketAddr,
+    conn: u64,
+    inbox: Inbox,
+) {
     async fn timed<F: Future<Output = io::Result<()>>>(write: F) -> io::Result<()> {
         tokio::time::timeout(WRITE_TIMEOUT, write)
             .await
             .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out")))
     }
+    let feed = async |sink: &mut Sink, msg: BtMessage| {
+        let block = match &msg {
+            BtMessage::Piece(piece) => piece.data.len(),
+            _ => 0,
+        };
+        sink.feed(msg).await?;
+        unsent.fetch_sub(block, Ordering::Relaxed);
+        io::Result::Ok(())
+    };
     let written: io::Result<()> = async {
         while let Some(msg) = queued.recv().await {
             // one timer per batch rather than per message: a burst is hundreds of them
             timed(async {
-                sink.feed(msg).await?;
+                feed(&mut sink, msg).await?;
                 while let Ok(msg) = queued.try_recv() {
-                    sink.feed(msg).await?;
+                    feed(&mut sink, msg).await?;
                 }
                 sink.flush().await
             })
