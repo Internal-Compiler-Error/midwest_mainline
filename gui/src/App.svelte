@@ -114,7 +114,7 @@
     // torrents that were there at startup (resumed, or given on the command line) get the
     // details panel too, without a click, and so does the next one when the selected one goes
     if (!torrents.some((t) => t.id === selected)) selected = torrents[0]?.id ?? null
-    await logs.poll()
+    if (pane === 'console') await logs.poll()
   }
 
   async function rescan() {
@@ -228,7 +228,7 @@
     <Resizable.Handle withHandle class={pane === null ? 'hidden' : ''} />
     <Resizable.Pane bind:this={bottom} defaultSize={pane === null ? 0 : 35} minSize={10} collapsible collapsedSize={0}>
       {#if pane === 'console'}
-        <ConsolePane lines={logs.lines} />
+        <ConsolePane lines={logs.lines} first={logs.first} />
       {:else if pane === 'insights'}
         <InsightsPane {insights} />
       {:else if pane === 'traces'}

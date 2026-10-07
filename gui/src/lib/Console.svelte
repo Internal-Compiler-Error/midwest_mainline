@@ -1,7 +1,7 @@
 <script lang="ts">
   // The library's tracing output, newest at the bottom, sticking there unless scrolled up.
   // Its height is whatever pane it's put in (see App.svelte).
-  let { lines }: { lines: string[] } = $props()
+  let { lines, first }: { lines: string[]; first: number } = $props()
   let scroller: HTMLDivElement | undefined = $state()
   let stick = $state(true)
 
@@ -27,7 +27,7 @@
   bind:this={scroller}
   {onscroll}
 >
-  {#each lines as line, i (i)}
+  {#each lines as line, i (first + i)}
     <div class={level(line)}>{line}</div>
   {/each}
 </div>
