@@ -234,6 +234,8 @@ pub(crate) enum SwarmEvent {
     /// `dialing`, it could never be retried -- an address a peer keeps re-gossiping over PEX
     /// needs to actually leave the set on failure.
     DialFailed(SocketAddr),
+    /// a hybrid's pieces that failed `recheck_by_layer`
+    Rechecked(Vec<u32>),
     /// a web seed's job (see `start_web_job`) fetched a block
     WebSeedBlock {
         seed: usize,
@@ -779,6 +781,7 @@ impl TorrentSwarm {
                 senders,
                 outcome,
             } => self.piece_done(piece, len, senders, outcome).await,
+            SwarmEvent::Rechecked(failed) => self.recheck_done(failed).await,
             SwarmEvent::WebSeedBlock { seed, job, block } => self.web_block_arrived(seed, job, block).await,
             SwarmEvent::WebSeedDone { seed, job, outcome } => self.web_job_done(seed, job, outcome).await,
             SwarmEvent::DialFailed(addr) => {
@@ -880,7 +883,8 @@ impl TorrentSwarm {
     }
 
     /// BEP 52: asks peers for the piece layers we lack, each from a peer that has some of the
-    /// file's pieces (and so must be able to answer).
+    /// file's pieces (and so must be able to answer) and speaks v2 (a hybrid's v1-only peers
+    /// don't know hash requests).
     async fn request_layers(&mut self) {
         if self.layers.is_empty() {
             return;
@@ -890,7 +894,7 @@ impl TorrentSwarm {
         let has = |addr: SocketAddr, file: usize| {
             peers
                 .binary_search_by_key(&addr, |p| p.remote_addr)
-                .is_ok_and(|i| torrent.pieces_of_file(file).any(|piece| peers[i].they_have(piece)))
+                .is_ok_and(|i| peers[i].v2 && torrent.pieces_of_file(file).any(|piece| peers[i].they_have(piece)))
         };
         let requests = self.layers.assign(torrent, &addrs, has, Instant::now());
         for (addr, req) in requests {
@@ -899,6 +903,60 @@ impl TorrentSwarm {
             {
                 self.drop_peer(idx, "send failed");
             }
+        }
+    }
+
+    /// A hybrid's pieces of `file` that only SHA-1 vouched for, before the file's piece layer
+    /// came, are read back and checked by both hashes on the blocking pool; `recheck_done`
+    /// gives up any that fail.
+    fn recheck_by_layer(&mut self, file: usize) {
+        if self.torrent.v2_only() {
+            return;
+        }
+        let verified = &self.stat.verified;
+        let pieces: Vec<u32> = self
+            .torrent
+            .pieces_of_file(file)
+            .filter(|&p| verified[p as usize])
+            .collect();
+        if pieces.is_empty() {
+            return;
+        }
+        let (torrent, storage, events) = (self.torrent.clone(), self.storage.clone(), self.events_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let failed = pieces
+                .into_iter()
+                .filter(|&p| storage.read_piece(p).is_ok_and(|data| !torrent.valid_piece(p, &data)))
+                .collect();
+            if let Some(events) = events.upgrade() {
+                let _ = events.blocking_send(SwarmEvent::Rechecked(failed));
+            }
+        });
+    }
+
+    /// Pieces that passed SHA-1 but not the Merkle tree: the hybrid's halves disagree about
+    /// them, so they're not had after all.
+    async fn recheck_done(&mut self, failed: Vec<u32>) {
+        for &piece in &failed {
+            if !self.stat.verified[piece as usize] {
+                continue;
+            }
+            warn!("piece {piece} matches its SHA-1 hash but not its piece layer; fetching it again");
+            self.bus.emit(Event::PieceFailed {
+                info_hash: self.torrent.info_hash,
+                piece,
+                peers: vec![],
+            });
+            self.stat.verified.set(piece as usize, false);
+            self.stat.written -= self.torrent.nth_piece_size(piece).expect("a piece of the torrent");
+            if self.stat.wanted[piece as usize] {
+                self.missing.push(piece);
+            }
+        }
+        if !failed.is_empty() {
+            self.stat.refresh(&self.torrent);
+            self.publish_stats();
+            self.schedule().await;
         }
     }
 
@@ -1252,6 +1310,7 @@ impl TorrentSwarm {
                     Received::Partial => {}
                     Received::Layer(file) => {
                         info!("piece layer of {:?} in from {addr}", self.torrent.files[file].1);
+                        self.recheck_by_layer(file);
                         self.schedule().await;
                     }
                     Received::Bad => {

@@ -47,9 +47,10 @@ pub struct LayerFetch {
 }
 
 impl LayerFetch {
-    /// Only a v2-only torrent needs them: a hybrid's pieces are checked by SHA-1.
+    /// Every v2 torrent fetches what it lacks: a v2-only one can't check a piece without
+    /// them, a hybrid checks by SHA-1 meanwhile and by both once they're in.
     pub fn new(torrent: &Torrent) -> Self {
-        if !torrent.v2_only() {
+        if torrent.v2.is_none() {
             return Self::default();
         }
         let jobs = torrent
@@ -362,28 +363,40 @@ mod test {
         assert!(t.missing_layers().is_empty());
     }
 
-    /// Two clients on loopback: one seeds a v2-only torrent, the other starts from its bare
-    /// info dict (as from a magnet), so it has to get the piece layers with hash requests
-    /// before any piece can be checked, then downloads and verifies everything by Merkle tree.
-    #[tokio::test]
-    async fn a_v2_torrent_downloads_between_two_clients() {
+    /// A seeder and a leecher of `full` on loopback, the seeder with `files` on disk under
+    /// `scratch/seed`, the leecher starting from `bare` (its info dict alone, as from a magnet)
+    /// under `scratch/leech` with `leech` verified, there already if any.
+    struct TwoClients {
+        seeder: crate::BtClient,
+        leecher: crate::BtClient,
+        scratch: std::path::PathBuf,
+    }
+
+    fn two_clients(
+        name: &str,
+        full: &Torrent,
+        bare: &Torrent,
+        files: &[(&[&str], Vec<u8>)],
+        leech: bitvec::boxed::BitBox<u8, bitvec::order::Msb0>,
+    ) -> TwoClients {
         use crate::BtClient;
         use crate::defs::Identity;
         use bitvec::prelude::*;
 
-        let files = files();
-        let full = parse_torrent(&fixtures::torrent_file("v2swarm", &files, P, false)).unwrap();
-        let info = fixtures::info("v2swarm", &files, P, false);
-        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
-        assert_eq!(full.info_hash, bare.info_hash);
-
-        let scratch = std::env::temp_dir().join(format!("downloader-v2swarm-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("downloader-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         let (seed_dir, leech_dir) = (scratch.join("seed"), scratch.join("leech"));
-        for (path, data) in &files {
-            let at = path.iter().fold(seed_dir.join("v2swarm"), |p, s| p.join(s));
-            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-            std::fs::write(at, data).unwrap();
+        let dirs: &[&std::path::Path] = if leech.any() {
+            &[&seed_dir, &leech_dir]
+        } else {
+            &[&seed_dir]
+        };
+        for dir in dirs {
+            for (path, data) in files {
+                let at = path.iter().fold(dir.join(name), |p, s| p.join(s));
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                std::fs::write(at, data).unwrap();
+            }
         }
         let free_port = || {
             std::net::TcpListener::bind("127.0.0.1:0")
@@ -402,26 +415,108 @@ mod test {
         let seeder = BtClient::new(identity(seed_port, b"-DL0100-v2-seeder..."), crate::dht::Dht::none());
         let all = bitvec![u8, Msb0; 1; full.num_pieces()].into_boxed_bitslice();
         seeder.add_torrent_resumed(full.clone(), &seed_dir, all).unwrap();
-        assert!(seeder.stats(&full).unwrap().borrow().completed);
+        assert!(seeder.stats(full).unwrap().borrow().completed);
 
         let leecher = BtClient::new(identity(free_port(), b"-DL0100-v2-leecher.."), crate::dht::Dht::none());
-        leecher.add_torrent(bare.clone(), &leech_dir).unwrap();
+        if leech.any() {
+            leecher.add_torrent_resumed(bare.clone(), &leech_dir, leech).unwrap();
+        } else {
+            leecher.add_torrent(bare.clone(), &leech_dir).unwrap();
+        }
         leecher.add_peers(&bare.info_hash, vec![SocketAddr::from(([127, 0, 0, 1], seed_port))]);
-        let mut stats = leecher.stats(&bare).unwrap();
+        TwoClients {
+            seeder,
+            leecher,
+            scratch,
+        }
+    }
+
+    impl Drop for TwoClients {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.scratch);
+        }
+    }
+
+    /// Downloads `full` from a seeder, starting from `bare`; checks the data and the layers.
+    async fn download(name: &str, full: Torrent, bare: Torrent, files: &[(&[&str], Vec<u8>)]) {
+        assert_eq!(full.info_hash, bare.info_hash);
+        let none = bitvec::bitbox![u8, bitvec::order::Msb0; 0; full.num_pieces()];
+        let clients = two_clients(name, &full, &bare, files, none);
+        let mut stats = clients.leecher.stats(&bare).unwrap();
         tokio::time::timeout(Duration::from_secs(30), stats.wait_for(|s| s.completed))
             .await
             .expect("download finished")
             .unwrap();
-
+        // a hybrid's pieces don't wait for the layers, so they may come after the last piece
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !bare.missing_layers().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(bare.missing_layers().is_empty(), "the layers came from the seeder");
-        for (path, data) in &files {
-            let at = path.iter().fold(leech_dir.join("v2swarm"), |p, s| p.join(s));
+
+        let leech_dir = clients.scratch.join("leech");
+        for (path, data) in files {
+            let at = path.iter().fold(leech_dir.join(name), |p, s| p.join(s));
             assert_eq!(&std::fs::read(&at).unwrap(), data, "{}", at.display());
         }
-        assert!(!leech_dir.join("v2swarm/.pad").exists(), "padding stays off disk");
+        assert!(!leech_dir.join(name).join(".pad").exists(), "padding stays off disk");
         let checked = crate::check::check_files(&bare, &leech_dir, |_| {});
         assert!(checked.all(), "a recheck agrees");
-        drop((seeder, leecher));
-        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// Two clients on loopback: one seeds a v2-only torrent, the other starts from its bare
+    /// info dict (as from a magnet), so it has to get the piece layers with hash requests
+    /// before any piece can be checked, then downloads and verifies everything by Merkle tree.
+    #[tokio::test]
+    async fn a_v2_torrent_downloads_between_two_clients() {
+        let files = files();
+        let full = parse_torrent(&fixtures::torrent_file("v2swarm", &files, P, false)).unwrap();
+        let info = fixtures::info("v2swarm", &files, P, false);
+        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+        download("v2swarm", full, bare, &files).await;
+    }
+
+    /// The same for a hybrid from a magnet: the leecher dials under the v1 hash with the v2
+    /// bit, the seeder upgrades the connection to the v2 hash, and the layers come over it
+    /// (only a v2 connection gets hash requests) while SHA-1 checks the pieces.
+    #[tokio::test]
+    async fn a_hybrid_magnet_gets_its_layers_over_an_upgraded_connection() {
+        let files = files();
+        let full = parse_torrent(&fixtures::torrent_file("hyswarm", &files, P, true)).unwrap();
+        let info = fixtures::info("hyswarm", &files, P, true);
+        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+        assert!(!bare.v2_only() && !bare.missing_layers().is_empty());
+        download("hyswarm", full, bare, &files).await;
+    }
+
+    /// A hybrid whose halves disagree about one piece of `more`: the leecher had all of it
+    /// verified by SHA-1, and once the layer comes that piece is checked again and dropped.
+    #[tokio::test]
+    async fn pieces_sha1_passed_are_rechecked_when_the_layer_comes() {
+        use bitvec::prelude::*;
+        let files = files();
+        let mut other = files.clone();
+        let more = other.iter().position(|(path, _)| *path == ["more"]).unwrap();
+        other[more].1[P + 5] ^= 1;
+        let v1 = fixtures::info("hyrecheck", &files, P, true);
+        let v2 = fixtures::info("hyrecheck", &other, P, true);
+        let at = |info: &[u8]| info.windows(8).position(|w| w == b"6:pieces").unwrap();
+        let mut info = v2[..at(&v2)].to_vec();
+        info.extend_from_slice(&v1[at(&v1)..]);
+        let layers = fixtures::piece_layers(&other, P);
+        let full = parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).unwrap();
+        let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
+        let file = bare.file_with_root(&fixtures::root(&other[more].1)).unwrap();
+        let bad = bare.pieces_of_file(file).start + 1;
+
+        let all = bitbox![u8, Msb0; 1; bare.num_pieces()];
+        let clients = two_clients("hyrecheck", &full, &bare, &files, all);
+        let mut stats = clients.leecher.stats(&bare).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), stats.wait_for(|s| !s.verified[bad as usize]))
+            .await
+            .expect("the piece was dropped")
+            .unwrap();
+        assert_eq!(stats.borrow().verified.count_zeros(), 1, "only that one");
+        assert!(bare.layer(file).is_some());
     }
 }

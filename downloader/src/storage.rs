@@ -43,7 +43,6 @@ impl TorrentStorage {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn read_piece(&self, piece: u32) -> anyhow::Result<Box<[u8]>> {
         self.read_range(self.piece_range(piece)?)
     }

@@ -802,7 +802,8 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     };
 
     // BEP 52: outside the info dict, so not covered by the info hash, but each must roll up to
-    // its file's root. A torrent rebuilt from a magnet's metadata has none: peers send them.
+    // its file's root. A torrent rebuilt from a magnet's metadata has none, and its resume file
+    // those that came before it stopped: peers send the rest.
     if parsed.v2.is_some()
         && let Some(layers) = torrent.remove(b"piece layers".as_slice())
     {
@@ -815,8 +816,10 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
                 .as_ref()
                 .and_then(|v2| v2.roots[file])
                 .expect("missing_layers has roots");
-            let Some(BencodeItemView::ByteString(layer)) = layers.get(root.as_slice()) else {
-                bail!("piece layers has none for {:?}", parsed.files[file].1);
+            let layer = match layers.get(root.as_slice()) {
+                Some(BencodeItemView::ByteString(layer)) => layer,
+                None => continue,
+                Some(_) => bail!("the piece layer of {:?} needs to be a string", parsed.files[file].1),
             };
             let (hashes, rest) = layer.as_chunks::<32>();
             if !rest.is_empty() || !parsed.set_layer(file, hashes.to_vec()) {
@@ -1523,10 +1526,6 @@ mod test {
         let last = layers.len() - 2;
         layers[last] ^= 1;
         assert!(parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).is_err());
-        assert!(
-            parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(b"de"))).is_err(),
-            "layers present but some missing"
-        );
     }
 
     #[test]
@@ -1606,6 +1605,27 @@ mod test {
         assert_eq!(t.hybrid_v2_hash().unwrap().as_bytes(), &v2.info_hash[..20]);
         let stream = stream(&files);
         assert!(t.valid_piece(1, &stream[P..2 * P]), "checked by SHA-1");
+    }
+
+    /// A resume file keeps whichever layers had come from peers when it was written; the
+    /// others are still to fetch. A wrong one is still an error.
+    #[test]
+    fn some_piece_layers_are_enough() {
+        let files = files();
+        let info = fixtures::info("v2", &files, P, false);
+        let mut layers = b"d".to_vec();
+        fixtures::bstr(&mut layers, &fixtures::root(&files[0].1));
+        fixtures::bstr(&mut layers, fixtures::layer(&files[0].1, P).as_flattened());
+        layers.push(b'e');
+        let t = parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).unwrap();
+        assert_eq!(
+            t.missing_layers(),
+            [t.file_with_root(&fixtures::root(&files[2].1)).unwrap()]
+        );
+
+        let wrong = layers.len() - 2;
+        layers[wrong] ^= 1;
+        assert!(parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).is_err());
     }
 
     /// The halves of a hybrid must agree on every piece: here the v1 hashes describe one `d`
