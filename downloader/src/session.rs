@@ -771,12 +771,23 @@ pub struct SessionConfig {
     pub settings: Settings,
 }
 
+/// Every peer connection is a socket and every open file a descriptor, and with no peer cap a
+/// busy session holds thousands. macOS hands an app launched from Finder a soft limit of 256,
+/// so lift the soft limit to the hard one (as far as the kernel's per-process maximum allows).
+fn raise_fd_limit() {
+    match rlimit::increase_nofile_limit(u64::MAX) {
+        Ok(n) => tracing::info!("file descriptor limit {n}"),
+        Err(e) => tracing::warn!("couldn't raise the file descriptor limit: {e}"),
+    }
+}
+
 impl Session {
     /// Creates a session with its own tokio runtime. Progress goes to `<data dir>/resume/<info
     /// hash>.resume` for every torrent; finding those files again and handing them to
     /// [`Session::resume`] is the caller's job, see `Session::resume_dir` and
     /// `list_resume_files`.
     pub fn new(config: SessionConfig) -> anyhow::Result<Self> {
+        raise_fd_limit();
         let resume_dir = config.data_dir.join("resume");
         std::fs::create_dir_all(&resume_dir)?;
         let rt = Runtime::new()?;

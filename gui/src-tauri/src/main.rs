@@ -8,7 +8,7 @@
 
 use downloader::{
     Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
-    TorrentId, TorrentState, TrackerInfo, TrackerState, data_dir,
+    TorrentId, TorrentState, TrackerInfo, TrackerState, data_dir, random_peer_id,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -434,12 +434,6 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
 }
 
 /// A fully random peer id, Azureus-style ("-DL0100-" + 12 random bytes).
-fn random_peer_id() -> [u8; 20] {
-    let mut id = *b"-DL0100-............";
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut id[8..]);
-    id
-}
-
 /// How long to gather library events before handing them to the webview as one batch: a
 /// busy swarm emits hundreds a second, and one IPC message per event would swamp it.
 const EVENT_BATCH_EVERY: Duration = Duration::from_millis(100);

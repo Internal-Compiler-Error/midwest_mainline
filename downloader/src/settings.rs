@@ -110,6 +110,11 @@ pub const ANNOUNCE_RETRY: Duration = Duration::from_secs(60);
 pub const ANNOUNCE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 
 pub const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// First retry after a DHT lookup that found no peers or failed, doubling up to
+/// `DHT_ANNOUNCE_INTERVAL`. Lookups right after the node comes up often converge on a sparse
+/// corner of a half-built routing table and come back empty; waiting the full interval then
+/// leaves a trackerless magnet with nothing to do for minutes.
+pub const DHT_RETRY: Duration = Duration::from_secs(5);
 
 /// BEP 11 (PEX): the spec recommends capping a single message at roughly 50 added peers.
 pub const PEX_MAX_ADDED_PEERS: usize = 50;

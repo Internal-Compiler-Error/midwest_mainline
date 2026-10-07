@@ -27,7 +27,7 @@ mod wire;
 pub use announcer::TrackerState;
 pub use bt_client::BtClient;
 pub use config::{Encryption, Settings, SettingsWatch};
-pub use defs::Identity;
+pub use defs::{Identity, random_peer_id};
 pub use dht::{Dht, DhtWatch};
 pub use events::{Event, EventBus, Events, PeerSource, Stamped};
 pub use logs::LogBuffer;

@@ -7,7 +7,7 @@
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::{Event as BusEvent, EventBus, PeerSource};
-use crate::settings::{ANNOUNCE_RETRY, ANNOUNCE_RETRY_MAX, DHT_ANNOUNCE_INTERVAL};
+use crate::settings::{ANNOUNCE_RETRY, ANNOUNCE_RETRY_MAX, DHT_ANNOUNCE_INTERVAL, DHT_RETRY};
 use crate::torrent_swarm::{SwarmEvent, TorrentSwarmStats};
 use anyhow::{self, Context, bail};
 use juicy_bencode::BencodeItemView;
@@ -172,7 +172,8 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
     statuses
 }
 
-/// BEP 5 as a peer source: every DHT_ANNOUNCE_INTERVAL, look the info hash up, hand whatever
+/// BEP 5 as a peer source: every DHT_ANNOUNCE_INTERVAL (sooner while lookups come back empty,
+/// see DHT_RETRY), look the info hash up, hand whatever
 /// peers come back to the swarm, and announce our port to the nodes that issued tokens.
 /// Waits for the node to come up first, and does nothing at all if it never does.
 async fn dht_announcer(
@@ -194,12 +195,24 @@ async fn dht_announcer(
         }
     };
     let port = Some(tcp_port);
+    let mut retry = DHT_RETRY;
 
     loop {
         let started = Instant::now();
         let lookup = tokio::select! {
             _ = shutdown.cancelled() => return,
             lookup = handle.client.get_peers(info_hash) => lookup,
+        };
+        let wait = match &lookup {
+            Ok(result) if !result.peers.is_empty() => {
+                retry = DHT_RETRY;
+                DHT_ANNOUNCE_INTERVAL
+            }
+            _ => {
+                let wait = retry;
+                retry = (retry * 2).min(DHT_ANNOUNCE_INTERVAL);
+                wait
+            }
         };
         match lookup {
             Ok(result) => {
@@ -216,7 +229,7 @@ async fn dht_announcer(
                 report(&board, slot, |row| {
                     row.state = TrackerState::Working;
                     row.peers = result.peers.len();
-                    row.next_announce = Some(Instant::now() + DHT_ANNOUNCE_INTERVAL);
+                    row.next_announce = Some(Instant::now() + wait);
                 });
                 let Some(events) = events.upgrade() else { return };
                 let peers = result.peers.into_iter().map(SocketAddr::V4).collect();
@@ -241,13 +254,13 @@ async fn dht_announcer(
                 warn!("DHT lookup for {info_hash:?} failed: {e:#}");
                 report(&board, slot, |row| {
                     row.state = TrackerState::Failed(format!("{e:#}"));
-                    row.next_announce = Some(Instant::now() + DHT_ANNOUNCE_INTERVAL);
+                    row.next_announce = Some(Instant::now() + wait);
                 });
             }
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = tokio::time::sleep(DHT_ANNOUNCE_INTERVAL) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }

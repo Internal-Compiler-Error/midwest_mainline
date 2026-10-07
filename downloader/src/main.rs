@@ -1,143 +1,147 @@
+//! The command-line client: one torrent, on the same `Session` the GUI uses, with the user's
+//! settings from the data directory. Progress goes to the log every few seconds; the process
+//! exits once the download is complete (or keeps seeding with `--seed`) and on Ctrl-C, saving
+//! resume data either way, so running the same command again carries on where it stopped.
+
 use downloader::{
-    BtClient, Dht, EventBus, Identity, ResumeData, ResumeInputs, Settings, data_dir, keep_saving, load_source,
+    ResumeData, Session, SessionConfig, Settings, TorrentState, data_dir, is_magnet_uri, parse_magnet, parse_torrent,
+    random_peer_id,
 };
-use std::env;
-use std::net::Ipv4Addr;
-use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
-fn random_idv4(external_ip: &Ipv4Addr, rand: u8) -> [u8; 20] {
-    let mut rng = rand::rng();
-    let r = rand & 0x07;
-    let mut id = [0u8; 20];
-    let mut ip = external_ip.octets();
-    let mask = [0x03, 0x0f, 0x3f, 0xff];
+const USAGE: &str = "usage: downloader [--seed] <path-to-.torrent | magnet-uri> [download-dir]
+       downloader [--seed] <path-to-.resume>
 
-    for (ip, mask) in ip.iter_mut().zip(mask.iter()) {
-        *ip &= mask;
-    }
+  --seed   keep uploading after the download completes, until Ctrl-C or the seed ratio limit";
 
-    ip[0] |= r << 5;
-    let crc = crc32c::crc32c(&ip);
+const REPORT_EVERY: Duration = Duration::from_secs(5);
 
-    id[0] = (crc >> 24) as u8;
-    id[1] = (crc >> 16) as u8;
-    id[2] = (((crc >> 8) & 0xf8) as u8) | (rand::RngExt::random::<u8>(&mut rng) & 0x7);
-
-    rand::Rng::fill_bytes(&mut rng, &mut id[3..19]);
-
-    id[19] = rand;
-
-    id
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // RUST_LOG picks the verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .pretty()
         .init();
 
-    let args = env::args().collect::<Vec<_>>();
-    let source = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!(
-            "usage: downloader <path-to-.torrent | magnet-uri> [download-dir]\n       downloader <path-to-.resume>"
-        );
-        std::process::exit(2);
-    });
-
-    let public_ip = Ipv4Addr::from_str("99.226.33.190")?;
-    let settings = Settings::default();
-    let identity = Identity {
-        peer_id: random_idv4(&public_ip, 3),
-        serving: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, settings.listen_port).into(),
-        dht: true,
-        encryption: settings.encryption,
-    };
-
-    // resume files and the DHT database live in the data dir (see `paths::data_dir`)
-    let data_dir = data_dir();
-    std::fs::create_dir_all(data_dir.join("resume"))?;
-    let events = EventBus::new();
-    let dht = Dht::start(data_dir.join("dht.db"), settings.dht_port(), events.clone());
-    let client = BtClient::with_events(identity, dht.watch(), events);
-    let (torrent, root) = if Path::new(&source)
-        .extension()
-        .is_some_and(|ext| ext == downloader::resume::EXTENSION)
-    {
-        let data = ResumeData::read(Path::new(&source))?;
-        let torrent = data.to_torrent()?;
-        tracing::info!(
-            "resuming {} in {} with {}/{} pieces already verified",
-            torrent.name,
-            data.root.display(),
-            data.verified.count_ones(),
-            data.verified.len()
-        );
-        client.add_torrent_resumed(torrent.clone(), &data.root, data.verified)?;
-        (torrent, data.root)
-    } else {
-        let root = PathBuf::from(args.get(2).map(String::as_str).unwrap_or("."));
-        // A magnet has to fetch its metadata off the network before there's anything to
-        // download, so this can run for a while (or fail) where a .torrent returns
-        // immediately -- long enough that Ctrl+C has to work during it, not just once the
-        // download proper has started.
-        if downloader::is_magnet_uri(&source) {
-            tracing::info!("resolving magnet link, fetching metadata from peers...");
-        }
-        let resolving = CancellationToken::new();
-        let loaded = tokio::select! {
-            resolved = load_source(&source, Arc::new(identity), resolving.clone(), client.dht(), client.utp(), client.events()) => resolved?,
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("interrupted while resolving, stopping tracker announces...");
-                resolving.cancel();
+    let mut seed = false;
+    let mut positional = Vec::new();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--seed" => seed = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
                 return Ok(());
             }
-        };
-        let torrent = loaded.torrent;
-        tracing::info!(
-            "got metadata for {} files, downloading into {}",
-            torrent.files.len(),
-            root.display()
-        );
-        client.add_torrent(torrent.clone(), &root)?;
-        client.add_peers(&torrent.info_hash, loaded.peers);
-        (torrent, root)
+            _ => positional.push(arg),
+        }
+    }
+    let Some(source) = positional.first().cloned() else {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
     };
 
-    let resume_dir = data_dir.join("resume");
-    tracing::info!(
-        "progress is saved to {}",
-        resume_dir.join(ResumeData::file_name(&torrent.info_hash)).display()
-    );
-    let stats = client.stats(&torrent).expect("torrent was just added");
-    let (_all_files, all_files) = tokio::sync::watch::channel(vec![true; torrent.files.len()]);
-    let (_rarest_first, rarest_first) = tokio::sync::watch::channel(false);
-    tokio::spawn(keep_saving(
-        Arc::new(torrent),
-        root,
-        stats,
-        ResumeInputs {
-            selected: all_files,
-            sequential: rarest_first,
-            uploaded_before: 0,
-        },
-        resume_dir,
-        client.shutdown_token(),
-    ));
+    let interrupted = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let interrupted = interrupted.clone();
+        move || interrupted.store(true, Ordering::SeqCst)
+    })?;
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutting down, sending a farewell announce to trackers...");
-    client.shutdown_token().cancel();
-    // dropping the client stops the swarm; give the announcer tasks a moment to get their
-    // event=stopped out before the runtime drops them on exit
-    drop(client);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let data_dir = data_dir();
+    let settings = Settings::load(&data_dir);
+    let root = positional
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| settings.download_dir.clone());
+    let mut session = Session::new(SessionConfig {
+        peer_id: random_peer_id(),
+        data_dir,
+        settings,
+    })?;
 
-    Ok(())
+    let id = match existing_resume_file(&session, &source) {
+        Some(path) => {
+            tracing::info!("carrying on from {}", path.display());
+            session.resume(path)
+        }
+        None => session.add(source, root),
+    };
+
+    let mut last_report = Instant::now();
+    let mut announced_metadata = false;
+    let status = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        if interrupted.load(Ordering::SeqCst) {
+            tracing::info!("interrupted, saving progress and stopping");
+            break 130;
+        }
+        let Some((_, state)) = session.torrents().into_iter().find(|(i, _)| *i == id) else {
+            break 1;
+        };
+        match state {
+            TorrentState::Failed { error, .. } => {
+                tracing::error!("{error}");
+                break 1;
+            }
+            TorrentState::Resolving { elapsed, .. } if last_report.elapsed() >= REPORT_EVERY => {
+                tracing::info!("resolving, {}s so far", elapsed.as_secs());
+                last_report = Instant::now();
+            }
+            TorrentState::Downloading(p) | TorrentState::Paused(p) | TorrentState::Queued(p) => {
+                if !announced_metadata {
+                    tracing::info!("got metadata for {} files, downloading into {}", p.files.len(), p.root);
+                    announced_metadata = true;
+                }
+                if p.completed && !seed {
+                    tracing::info!("{} is complete in {}", p.name, p.root);
+                    break 0;
+                }
+                if last_report.elapsed() >= REPORT_EVERY {
+                    tracing::info!(
+                        "{:.1}%  {}/{} pieces  down {}  up {}  {} peers{}",
+                        p.fraction() * 100.0,
+                        p.verified_pieces,
+                        p.total_pieces,
+                        rate(p.download_bps),
+                        rate(p.upload_bps),
+                        p.peers.len(),
+                        if p.completed { "  seeding" } else { "" }
+                    );
+                    last_report = Instant::now();
+                }
+            }
+            _ => {}
+        }
+    };
+
+    // stops the swarms (resume data is written on the way out) and the runtime
+    session.shutdown();
+    std::process::exit(status);
+}
+
+/// The resume file a previous run of the same source left behind, so it continues rather
+/// than starting over. A `.resume` path is its own answer.
+fn existing_resume_file(session: &Session, source: &str) -> Option<PathBuf> {
+    let path = Path::new(source);
+    if path.extension().is_some_and(|ext| ext == downloader::resume::EXTENSION) {
+        return Some(path.to_path_buf());
+    }
+    let info_hash = if is_magnet_uri(source) {
+        parse_magnet(source).ok()?.info_hash
+    } else {
+        parse_torrent(&std::fs::read(path).ok()?).ok()?.info_hash
+    };
+    let candidate = session.resume_dir().join(ResumeData::file_name(&info_hash));
+    candidate.exists().then_some(candidate)
+}
+
+fn rate(bps: f64) -> String {
+    if bps >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB/s", bps / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KiB/s", bps / 1024.0)
+    }
 }

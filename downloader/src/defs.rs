@@ -12,3 +12,12 @@ pub struct Identity {
     pub dht: bool,
     pub encryption: Encryption,
 }
+
+/// A fresh peer id in the Azureus style other clients recognise: `-DL0100-` (this client,
+/// version 0.1.0) then twelve random bytes, new every start so peers can't track us across
+/// sessions by it.
+pub fn random_peer_id() -> [u8; 20] {
+    let mut id = *b"-DL0100-............";
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut id[8..]);
+    id
+}
