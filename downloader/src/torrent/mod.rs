@@ -44,7 +44,7 @@ pub struct V2 {
     /// SHA-256 of the info dict; its first 20 bytes stand for it where only 20 fit
     pub info_hash: Hash,
     /// per entry of `Torrent::files`: its `pieces root`, `None` for padding and empty files
-    pub roots: Vec<Option<Hash>>,
+    roots: Vec<Option<Hash>>,
     /// per entry of `Torrent::files`: its piece layer, once known -- from the .torrent's
     /// `piece layers`, or from peers (BEP 52 hash requests) for a magnet. Only files of more
     /// than one piece have one; a smaller file's root is its one piece's hash. Clones share
@@ -259,6 +259,12 @@ impl Torrent {
         }
         let _ = v2.layers[file].set(layer.into_boxed_slice());
         true
+    }
+
+    /// BEP 52: the `pieces root` of `file`, the root of its Merkle tree; `None` for padding,
+    /// empty files and v1 torrents.
+    pub fn pieces_root(&self, file: usize) -> Option<Hash> {
+        self.v2.as_ref()?.roots[file]
     }
 
     /// The file whose `pieces root` is `root`.

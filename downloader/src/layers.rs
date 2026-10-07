@@ -79,11 +79,7 @@ impl LayerFetch {
         let pieces = torrent.pieces_of_file(file).len() as u32;
         let index = chunk as u32 * CHUNK;
         HashRequest {
-            root: torrent
-                .v2
-                .as_ref()
-                .and_then(|v2| v2.roots[file])
-                .expect("a file with a layer has a root"),
+            root: torrent.pieces_root(file).expect("a file with a layer has a root"),
             base: piece_layer_base(torrent),
             index,
             // BEP 52: a power of two, at least 2
@@ -299,7 +295,7 @@ pub fn answer_from_data(
     let below = Below::of(torrent, req)?;
     let (file, level) = (below.file, below.piece_level);
     let layer = torrent.layer(file);
-    let root = torrent.v2.as_ref()?.roots[file]?;
+    let root = torrent.pieces_root(file)?;
     let len = torrent.files[file].len;
     let mut trees = BTreeMap::new();
     for piece in below.data(req) {
@@ -486,7 +482,7 @@ mod test {
         assert_eq!(half.hashes[2], uncle);
         assert_eq!(
             merkle::pair(&uncle, &merkle::pair(&layer[2], &pad)),
-            t.v2.as_ref().unwrap().roots[big].unwrap()
+            t.pieces_root(big).unwrap()
         );
 
         assert!(
