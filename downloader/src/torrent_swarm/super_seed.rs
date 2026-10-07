@@ -83,7 +83,7 @@ impl TorrentSwarm {
     /// which means it passed it on. Alone in the swarm, or holding its piece for a while with
     /// no taker, it gets the next one anyway rather than waiting forever.
     pub(super) fn reveal_where_spread(&mut self) {
-        if !self.peers.iter().any(|p| p.super_seed.is_some()) {
+        if !self.super_seed.on || !self.peers.iter().any(|p| p.super_seed.is_some()) {
             return;
         }
         const PATIENCE: Duration = Duration::from_secs(120);

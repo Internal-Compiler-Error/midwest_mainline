@@ -58,6 +58,8 @@ pub(super) struct InFlight {
     wire_len: usize,
     /// per block, the claimant it arrived from
     received: Vec<Option<SocketAddr>>,
+    /// the blocks of `received` still to come
+    left: usize,
     claims: BTreeMap<SocketAddr, Claim>,
     /// from assignment to verification, for the traces
     pub(super) span: tracing::Span,
@@ -95,10 +97,12 @@ impl InFlight {
                 *slot = Some(PADDING);
             }
         }
+        let left = received.iter().filter(|r| r.is_none()).count();
         Self {
             buf: vec![0u8; size],
             wire_len: torrent.wire_piece_len(piece).expect("piece index in range"),
             received,
+            left,
             claims: BTreeMap::from([(claimant, Claim::from(0, false))]),
             span: tracing::info_span!(
                 "piece",
@@ -200,7 +204,7 @@ impl InFlight {
     }
 
     pub(super) fn blocks_left(&self) -> usize {
-        self.received.iter().filter(|r| r.is_none()).count()
+        self.left
     }
 
     /// Puts a block from `from` in its place. Its length is the sender's word, so it's checked
@@ -217,10 +221,9 @@ impl InFlight {
             Some(_) => return Stored::Duplicate,
             None => *slot = Some(from),
         }
+        self.left -= 1;
         self.buf[begin..end].copy_from_slice(&block.data);
-        Stored::Added {
-            blocks_left: self.blocks_left(),
-        }
+        Stored::Added { blocks_left: self.left }
     }
 
     /// Everyone who delivered a block of it.
