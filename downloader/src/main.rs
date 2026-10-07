@@ -4,14 +4,14 @@
 //! resume data either way, so running the same command again carries on where it stopped.
 
 use downloader::{
-    ResumeData, Session, SessionConfig, Settings, TorrentState, data_dir, is_magnet_uri, parse_magnet, parse_torrent,
-    random_peer_id,
+    ResumeData, Session, SessionConfig, Settings, Telemetry, TorrentState, data_dir, is_magnet_uri, parse_magnet,
+    parse_torrent, random_peer_id,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 
 const USAGE: &str = "usage: downloader [--seed] <path-to-.torrent | magnet-uri> [download-dir]
        downloader [--seed] <path-to-.resume>
@@ -21,11 +21,9 @@ const USAGE: &str = "usage: downloader [--seed] <path-to-.torrent | magnet-uri> 
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
-    // RUST_LOG picks the verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .pretty()
-        .init();
+    // RUST_LOG picks the console's verbosity, e.g. `RUST_LOG=info,downloader::metadata=debug`;
+    // OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 also sends the traces to a collector
+    let telemetry = Telemetry::install(tracing_subscriber::fmt::layer().pretty().boxed())?;
 
     let mut seed = false;
     let mut positional = Vec::new();
@@ -126,6 +124,8 @@ fn main() -> anyhow::Result<()> {
 
     // stops the swarms (resume data is written on the way out) and the runtime
     session.shutdown();
+    // exit skips destructors, and this one flushes the last traces
+    drop(telemetry);
     std::process::exit(status);
 }
 

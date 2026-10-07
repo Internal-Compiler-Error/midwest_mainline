@@ -39,6 +39,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use tracing::{debug, info};
 
 /// The ut_metadata message id we advertise for peers to send *us* ut_metadata messages on.
@@ -73,6 +74,11 @@ const MAX_CONCURRENT_FETCHES: usize = 32;
 const UNKNOWN_BYTES_LEFT: usize = METADATA_PIECE_SIZE;
 
 /// Resolves a magnet link into a full `Torrent` by fetching its metadata from peers.
+#[tracing::instrument(
+    name = "metadata",
+    skip_all,
+    fields(info_hash = %magnet.info_hash, from = tracing::field::Empty, bytes = tracing::field::Empty, tried = tracing::field::Empty)
+)]
 pub async fn fetch(
     magnet: &MagnetLink,
     identity: Arc<Identity>,
@@ -150,12 +156,22 @@ pub async fn fetch(
             let identity = identity.clone();
             let result_tx = result_tx.clone();
             let utp = utp.borrow().clone();
-            tokio::spawn(async move {
-                let result = tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity, utp))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
-                let _ = result_tx.send((peer, result)).await;
-            });
+            let span = tracing::info_span!("metadata.peer", info_hash = %info_hash, peer = %peer, outcome = tracing::field::Empty);
+            tokio::spawn(
+                async move {
+                    let result =
+                        tokio::time::timeout(PER_PEER_TIMEOUT, fetch_from_peer(peer, info_hash, identity, utp))
+                            .await
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+                    let outcome = match &result {
+                        Ok(raw) => format!("{} bytes", raw.len()),
+                        Err(e) => format!("{e:#}"),
+                    };
+                    tracing::Span::current().record("outcome", outcome);
+                    let _ = result_tx.send((peer, result)).await;
+                }
+                .instrument(span),
+            );
         }
 
         tokio::select! {
@@ -196,6 +212,10 @@ pub async fn fetch(
         "fetched {} bytes of metadata from {from}, building torrent",
         raw_info.len()
     );
+    let span = tracing::Span::current();
+    span.record("from", from.to_string());
+    span.record("bytes", raw_info.len());
+    span.record("tried", tried.len());
     bus.emit(Event::MetadataFetched {
         info_hash: magnet.info_hash,
         from,

@@ -25,6 +25,7 @@ use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 use zerocopy::network_endian::{I32, I64, U16, U32};
@@ -189,10 +190,27 @@ async fn dht_announcer(
                 let _ = events.try_send(SwarmEvent::PeersDiscovered(peers, PeerSource::Dht));
             }
         });
+        let span = tracing::info_span!(
+            "dht.lookup",
+            info_hash = %info_hash,
+            peers = tracing::field::Empty,
+            announce_to = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
         let lookup = tokio::select! {
             _ = shutdown.cancelled() => return,
-            lookup = streamed => lookup,
+            lookup = streamed.instrument(span.clone()) => lookup,
         };
+        match &lookup {
+            Ok(result) => {
+                span.record("peers", result.peers.len());
+                span.record("announce_to", result.announce_candidates.len());
+            }
+            Err(e) => {
+                span.record("error", format!("{e:#}"));
+            }
+        }
+        drop(span);
         let wait = match &lookup {
             Ok(result) if !result.peers.is_empty() => {
                 retry = DHT_RETRY;
@@ -406,10 +424,36 @@ impl Tracker {
         }
     }
 
+    /// One announce, for the traces. The URL leaves out its query, where private trackers keep
+    /// the user's passkey.
+    fn announce_span(&self, event: AnnounceEvent) -> tracing::Span {
+        let mut url = self.url.clone();
+        url.set_query(None);
+        tracing::info_span!(
+            "tracker.announce",
+            info_hash = %self.info_hash,
+            url = %url,
+            event = ?event,
+            peers = tracing::field::Empty,
+            interval_secs = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    }
+
     /// Books an announce's outcome: the schedule or backoff, the board row, the event bus, and
     /// the peers to the swarm.
     async fn settle(&mut self, event: AnnounceEvent, announced: anyhow::Result<(Vec<SocketAddr>, Duration)>) {
         let (board, slot) = &self.board;
+        let span = tracing::Span::current();
+        match &announced {
+            Ok((peers, interval)) => {
+                span.record("peers", peers.len());
+                span.record("interval_secs", interval.as_secs());
+            }
+            Err(e) => {
+                span.record("error", format!("{e:#}"));
+            }
+        }
         match announced {
             Ok((peers, interval)) => {
                 self.sent_started = true;
@@ -668,11 +712,12 @@ impl HttpAnnouncer {
         let shutdown = self.tracker.shutdown.clone();
         while self.tracker.due().await {
             let event = self.tracker.next_event();
+            let span = self.tracker.announce_span(event);
             let announced = tokio::select! {
-                announced = self.announce(event) => announced,
+                announced = self.announce(event).instrument(span.clone()) => announced,
                 _ = shutdown.cancelled() => break,
             };
-            self.tracker.settle(event, announced).await;
+            self.tracker.settle(event, announced).instrument(span).await;
         }
         // BEP 3: send a courtesy event=stopped on graceful shutdown so the tracker drops us
         // immediately instead of waiting out the interval; best-effort, since we're on our
@@ -965,15 +1010,16 @@ impl UdpAnnouncer {
         let shutdown = self.tracker.shutdown.clone();
         while self.tracker.due().await {
             let event = self.tracker.next_event();
+            let span = self.tracker.announce_span(event);
             let announced = tokio::select! {
-                announced = self.announce(event) => announced,
+                announced = self.announce(event).instrument(span.clone()) => announced,
                 _ = shutdown.cancelled() => break,
             };
             if announced.is_err() {
                 self.socket = None;
                 self.connection = None;
             }
-            self.tracker.settle(event, announced).await;
+            self.tracker.settle(event, announced).instrument(span).await;
         }
         // BEP 15: send a courtesy event=stopped on graceful shutdown so the tracker drops us
         // immediately instead of waiting out the interval; best-effort

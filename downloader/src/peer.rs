@@ -64,6 +64,8 @@ pub(crate) struct Peer {
     pub conn: u64,
     outbox: mpsc::Sender<BtMessage>,
     io_tasks: [AbortHandle; 2],
+    /// the connection's lifetime, for the traces; set by the swarm once the peer is in
+    pub span: tracing::Span,
 
     /// BEP 3 bitfield layout: `ceil(num_pieces / 8)` bytes, piece 0 is the high bit of byte 0
     they_have: Box<[u8]>,
@@ -226,6 +228,7 @@ impl Peer {
             conn,
             outbox,
             io_tasks: [reader.abort_handle(), writer.abort_handle()],
+            span: tracing::Span::none(),
             they_have: vec![0u8; num_pieces.div_ceil(8)].into(),
             num_pieces,
             // BEP 3: "At the start of the connection, both sides ... are choked."

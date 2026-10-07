@@ -19,6 +19,7 @@ pub mod session;
 mod settings;
 mod storage;
 mod stream;
+pub mod telemetry;
 mod torrent;
 pub mod torrent_swarm;
 pub mod utp;
@@ -38,6 +39,7 @@ pub use resume::{ResumeData, ResumeInputs, ResumeSummary, keep_saving, list_resu
 pub use session::{
     FileInfo, PeerInfo, Progress, Session, SessionConfig, SessionStatus, TorrentId, TorrentState, TrackerInfo,
 };
+pub use telemetry::{Telemetry, TraceRecorder, TraceSnapshot, TraceSpan};
 pub use torrent::{Torrent, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
 pub use utp::UtpWatch;

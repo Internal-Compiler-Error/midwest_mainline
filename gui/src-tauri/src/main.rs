@@ -8,7 +8,7 @@
 
 use downloader::{
     Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
-    TorrentId, TorrentState, TrackerInfo, TrackerState, data_dir, random_peer_id,
+    Telemetry, TorrentId, TorrentState, TraceSnapshot, TrackerInfo, TrackerState, data_dir, random_peer_id,
 };
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,8 @@ use tokio::sync::Notify;
 struct App {
     session: Mutex<Session>,
     logs: LogBuffer,
+    /// the tracing setup, kept for the trace recorder and so OTLP export flushes on exit
+    telemetry: Telemetry,
     /// the bus subscription, taken before the first torrent starts so nothing is missed;
     /// `forward_events` takes it out
     events: Mutex<Option<Events>>,
@@ -333,6 +335,12 @@ fn logs_since(app: State<App>, seen: u64) -> LogChunk {
     LogChunk { seen, lines }
 }
 
+/// The torrent's spans (see `TraceRecorder`) that finished since `since`, and its open ones.
+#[tauri::command]
+fn traces(app: State<App>, info_hash: String, since: u64) -> TraceSnapshot {
+    app.telemetry.traces.snapshot(&info_hash, since)
+}
+
 #[tauri::command]
 fn clear_logs(app: State<App>) {
     app.logs.clear();
@@ -463,7 +471,8 @@ fn forward_events(app: tauri::AppHandle) {
 
 fn main() {
     // installed before anything that logs; the console panel shows what lands here
-    let logs = LogBuffer::install(5_000).expect("failed to install the log buffer");
+    let logs = LogBuffer::new(5_000);
+    let telemetry = Telemetry::install(Box::new(logs.layer())).expect("failed to install tracing");
     let data_dir = data_dir();
     let mut session = Session::new(SessionConfig {
         peer_id: random_peer_id(),
@@ -486,6 +495,7 @@ fn main() {
         .manage(App {
             session: Mutex::new(session),
             logs,
+            telemetry,
             events: Mutex::new(Some(events)),
             page_ready: Arc::new(Notify::new()),
         })
@@ -502,6 +512,7 @@ fn main() {
             select_files,
             resumable,
             logs_since,
+            traces,
             clear_logs,
             report_error,
             events_ready,

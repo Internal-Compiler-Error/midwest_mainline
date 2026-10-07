@@ -9,9 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::layer::{Context, Layer};
 
 /// The most recent `capacity` log lines. Cheap to clone; clones share the buffer.
 #[derive(Clone)]
@@ -25,22 +23,20 @@ pub struct LogBuffer {
 }
 
 impl LogBuffer {
-    /// Installs this buffer as the process's global `tracing` subscriber, keeping the last
-    /// `capacity` events. Honours `RUST_LOG`, defaulting to `info`. Fails if something else
-    /// already installed a global subscriber.
-    pub fn install(capacity: usize) -> anyhow::Result<Self> {
-        let buffer = Self {
+    /// A buffer keeping the last `capacity` events; it fills once its `layer` is installed
+    /// (see `Telemetry::install`).
+    pub fn new(capacity: usize) -> Self {
+        Self {
             lines: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity,
             pushed: Arc::new(AtomicU64::new(0)),
             forward: std::env::var("DOWNLOADER_LOG_ADDR").ok().map(spawn_forwarder),
-        };
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(BufferLayer(buffer.clone()))
-            .try_init()?;
-        Ok(buffer)
+        }
+    }
+
+    /// The `tracing` layer that fills this buffer.
+    pub fn layer(&self) -> impl Layer<tracing_subscriber::Registry> + Send + Sync + use<> {
+        BufferLayer(self.clone())
     }
 
     /// A snapshot of the buffered lines, oldest first.

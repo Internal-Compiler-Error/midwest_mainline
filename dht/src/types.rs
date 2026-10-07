@@ -100,6 +100,13 @@ impl InfoHash {
     }
 }
 
+/// 40 hex digits, the way magnet links and trackers' web pages show it.
+impl std::fmt::Display for InfoHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
 impl Debug for InfoHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use base64::prelude::*;

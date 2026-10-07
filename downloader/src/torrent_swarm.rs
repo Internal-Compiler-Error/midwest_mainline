@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::Instrument;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +233,8 @@ struct InFlight {
     /// per block, the peer it arrived from
     received: Vec<Option<SocketAddr>>,
     claims: BTreeMap<SocketAddr, Claim>,
+    /// from assignment to verification, for the traces
+    span: tracing::Span,
 }
 
 impl InFlight {
@@ -249,6 +252,7 @@ impl InFlight {
             buf: vec![0u8; size],
             received: vec![None; blocks],
             claims,
+            span: tracing::Span::none(),
         }
     }
 
@@ -256,6 +260,8 @@ impl InFlight {
         let reverse = self.claims.len() % 2 == 1;
         let cursor = if reverse { self.received.len() - 1 } else { 0 };
         self.claims.insert(peer, Claim { cursor, reverse });
+        self.span.record("racers", self.claims.len());
+        tracing::debug!(parent: &self.span, %peer, "racer joined");
     }
 
     fn request(&self, piece: u32, block: usize) -> Request {
@@ -769,6 +775,9 @@ impl TorrentSwarm {
     /// Removes a peer and puts whatever it was downloading for us back up for grabs.
     fn drop_peer(&mut self, idx: usize, reason: &'static str) {
         let peer = self.peers.remove(idx);
+        peer.span.record("downloaded", peer.stats.received as u64);
+        peer.span.record("uploaded", peer.stats.sent as u64);
+        peer.span.record("reason", reason);
         self.bus.emit(Event::PeerDisconnected {
             info_hash: self.torrent.info_hash,
             addr: peer.remote_addr,
@@ -802,7 +811,9 @@ impl TorrentSwarm {
             return;
         };
         in_flight.claims.remove(&peer);
+        tracing::debug!(parent: &in_flight.span, %peer, "claim released");
         if in_flight.claims.is_empty() {
+            in_flight.span.record("outcome", "released");
             self.in_flight.remove(&piece);
             self.missing.push(piece);
         }
@@ -860,6 +871,7 @@ impl TorrentSwarm {
         let msg = match applied {
             Ok(None) => {
                 if peer.choked_us != choked_us_before {
+                    tracing::debug!(parent: &peer.span, choked = peer.choked_us, "choke changed by the peer");
                     self.bus.emit(Event::ChokeChanged {
                         info_hash: self.torrent.info_hash,
                         addr: peer.remote_addr,
@@ -1150,14 +1162,24 @@ impl TorrentSwarm {
         let events = self.events_tx.clone();
         tokio::task::spawn_blocking(move || {
             let buf = in_flight.buf;
-            let outcome = if torrent.valid_piece(piece, &buf) {
-                storage
-                    .write_piece(piece, &buf)
-                    .map(|()| true)
-                    .map_err(|e| format!("{e:#}"))
-            } else {
-                Ok(false)
-            };
+            let outcome = tracing::info_span!(parent: &in_flight.span, "piece.check", piece).in_scope(|| {
+                if torrent.valid_piece(piece, &buf) {
+                    storage
+                        .write_piece(piece, &buf)
+                        .map(|()| true)
+                        .map_err(|e| format!("{e:#}"))
+                } else {
+                    Ok(false)
+                }
+            });
+            in_flight.span.record(
+                "outcome",
+                match &outcome {
+                    Ok(true) => "verified".to_string(),
+                    Ok(false) => "hash mismatch".to_string(),
+                    Err(e) => format!("write failed: {e}"),
+                },
+            );
             if let Some(events) = events.upgrade() {
                 let _ = events.blocking_send(SwarmEvent::PieceDone {
                     piece,
@@ -1380,7 +1402,16 @@ impl TorrentSwarm {
                 let size = self.torrent.nth_piece_size(piece).expect("piece index in range");
                 let addr = self.peers[idx].remote_addr;
                 self.emit_pick(idx, piece, rate_scale);
-                let in_flight = InFlight::new(size, addr);
+                let mut in_flight = InFlight::new(size, addr);
+                in_flight.span = tracing::info_span!(
+                    "piece",
+                    info_hash = %self.torrent.info_hash,
+                    piece,
+                    size,
+                    peer = %addr,
+                    racers = 1,
+                    outcome = tracing::field::Empty,
+                );
                 *backlog.entry(addr).or_default() += in_flight.received.len();
                 self.in_flight.insert(piece, in_flight);
                 in_flight_bytes += size;
@@ -1676,6 +1707,18 @@ impl TorrentSwarm {
         }
 
         info!("{remote_addr} connected, {} peers now", self.peers.len() + 1);
+        peer.span = tracing::info_span!(
+            "peer",
+            info_hash = %self.torrent.info_hash,
+            peer = %remote_addr,
+            client = %crate::peer::client_name(&peer.peer_id),
+            transport = if peer.utp { "utp" } else { "tcp" },
+            encrypted = peer.encrypted,
+            dialed = connected.dialed,
+            downloaded = tracing::field::Empty,
+            uploaded = tracing::field::Empty,
+            reason = tracing::field::Empty,
+        );
         self.bus.emit(Event::PeerConnected {
             info_hash: self.torrent.info_hash,
             addr: remote_addr,
@@ -1720,17 +1763,32 @@ impl TorrentSwarm {
             let our_id = self.id.clone();
             let utp = self.utp.borrow().clone();
             let hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
+            let span = tracing::info_span!(
+                "dial",
+                info_hash = %torrent.info_hash,
+                peer = %addr,
+                transport = tracing::field::Empty,
+                encrypted = tracing::field::Empty,
+                error = tracing::field::Empty,
+            );
             tokio::spawn(async move {
                 let Ok(_permit) = HALF_OPEN.acquire().await else {
                     return;
                 };
-                let result = match dial(addr, &torrent, &our_id, utp, hints).await {
-                    Ok(connected) => SwarmEvent::PeerConnected(connected),
+                let dialed = dial(addr, &torrent, &our_id, utp, hints).instrument(span.clone()).await;
+                let result = match dialed {
+                    Ok(connected) => {
+                        span.record("transport", if connected.stream.is_utp() { "utp" } else { "tcp" });
+                        span.record("encrypted", connected.stream.is_encrypted());
+                        SwarmEvent::PeerConnected(connected)
+                    }
                     Err(e) => {
                         tracing::debug!("couldn't connect to {addr}: {e:#}");
+                        span.record("error", format!("{e:#}"));
                         SwarmEvent::DialFailed(addr)
                     }
                 };
+                drop(span);
                 // if the swarm is gone meanwhile, the socket just drops here
                 if let Some(events) = events.upgrade() {
                     let _ = events.send(result).await;
