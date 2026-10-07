@@ -80,6 +80,7 @@ impl Crawler {
         let mut rest_until: HashMap<SocketAddr, Instant> = HashMap::new();
         let mut in_flight = FuturesUnordered::new();
         let mut last_report = Instant::now();
+        let us = self.client.our_id();
         info!("BEP 51 crawler: {} queries a second", self.per_second);
 
         loop {
@@ -128,7 +129,9 @@ impl Crawler {
                         sampled.nodes.len()
                     );
                     for node in sampled.nodes {
-                        if frontier.len() < MAX_FRONTIER
+                        // other nodes know us too
+                        if node.id() != us
+                            && frontier.len() < MAX_FRONTIER
                             && !rest_until.contains_key(&host(&node))
                             && queued.insert(node.end_point())
                         {

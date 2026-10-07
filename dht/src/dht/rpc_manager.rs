@@ -18,7 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
 };
-use tracing::{info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     message::{Krpc, KrpcBody, error::KrpcError},
@@ -130,55 +130,22 @@ impl RpcManager {
             match Krpc::decode(&buf[..amount]) {
                 Ok(msg) => {
                     trace!("{} sent {:?}", socket_addr, msg);
-
-                    let id = msg.transaction_id();
-                    trace!(
-                        "received message for transaction id {:?}",
-                        hex::encode_upper(id.as_bytes())
-                    );
-
-                    // notify those that subscribed for all inbound messages
-                    {
-                        let mut subcribers = self.inbound_subscribers.lock().unwrap();
-
-                        subcribers.retain(|s| !s.is_closed());
-
-                        for sub in &*subcribers {
-                            // Not using send here because `subcribers` mutex guard
-                            // is not Send and it lives across await points; a lagging
-                            // subscriber loses messages but must not stall the broker
-                            if sub.try_send((msg.clone(), socket_addr)).is_err() {
-                                warn!("inbound subscriber lagging, dropping a message for it");
-                            }
-                        }
+                    self.fan_out(&msg, socket_addr);
+                    // a query is never the answer to one of ours, whatever its transaction id
+                    if msg.is_query() {
+                        continue;
                     }
-
-                    {
-                        // see if we have a slot for this transaction id, if we do, that means one of the
-                        // messages that we expect, otherwise the message is a query we need to handle
-                        let entry = self.pending_responses.lock().unwrap().remove(id);
-                        if let Some((expected, sender)) = entry {
-                            if expected == socket_addr {
-                                // only answers to our own queries get a say in what our
-                                // external address is; anyone can send a query
-                                if let Some(seen) = msg.ip {
-                                    self.record_external_ip(socket_addr.ip(), seen.ip());
-                                }
-                                // failing means the receiver has dropped, meaning they are no
-                                // longer interested in the message, not a bug
-                                let _ = sender.send((msg, socket_addr));
-                            } else {
-                                warn!(
-                                    "ignoring response for a pending transaction from the wrong address: expected {expected}, got {socket_addr}"
-                                );
-                                // the genuine response may still arrive; keep the slot
-                                self.pending_responses
-                                    .lock()
-                                    .unwrap()
-                                    .insert(id.clone(), (expected, sender));
-                            }
-                        }
+                    let Some(waiting) = self.take_pending(msg.transaction_id(), socket_addr) else {
+                        continue;
+                    };
+                    // only answers to our own queries get a say in what our external address
+                    // is; anyone can send a query
+                    if let Some(seen) = msg.ip {
+                        self.record_external_ip(socket_addr.ip(), seen.ip());
                     }
+                    // failing means the receiver has dropped, meaning they are no longer
+                    // interested in the message, not a bug
+                    let _ = waiting.send((msg, socket_addr));
                 }
                 // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
                 // we're read-only (BEP 43) and answer nothing
@@ -191,6 +158,30 @@ impl RpcManager {
                 }
             }
         }
+    }
+
+    /// Hands `msg` to every subscriber of the inbound queue. A subscriber that lags loses the
+    /// message rather than stall the broker.
+    fn fan_out(&self, msg: &Krpc, from: SocketAddr) {
+        let mut subscribers = self.inbound_subscribers.lock().unwrap();
+        subscribers.retain(|s| !s.is_closed());
+        for sub in &*subscribers {
+            if sub.try_send((msg.clone(), from)).is_err() {
+                warn!("inbound subscriber lagging, dropping a message for it");
+            }
+        }
+    }
+
+    /// Who waits for the answer to transaction `id`, if it was sent to `from`
+    fn take_pending(&self, id: &TransactionId, from: SocketAddr) -> Option<oneshot::Sender<Inbound>> {
+        let mut pending = self.pending_responses.lock().unwrap();
+        let (expected, _) = pending.get(id)?;
+        if *expected != from {
+            // the genuine answer may still come
+            debug!("an answer for a query to {expected} came from {from}");
+            return None;
+        }
+        pending.remove(id).map(|(_, waiting)| waiting)
     }
 
     /// Subscribe to the reply with the provided transaction_id, expected from `endpoint`
@@ -412,6 +403,33 @@ mod tests {
             "expected the client version key, got: {text}"
         );
         assert!(text.contains("2:ip6:"), "expected the BEP 42 ip key, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_query_with_the_transaction_id_of_ours_is_not_its_answer() {
+        let broker = test_broker().await;
+        spawn_run(&broker);
+        let broker_addr = broker.socket.local_addr().unwrap();
+        let other = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let txn = TransactionId::from_bytes(&[9, 9]);
+        let mut rx = broker.subscribe_one(txn.clone(), other.local_addr().unwrap());
+
+        // the node we asked happens to ask us something under the same transaction id
+        let query = Krpc::new(txn.clone(), KrpcBody::PingQuery(PingQuery::new(NodeId([4; 20])))).encode();
+        other.send_to(&query, broker_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "a query must not be taken for the answer");
+
+        let answer = Krpc::new(
+            txn,
+            KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(NodeId([4; 20]))),
+        )
+        .encode();
+        other.send_to(&answer, broker_addr).await.unwrap();
+        let (msg, _) = timeout(Duration::from_secs(1), &mut rx).await.unwrap().unwrap();
+        assert!(msg.is_response());
     }
 
     #[tokio::test]
