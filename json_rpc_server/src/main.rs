@@ -225,16 +225,20 @@ async fn main() -> anyhow::Result<()> {
         Ok("expire") | Err(_) => Retention::Expire,
         Ok(other) => return Err(anyhow!("DHT_RETENTION must be `expire` or `forever`, not `{other}`")),
     };
+    // DHT_READ_ONLY=1: ask, but answer nothing (BEP 43)
+    let read_only = env::var("DHT_READ_ONLY").is_ok_and(|v| v == "1");
     let dht = Arc::new(
         DhtSession::with_stable_id(dht_socket, None, &database_url)
             .unwrap()
-            .with_retention(retention),
+            .with_retention(retention)
+            .with_read_only(read_only),
     );
     let dht6 = match bind_v6(dht_port) {
         Ok(socket) => {
             let dht6 = DhtSession::with_stable_id(socket, None, &database_url)
                 .unwrap()
-                .with_retention(retention);
+                .with_retention(retention)
+                .with_read_only(read_only);
             dht.pair_with(&dht6);
             Some(Arc::new(dht6))
         }

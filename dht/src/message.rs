@@ -570,6 +570,7 @@ impl ParseKrpc for &[u8] {
             _ => None,
         };
         let _ = parsed.remove(b"v".as_slice()); // user agent string
+        let read_only = extract_flag(&mut parsed, b"ro");
 
         if !parsed.is_empty() {
             let keys = parsed
@@ -579,7 +580,12 @@ impl ParseKrpc for &[u8] {
                 .join(",");
             info!("Message has unused fields at top level: {keys}");
         }
-        Ok(Krpc { txn_id, body, ip })
+        Ok(Krpc {
+            txn_id,
+            body,
+            ip,
+            read_only,
+        })
     }
 }
 
@@ -590,6 +596,8 @@ pub struct Krpc {
     /// BEP 42: the sender's view of the recipient's external address. In a message we
     /// received it's what that node sees of us; in a response we send it's the querier.
     pub ip: Option<SocketAddr>,
+    /// BEP 43's `ro`: a query from a node that answers none, so it's no use in a routing table
+    pub read_only: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -711,6 +719,9 @@ impl Krpc {
             if let Some(ip) = self.ip {
                 enc.emit_pair_with(b"ip", |enc| enc.emit_bytes(&compact_addr(&ip)))?;
             }
+            if self.read_only {
+                enc.emit_pair(b"ro", 1)?;
+            }
 
             for (k, v) in additional.iter() {
                 enc.emit_pair(k, v)?;
@@ -767,6 +778,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::PingQuery(PingQuery::new(querying_id)),
         }
     }
@@ -775,6 +787,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::FindNodeQuery(FindNodeQuery::new(querying_id, target_id)),
         }
     }
@@ -783,12 +796,18 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::GetPeersQuery(GetPeersQuery::new(querying_id, info_hash)),
         }
     }
 
     pub fn new_with_body(txn_id: TransactionId, body: KrpcBody) -> Self {
-        Self { txn_id, body, ip: None }
+        Self {
+            txn_id,
+            body,
+            ip: None,
+            read_only: false,
+        }
     }
 
     pub fn new_announce_peer_query(
@@ -802,6 +821,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
                 querying_id,
                 implied_port,
@@ -816,6 +836,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
         }
     }
@@ -824,6 +845,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(responding_id)),
         }
     }
@@ -832,6 +854,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::ErrorResponse(KrpcError::new(201, "A Generic Error Occurred".to_string())),
         }
     }
@@ -840,6 +863,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::ErrorResponse(KrpcError::new(202, "A Server Error Occurred".to_string())),
         }
     }
@@ -848,6 +872,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::ErrorResponse(KrpcError::new(203, "A Protocol Error Occurred".to_string())),
         }
     }
@@ -856,6 +881,7 @@ impl Krpc {
         Self {
             txn_id: transaction_id,
             ip: None,
+            read_only: false,
             body: KrpcBody::ErrorResponse(KrpcError::new(204, "A Unsupported Method Error Occurred".to_string())),
         }
     }
@@ -984,6 +1010,7 @@ mod test {
             body,
             // the responder's view of the querier's address, `434545f1c8d6` in the fixture
             ip: Some(SocketAddrV4::new(Ipv4Addr::new(67, 69, 69, 241), 51414).into()),
+            read_only: false,
         };
 
         assert_eq!(decoded, expected);
@@ -1395,6 +1422,26 @@ mod test {
         // a filter that isn't a string
         let msg = b"d1:rd4:BFpei1e2:id20:0123456789abcdefghij5:token3:toke1:t2:aa1:y1:re" as &[u8];
         assert!(msg.parse().is_err());
+    }
+
+    #[test]
+    fn bep_43s_ro_flag_round_trips_and_only_1_counts() {
+        let mut msg = Krpc::new_ping_query(
+            TransactionId::from_bytes(b"aa"),
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+        );
+        msg.read_only = true;
+        let encoded = msg.encode();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            "d1:ad2:id20:abcdefghij0123456789e1:q4:ping2:roi1e1:t2:aa1:y1:qe"
+        );
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let msg = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping2:roi2e1:t2:aa1:y1:qe" as &[u8];
+        assert!(!msg.parse().unwrap().read_only);
+        let msg = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping2:ro1:11:t2:aa1:y1:qe" as &[u8];
+        assert!(!msg.parse().unwrap().read_only);
     }
 
     #[test]

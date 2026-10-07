@@ -158,6 +158,10 @@ impl RoutingTable {
         let Some(node_id) = message.node_id() else {
             return;
         };
+        // BEP 43: a read-only node wouldn't answer us; its query is served, it isn't kept
+        if message.is_query() && message.read_only {
+            return;
+        }
 
         {
             let mut conn = self.conn();

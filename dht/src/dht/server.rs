@@ -42,6 +42,10 @@ impl DhtServer {
 
         // respond to messages, as fast as possible
         while let Some((inbound_msg, socket_addr)) = requests.next().await {
+            // BEP 43: a read-only node answers nothing
+            if self.state.rpc_manager.is_read_only() {
+                continue;
+            }
             // the server is a cheap handle (one refcount on the shared state), so each
             // response task just gets its own clone
             let this = self.clone();

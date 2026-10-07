@@ -330,6 +330,14 @@ impl DhtSession {
         self
     }
 
+    /// BEP 43: a read-only node answers no queries and tells the nodes it asks so, which
+    /// leave it out of their routing tables. For a host that can't take inbound UDP (behind
+    /// a NAT that won't forward, or on a metered link); lookups and announces work as ever.
+    pub fn with_read_only(self, read_only: bool) -> Self {
+        self.rpc_manager.set_read_only(read_only);
+        self
+    }
+
     /// Makes `self` and `other`, nodes of the two address families on this host, aware of each
     /// other (BEP 32): each answers a `want` for the other's family from the other's table, and
     /// while one has few nodes, the other's lookups ask for its family too and hand it what
@@ -1026,6 +1034,44 @@ mod bep45_tests {
         // the address keeps its id across starts
         drop(second);
         assert_eq!(own_address(&db).await.handle().our_id(), second_id);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bep43_tests {
+    use super::*;
+    use crate::message::ping_query::PingQuery;
+    use crate::test_support::{node, node_of, scratch_dir};
+
+    const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_node_asks_but_neither_answers_nor_gets_kept() {
+        let dir = scratch_dir("bep43");
+        let a = node(&dir, "a", LOOPBACK).await;
+        let socket = UdpSocket::bind(LOOPBACK).await.unwrap();
+        let db = dir.join("ro.db");
+        let ro = DhtSession::with_stable_id(socket, None, db.to_str().unwrap())
+            .unwrap()
+            .with_read_only(true);
+        let ro = node_of(Arc::new(ro));
+
+        // its lookups work, and A serves them, but leaves it out of its table
+        ro.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
+        assert_eq!(ro.session.node_count(), 1);
+        let found = ro.session.get_peers(InfoHash([1; 20])).await.unwrap();
+        assert_eq!(found.announce_candidates.len(), 1, "A answered with a token");
+        assert_eq!(a.session.node_count(), 0);
+
+        // and it answers nothing
+        let ping = KrpcBody::PingQuery(PingQuery::new(a.session.handle().our_id()));
+        let answer = a
+            .session
+            .rpc_manager
+            .query(ping, &ro.session.local_addr(), Duration::from_millis(300))
+            .await;
+        assert!(answer.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

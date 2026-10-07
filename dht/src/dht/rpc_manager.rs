@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
     time::Duration,
 };
 
@@ -54,6 +57,8 @@ pub struct RpcManager {
     external_ip: Arc<ExternalIp>,
     /// where in the database the node behind this socket keeps its own things
     scope: Scope,
+    /// BEP 43: we answer no queries, and say so in ours
+    read_only: Arc<AtomicBool>,
 }
 
 pub trait Routable {
@@ -97,7 +102,16 @@ impl RpcManager {
             txn_id_generator,
             external_ip: Arc::new(ExternalIp::new(external_ip)),
             scope: Scope::primary(family),
+            read_only: Arc::default(),
         }
+    }
+
+    pub(crate) fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, Relaxed);
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only.load(Relaxed)
     }
 
     /// The broker of a node in `scope` rather than its family's (BEP 45)
@@ -189,8 +203,9 @@ impl RpcManager {
                             }
                         }
                     }
-                    Err(OurError::UnsupportedQuery(txn)) => {
-                        // BEP 5: unknown query methods get a 204 Method Unknown error reply
+                    // BEP 5: unknown query methods get a 204 Method Unknown error reply, unless
+                    // we're read-only (BEP 43) and answer nothing
+                    Err(OurError::UnsupportedQuery(txn)) if !this.is_read_only() => {
                         let response = Krpc::new_unsupported_error(txn);
                         this.send_msg_background(&response, socket_addr);
                     }
@@ -242,12 +257,15 @@ impl RpcManager {
         });
     }
 
-    fn encode_for(msg: &Krpc, peer: SocketAddr) -> Box<[u8]> {
+    fn encode_for(&self, msg: &Krpc, peer: SocketAddr) -> Box<[u8]> {
         let mut additional = HashMap::new();
         // BEP 5: every message should carry our client version
         additional.insert(&b"v"[..], value::Value::Bytes(Cow::Borrowed(&b"MW01"[..])));
 
         if msg.body.is_query() {
+            // BEP 43: so nobody puts us in a routing table only to find we don't answer
+            let mut msg = msg.clone();
+            msg.read_only = self.is_read_only();
             msg.encode_with_additional(&additional)
         } else {
             // BEP 42: a response tells the querier the external address we see for it
@@ -260,7 +278,7 @@ impl RpcManager {
     /// Send a message, fires up a new stask in background
     fn send_msg_background(&self, msg: &Krpc, peer: SocketAddr) {
         let socket = self.socket.clone();
-        let buf = Self::encode_for(msg, peer);
+        let buf = self.encode_for(msg, peer);
 
         tokio::spawn(async move {
             if let Err(e) = socket.send_to(&buf, peer).await {
@@ -276,7 +294,7 @@ impl RpcManager {
         let sent_time = unix_timestmap_ms();
         let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
         self.socket
-            .send_to(&Self::encode_for(&message, endpoint), endpoint)
+            .send_to(&self.encode_for(&message, endpoint), endpoint)
             .await?;
         let (response, _addr) = rx
             .await
