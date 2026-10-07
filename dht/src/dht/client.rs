@@ -15,14 +15,33 @@ use crate::dht::bep42;
 use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
-    KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
-    get_peers_query::GetPeersQuery, ping_query::PingQuery, sample_infohashes_query::SampleInfohashesQuery,
+    KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_get_peers_response::ScrapeFilters,
+    find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery, ping_query::PingQuery,
+    sample_infohashes_query::SampleInfohashesQuery,
 };
 use crate::our_error::{OurError, naur};
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 
-/// What one node answers a `get_peers` with: a write token, closer nodes, and peers
-type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddr>);
+/// What one node answers a `get_peers` with
+struct GetPeersReply {
+    /// to announce with
+    token: Option<Token>,
+    /// closer nodes
+    nodes: Vec<NodeInfo>,
+    values: Vec<SocketAddr>,
+    /// BEP 33, when asked for
+    scrape: Option<ScrapeFilters>,
+}
+
+/// BEP 33's estimate of a swarm's size
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwarmEstimate {
+    pub seeds: u64,
+    /// peers that aren't seeds
+    pub peers: u64,
+    /// nodes whose filters went into it
+    pub nodes: usize,
+}
 
 /// Queries in flight at once in a lookup. BEP 5 suggests 3; more costs little on UDP and finishes
 /// a lookup in seconds rather than a minute when many nodes are dead.
@@ -360,15 +379,55 @@ impl DhtClient {
             });
         }
 
-        // iterative lookup: query the closest-known nodes, follow their `nodes` referrals
-        // towards the info hash, and harvest peers and tokens along the way
+        let (result, _) = self.lookup_peers(info_hash, false, found).await;
+        Ok(result)
+    }
+
+    /// BEP 33: how big the swarm is, from the bloom filters of seeds and peers the nodes
+    /// nearest the hash keep, ORed together (with our own, if we hold any), so a peer
+    /// announced to several of them counts once
+    #[tracing::instrument(skip(self))]
+    pub async fn scrape(&self, info_hash: InfoHash) -> Result<SwarmEstimate, OurError> {
+        let (_, filters) = self.lookup_peers(info_hash, true, |_| {}).await;
+        let ours = self.state.scrape_filters(&info_hash);
+        let answered = filters.len();
+        let both = filters
+            .into_iter()
+            .chain(ours)
+            .fold(ScrapeFilters::default(), |acc, f| ScrapeFilters {
+                seeds: acc.seeds.union(&f.seeds),
+                peers: acc.peers.union(&f.peers),
+            });
+        Ok(SwarmEstimate {
+            seeds: both.seeds.estimate().round() as u64,
+            peers: both.peers.estimate().round() as u64,
+            nodes: answered,
+        })
+    }
+
+    /// The iterative lookup behind `get_peers` and `scrape`: query the closest-known nodes,
+    /// follow their `nodes` referrals towards the info hash, and harvest peers, tokens and,
+    /// with `scrape`, BEP 33 filters along the way
+    async fn lookup_peers(
+        &self,
+        info_hash: InfoHash,
+        scrape: bool,
+        mut found: impl FnMut(&[SocketAddr]) + Send,
+    ) -> (GetPeersResult, Vec<ScrapeFilters>) {
         let want = self.want();
         let mut peers: Vec<SocketAddr> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
+        let mut filters = vec![];
         self.lookup(
             NodeId(info_hash.0),
-            |node| self.send_get_peers_rpc(node.end_point(), info_hash, want),
-            |node, (token, nodes, values): GetPeersReply| {
+            |node| self.send_get_peers_rpc(node.end_point(), info_hash, want, scrape),
+            |node, reply: GetPeersReply| {
+                let GetPeersReply {
+                    token,
+                    nodes,
+                    values,
+                    scrape,
+                } = reply;
                 debug!("get_peers: {} answered with {} peers", node.end_point(), values.len());
                 if !values.is_empty() {
                     found(&values);
@@ -384,6 +443,7 @@ impl DhtClient {
                 if let Some(token) = token {
                     announce_candidates.push((node, token));
                 }
+                filters.extend(scrape);
                 Heard {
                     nodes,
                     useful,
@@ -405,12 +465,15 @@ impl DhtClient {
         });
         announce_candidates.truncate(LOOKUP_K);
 
-        Ok(GetPeersResult {
+        let result = GetPeersResult {
             peers,
             announce_candidates,
-        })
+        };
+        (result, filters)
     }
 
+    /// Announces us as a peer for `info_hash` to `recipient`, on `port` or, `None`, the port
+    /// our packets come from; `seed` says we have it all (BEP 33)
     #[tracing::instrument(skip(self))]
     pub async fn announce_peers(
         &self,
@@ -418,15 +481,19 @@ impl DhtClient {
         info_hash: InfoHash,
         port: Option<u16>,
         token: Token,
+        seed: bool,
     ) -> Result<(), OurError> {
         // 6881 is a default port when implied_port is used
-        let query = KrpcBody::AnnouncePeerQuery(AnnouncePeerQuery::new(
-            self.state.our_id,
-            port.is_none(),
-            port.unwrap_or(6881),
-            info_hash,
-            token,
-        ));
+        let query = KrpcBody::AnnouncePeerQuery(
+            AnnouncePeerQuery::new(
+                self.state.our_id,
+                port.is_none(),
+                port.unwrap_or(6881),
+                info_hash,
+                token,
+            )
+            .with_seed(seed),
+        );
 
         let response = self.state.rpc_manager.query(query, &recipient, REQ_TIMEOUT).await?;
 
@@ -445,9 +512,13 @@ impl DhtClient {
         dest: SocketAddr,
         info_hash: InfoHash,
         want: Option<Want>,
+        scrape: bool,
     ) -> Result<GetPeersReply, OurError> {
-        // construct the message to query our friends
-        let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(self.state.our_id, info_hash).with_want(want));
+        let query = KrpcBody::GetPeersQuery(
+            GetPeersQuery::new(self.state.our_id, info_hash)
+                .with_want(want)
+                .with_scrape(scrape),
+        );
 
         // send the message and await for a response
         let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
@@ -468,7 +539,12 @@ impl DhtClient {
                 values.sort_unstable();
                 values.dedup();
 
-                Ok((token, nodes, values))
+                Ok(GetPeersReply {
+                    token,
+                    nodes,
+                    values,
+                    scrape: response.scrape().copied(),
+                })
             }
             other => {
                 debug!("Unexpected response to get peers: {:?}", other);

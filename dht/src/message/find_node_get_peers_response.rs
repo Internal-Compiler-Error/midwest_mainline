@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use bendy::encoding::SingleItemEncoder;
 
+use crate::bloom::BloomFilter;
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token};
 
 use super::{ToKrpcBody, compact_addr};
@@ -13,7 +14,7 @@ use super::{ToKrpcBody, compact_addr};
 /// `nodes` and `nodes6` are `None` when the key is absent, which is not the same as present
 /// and empty: an answer without peers must carry at least one of them.
 ///
-/// The extensions that answer with nodes too ride along: BEP 51's samples.
+/// The extensions that answer with nodes too ride along: BEP 51's samples, BEP 33's filters.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     queried: NodeId,
@@ -22,6 +23,17 @@ pub struct FindNodeGetPeersResponse {
     nodes: Option<Vec<NodeInfo>>,
     nodes6: Option<Vec<NodeInfo>>,
     samples: Option<Samples>,
+    /// boxed: 512 bytes most answers don't carry
+    scrape: Option<Box<ScrapeFilters>>,
+}
+
+/// BEP 33's answer to a get_peers with `scrape`: the node's seeds and other peers
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
+pub struct ScrapeFilters {
+    /// `BFsd`
+    pub seeds: BloomFilter,
+    /// `BFpe`
+    pub peers: BloomFilter,
 }
 
 /// BEP 51's answer to sample_infohashes
@@ -45,6 +57,7 @@ pub struct Builder {
     nodes: Option<Vec<NodeInfo>>,
     nodes6: Option<Vec<NodeInfo>>,
     samples: Option<Samples>,
+    scrape: Option<Box<ScrapeFilters>>,
 }
 
 impl Builder {
@@ -56,7 +69,13 @@ impl Builder {
             nodes: None,
             nodes6: None,
             samples: None,
+            scrape: None,
         }
+    }
+
+    pub fn with_scrape(mut self, scrape: ScrapeFilters) -> Self {
+        self.scrape = Some(Box::new(scrape));
+        self
     }
 
     pub fn with_samples(mut self, samples: Samples) -> Self {
@@ -122,6 +141,7 @@ impl Builder {
             nodes,
             nodes6: self.nodes6,
             samples: self.samples,
+            scrape: self.scrape,
         }
     }
 }
@@ -163,6 +183,11 @@ impl FindNodeGetPeersResponse {
     /// BEP 51, in an answer to sample_infohashes
     pub fn samples(&self) -> Option<&Samples> {
         self.samples.as_ref()
+    }
+
+    /// BEP 33, in an answer to a get_peers with `scrape`
+    pub fn scrape(&self) -> Option<&ScrapeFilters> {
+        self.scrape.as_deref()
     }
 }
 
@@ -214,6 +239,10 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
                 enc.emit_pair(b"num", samples.num);
                 let raw: Vec<u8> = samples.samples.iter().flat_map(|h| h.0).collect();
                 enc.emit_pair_with(b"samples", |e| e.emit_bytes(&raw));
+            }
+            if let Some(scrape) = &self.scrape {
+                enc.emit_pair_with(b"BFsd", |e| e.emit_bytes(&scrape.seeds.0));
+                enc.emit_pair_with(b"BFpe", |e| e.emit_bytes(&scrape.peers.0));
             }
             Ok(())
         })

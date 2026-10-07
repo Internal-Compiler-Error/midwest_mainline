@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::dht::routing_table::RoutingTable;
 use crate::dht::rpc_manager::RpcManager;
-use crate::message::find_node_get_peers_response::Samples;
+use crate::message::find_node_get_peers_response::{Samples, ScrapeFilters};
 use crate::schema::{peer, swarm};
 use crate::token_generator::TokenGenerator;
 use crate::types::{Family, InfoHash, NodeId};
@@ -116,14 +116,22 @@ impl SharedState {
     /// [`PEER_LIFETIME`], freshest first, capped so a get_peers response fits BEP 32's 1024
     /// bytes. A get_peers answer only carries the family it was asked over (BEP 32).
     pub(crate) fn swarm_peers(&self, info_hash: &InfoHash, family: Family) -> Vec<SocketAddr> {
+        self.swarm_peers_preferring(info_hash, family, false)
+    }
+
+    /// `swarm_peers`, and with `noseed` (BEP 33), the ones that aren't seeds first
+    pub(crate) fn swarm_peers_preferring(&self, info_hash: &InfoHash, family: Family, noseed: bool) -> Vec<SocketAddr> {
         let mut conn = self.conn.get().expect("failed to get one connection from pool");
 
         let query = peer::table
             .filter(peer::swarm.eq(&info_hash.0))
             .filter(peer::last_announced.ge(lifetime_cutoff()))
-            .order(peer::last_announced.desc())
             .select((peer::ip_addr, peer::port))
             .into_boxed();
+        let query = match noseed {
+            true => query.order((peer::seed.asc(), peer::last_announced.desc())),
+            false => query.order(peer::last_announced.desc()),
+        };
         // an IPv6 address in text always has a colon, an IPv4 one never does
         let query = match family {
             Family::V4 => query.filter(peer::ip_addr.not_like("%:%")).limit(50),
@@ -135,6 +143,30 @@ impl SharedState {
             .into_iter()
             .map(|(ip, port)| parse_addr(&ip, port))
             .collect()
+    }
+
+    /// BEP 33: bloom filters of the seeds' and the other peers' addresses announced to us for
+    /// `info_hash` within [`PEER_LIFETIME`], both families; `None` if there are none
+    pub(crate) fn scrape_filters(&self, info_hash: &InfoHash) -> Option<ScrapeFilters> {
+        let mut conn = self.conn.get().expect("failed to get one connection from pool");
+        let peers = peer::table
+            .filter(peer::swarm.eq(&info_hash.0))
+            .filter(peer::last_announced.ge(lifetime_cutoff()))
+            .select((peer::ip_addr, peer::seed))
+            .load::<(String, bool)>(&mut conn)
+            .unwrap_or_default();
+        if peers.is_empty() {
+            return None;
+        }
+        let mut filters = ScrapeFilters::default();
+        for (ip, seed) in peers {
+            let Ok(ip) = ip.parse() else { continue };
+            match seed {
+                true => filters.seeds.insert(ip),
+                false => filters.peers.insert(ip),
+            }
+        }
+        Some(filters)
     }
 
     /// Every peer ever announced to us for `info_hash` that the store still holds, stale or

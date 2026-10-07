@@ -16,6 +16,7 @@ pub struct Peer {
     pub last_announced: i64, // 63 bits should be enough even for milliseconds
     pub swarm: Vec<u8>,
     pub first_announced: i64,
+    pub seed: bool,
 }
 
 #[derive(Queryable, Selectable, AsChangeset, Insertable)]

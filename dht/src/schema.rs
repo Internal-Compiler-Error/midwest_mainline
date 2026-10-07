@@ -31,6 +31,7 @@ diesel::table! {
         last_announced -> BigInt,
         swarm -> Binary,
         first_announced -> BigInt,
+        seed -> Bool,
     }
 }
 

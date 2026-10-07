@@ -741,7 +741,7 @@ mod ipv6_tests {
             .expect("B hands out a token");
         a.session
             .handle()
-            .announce_peers(b_addr, info_hash, Some(1234), token)
+            .announce_peers(b_addr, info_hash, Some(1234), token, false)
             .await
             .unwrap();
 
@@ -798,7 +798,7 @@ mod bep51_tests {
 
     fn store(session: &DhtSession, info_hash: InfoHash) {
         let mut conn = session.state.conn.get().unwrap();
-        server::DhtServer::add_peers_to_db(&info_hash, "10.0.0.1:6881".parse().unwrap(), &mut conn).unwrap();
+        server::DhtServer::add_peers_to_db(&info_hash, "10.0.0.1:6881".parse().unwrap(), false, &mut conn).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -859,5 +859,72 @@ mod bep51_tests {
         assert_eq!(crawler.stats().new_info_hashes.load(Relaxed), 2);
         assert_eq!(crawler.stats().samples.load(Relaxed), 3);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bep33_tests {
+    use super::*;
+    use crate::test_support::{node, scratch_dir};
+
+    const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    fn store(session: &DhtSession, info_hash: InfoHash, ips: std::ops::Range<u8>, seed: bool) {
+        let mut conn = session.state.conn.get().unwrap();
+        for i in ips {
+            let addr = SocketAddr::from(([10, 0, 0, i], 6881));
+            server::DhtServer::add_peers_to_db(&info_hash, addr, seed, &mut conn).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scrape_counts_seeds_and_peers_across_nodes_once_each() {
+        let dir = scratch_dir("bep33");
+        let hash = InfoHash([0x33; 20]);
+        // A holds seeds .0-.29 and peers .100-.119; B the seeds .20-.39 and no peers
+        let a = node(&dir, "a", LOOPBACK).await;
+        let b = node(&dir, "b", LOOPBACK).await;
+        store(&a.session, hash, 0..30, true);
+        store(&a.session, hash, 100..120, false);
+        store(&b.session, hash, 20..40, true);
+        b.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
+        let us = node(&dir, "us", LOOPBACK).await;
+        us.session
+            .bootstrap(vec![a.session.local_addr(), b.session.local_addr()])
+            .await
+            .unwrap();
+
+        let estimate = us.session.handle().scrape(hash).await.unwrap();
+        assert_eq!(estimate.nodes, 2);
+        assert!(estimate.seeds.abs_diff(40) <= 2, "{estimate:?}");
+        assert!(estimate.peers.abs_diff(20) <= 1, "{estimate:?}");
+
+        // a hash nobody holds: nothing, and no filters
+        let none = us.session.handle().scrape(InfoHash([0x44; 20])).await.unwrap();
+        assert_eq!((none.seeds, none.peers, none.nodes), (0, 0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn noseed_puts_the_peers_that_are_not_seeds_first() {
+        let pool = crate::test_support::memory_pool();
+        let socket = UdpSocket::bind(LOOPBACK).await.unwrap();
+        let rpc = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
+        let id = NodeId([7; 20]);
+        let state = SharedState::new(id, RoutingTable::new(id, rpc.clone(), pool.clone()), rpc, pool);
+        let hash = InfoHash([1; 20]);
+        // the seed is the latest announce, so it comes first unless asked otherwise
+        store_in(&state, hash, 2, false);
+        store_in(&state, hash, 1, true);
+        let first = |noseed| state.swarm_peers_preferring(&hash, Family::V4, noseed)[0];
+        assert_eq!(first(false), SocketAddr::from(([10, 0, 0, 1], 6881)));
+        assert_eq!(first(true), SocketAddr::from(([10, 0, 0, 2], 6881)));
+    }
+
+    fn store_in(state: &SharedState, info_hash: InfoHash, i: u8, seed: bool) {
+        let mut conn = state.conn.get().unwrap();
+        let addr = SocketAddr::from(([10, 0, 0, i], 6881));
+        server::DhtServer::add_peers_to_db(&info_hash, addr, seed, &mut conn).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }

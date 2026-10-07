@@ -123,6 +123,7 @@
 //! }
 //! ```
 
+pub mod bloom;
 pub mod dht;
 pub mod message;
 pub(crate) mod models;

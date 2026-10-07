@@ -81,6 +81,20 @@ async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) 
             "bep42_v4": s.dht.bep42_compliance().0,
             "bep42_v6": s.dht6.as_ref().map(|d| d.bep42_compliance().0),
         }),
+        // BEP 33: the swarm's size as the DHT knows it, over IPv4
+        "scrape" => {
+            let Some(info_hash) = info_hash_param(&req.params) else {
+                return Json(invalid_params(req.id));
+            };
+            match s.dht.handle().scrape(info_hash).await {
+                Ok(estimate) => serde_json::json!({
+                    "seeds": estimate.seeds,
+                    "peers": estimate.peers,
+                    "nodes": estimate.nodes,
+                }),
+                Err(e) => serde_json::json!({ "code": -32000, "message": e.to_string() }),
+            }
+        }
         "sampled" => {
             let count = |field: fn(&CrawlStats) -> &AtomicU64| -> u64 {
                 s.crawlers.iter().map(|c| field(c.stats()).load(Relaxed)).sum()

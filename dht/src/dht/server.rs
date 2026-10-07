@@ -114,9 +114,17 @@ impl DhtServer {
 
     #[tracing::instrument(skip(self))]
     fn generate_get_peers_response(&self, query: &GetPeersQuery, origin: SocketAddr) -> KrpcBody {
-        let peers = self.state.swarm_peers(query.info_hash(), self.state.family);
+        let peers = self
+            .state
+            .swarm_peers_preferring(query.info_hash(), self.state.family, query.noseed());
         let token = self.state.token_generator.token_for_ip(&origin.ip());
-        let res = ResBuilder::new(self.state.our_id).with_token(token);
+        let mut res = ResBuilder::new(self.state.our_id).with_token(token);
+        // BEP 33: filters only when we hold something for the hash
+        if query.scrape()
+            && let Some(filters) = self.state.scrape_filters(query.info_hash())
+        {
+            res = res.with_scrape(filters);
+        }
 
         let res = if !peers.is_empty() {
             res.with_values(&peers)
@@ -150,7 +158,8 @@ impl DhtServer {
         };
 
         let mut conn = self.state.conn.get().unwrap();
-        let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, &mut conn).inspect_err(|e| warn!("{e}"));
+        let _ = Self::add_peers_to_db(announce.info_hash(), peer_contact, announce.seed(), &mut conn)
+            .inspect_err(|e| warn!("{e}"));
 
         KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
     }
@@ -158,6 +167,7 @@ impl DhtServer {
     pub(crate) fn add_peers_to_db(
         info_hash: &InfoHash,
         peer_contact: SocketAddr,
+        seed: bool,
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,
     ) -> Result<usize, diesel::result::Error> {
         conn.transaction(|conn| {
@@ -180,11 +190,12 @@ impl DhtServer {
                         peer::swarm.eq(info_hash),
                         peer::first_announced.eq(now),
                         peer::last_announced.eq(now),
+                        peer::seed.eq(seed),
                     ),
                 )
                 .on_conflict((peer::ip_addr, peer::port, peer::swarm))
                 .do_update()
-                .set(peer::last_announced.eq(now))
+                .set((peer::last_announced.eq(now), peer::seed.eq(seed)))
                 .execute(conn)
                 .inspect_err(|e| warn!("{e}"))
         })
@@ -204,12 +215,12 @@ mod tests {
         let info_hash = InfoHash([3; 20]);
         let addr = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 6881));
 
-        DhtServer::add_peers_to_db(&info_hash, addr, &mut conn).unwrap();
+        DhtServer::add_peers_to_db(&info_hash, addr, false, &mut conn).unwrap();
         diesel::update(peer::table)
             .set((peer::first_announced.eq(1), peer::last_announced.eq(1)))
             .execute(&mut conn)
             .unwrap();
-        DhtServer::add_peers_to_db(&info_hash, addr, &mut conn).unwrap();
+        DhtServer::add_peers_to_db(&info_hash, addr, false, &mut conn).unwrap();
 
         let (first, last): (i64, i64) = peer::table
             .select((peer::first_announced, peer::last_announced))

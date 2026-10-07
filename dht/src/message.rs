@@ -16,6 +16,7 @@ use find_node_get_peers_response::{Builder, FindNodeGetPeersResponse};
 use ping_announce_peer_response::PingAnnouncePeerResponse;
 use tracing::{info, instrument};
 
+use crate::bloom::BloomFilter;
 use crate::message::announce_peer_query::AnnouncePeerQuery;
 use crate::message::error::KrpcError;
 use crate::message::find_node_query::FindNodeQuery;
@@ -23,7 +24,7 @@ use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
 use crate::message::sample_infohashes_query::SampleInfohashesQuery;
 use crate::types::{InfoHash, NodeId};
-use find_node_get_peers_response::{MAX_SAMPLE_INTERVAL, Samples};
+use find_node_get_peers_response::{MAX_SAMPLE_INTERVAL, Samples, ScrapeFilters};
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 
 pub mod announce_peer_query;
@@ -242,6 +243,27 @@ fn extract_samples(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Op
     }))
 }
 
+/// An integer flag that's on when 1, as BEP 33 and BEP 43 spell them; off when absent or
+/// anything else
+fn extract_flag(dict: &mut BTreeMap<&[u8], BencodeItemView>, key: &[u8]) -> bool {
+    matches!(dict.remove(key), Some(BencodeItemView::Integer(1)))
+}
+
+/// BEP 33's `BFsd` and `BFpe`: both, each a whole filter, or nothing
+fn extract_scrape(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<ScrapeFilters>, OurError> {
+    let mut filter = |key: &[u8]| match response.remove(key) {
+        None => Ok(None),
+        Some(BencodeItemView::ByteString(raw)) => Ok(BloomFilter::from_bytes(raw)),
+        Some(_) => Err(OurError::DecodeError(eyre!(
+            "'{}' key is not a binary string",
+            String::from_utf8_lossy(key)
+        ))),
+    };
+    let seeds = filter(b"BFsd")?;
+    let peers = filter(b"BFpe")?;
+    Ok(seeds.zip(peers).map(|(seeds, peers)| ScrapeFilters { seeds, peers }))
+}
+
 fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
@@ -255,7 +277,10 @@ fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
 
     let info_hash =
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
-    let get_peers = GetPeersQuery::new(querier, info_hash).with_want(extract_want(arguments)?);
+    let get_peers = GetPeersQuery::new(querier, info_hash)
+        .with_want(extract_want(arguments)?)
+        .with_scrape(extract_flag(arguments, b"scrape"))
+        .with_noseed(extract_flag(arguments, b"noseed"));
 
     report_unused_keys(arguments, "Get_peers query body has unused keys");
     Ok(get_peers)
@@ -295,7 +320,8 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
 
     let info_hash =
         InfoHash::try_from_bytes(info_hash).ok_or(OurError::DecodeError(eyre!("'info_hash' key is not 20 bytes")))?;
-    let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port, info_hash, token);
+    let announce_peer = AnnouncePeerQuery::new(querier, implied_port, port, info_hash, token)
+        .with_seed(extract_flag(arguments, b"seed"));
 
     report_unused_keys(arguments, "Announce_peer query body has unused keys");
     Ok(announce_peer)
@@ -486,8 +512,15 @@ impl ParseKrpc for &[u8] {
             let values = extract_peers(&mut response)?;
             let token = extract_token(&mut response)?;
             let samples = extract_samples(&mut response)?;
+            let scrape = extract_scrape(&mut response)?;
 
-            if nodes.is_none() && nodes6.is_none() && values.is_none() && token.is_none() && samples.is_none() {
+            if nodes.is_none()
+                && nodes6.is_none()
+                && values.is_none()
+                && token.is_none()
+                && samples.is_none()
+                && scrape.is_none()
+            {
                 // when they have none of these, then it's just a response to ping to announce query
                 KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id))
             } else {
@@ -516,6 +549,11 @@ impl ParseKrpc for &[u8] {
 
                 let builder = match samples {
                     Some(samples) => builder.with_samples(samples),
+                    None => builder,
+                };
+
+                let builder = match scrape {
+                    Some(scrape) => builder.with_scrape(scrape),
                     None => builder,
                 };
 
@@ -1281,6 +1319,82 @@ mod test {
             panic!("expected a find_node/get_peers response")
         };
         assert_eq!(res.samples().unwrap().interval, 0);
+    }
+
+    #[test]
+    fn bep_33_flags_and_filters_round_trip() {
+        let query = GetPeersQuery::new(
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
+        )
+        .with_scrape(true)
+        .with_noseed(true);
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::GetPeersQuery(query));
+        let encoded = msg.encode();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            "d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234566:noseedi1e6:scrapei1ee1:q9:get_peers1:t2:aa1:y1:qe"
+        );
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let announce = AnnouncePeerQuery::new(
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            false,
+            6881,
+            InfoHash::from_bytes(b"mnopqrstuvwxyz123456"),
+            Token::from_bytes(b"tok"),
+        )
+        .with_seed(true);
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::AnnouncePeerQuery(announce));
+        let encoded = msg.encode();
+        assert!(String::from_utf8_lossy(&encoded).contains("4:seedi1e"));
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let mut filters = ScrapeFilters::default();
+        filters.seeds.insert("1.2.3.4".parse().unwrap());
+        filters.peers.insert("2001:db8::1".parse().unwrap());
+        let res = Builder::new(NodeId::from_bytes(b"0123456789abcdefghij"))
+            .with_token(Token::from_bytes(b"tok"))
+            .with_value("5.6.7.8:1".parse::<SocketAddr>().unwrap())
+            .with_scrape(filters)
+            .build();
+        let msg = Krpc::new_with_body(
+            TransactionId::from_bytes(b"aa"),
+            KrpcBody::FindNodeGetPeersResponse(res),
+        );
+        let encoded = msg.encode();
+        assert!(String::from_utf8_lossy(&encoded).contains("4:BFpe256:"));
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+    }
+
+    #[test]
+    fn malformed_bep_33_wire_data_is_ignored_or_a_decode_error_not_a_panic() {
+        // flags that aren't 1 are off
+        let msg = b"d1:ad2:id20:abcdefghij01234567899:info_hash20:mnopqrstuvwxyz1234566:noseed1:16:scrapei2ee1:q9:get_peers1:t2:aa1:y1:qe" as &[u8];
+        let KrpcBody::GetPeersQuery(query) = msg.parse().unwrap().body else {
+            panic!("expected a get_peers query")
+        };
+        assert!(!query.scrape() && !query.noseed());
+
+        // a filter of the wrong length, or one without the other: no filters
+        let mut msg = b"d1:rd4:BFpe3:abc4:BFsd256:".to_vec();
+        msg.extend_from_slice(&[0xff; 256]);
+        msg.extend_from_slice(b"2:id20:0123456789abcdefghij5:token3:toke1:t2:aa1:y1:re");
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.as_slice().parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.scrape(), None);
+        let mut msg = b"d1:rd4:BFsd256:".to_vec();
+        msg.extend_from_slice(&[0xff; 256]);
+        msg.extend_from_slice(b"2:id20:0123456789abcdefghij5:token3:toke1:t2:aa1:y1:re");
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.as_slice().parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.scrape(), None);
+
+        // a filter that isn't a string
+        let msg = b"d1:rd4:BFpei1e2:id20:0123456789abcdefghij5:token3:toke1:t2:aa1:y1:re" as &[u8];
+        assert!(msg.parse().is_err());
     }
 
     #[test]

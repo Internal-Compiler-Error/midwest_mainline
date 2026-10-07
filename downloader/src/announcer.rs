@@ -101,6 +101,7 @@ fn retry_delay(failures: u32) -> Duration {
 }
 
 /// What every announcer of one torrent shares.
+#[derive(Clone)]
 pub(crate) struct Announcing {
     pub trackers: Vec<String>,
     pub info_hash: InfoHash,
@@ -127,11 +128,7 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
     let Announcing {
         trackers,
         info_hash,
-        identity,
-        events,
-        shutdown,
         dht,
-        bus,
         v2,
         ..
     } = &args;
@@ -156,15 +153,11 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
     let _ = board.send(rows);
 
     for (hash, slot) in dht_slot.map(|slot| (*info_hash, slot)).into_iter().chain(dht_v2_slot) {
-        tokio::spawn(dht_announcer(
-            hash,
-            identity.serving.port(),
-            dht.clone(),
-            events.clone(),
-            shutdown.clone(),
-            (board.clone(), slot),
-            bus.clone(),
-        ));
+        let args = Announcing {
+            info_hash: hash,
+            ..args.clone()
+        };
+        tokio::spawn(dht_announcer(args, (board.clone(), slot)));
     }
     for (url, slot) in usable.into_iter().zip(slots) {
         match url.scheme() {
@@ -198,15 +191,18 @@ pub(crate) fn spawn_announcers(args: Announcing) -> watch::Receiver<Vec<TrackerS
 /// peers come back to the swarm, and announce our port to the nodes that issued tokens.
 /// With an IPv6 node too (BEP 32), both DHTs are looked up at once and their peers merged.
 /// Waits for the node to come up first, and does nothing at all if it never does.
-async fn dht_announcer(
-    info_hash: InfoHash,
-    tcp_port: u16,
-    mut dht: DhtWatch,
-    events: mpsc::WeakSender<SwarmEvent>,
-    shutdown: CancellationToken,
-    (board, slot): (TrackerBoard, usize),
-    bus: EventBus,
-) {
+async fn dht_announcer(args: Announcing, (board, slot): (TrackerBoard, usize)) {
+    let Announcing {
+        info_hash,
+        identity,
+        stats,
+        events,
+        shutdown,
+        mut dht,
+        bus,
+        ..
+    } = args;
+    let tcp_port = identity.serving.port();
     let handle = loop {
         if let Some(handle) = dht.borrow().clone() {
             break handle;
@@ -312,11 +308,19 @@ async fn dht_announcer(
             {
                 return;
             }
+            // BEP 33: nodes count seeds apart, for DHT scrapes
+            let seed = {
+                let stats = stats.borrow();
+                !stats.verified.is_empty() && stats.verified.all()
+            };
             // all at once and in the background: one at a time, each dead node held the next
             // lookup back by a full request timeout
             tokio::spawn(futures::future::join_all(announces.into_iter().map(
                 move |(client, (node, token))| async move {
-                    if let Err(e) = client.announce_peers(node.end_point(), info_hash, port, token).await {
+                    if let Err(e) = client
+                        .announce_peers(node.end_point(), info_hash, port, token, seed)
+                        .await
+                    {
                         tracing::debug!("announce to DHT node {} failed: {e:#}", node.end_point());
                     }
                 },

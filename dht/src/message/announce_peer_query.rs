@@ -10,6 +10,8 @@ pub struct AnnouncePeerQuery {
     info_hash: InfoHash,
     port: u16,
     token: Token,
+    /// BEP 33: the announcer is a seed
+    seed: bool,
 }
 
 impl AnnouncePeerQuery {
@@ -20,7 +22,17 @@ impl AnnouncePeerQuery {
             info_hash,
             port,
             token,
+            seed: false,
         }
+    }
+
+    pub fn with_seed(mut self, seed: bool) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub fn seed(&self) -> bool {
+        self.seed
     }
 
     pub fn token(&self) -> &Token {
@@ -52,6 +64,9 @@ impl ToKrpcBody for AnnouncePeerQuery {
             enc.emit_pair(b"token", &self.token)?;
             enc.emit_pair(b"implied_port", if self.implied_port { 1 } else { 0 })?;
             enc.emit_pair(b"info_hash", self.info_hash)?;
+            if self.seed {
+                enc.emit_pair(b"seed", 1)?;
+            }
             enc.emit_pair(b"port", self.port)
         })
         .unwrap()
