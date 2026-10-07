@@ -3,14 +3,14 @@
   import { Checkbox } from '$lib/components/ui/checkbox'
   import { Switch } from '$lib/components/ui/switch'
   import { Label } from '$lib/components/ui/label'
-  import * as Table from '$lib/components/ui/table'
   import * as Tabs from '$lib/components/ui/tabs'
-  import { isFeedUri, isKnown, isMagnetUri, trackerStatus, type TorrentRow } from './api'
+  import { isFeedUri, isKnown, isMagnetUri, type TorrentRow } from './api'
   import { fraction, humanBytes, rate } from './format'
   import Flip from './Flip.svelte'
   import Num from './Num.svelte'
   import PeerTable from './PeerTable.svelte'
   import ProgressBar from './ProgressBar.svelte'
+  import TrackerTable from './TrackerTable.svelte'
 
   let {
     torrent,
@@ -143,33 +143,7 @@
           <Tabs.Trigger value="trackers">Trackers ({torrent.trackers.length})</Tabs.Trigger>
         </Tabs.List>
         <Tabs.Content value="trackers" class="max-h-64 overflow-auto rounded-md border">
-        <Table.Root class="table-fixed">
-          <Table.Body>
-            {#each torrent.trackers as tracker (tracker.url)}
-              <Table.Row>
-                <Table.Cell class="truncate select-text" title={tracker.url}>{tracker.url}</Table.Cell>
-                <Table.Cell
-                  class="w-64 truncate {tracker.state === 'working' ? '' : tracker.state === 'pending' ? 'text-muted-foreground' : 'text-destructive'}"
-                  title={trackerStatus(tracker)}>{trackerStatus(tracker)}</Table.Cell
-                >
-                <Table.Cell class="w-24 whitespace-nowrap tabular-nums">{tracker.peers} peers</Table.Cell>
-                {@const estimated = tracker.url.startsWith('DHT')}
-                <Table.Cell
-                  class="w-48 whitespace-nowrap text-muted-foreground tabular-nums"
-                  title={estimated
-                    ? 'estimated from the bloom filters of the DHT nodes nearest the hash (BEP 33)'
-                    : 'the swarm as this tracker counts it'}
-                >
-                  {#if tracker.seeders !== null}{estimated ? '~' : ''}{tracker.seeders} seeds · {tracker.leechers ?? '?'} leechers{/if}
-                  {#if tracker.downloaded !== null}· {tracker.downloaded} done{/if}
-                </Table.Cell>
-                <Table.Cell class="w-36 whitespace-nowrap text-muted-foreground tabular-nums">
-                  {tracker.next_announce_secs === null ? '' : `next in ${Math.floor(tracker.next_announce_secs / 60)}m ${tracker.next_announce_secs % 60}s`}
-                </Table.Cell>
-              </Table.Row>
-            {/each}
-          </Table.Body>
-        </Table.Root>
+          <TrackerTable trackers={torrent.trackers} />
         </Tabs.Content>
         <Tabs.Content value="peers" class="max-h-64 overflow-auto rounded-md border">
           <PeerTable peers={torrent.peers} {onpeer} />

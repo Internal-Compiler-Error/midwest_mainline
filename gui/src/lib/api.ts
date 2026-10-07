@@ -91,10 +91,6 @@ export function peerFlags(p: Peer): string {
   return flags
 }
 
-export function trackerStatus(t: Tracker): string {
-  return t.state === 'failed' ? (t.error ?? 'failed') : t.state === 'working' ? 'working' : 'waiting'
-}
-
 export type TorrentRow = { id: TorrentId } & (
   | { kind: 'resolving'; source: string; elapsed_ms: number }
   | ({ kind: 'downloading' } & Progress)
