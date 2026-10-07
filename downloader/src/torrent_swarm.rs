@@ -854,6 +854,29 @@ impl TorrentSwarm {
         }
     }
 
+    /// Our address as peers see it, for BEP 40: the agreed public IP and our listening port.
+    fn our_address(&self) -> Option<SocketAddr> {
+        let ip = self.external.best()?;
+        Some(SocketAddr::new(ip, self.id.serving.port()))
+    }
+
+    /// At the cap, the connection `newcomer` may replace (BEP 40): the lowest ranked of those
+    /// that have never delivered a block, if `newcomer` outranks it. A peer that has delivered
+    /// keeps its place: what UCB measured is better evidence than a hash.
+    fn make_room_for(&self, newcomer: SocketAddr) -> Option<usize> {
+        let us = self.our_address()?;
+        let rank = |addr| crate::priority::peer_priority(us, addr);
+        let theirs = rank(newcomer)?;
+        let (idx, lowest) = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.stats.received == 0)
+            .filter_map(|(idx, p)| Some((idx, rank(p.remote_addr)?)))
+            .min_by_key(|&(_, r)| r)?;
+        (theirs > lowest).then_some(idx)
+    }
+
     fn ban(&mut self, addr: SocketAddr) {
         self.known.entry(addr).or_default().ban(Instant::now());
     }
@@ -2093,23 +2116,29 @@ impl TorrentSwarm {
     async fn add_peer(&mut self, connected: ConnectedPeer) {
         let remote_addr = canonical(connected.remote_addr);
         self.dialing.remove(&remote_addr);
-        let Err(insert_at) = self.peers.binary_search_by_key(&remote_addr, |p| p.remote_addr) else {
+        if self.peer_index(remote_addr).is_some() {
             info!("{remote_addr} is already connected, dropping the duplicate");
             return;
-        };
-        let known = self.known.entry(remote_addr).or_default();
-        if known.banned(Instant::now()) {
+        }
+        if self.known.get(&remote_addr).is_some_and(|k| k.banned(Instant::now())) {
             info!("{remote_addr} is banned, refusing it");
             return;
         }
+        if self.peers.len() >= self.settings.borrow().peer_cap() {
+            match self.make_room_for(remote_addr) {
+                Some(idx) => self.drop_peer(idx, "replaced by a peer of higher BEP 40 priority"),
+                None => {
+                    tracing::debug!("{remote_addr} refused, at the connection cap");
+                    self.known.entry(remote_addr).or_default().connected();
+                    return;
+                }
+            }
+        }
+        let known = self.known.entry(remote_addr).or_default();
         known.connected();
         // a dialled peer that came up plaintext under `Prefer` refused the encrypted opening
         if connected.dialed && self.id.encryption == crate::config::Encryption::Prefer {
             known.plaintext_only = !connected.stream.is_encrypted();
-        }
-        if self.peers.len() >= self.settings.borrow().peer_cap() {
-            tracing::debug!("{remote_addr} refused, at the connection cap");
-            return;
         }
 
         let dht_port = self.dht.borrow().as_ref().map(|dht| dht.udp_port_for(&remote_addr));
@@ -2185,6 +2214,7 @@ impl TorrentSwarm {
             encrypted: peer.encrypted,
             utp: peer.utp,
         });
+        let insert_at = self.peers.partition_point(|p| p.remote_addr < remote_addr);
         self.peers.insert(insert_at, peer);
     }
 
@@ -2197,9 +2227,14 @@ impl TorrentSwarm {
     /// Dials what a tracker, the DHT, LSD or PEX handed out, as far as the peer cap allows.
     /// The flag marks an address PEX said speaks uTP; it's remembered only for addresses
     /// that get dialled, so gossip about peers we never call doesn't pile up in `known`.
-    fn connect_to_peers(&mut self, peers: Vec<(SocketAddr, bool)>, via: Option<SocketAddr>) {
+    fn connect_to_peers(&mut self, mut peers: Vec<(SocketAddr, bool)>, via: Option<SocketAddr>) {
         let now = Instant::now();
         let cap = self.settings.borrow().peer_cap();
+        // best BEP 40 rank first: what the cap cuts off, and what waits longest for a
+        // half-open slot, is the end of the list
+        if let Some(us) = self.our_address() {
+            peers.sort_by_cached_key(|(addr, _)| std::cmp::Reverse(crate::priority::peer_priority(us, *addr)));
+        }
         for (addr, utp_capable) in peers {
             let addr = canonical(addr);
             if self.peers.len() + self.dialing.len() >= cap {
@@ -2598,6 +2633,41 @@ mod test {
         };
         let (swarm, handle) = TorrentSwarm::new(torrent, storage, verified, shared);
         (swarm, handle, path)
+    }
+
+    /// BEP 40 at the connection cap: a newcomer that outranks an idle peer takes its place;
+    /// one that doesn't is turned away.
+    #[tokio::test]
+    async fn at_the_cap_a_higher_priority_peer_replaces_an_idle_one() {
+        let settings = crate::config::Settings {
+            max_peers_per_torrent: 1,
+            ..Default::default()
+        };
+        let (swarm, handle, path) = swarm_with_settings("bep40", true, settings);
+        let ours: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        swarm.external.vote(ours, "a");
+        swarm.external.vote(ours, "b");
+        let us = SocketAddr::new(ours, 0);
+        tokio::spawn(swarm.work_loop());
+        let mut candidates: Vec<SocketAddr> = (1..=3)
+            .map(|n| format!("198.51.{n}.{n}:6881").parse().unwrap())
+            .collect();
+        candidates.sort_by_key(|addr| crate::priority::peer_priority(us, *addr));
+        let [low, mid, high] = candidates[..] else {
+            unreachable!()
+        };
+
+        // a closed connection reads as the end of the stream, after whatever was sent first
+        async fn closed(peer: &mut Framed<tokio::net::TcpStream, BtCodec>) -> bool {
+            let drained = async { while let Some(Ok(_)) = peer.next().await {} };
+            tokio::time::timeout(Duration::from_secs(5), drained).await.is_ok()
+        }
+        let mut first = fake_peer(&handle, &mid.to_string()).await;
+        let mut outranked = fake_peer(&handle, &low.to_string()).await;
+        assert!(closed(&mut outranked).await, "a lower rank is refused");
+        let _better = fake_peer(&handle, &high.to_string()).await;
+        assert!(closed(&mut first).await, "a higher rank replaces the idle peer");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// The bus hears a peer arrive and leave, with the reason.

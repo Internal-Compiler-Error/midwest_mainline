@@ -15,6 +15,7 @@ mod mse;
 pub mod paths;
 mod peer;
 pub mod portmap;
+pub mod priority;
 pub mod resume;
 pub mod session;
 mod settings;

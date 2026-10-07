@@ -29,6 +29,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 27 | Private torrents (no DHT/PEX/LSD for them) | `torrent.rs`, `torrent_swarm.rs`, `announcer.rs` |
 | 29 | uTP (via `librqbit-utp`; happy-eyeballs with TCP) | `utp.rs`, `stream.rs` |
 | 32 | IPv6 DHT: a second `DhtSession` on an IPv6 socket, `nodes6`/`want`, 18-byte values, per-/64 Sybil rule, v6 table seeded from v4 `nodes6` answers (untested on a live v6 route: the dev Mac has none) | `dht/` (`DhtSession::pair_with`, migration `2026-10-07-000000_ipv6_nodes`), `downloader/src/dht.rs` |
+| 40 | Canonical peer priority: each batch of addresses is dialled best-ranked first; at the connection cap a higher-ranked newcomer replaces the lowest-ranked peer that hasn't delivered a block (productive peers are never evicted). Needs our agreed external address. IPv6 masks follow the IPv4 pattern over the first 8 bytes (the BEP only has IPv4 examples) | `priority.rs`, `torrent_swarm.rs` (`make_room_for`, `connect_to_peers`) |
 | 41 | UDP tracker extensions: we send an empty option list only | `announcer.rs` |
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
@@ -43,7 +44,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Why / notes |
 |---|---|---|
 | 52 + 47 | BitTorrent v2 (SHA-256 Merkle trees, `piece layers`, `btmh` magnets) and padding files / file attributes | Hybrid v1+v2 torrents are increasingly common; without 47 we'd write pad files to disk. Big: per-file Merkle verification, hash requests (`hash request`/`hashes`/`hash reject` messages), v2 info hash in the handshake |
-| 40 | Canonical peer priority | Deterministic choice of which connections to keep under churn |
 | 42 (verify) | Check other nodes' ids against their IPs | Complements the one-node-per-IP Sybil defence in the routing table |
 | 51 | DHT `sample_infohashes` | Fits the DHT's long-term index mode (`Retention::Forever`) |
 | 33 | DHT scrape (bloom filters of seeds/peers) | Swarm size without a tracker |
