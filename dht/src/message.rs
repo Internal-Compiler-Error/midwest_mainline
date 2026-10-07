@@ -1,6 +1,6 @@
 //! The KRPC wire protocol (BEP 5): bencoded dicts with a transaction id (`t`), a message
-//! type (`y` = q/r/e), and a body. Parsing is one pass with juicy_bencode,
-//! juicy_bencode borrows the fields. KRPC responses are not self-describing, so both
+//! type (`y` = q/r/e), and a body. Parsing is one pass over the packet (see [`bencode`]),
+//! borrowing the fields. KRPC responses are not self-describing, so both
 //! find_node and get_peers responses map to one [`FindNodeGetPeersResponse`] struct.
 
 use std::collections::{BTreeMap, HashMap};
@@ -24,11 +24,12 @@ use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
 use crate::message::sample_infohashes_query::SampleInfohashesQuery;
 use crate::types::{InfoHash, NodeId};
+use bencode::{Value, parse_dict};
 use find_node_get_peers_response::{Item, ItemSignature, MAX_SAMPLE_INTERVAL, Samples, ScrapeFilters};
 use item_queries::{GetQuery, PutQuery, Signed};
-use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 
 pub mod announce_peer_query;
+mod bencode;
 pub mod error;
 pub mod find_node_get_peers_response;
 pub mod find_node_query;
@@ -111,18 +112,18 @@ impl Want {
 }
 
 /// Unknown entries are ignored, as BEP 32 asks, so later families can be added.
-fn extract_want(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Want>, OurError> {
+fn extract_want(arguments: &mut BTreeMap<&[u8], Value>) -> Result<Option<Want>, OurError> {
     let Some(want) = arguments.remove(&b"want".as_slice()) else {
         return Ok(None);
     };
-    let BencodeItemView::List(want) = want else {
+    let Value::List(want) = want else {
         return Err(OurError::DecodeError(eyre!("'want' key is not a list")));
     };
     let mut wanted = Want::default();
     for item in want {
         match item {
-            BencodeItemView::ByteString(b"n4") => wanted.v4 = true,
-            BencodeItemView::ByteString(b"n6") => wanted.v6 = true,
+            Value::Bytes(b"n4") => wanted.v4 = true,
+            Value::Bytes(b"n6") => wanted.v6 = true,
             _ => {}
         }
     }
@@ -137,7 +138,7 @@ pub trait ParseKrpc {
     fn parse(&self) -> Result<Krpc, OurError>;
 }
 
-fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurError> {
+fn extract_error_content(body: &Vec<Value>) -> Result<KrpcError, OurError> {
     let code = body.first().ok_or(OurError::DecodeError(eyre!(
         "Error message has no first elem/error code"
     )))?;
@@ -146,11 +147,11 @@ fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurEr
         "Error message has no second elem/description"
     )))?;
 
-    let BencodeItemView::Integer(code) = code else {
+    let Value::Int(code) = code else {
         return Err(OurError::DecodeError(eyre!("First element is not an int")));
     };
 
-    let BencodeItemView::ByteString(message) = message else {
+    let Value::Bytes(message) = message else {
         return Err(OurError::DecodeError(eyre!("Second element is not a binary string")));
     };
     let message = str::from_utf8(message)
@@ -161,12 +162,12 @@ fn extract_error_content(body: &Vec<BencodeItemView>) -> Result<KrpcError, OurEr
     Ok(KrpcError::new(code, message))
 }
 
-fn extract_node_id(argument: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<NodeId, OurError> {
+fn extract_node_id(argument: &mut BTreeMap<&[u8], Value>) -> Result<NodeId, OurError> {
     let querier = argument
         .remove(&b"id".as_slice())
         .ok_or(OurError::DecodeError(eyre!("query doesn't have an `id` key")))?;
 
-    let BencodeItemView::ByteString(querier) = querier else {
+    let Value::Bytes(querier) = querier else {
         return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
     };
 
@@ -184,7 +185,7 @@ fn report_unused_keys<V>(dict: &BTreeMap<&[u8], V>, err_template: &'static str) 
     }
 }
 
-fn extract_ping(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PingQuery, OurError> {
+fn extract_ping(arguments: &mut BTreeMap<&[u8], Value>) -> Result<PingQuery, OurError> {
     let node_id = extract_node_id(arguments)?;
     let ping = PingQuery::new(node_id);
 
@@ -192,13 +193,13 @@ fn extract_ping(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Ping
     Ok(ping)
 }
 
-fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<FindNodeQuery, OurError> {
+fn extract_find_node(arguments: &mut BTreeMap<&[u8], Value>) -> Result<FindNodeQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
     let target = arguments
         .remove(&b"target".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'target' key")))?;
-    let BencodeItemView::ByteString(target) = target else {
+    let Value::Bytes(target) = target else {
         return Err(OurError::DecodeError(eyre!("'target' key is not a binary string")));
     };
 
@@ -209,11 +210,9 @@ fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
     Ok(find_node_request)
 }
 
-fn extract_sample_infohashes(
-    arguments: &mut BTreeMap<&[u8], BencodeItemView>,
-) -> Result<SampleInfohashesQuery, OurError> {
+fn extract_sample_infohashes(arguments: &mut BTreeMap<&[u8], Value>) -> Result<SampleInfohashesQuery, OurError> {
     let querier = extract_node_id(arguments)?;
-    let Some(BencodeItemView::ByteString(target)) = arguments.remove(&b"target".as_slice()) else {
+    let Some(Value::Bytes(target)) = arguments.remove(&b"target".as_slice()) else {
         return Err(OurError::DecodeError(eyre!("sample_infohashes has no 'target' string")));
     };
     let target = NodeId::try_from_bytes(target).ok_or(OurError::DecodeError(eyre!("'target' key is not 20 bytes")))?;
@@ -225,15 +224,15 @@ fn extract_sample_infohashes(
 
 /// BEP 51's `samples`, `interval` and `num`: present when `samples` is. Whole info hashes
 /// only, the interval clamped to BEP 51's range.
-fn extract_samples(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Samples>, OurError> {
+fn extract_samples(response: &mut BTreeMap<&[u8], Value>) -> Result<Option<Samples>, OurError> {
     let Some(samples) = response.remove(b"samples".as_slice()) else {
         return Ok(None);
     };
-    let BencodeItemView::ByteString(samples) = samples else {
+    let Value::Bytes(samples) = samples else {
         return Err(OurError::DecodeError(eyre!("'samples' key is not a binary string")));
     };
-    let int = |v: Option<BencodeItemView>| match v {
-        Some(BencodeItemView::Integer(i)) => Some(i),
+    let int = |v: Option<Value>| match v {
+        Some(Value::Int(i)) => Some(i),
         _ => None,
     };
     let interval = int(response.remove(b"interval".as_slice())).unwrap_or(0);
@@ -245,34 +244,8 @@ fn extract_samples(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Op
     }))
 }
 
-/// `view` bencoded again. For canonical bencode (sorted keys, which BEP 44 values must be) it's
-/// the bytes it was parsed from, which is what signatures and targets are computed over.
-pub(crate) fn encode_view(view: &BencodeItemView) -> Vec<u8> {
-    fn write(view: &BencodeItemView, out: &mut Vec<u8>) {
-        match view {
-            BencodeItemView::Integer(i) => out.extend_from_slice(format!("i{i}e").as_bytes()),
-            BencodeItemView::ByteString(s) => {
-                out.extend_from_slice(format!("{}:", s.len()).as_bytes());
-                out.extend_from_slice(s);
-            }
-            BencodeItemView::List(items) => {
-                out.push(b'l');
-                items.iter().for_each(|item| write(item, out));
-                out.push(b'e');
-            }
-            BencodeItemView::Dictionary(dict) => {
-                out.push(b'd');
-                for (k, v) in dict {
-                    write(&BencodeItemView::ByteString(k), out);
-                    write(v, out);
-                }
-                out.push(b'e');
-            }
-        }
-    }
-    let mut out = vec![];
-    write(view, &mut out);
-    out
+fn encode_view(view: &Value) -> Vec<u8> {
+    view.encode()
 }
 
 /// `raw` as one bencoded value (nested at most 64 deep); `None` if it's anything else
@@ -295,10 +268,10 @@ pub(crate) fn emit_raw(enc: SingleItemEncoder, raw: &[u8]) -> Result<(), bendy::
     }
 }
 
-fn extract_int(dict: &mut BTreeMap<&[u8], BencodeItemView>, key: &[u8]) -> Result<Option<i64>, OurError> {
+fn extract_int(dict: &mut BTreeMap<&[u8], Value>, key: &[u8]) -> Result<Option<i64>, OurError> {
     match dict.remove(key) {
         None => Ok(None),
-        Some(BencodeItemView::Integer(i)) => Ok(Some(i)),
+        Some(Value::Int(i)) => Ok(Some(i)),
         Some(_) => Err(OurError::DecodeError(eyre!(
             "'{}' key is not an integer",
             String::from_utf8_lossy(key)
@@ -306,13 +279,10 @@ fn extract_int(dict: &mut BTreeMap<&[u8], BencodeItemView>, key: &[u8]) -> Resul
     }
 }
 
-fn extract_bytes<'a>(
-    dict: &mut BTreeMap<&[u8], BencodeItemView<'a>>,
-    key: &[u8],
-) -> Result<Option<&'a [u8]>, OurError> {
+fn extract_bytes<'a>(dict: &mut BTreeMap<&[u8], Value<'a>>, key: &[u8]) -> Result<Option<&'a [u8]>, OurError> {
     match dict.remove(key) {
         None => Ok(None),
-        Some(BencodeItemView::ByteString(s)) => Ok(Some(s)),
+        Some(Value::Bytes(s)) => Ok(Some(s)),
         Some(_) => Err(OurError::DecodeError(eyre!(
             "'{}' key is not a binary string",
             String::from_utf8_lossy(key)
@@ -320,7 +290,7 @@ fn extract_bytes<'a>(
     }
 }
 
-fn extract_get(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetQuery, OurError> {
+fn extract_get(arguments: &mut BTreeMap<&[u8], Value>) -> Result<GetQuery, OurError> {
     let querier = extract_node_id(arguments)?;
     let target = extract_bytes(arguments, b"target")?
         .and_then(NodeId::try_from_bytes)
@@ -332,7 +302,7 @@ fn extract_get(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetQu
     Ok(query)
 }
 
-fn extract_put(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PutQuery, OurError> {
+fn extract_put(arguments: &mut BTreeMap<&[u8], Value>) -> Result<PutQuery, OurError> {
     let querier = extract_node_id(arguments)?;
     let token = extract_bytes(arguments, b"token")?.ok_or(OurError::DecodeError(eyre!("put has no 'token'")))?;
     let value = arguments
@@ -360,7 +330,7 @@ fn extract_put(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PutQu
 
 /// BEP 44's item in an answer to `get`: `v`, and `k`, `seq` and `sig` if it's mutable. Those
 /// three are taken only whole; a mutable item without them doesn't verify anyway.
-fn extract_item(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Item>, OurError> {
+fn extract_item(response: &mut BTreeMap<&[u8], Value>) -> Result<Option<Item>, OurError> {
     let key = extract_bytes(response, b"k")?.and_then(|k| <[u8; 32]>::try_from(k).ok());
     let seq = extract_int(response, b"seq")?;
     let sig = extract_bytes(response, b"sig")?.and_then(|s| <[u8; 64]>::try_from(s).ok());
@@ -379,15 +349,15 @@ fn extract_item(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Optio
 
 /// An integer flag that's on when 1, as BEP 33 and BEP 43 spell them; off when absent or
 /// anything else
-fn extract_flag(dict: &mut BTreeMap<&[u8], BencodeItemView>, key: &[u8]) -> bool {
-    matches!(dict.remove(key), Some(BencodeItemView::Integer(1)))
+fn extract_flag(dict: &mut BTreeMap<&[u8], Value>, key: &[u8]) -> bool {
+    matches!(dict.remove(key), Some(Value::Int(1)))
 }
 
 /// BEP 33's `BFsd` and `BFpe`: both, each a whole filter, or nothing
-fn extract_scrape(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<ScrapeFilters>, OurError> {
+fn extract_scrape(response: &mut BTreeMap<&[u8], Value>) -> Result<Option<ScrapeFilters>, OurError> {
     let mut filter = |key: &[u8]| match response.remove(key) {
         None => Ok(None),
-        Some(BencodeItemView::ByteString(raw)) => Ok(BloomFilter::from_bytes(raw)),
+        Some(Value::Bytes(raw)) => Ok(BloomFilter::from_bytes(raw)),
         Some(_) => Err(OurError::DecodeError(eyre!(
             "'{}' key is not a binary string",
             String::from_utf8_lossy(key)
@@ -398,14 +368,14 @@ fn extract_scrape(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opt
     Ok(seeds.zip(peers).map(|(seeds, peers)| ScrapeFilters { seeds, peers }))
 }
 
-fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
+fn extract_get_peers(arguments: &mut BTreeMap<&[u8], Value>) -> Result<GetPeersQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
     let info_hash = arguments
         .remove(&b"info_hash".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'info_hash' key")))?;
 
-    let BencodeItemView::ByteString(info_hash) = info_hash else {
+    let Value::Bytes(info_hash) = info_hash else {
         return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
     };
 
@@ -420,18 +390,18 @@ fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
     Ok(get_peers)
 }
 
-fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<AnnouncePeerQuery, OurError> {
+fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], Value>) -> Result<AnnouncePeerQuery, OurError> {
     let querier = extract_node_id(arguments)?;
 
     let implied_port = arguments.remove(&b"implied_port".as_slice());
     let implied_port = match implied_port {
         // BEP 5: any non-zero value means use the packet's origin port
-        Some(BencodeItemView::Integer(i)) => i != 0,
+        Some(Value::Int(i)) => i != 0,
         _ => false,
     };
 
     let port = arguments.remove(&b"port".as_slice());
-    let Some(BencodeItemView::Integer(port)) = port else {
+    let Some(Value::Int(port)) = port else {
         return Err(OurError::DecodeError(eyre!("'port' key is not a number")));
     };
     let port = u16::try_from(port).map_err(|_| OurError::DecodeError(eyre!("'port' out of range: {port}")))?;
@@ -439,7 +409,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
     let token = arguments
         .remove(&b"token".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'token' key")))?;
-    let BencodeItemView::ByteString(token) = token else {
+    let Value::Bytes(token) = token else {
         return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
     };
     let token = Token::from_bytes(token);
@@ -448,7 +418,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
     let info_hash = arguments
         .remove(&b"info_hash".as_slice())
         .ok_or(OurError::DecodeError(eyre!("Query message has no 'info_hash' key")))?;
-    let BencodeItemView::ByteString(info_hash) = info_hash else {
+    let Value::Bytes(info_hash) = info_hash else {
         return Err(OurError::DecodeError(eyre!("'info_hash' key is not a binary string")));
     };
 
@@ -462,10 +432,7 @@ fn extract_announce_peer(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Re
 }
 
 /// `nodes` (IPv4, 26 bytes a node) or `nodes6` (IPv6, 38 bytes a node, BEP 32)
-fn extract_nodes(
-    response: &mut BTreeMap<&[u8], BencodeItemView>,
-    family: Family,
-) -> Result<Option<Vec<NodeInfo>>, OurError> {
+fn extract_nodes(response: &mut BTreeMap<&[u8], Value>, family: Family) -> Result<Option<Vec<NodeInfo>>, OurError> {
     let key: &[u8] = match family {
         Family::V4 => b"nodes",
         Family::V6 => b"nodes6",
@@ -474,7 +441,7 @@ fn extract_nodes(
         return Ok(None);
     };
 
-    let BencodeItemView::ByteString(nodes) = compact_nodes else {
+    let Value::Bytes(nodes) = compact_nodes else {
         return Err(OurError::DecodeError(eyre!(
             "'{}' key is not a binary string",
             String::from_utf8_lossy(key)
@@ -505,20 +472,20 @@ fn extract_nodes(
 }
 
 /// Peers come as 6-byte (IPv4) or 18-byte (IPv6) strings; BEP 32 lets a list mix them.
-fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Vec<SocketAddr>>, OurError> {
+fn extract_peers(response: &mut BTreeMap<&[u8], Value>) -> Result<Option<Vec<SocketAddr>>, OurError> {
     let values = response.remove(&b"values".as_slice());
     let Some(values) = values else {
         return Ok(None);
     };
 
-    let BencodeItemView::List(values) = values else {
+    let Value::List(values) = values else {
         return Err(OurError::DecodeError(eyre!("'values' key is not a list")));
     };
 
     let contacts: Vec<SocketAddr> = values
         .iter()
         .filter_map(|x| match x {
-            BencodeItemView::ByteString(s) => Some(s),
+            Value::Bytes(s) => Some(s),
             _ => {
                 info!("Encoutered one element in `values` list that isn't a string");
                 None
@@ -539,13 +506,13 @@ fn extract_peers(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Opti
     Ok(Some(contacts))
 }
 
-fn extract_token(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Token>, OurError> {
+fn extract_token(response: &mut BTreeMap<&[u8], Value>) -> Result<Option<Token>, OurError> {
     let token = response.remove(&b"token".as_slice());
     let Some(token) = token else {
         return Ok(None);
     };
 
-    let BencodeItemView::ByteString(token) = token else {
+    let Value::Bytes(token) = token else {
         return Err(OurError::DecodeError(eyre!("'token' key is not a binary string")));
     };
     let token = Token::from_bytes(token);
@@ -557,23 +524,19 @@ impl ParseKrpc for &[u8] {
     #[instrument(skip(self))]
     fn parse(&self) -> Result<Krpc, OurError> {
         // dicts with unsorted keys are accepted: plenty of live nodes send them
-        let (unused, mut parsed) =
-            parse_bencode_dict(self).map_err(|e| OurError::DecodeError(eyre!("nom complained: {e}")))?;
-        if !unused.is_empty() {
-            return Err(OurError::DecodeError(eyre!("trailing bytes after the bencode dict")));
-        }
+        let mut parsed = parse_dict(self).ok_or(OurError::DecodeError(eyre!("not one bencoded dict")))?;
 
         let message_type_indicator = parsed
             .remove(b"y".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message as no 'y' key")))?;
-        let BencodeItemView::ByteString(message_type) = message_type_indicator else {
+        let Value::Bytes(message_type) = message_type_indicator else {
             return Err(OurError::DecodeError(eyre!("Message 'y' key is not a binary string")));
         };
 
         let transaction_id = parsed
             .remove(&b"t".as_slice())
             .ok_or(OurError::DecodeError(eyre!("Message has no 't' key")))?;
-        let BencodeItemView::ByteString(transaction_id) = transaction_id else {
+        let Value::Bytes(transaction_id) = transaction_id else {
             return Err(OurError::DecodeError(eyre!("Message 't' key is not a binary string")));
         };
         let txn_id = TransactionId::from_bytes(transaction_id);
@@ -583,7 +546,7 @@ impl ParseKrpc for &[u8] {
             let error_body = parsed
                 .remove(b"e".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Error message has no 'e' key")))?;
-            let BencodeItemView::List(code_and_message) = error_body else {
+            let Value::List(code_and_message) = error_body else {
                 return Err(OurError::DecodeError(eyre!("'e' key is not a list")));
             };
 
@@ -596,7 +559,7 @@ impl ParseKrpc for &[u8] {
                     .ok_or(OurError::DecodeError(eyre!("Query message has no 'q' key")))?;
 
                 match query_type {
-                    BencodeItemView::ByteString(query_type) => query_type.to_vec().into_boxed_slice(),
+                    Value::Bytes(query_type) => query_type.to_vec().into_boxed_slice(),
                     _ => return Err(OurError::DecodeError(eyre!("'q' key is not a binary string"))),
                 }
             };
@@ -604,7 +567,7 @@ impl ParseKrpc for &[u8] {
             let arguments = parsed
                 .remove(&b"a".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Query message has no 'a' key")))?;
-            let BencodeItemView::Dictionary(mut arguments) = arguments else {
+            let Value::Dict(mut arguments) = arguments else {
                 return Err(OurError::DecodeError(eyre!("'a' key is not a dict")));
             };
 
@@ -632,14 +595,14 @@ impl ParseKrpc for &[u8] {
             let body = parsed
                 .remove(b"r".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Response message has no 'r' key")))?;
-            let BencodeItemView::Dictionary(mut response) = body else {
+            let Value::Dict(mut response) = body else {
                 return Err(OurError::DecodeError(eyre!("'r' key is not a dict")));
             };
 
             let id = response
                 .remove(b"id".as_slice())
                 .ok_or(OurError::DecodeError(eyre!("Response message has no 'id' key")))?;
-            let BencodeItemView::ByteString(target_id) = id else {
+            let Value::Bytes(target_id) = id else {
                 return Err(OurError::DecodeError(eyre!("'id' key is not a binary string")));
             };
             let target_id = NodeId::try_from_bytes(target_id)
@@ -711,7 +674,7 @@ impl ParseKrpc for &[u8] {
         };
 
         let ip = match parsed.remove(b"ip".as_slice()) {
-            Some(BencodeItemView::ByteString(raw)) => parse_compact_addr(raw),
+            Some(Value::Bytes(raw)) => parse_compact_addr(raw),
             _ => None,
         };
         let _ = parsed.remove(b"v".as_slice()); // user agent string
@@ -1685,6 +1648,14 @@ mod test {
         };
         let item = res.item().unwrap();
         assert_eq!((item.value.as_slice(), &item.signature), (b"i7e".as_slice(), &None));
+    }
+
+    #[test]
+    fn an_integer_past_i64_is_a_decode_error_not_a_panic() {
+        let msg = b"d1:ad2:id20:abcdefghij01234567894:porti99999999999999999999ee1:q4:ping1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+        let msg = b"d1:rd2:id20:0123456789abcdefghij3:seqi-99999999999999999999ee1:t2:aa1:y1:re" as &[u8];
+        assert!(msg.parse().is_err());
     }
 
     #[test]
