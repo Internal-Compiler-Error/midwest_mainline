@@ -229,12 +229,12 @@ fn parse_multihash(raw: &str) -> anyhow::Result<[u8; 32]> {
     decode_hex(digest)
 }
 
+/// Exactly `2 * N` hex digits, either case, as `N` bytes.
 pub(crate) fn decode_hex<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
+    ensure!(s.len() == 2 * N, "expected {} hex digits, got {}", 2 * N, s.len());
     let mut out = [0u8; N];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_val(s.as_bytes()[i * 2])?;
-        let lo = hex_val(s.as_bytes()[i * 2 + 1])?;
-        *byte = (hi << 4) | lo;
+    for (byte, &[hi, lo]) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
+        *byte = (hex_val(hi)? << 4) | hex_val(lo)?;
     }
     Ok(out)
 }
@@ -244,7 +244,7 @@ fn hex_val(c: u8) -> anyhow::Result<u8> {
         b'0'..=b'9' => Ok(c - b'0'),
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => bail!("invalid hex character {:?} in info hash", c as char),
+        _ => bail!("invalid hex character {:?}", c as char),
     }
 }
 
@@ -464,6 +464,15 @@ mod test {
 
     fn feed_of(uri: &str) -> FeedKey {
         parse_feed(uri).unwrap().unwrap()
+    }
+
+    #[test]
+    fn decode_hex_wants_exactly_its_digits() {
+        assert_eq!(decode_hex::<2>("0aFf").unwrap(), [0x0a, 0xff]);
+        assert!(decode_hex::<2>("0aF").is_err(), "short");
+        assert!(decode_hex::<2>("0aFf0").is_err(), "long");
+        assert!(decode_hex::<2>("+1ff").is_err());
+        assert!(decode_hex::<2>("é1f").is_err());
     }
 
     #[test]

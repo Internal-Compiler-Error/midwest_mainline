@@ -5,6 +5,7 @@
 //! into a `PeersDiscovered` for that swarm.
 
 use crate::events::PeerSource;
+use crate::magnet::decode_hex;
 use crate::settings::LSD_INTERVAL;
 use crate::torrent_swarm::TorrentSwarmHandle;
 use midwest_mainline::types::InfoHash;
@@ -166,17 +167,7 @@ pub(crate) fn parse_bt_search(bytes: &[u8]) -> Option<BtSearch> {
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
             "port" => port = value.parse().ok(),
-            "infohash" => {
-                if value.len() == 40
-                    && value.bytes().all(|b| b.is_ascii_hexdigit())
-                    && let Ok(bytes) = (0..40)
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
-                        .collect::<Result<Vec<u8>, _>>()
-                {
-                    info_hashes.push(InfoHash::from_bytes(&bytes));
-                }
-            }
+            "infohash" => info_hashes.extend(decode_hex::<20>(value).map(InfoHash)),
             "cookie" => cookie = Some(value.to_string()),
             _ => {}
         }
@@ -225,10 +216,7 @@ mod test {
         let multibyte = "BT-SEARCH * HTTP/1.1\r\nPort: 1\r\nInfohash: 0é102030405060708090A0B0C0D0E0F10111213\r\n\r\n";
         assert!(parse_bt_search(multibyte.as_bytes()).is_none());
         let signed = b"BT-SEARCH * HTTP/1.1\r\nPort: 1\r\nInfohash: +1+2030405060708090A0B0C0D0E0F1011121314\r\n\r\n";
-        assert!(
-            parse_bt_search(signed).is_none(),
-            "from_str_radix alone would take a '+'"
-        );
+        assert!(parse_bt_search(signed).is_none(), "not hex");
     }
 
     #[test]
