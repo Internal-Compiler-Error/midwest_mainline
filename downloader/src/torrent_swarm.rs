@@ -237,7 +237,10 @@ pub(crate) enum SwarmEvent {
     /// a hybrid's pieces that failed `recheck_by_layer`
     Rechecked(Vec<u32>),
     /// the answer to a hash request below the piece layer, see `answer_from_data`
-    HashesRead { to: SocketAddr, reply: BtMessage },
+    HashesRead {
+        to: SocketAddr,
+        reply: BtMessage,
+    },
     /// a web seed's job (see `start_web_job`) fetched a block
     WebSeedBlock {
         seed: usize,
