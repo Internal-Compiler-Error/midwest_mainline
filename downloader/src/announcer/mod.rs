@@ -96,6 +96,8 @@ pub(crate) struct Announcing {
     /// a swarm of its own) so v2-only peers find us
     pub v2: Option<InfoHash>,
     pub trackers: Vec<String>,
+    /// BEP 27: a private torrent's peers come from its trackers alone, so no DHT
+    pub private: bool,
     pub dht: DhtWatch,
     pub identity: Arc<Identity>,
     /// what to tell the trackers about our progress
@@ -149,6 +151,7 @@ pub(crate) fn spawn_announcers(torrent: Announcing) -> watch::Receiver<Vec<Track
         info_hash,
         v2,
         trackers,
+        private,
         dht,
         identity,
         stats,
@@ -164,7 +167,7 @@ pub(crate) fn spawn_announcers(torrent: Announcing) -> watch::Receiver<Vec<Track
     };
     let mut planned: Vec<(String, Result<Source, String>, InfoHash)> = vec![];
     // a watch whose sender is gone is a client with no DHT, now or ever; no row for it
-    if dht.has_changed().is_ok() {
+    if !private && dht.has_changed().is_ok() {
         planned.extend(
             per_hash("DHT")
                 .into_iter()
@@ -259,6 +262,7 @@ mod test {
     pub(super) fn announcing(events: &mpsc::Sender<SwarmEvent>) -> Announcing {
         Announcing {
             trackers: vec![],
+            private: false,
             info_hash: InfoHash::from_bytes(&[2; 20]),
             identity: Arc::new(Identity {
                 peer_id: [1; 20],
@@ -429,6 +433,25 @@ mod test {
         let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
         assert_eq!(urls, ["DHT", "http://127.0.0.1:1/announce"]);
         drop(dht_tx);
+        shutdown.cancel();
+    }
+
+    /// BEP 27: a private torrent's peers come from its trackers alone, so it never goes near
+    /// the DHT, however ready the node is.
+    #[tokio::test]
+    async fn a_private_torrent_is_not_announced_to_the_dht() {
+        let (events, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let (_dht_tx, dht_rx) = watch::channel(None);
+        let rows = spawn_announcers(Announcing {
+            trackers: vec!["http://127.0.0.1:1/announce".to_string()],
+            private: true,
+            shutdown: shutdown.clone(),
+            dht: dht_rx,
+            ..announcing(&events)
+        });
+        let urls: Vec<String> = rows.borrow().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(urls, ["http://127.0.0.1:1/announce"]);
         shutdown.cancel();
     }
 }

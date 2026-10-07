@@ -99,6 +99,8 @@ pub async fn fetch(
     let _stop_announcers = announcers.clone().drop_guard();
     spawn_announcers(Announcing {
         trackers: magnet.trackers.clone(),
+        // whether it's private (BEP 27) is in the metadata this fetches
+        private: false,
         info_hash: magnet.info_hash,
         identity: identity.clone(),
         stats: watch::channel(placeholder_stats()).1,

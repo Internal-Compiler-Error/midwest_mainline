@@ -396,6 +396,7 @@ impl TorrentSwarm {
         let announcers = CancellationToken::new();
         let trackers = spawn_announcers(Announcing {
             trackers: torrent.all_trackers(),
+            private: torrent.private,
             info_hash: torrent.info_hash,
             identity: id.clone(),
             stats: stat_rx.clone(),
