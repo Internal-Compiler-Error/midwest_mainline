@@ -116,6 +116,9 @@ the same way, and deletes stale peers on a timer. The node's log (DEBUG, fixed i
 index mode only); `$D rpc sampled` counts what it found (`info_hashes`, about 10k after the
 first minute) and how many nodes it asked and heard back from (about half answer).
 `$D rpc node_counts` splits the routing tables by family and BEP 42 compliance.
+`stored_swarms` returns a page (`'{"after":"<hex>","limit":100}'`, 1000 by default). The RPC
+listens on loopback unless `RPC_ADDR` says otherwise; `TOKIO_CONSOLE=1` turns on tokio-console
+(it holds every task for an hour, ~150 MB after two minutes, so it's off by default).
 
 **Traces in Jaeger** (optional, for developers; users get the Traces pane). The image is
 pulled already (`docker.io/jaegertracing/jaeger:latest` in Podman). Any run with
@@ -246,14 +249,14 @@ binary) and no DHT, so they run offline.
 - **The uTP crate parents its connection spans on the current span**, so anything that
   connects uTP inside one of our spans keeps that span open for the connection's life (it
   showed as 408 "dialling" with a 256-dial cap). `stream.rs` gives uTP connects a root span.
-- **`krpc.py` adds itself to the node's routing table** as a `127.0.0.1` contact, one per
-  run (the node learns from everyone who talks to it). Harmless in the scratch database,
-  but don't point it at the user's own.
+- **`krpc.py` doesn't end up in the node's routing table**: a node that queries us is pinged
+  first and joins only by answering, which the script, gone by then, never does. Likewise the
+  table holds only nodes that answered: after two minutes ~1000 IPv4 nodes, ~96% of them alive.
 - **A fresh index node collects no real announces for a long while.** Peers announce to the
   nodes closest to a torrent's hash, and a new node with a random id is close to almost
   nothing; `stored_swarms` stays `[]` for minutes. Use `krpc announce` to exercise the index.
-- **`json_rpc_server` reports errors inside `result`** (`{"result":{"code":-32602,...}}`),
-  not in a JSON-RPC `error` member, so check the body, not just the HTTP status.
+- **`json_rpc_server` answers 25 queries a second per address** (LAN and loopback exempt),
+  so a test from a public address that floods it sees the rest go unanswered.
 
 ## Troubleshooting
 
