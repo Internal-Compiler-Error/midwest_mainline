@@ -53,16 +53,37 @@
         return t.completed ? 'seeding' : 'downloading'
     }
   }
+
+  /** the one row in the tab order: the selected one, arrow keys move between rows */
+  let tabStop = $derived(torrents.some((t) => t.id === selected) ? selected : torrents[0]?.id)
+
+  const STEPS: Record<string, (at: number) => number> = {
+    ArrowDown: (at) => at + 1,
+    ArrowUp: (at) => at - 1,
+    Home: () => 0,
+    End: () => torrents.length - 1,
+  }
+
+  function onkeydown(e: KeyboardEvent & { currentTarget: HTMLElement }, at: number) {
+    if (e.target !== e.currentTarget) return
+    if (e.key === 'Enter') return onselect(torrents[at].id)
+    const step = STEPS[e.key]
+    if (!step) return
+    e.preventDefault()
+    const to = Math.max(0, Math.min(torrents.length - 1, step(at)))
+    onselect(torrents[to].id)
+    ;(e.currentTarget.parentElement?.children[to] as HTMLElement | undefined)?.focus()
+  }
 </script>
 
 <Table.Root>
   <Table.Body>
-    {#each torrents as t (t.id)}
+    {#each torrents as t, i (t.id)}
       <Table.Row
         data-state={t.id === selected ? 'selected' : undefined}
-        tabindex={0}
+        tabindex={t.id === tabStop ? 0 : -1}
         onclick={() => onselect(t.id)}
-        onkeydown={(e) => e.key === 'Enter' && e.target === e.currentTarget && onselect(t.id)}
+        onkeydown={(e) => onkeydown(e, i)}
       >
         <Table.Cell class="w-full max-w-0 truncate" title={name(t)}>{name(t)}</Table.Cell>
         <Table.Cell class="w-44 min-w-44">
