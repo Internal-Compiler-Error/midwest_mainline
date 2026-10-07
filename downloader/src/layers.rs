@@ -362,19 +362,6 @@ mod test {
         SocketAddr::from(([10, 0, 0, n], 6881))
     }
 
-    /// The piece stream of a v2 torrent of `files`: each padded to a piece boundary but the last.
-    fn stream(files: &[(&[&str], Vec<u8>)]) -> Vec<u8> {
-        let mut out = vec![];
-        let last = files.iter().rposition(|(_, d)| !d.is_empty()).unwrap();
-        for (i, (_, d)) in files.iter().enumerate() {
-            out.extend_from_slice(d);
-            if i != last {
-                out.resize(out.len().next_multiple_of(P), 0);
-            }
-        }
-        out
-    }
-
     /// Every layer of `data`'s tree from the leaves up, straight from BEP 52's definition.
     fn full_tree(data: &[u8]) -> Vec<Vec<Hash>> {
         let mut leaves = merkle::leaves(data);
@@ -409,7 +396,7 @@ mod test {
     fn answers_leaf_requests_from_the_data() {
         let files = files();
         let t = parse_torrent(&fixtures::torrent_file("v2", &files, P, false)).unwrap();
-        let data = stream(&files);
+        let data = fixtures::stream(&files, P);
         let req = |root, base, index, length, proof_layers| HashRequest {
             root,
             base,

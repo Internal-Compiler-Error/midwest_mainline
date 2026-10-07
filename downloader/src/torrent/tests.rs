@@ -418,17 +418,8 @@ fn files() -> Vec<(&'static [&'static str], Vec<u8>)> {
     ])
 }
 
-/// The piece stream: each file padded to a piece boundary but the last.
 fn stream(files: &[(&[&str], Vec<u8>)]) -> Vec<u8> {
-    let mut out = vec![];
-    let last = files.iter().rposition(|(_, d)| !d.is_empty()).unwrap();
-    for (i, (_, d)) in files.iter().enumerate() {
-        out.extend_from_slice(d);
-        if i != last {
-            out.resize(out.len().next_multiple_of(P), 0);
-        }
-    }
-    out
+    fixtures::stream(files, P)
 }
 
 #[test]

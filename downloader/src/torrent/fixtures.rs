@@ -51,6 +51,20 @@ pub fn sorted<'a>(files: &[(&'a [&'a str], Vec<u8>)]) -> Vec<(&'a [&'a str], Vec
     files
 }
 
+/// The piece stream of `files` in pieces of `piece` bytes: each file padded to a piece
+/// boundary but the last.
+pub fn stream(files: &[(&[&str], Vec<u8>)], piece: usize) -> Vec<u8> {
+    let mut out = vec![];
+    let last = files.iter().rposition(|(_, d)| !d.is_empty()).unwrap();
+    for (i, (_, d)) in files.iter().enumerate() {
+        out.extend_from_slice(d);
+        if i != last {
+            out.resize(out.len().next_multiple_of(piece), 0);
+        }
+    }
+    out
+}
+
 /// The info dict of a torrent `name` holding `files` (already in file tree order), in
 /// pieces of `piece` bytes; a hybrid also gets the v1 keys, padding files included.
 pub fn info(name: &str, files: &[(&[&str], Vec<u8>)], piece: usize, hybrid: bool) -> Vec<u8> {
