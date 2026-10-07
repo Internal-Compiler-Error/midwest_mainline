@@ -387,8 +387,8 @@ pub struct TorrentSwarm {
     peers: Vec<Peer>,
     /// addresses with a dial in progress, so the same peer isn't dialed twice
     dialing: BTreeSet<SocketAddr>,
-    /// every address that ever connected, disconnected, or failed to dial; not pruned, a
-    /// swarm sees a few thousand at most
+    /// every address that connected, disconnected, or failed to dial; pruned once it's large
+    /// (see `prune_known`)
     known: BTreeMap<SocketAddr, KnownPeer>,
     /// every peer's reader delivers here (see `Peer`)
     inbox: Inbox,
@@ -735,11 +735,31 @@ impl TorrentSwarm {
 
         self.schedule().await;
         self.send_held_uploads().await;
+        self.prune_known();
         self.publish_stats();
         self.sample_peers();
         let _ = self
             .peers_snapshot_tx
             .send(self.peers.iter().map(Peer::snapshot).collect());
+    }
+
+    /// Keeps `known` from growing without bound over a long seed: past `KNOWN_PEERS_MAX`, the
+    /// entries that remember nothing worth keeping go (never delivered, not banned, not
+    /// connected or being dialled, not waiting out a dial backoff).
+    fn prune_known(&mut self) {
+        if self.known.len() <= KNOWN_PEERS_MAX {
+            return;
+        }
+        let now = Instant::now();
+        let peers = &self.peers;
+        let dialing = &self.dialing;
+        self.known.retain(|addr, k| {
+            k.stats.received > 0
+                || k.banned(now)
+                || k.dial_after.is_some_and(|after| after > now)
+                || dialing.contains(addr)
+                || peers.binary_search_by_key(addr, |p| p.remote_addr).is_ok()
+        });
     }
 
     /// Sends blocks the upload limit held back, as far as it allows now. A block for a peer
@@ -1901,9 +1921,10 @@ impl TorrentSwarm {
 
         let all: Vec<(SocketAddr, u8)> = self.peers.iter().map(|p| (p.remote_addr, p.pex_flags())).collect();
         self.broadcast(move |peer| {
-            // BEP 11 recommends capping a single PEX message at roughly 50 added peers
+            // BEP 11 recommends capping a single PEX message at roughly 50 added peers; a
+            // fresh random sample each round, so over time every peer hears of the whole swarm
             let added: Vec<(SocketAddr, u8)> = all
-                .iter()
+                .sample(&mut rand::rng(), PEX_MAX_ADDED_PEERS + 1)
                 .copied()
                 .filter(|(a, _)| *a != peer.remote_addr)
                 .take(PEX_MAX_ADDED_PEERS)
@@ -1926,6 +1947,9 @@ impl TorrentSwarm {
 fn upload_slots(interested: usize) -> usize {
     MAX_UNCHOKED_PEERS.max(interested.isqrt() + 1)
 }
+
+/// See `prune_known`. A few thousand is a busy swarm's worth over days.
+const KNOWN_PEERS_MAX: usize = 20_000;
 
 /// See `MAX_HALF_OPEN`.
 static HALF_OPEN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_HALF_OPEN);
