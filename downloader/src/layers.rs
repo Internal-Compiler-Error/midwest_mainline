@@ -742,10 +742,11 @@ mod test {
         download("hyswarm", full, bare, &files).await;
     }
 
-    /// A hybrid whose halves disagree about one piece of `more`: the leecher had all of it
-    /// verified by SHA-1, and once the layer comes that piece is checked again and dropped.
+    /// A hybrid whose halves disagree about one piece of `more` still downloads: the piece
+    /// passes SHA-1, so it's taken, and the leecher stops trusting (and answering with) its
+    /// v2 hashes.
     #[tokio::test]
-    async fn pieces_sha1_passed_are_rechecked_when_the_layer_comes() {
+    async fn an_inconsistent_hybrid_still_downloads() {
         use bitvec::prelude::*;
         let files = files();
         let mut other = files.clone();
@@ -762,15 +763,18 @@ mod test {
         let file = bare.file_with_root(&fixtures::root(&other[more].1)).unwrap();
         let bad = bare.pieces_of_file(file).start + 1;
 
-        let all = bitbox![u8, Msb0; 1; bare.num_pieces()];
-        let clients = two_clients("hyrecheck", &full, &bare, &files, all);
-        let mut stats = clients.leecher.stats(&bare).unwrap();
-        tokio::time::timeout(Duration::from_secs(30), stats.wait_for(|s| !s.verified[bad as usize]))
+        // the leecher has the layers (a .torrent) and lacks only the piece they disagree on
+        let leeching = parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).unwrap();
+        let mut had = bitbox![u8, Msb0; 1; bare.num_pieces()];
+        had.set(bad as usize, false);
+        let clients = two_clients("hyrecheck", &full, &leeching, &files, had);
+        let mut stats = clients.leecher.stats(&leeching).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), stats.wait_for(|s| s.verified.all()))
             .await
-            .expect("the piece was dropped")
+            .expect("the piece came in")
             .unwrap();
-        assert_eq!(stats.borrow().verified.count_zeros(), 1, "only that one");
-        assert!(bare.layer(file).is_some());
+        assert!(!leeching.v2_consistent());
+        assert!(full.v2_consistent(), "the seed never checked that piece");
     }
 
     /// A seeder answers a leaf-layer request on the wire, from what it has on disk.

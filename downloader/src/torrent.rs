@@ -106,6 +106,10 @@ pub struct V2 {
     /// than one piece have one; a smaller file's root is its one piece's hash. Clones share
     /// it, so a layer that arrives in the swarm's copy is in the session's for the resume file.
     layers: Arc<[OnceLock<Box<[Hash]>>]>,
+    /// set once a hybrid's piece passed SHA-1 but not its v2 hash: the halves disagree, and
+    /// as the v1 info hash covers the whole info dict, SHA-1 alone decides from then on.
+    /// Shared by clones, like `layers`
+    inconsistent: Arc<OnceLock<()>>,
 }
 
 /// Represents a parsed torrent metadata file
@@ -222,13 +226,35 @@ impl Torrent {
     /// hash and, once its file's piece layer is known, its Merkle hash. A v2-only piece whose
     /// file's piece layer isn't known yet can't be checked, and fails.
     pub fn valid_piece(&self, piece: u32, data: &[u8]) -> bool {
-        if !self.v2_only() && *Sha1::digest(data) != self.pieces[piece as usize] {
+        let v2_valid = |(expected, len, leaves): (Hash, usize, usize)| {
+            data.len() >= len && merkle::data_root(&data[..len], leaves) == expected
+        };
+        if self.v2_only() {
+            return self.v2_piece_hash(piece).is_some_and(v2_valid);
+        }
+        if *Sha1::digest(data) != self.pieces[piece as usize] {
             return false;
         }
-        match self.v2_piece_hash(piece) {
-            Some((expected, len, leaves)) => data.len() >= len && merkle::data_root(&data[..len], leaves) == expected,
-            None => !self.v2_only(),
+        // data can't be forged to pass SHA-1, so a v2 mismatch here is the torrent's fault,
+        // not the peer's: no peer could ever send a piece that passes both
+        if self.v2_consistent()
+            && let Some(expected) = self.v2_piece_hash(piece)
+            && !v2_valid(expected)
+            && let Some(v2) = &self.v2
+            && v2.inconsistent.set(()).is_ok()
+        {
+            tracing::warn!(
+                "{}: piece {piece} matches its SHA-1 hash but not its v2 hash; the hybrid's halves disagree, so SHA-1 alone checks it from now on",
+                self.name
+            );
         }
+        true
+    }
+
+    /// False once a hybrid turned out to describe different data in its two halves; its v2
+    /// hashes are then neither checked nor handed to peers.
+    pub fn v2_consistent(&self) -> bool {
+        self.v2.as_ref().is_some_and(|v2| v2.inconsistent.get().is_none())
     }
 
     /// Whether `valid_piece` can tell for `piece`: always, but for a v2-only torrent from a
@@ -775,6 +801,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
             info_hash: Sha256::digest(&raw_info).into(),
             layers: (0..roots.len()).map(|_| OnceLock::new()).collect(),
             roots,
+            inconsistent: Arc::default(),
         });
     }
     let info_hash = match &torrent_v2 {
@@ -1628,10 +1655,11 @@ mod test {
         assert!(parse_torrent(&crate::metadata::build_torrent_file_with(&info, &[], Some(&layers))).is_err());
     }
 
-    /// The halves of a hybrid must agree on every piece: here the v1 hashes describe one `d`
-    /// and the file tree another, so `d`'s second piece passes neither way.
+    /// A hybrid whose halves disagree: here the v1 hashes describe one `d` and the file tree
+    /// another. Data that passes SHA-1 is good (nothing else could pass it), so the piece is
+    /// taken, and the torrent's v2 hashes stop counting.
     #[test]
-    fn a_hybrid_piece_must_match_both_hashes() {
+    fn an_inconsistent_hybrid_trusts_sha1() {
         let files = files();
         let mut other = files.clone();
         other[2].1[40_000] ^= 1;
@@ -1650,10 +1678,19 @@ mod test {
             assert!(t.valid_piece(i as u32, &piece(&ours, i)), "piece {i}");
         }
         assert!(
-            !t.valid_piece(3, &piece(&ours, 3)),
+            !t.valid_piece(3, &piece(&theirs, 3)),
+            "the Merkle tree agrees, SHA-1 doesn't"
+        );
+        assert!(t.v2_consistent());
+        assert!(
+            t.valid_piece(3, &piece(&ours, 3)),
             "SHA-1 agrees, the Merkle tree doesn't"
         );
-        assert!(!t.valid_piece(3, &piece(&theirs, 3)), "the other way round");
+        assert!(
+            !t.v2_consistent() && !t.clone().v2_consistent(),
+            "flagged, for clones too"
+        );
+        assert!(!t.valid_piece(3, &piece(&theirs, 3)), "still SHA-1's call");
 
         // without the piece layers (as from a magnet), only SHA-1 can tell
         let bare = parse_torrent(&crate::metadata::build_torrent_file(&info, &[])).unwrap();
