@@ -43,10 +43,7 @@ fn masked_crc<const N: usize>(x: &[u8; N], y: &[u8; N], whole: usize) -> u32 {
     };
     let (x, y) = (mask(x), mask(y));
     let (lo, hi) = if x <= y { (x, y) } else { (y, x) };
-    let mut buf = Vec::with_capacity(2 * N);
-    buf.extend_from_slice(&lo);
-    buf.extend_from_slice(&hi);
-    crc32c::crc32c(&buf)
+    crc32c::crc32c_append(crc32c::crc32c(&lo), &hi)
 }
 
 fn canonical(addr: SocketAddr) -> SocketAddr {
