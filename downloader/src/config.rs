@@ -30,6 +30,10 @@ pub struct Settings {
     pub download_dir: PathBuf,
     /// run a DHT node; off means peers come from trackers and PEX only. Next start.
     pub dht: bool,
+    /// BEP 43: the DHT node asks but never answers, and other nodes leave it out of their
+    /// routing tables; for a host that can't take inbound UDP or is on a metered link. Next
+    /// start.
+    pub dht_read_only: bool,
     /// connections per torrent, inbound and outbound together, 0 for no limit; applies live
     pub max_peers_per_torrent: usize,
     /// bytes per second across all torrents, 0 for no limit; applies live
@@ -56,6 +60,7 @@ impl Default for Settings {
             listen_port: 6881,
             download_dir: default_download_dir(),
             dht: true,
+            dht_read_only: false,
             max_peers_per_torrent: 0,
             download_limit: 0,
             upload_limit: 0,

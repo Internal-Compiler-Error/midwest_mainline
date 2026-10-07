@@ -77,6 +77,11 @@
         <Label for="dht">DHT</Label>
         <Switch id="dht" bind:checked={draft.dht} />
 
+        <Label for="dht-read-only" title="asks but never answers; for a host that can't take inbound UDP (BEP 43)"
+          >DHT read-only</Label
+        >
+        <Switch id="dht-read-only" bind:checked={draft.dht_read_only} disabled={!draft.dht} />
+
         <Label for="utp">uTP</Label>
         <Switch id="utp" bind:checked={draft.utp} />
 

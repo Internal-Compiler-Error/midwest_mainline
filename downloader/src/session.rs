@@ -1173,6 +1173,7 @@ impl Session {
                 Dht::start(
                     config.data_dir.join("dht.db"),
                     config.settings.dht_port(),
+                    config.settings.dht_read_only,
                     events.clone(),
                 )
             });

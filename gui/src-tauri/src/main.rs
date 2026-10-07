@@ -415,6 +415,7 @@ struct SettingsDto {
     listen_port: u16,
     download_dir: String,
     dht: bool,
+    dht_read_only: bool,
     max_peers_per_torrent: usize,
     download_limit: u64,
     upload_limit: u64,
@@ -431,6 +432,7 @@ impl From<Settings> for SettingsDto {
             listen_port: s.listen_port,
             download_dir: s.download_dir.display().to_string(),
             dht: s.dht,
+            dht_read_only: s.dht_read_only,
             max_peers_per_torrent: s.max_peers_per_torrent,
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
@@ -449,6 +451,7 @@ impl From<SettingsDto> for Settings {
             listen_port: s.listen_port,
             download_dir: s.download_dir.into(),
             dht: s.dht,
+            dht_read_only: s.dht_read_only,
             max_peers_per_torrent: s.max_peers_per_torrent,
             download_limit: s.download_limit,
             upload_limit: s.upload_limit,
@@ -474,6 +477,7 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
     let settings: Settings = settings.into();
     let restart = settings.listen_port != before.listen_port
         || settings.dht != before.dht
+        || settings.dht_read_only != before.dht_read_only
         || settings.encryption != before.encryption
         || settings.utp != before.utp
         || settings.port_mapping != before.port_mapping;

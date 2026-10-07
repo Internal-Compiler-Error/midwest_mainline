@@ -149,6 +149,8 @@ export interface Settings {
   listen_port: number
   download_dir: string
   dht: boolean
+  /** BEP 43: the DHT node asks but never answers; for hosts that can't take inbound UDP */
+  dht_read_only: boolean
   max_peers_per_torrent: number
   /** bytes per second, 0 for no limit */
   download_limit: number

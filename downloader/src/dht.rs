@@ -108,10 +108,11 @@ pub struct Dht {
 impl Dht {
     /// Starts the nodes on the current tokio runtime, listening on UDP `port` (or any free
     /// port if that one is taken) and keeping their routing tables in the database at `db`.
-    pub fn start(db: PathBuf, port: u16, bus: EventBus) -> Dht {
+    /// `read_only` makes them BEP 43 read-only nodes.
+    pub fn start(db: PathBuf, port: u16, read_only: bool, bus: EventBus) -> Dht {
         let (tx, rx) = watch::channel(None);
         let stop = CancellationToken::new();
-        tokio::spawn(run(db, port, tx, stop.clone(), bus));
+        tokio::spawn(run(db, port, read_only, tx, stop.clone(), bus));
         Dht {
             handle: rx,
             _stop: stop.drop_guard(),
@@ -131,14 +132,21 @@ impl Dht {
 
 /// A node on `socket` with its database at `db`, off the async threads (opening the database
 /// migrates it)
-async fn open(socket: UdpSocket, db: String) -> anyhow::Result<Arc<DhtSession>> {
+async fn open(socket: UdpSocket, db: String, read_only: bool) -> anyhow::Result<Arc<DhtSession>> {
     // the crate learns our external address from other nodes and derives the BEP 42 node id
     // from it at the next start
     let session = tokio::task::spawn_blocking(move || DhtSession::with_stable_id(socket, None, &db)).await??;
-    Ok(Arc::new(session))
+    Ok(Arc::new(session.with_read_only(read_only)))
 }
 
-async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, stop: CancellationToken, bus: EventBus) {
+async fn run(
+    db: PathBuf,
+    port: u16,
+    read_only: bool,
+    ready: watch::Sender<Option<DhtHandle>>,
+    stop: CancellationToken,
+    bus: EventBus,
+) {
     let socket = match bind(port).await {
         Ok(socket) => socket,
         Err(e) => {
@@ -158,7 +166,7 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
     let udp_port6 = socket6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
 
     let db = db.display().to_string();
-    let session = match open(socket, db.clone()).await {
+    let session = match open(socket, db.clone(), read_only).await {
         Ok(session) => session,
         Err(e) => {
             warn!("no DHT: couldn't open its database ({e:#})");
@@ -166,7 +174,7 @@ async fn run(db: PathBuf, port: u16, ready: watch::Sender<Option<DhtHandle>>, st
         }
     };
     let session6 = match socket6 {
-        Some(socket) => match open(socket, db).await {
+        Some(socket) => match open(socket, db, read_only).await {
             Ok(session6) => {
                 session.pair_with(&session6);
                 Some(session6)
