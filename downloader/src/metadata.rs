@@ -497,7 +497,6 @@ mod test {
     }
 
     use super::*;
-    use crate::wire::{BtDecoder, BtEncoder};
     use tokio_util::codec::{FramedRead, FramedWrite};
 
     fn bencode_str(bytes: &[u8]) -> Vec<u8> {
@@ -618,8 +617,8 @@ mod test {
                     }
 
                     let (reader, writer) = tcp.into_split();
-                    let mut reader = FramedRead::new(reader, BtDecoder);
-                    let mut writer = FramedWrite::new(writer, BtEncoder);
+                    let mut reader = FramedRead::new(reader, BtCodec);
+                    let mut writer = FramedWrite::new(writer, BtCodec);
 
                     let handshake = format!("d1:md11:ut_metadatai{their_id}ee13:metadata_sizei{}ee", served.len());
                     if writer

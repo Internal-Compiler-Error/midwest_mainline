@@ -1,114 +1,38 @@
+//! The peer wire protocol: BEP 3's length-prefixed messages and the BEP 6, 10 and 52 ones
+//! that share the framing, and the handshake that comes before them.
+
 use crate::defs::Identity;
 use midwest_mainline::types::InfoHash;
 use std::io;
-use std::io::ErrorKind;
-use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_util::{
-    bytes::Buf,
-    codec::{Decoder, Encoder},
-};
+use tokio_util::bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
-use zerocopy::FromBytes;
-use zerocopy::Immutable;
-use zerocopy::IntoBytes;
-use zerocopy::KnownLayout;
-use zerocopy::Unaligned;
-
-pub trait Encode {
-    fn encode(&self, buf: &mut [u8]);
-}
-
-macro_rules! u32s_to_be_bytes {
-    ( $( $x:expr ),* ) => {
-        [
-            $(
-                (($x >> 24)& 0xFF) as u8,
-                (($x >> 16)& 0xFF) as u8,
-                (($x >> 8) & 0xFF) as u8,
-                ( $x       & 0xFF) as u8,
-            )*
-        ]
-    };
-}
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct KeepAlive;
-impl Encode for KeepAlive {
-    fn encode(&self, buf: &mut [u8]) {
-        buf.copy_from_slice(&0u32.to_be_bytes());
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Choke;
-impl Encode for Choke {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[0u8]);
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Unchoke;
-impl Encode for Unchoke {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[1u8]);
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Interested;
-impl Encode for Interested {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[2u8]);
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct NotInterested;
-impl Encode for NotInterested {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[3u8]);
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct Have {
     pub checked: u32,
 }
 
-impl Encode for Have {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&5u32.to_be_bytes());
-        header.copy_from_slice(&[4u8]);
-        body.copy_from_slice(&self.checked.to_be_bytes());
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BitField {
     pub has: Box<[u8]>,
-}
-
-impl Encode for BitField {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&(1 + self.has.len() as u32).to_be_bytes());
-        header.copy_from_slice(&[5u8]);
-        body.copy_from_slice(&self.has);
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
@@ -118,35 +42,14 @@ pub struct Request {
     pub length: u32,
 }
 
-impl Encode for Request {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&(1 + 12_u32).to_be_bytes());
-        header.copy_from_slice(&[6u8]);
-        body.copy_from_slice(&u32s_to_be_bytes!(self.index, self.begin, self.length));
-    }
-}
-
+/// A block. On the wire it's `<index><begin><data>`; `length` is `data`'s, for symmetry with
+/// `Request`.
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
     pub data: Box<[u8]>,
-}
-
-impl Encode for Piece {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&((1 + 8 + self.data.len()) as u32).to_be_bytes());
-        header.copy_from_slice(&[7u8]);
-        let (index_begin, data) = body.split_at_mut(8);
-        index_begin[0..4].copy_from_slice(&self.index.to_be_bytes());
-        index_begin[4..8].copy_from_slice(&self.begin.to_be_bytes());
-        data.copy_from_slice(&self.data);
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Default)]
@@ -156,16 +59,6 @@ pub struct Cancel {
     pub length: u32,
 }
 
-impl Encode for Cancel {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&(1 + 12u32).to_be_bytes());
-        header.copy_from_slice(&[8u8]);
-        body.copy_from_slice(&u32s_to_be_bytes!(self.index, self.begin, self.length));
-    }
-}
-
 /// BEP 6 (Fast Extension): an advisory hint that the sender suggests downloading this piece.
 /// Purely advisory -- a receiver is free to ignore it.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
@@ -173,27 +66,10 @@ pub struct SuggestPiece {
     pub piece: u32,
 }
 
-impl Encode for SuggestPiece {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&5u32.to_be_bytes());
-        header.copy_from_slice(&[13u8]);
-        body.copy_from_slice(&self.piece.to_be_bytes());
-    }
-}
-
 /// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has every piece --
 /// smaller than sending a full one-bits bitfield.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct HaveAll;
-impl Encode for HaveAll {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[14u8]);
-    }
-}
 
 /// BEP 5: the UDP port the peer's DHT node listens on, sent after the handshake by peers
 /// that set the DHT bit in the reserved bytes.
@@ -202,26 +78,9 @@ pub struct Port {
     pub port: u16,
 }
 
-impl Encode for Port {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&3u32.to_be_bytes());
-        header.copy_from_slice(&[9u8]);
-        body.copy_from_slice(&self.port.to_be_bytes());
-    }
-}
-
 /// BEP 6 (Fast Extension): sent in place of `BitField` when the sender has no pieces at all.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct HaveNone;
-impl Encode for HaveNone {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        length.copy_from_slice(&1u32.to_be_bytes());
-        header.copy_from_slice(&[15u8]);
-    }
-}
 
 /// BEP 6 (Fast Extension): once the fast extension is enabled for a connection, a peer MUST
 /// send this for any `Request` it declines to service, instead of the classic protocol's
@@ -233,31 +92,11 @@ pub struct RejectRequest {
     pub length: u32,
 }
 
-impl Encode for RejectRequest {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&(1 + 12u32).to_be_bytes());
-        header.copy_from_slice(&[16u8]);
-        body.copy_from_slice(&u32s_to_be_bytes!(self.index, self.begin, self.length));
-    }
-}
-
 /// BEP 6 (Fast Extension): a hint that the receiver may request this piece even while choked.
 /// Purely advisory -- acting on it is optional for the receiver.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Default, Hash, PartialOrd, Ord)]
 pub struct AllowedFast {
     pub piece: u32,
-}
-
-impl Encode for AllowedFast {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&5u32.to_be_bytes());
-        header.copy_from_slice(&[17u8]);
-        body.copy_from_slice(&self.piece.to_be_bytes());
-    }
 }
 
 /// BEP 10 extension protocol message: `<len><id=20><ext_id><payload>`. `ext_id` 0 is always the
@@ -267,18 +106,6 @@ impl Encode for AllowedFast {
 pub struct Extended {
     pub ext_id: u8,
     pub payload: Box<[u8]>,
-}
-
-impl Encode for Extended {
-    fn encode(&self, buf: &mut [u8]) {
-        let (length, header) = buf.split_at_mut(4);
-        let (header, body) = header.split_at_mut(1);
-        length.copy_from_slice(&((1 + 1 + self.payload.len()) as u32).to_be_bytes());
-        header.copy_from_slice(&[20u8]);
-        let (ext_id_byte, payload) = body.split_at_mut(1);
-        ext_id_byte[0] = self.ext_id;
-        payload.copy_from_slice(&self.payload);
-    }
 }
 
 /// BEP 52 `hash request` (id 21) and `hash reject` (id 23): which hashes of the tree under
@@ -296,18 +123,14 @@ pub struct HashRequest {
 impl HashRequest {
     const LEN: usize = 32 + 16;
 
-    fn encode_as(&self, id: u8, extra: usize, buf: &mut [u8]) {
-        buf[..4].copy_from_slice(&((1 + Self::LEN + extra) as u32).to_be_bytes());
-        buf[4] = id;
-        buf[5..37].copy_from_slice(&self.root);
-        buf[37..53].copy_from_slice(&u32s_to_be_bytes!(
-            self.base,
-            self.index,
-            self.length,
-            self.proof_layers
-        ));
+    fn put(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.root);
+        for n in [self.base, self.index, self.length, self.proof_layers] {
+            dst.put_u32(n);
+        }
     }
 
+    /// From a payload of at least `LEN` bytes.
     fn decode(buf: &[u8]) -> Self {
         Self {
             root: buf[..32].try_into().unwrap(),
@@ -349,97 +172,120 @@ pub(crate) enum BtMessage {
     HashRequest(HashRequest),
     Hashes(Hashes),
     HashReject(HashRequest),
-    Unknown(u8, #[allow(unused)] Box<[u8]>),
+    Unknown(u8, Box<[u8]>),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BtEncoder;
+/// The message ids, for encoding and decoding alike.
+mod id {
+    pub const CHOKE: u8 = 0;
+    pub const UNCHOKE: u8 = 1;
+    pub const INTERESTED: u8 = 2;
+    pub const NOT_INTERESTED: u8 = 3;
+    pub const HAVE: u8 = 4;
+    pub const BITFIELD: u8 = 5;
+    pub const REQUEST: u8 = 6;
+    pub const PIECE: u8 = 7;
+    pub const CANCEL: u8 = 8;
+    pub const PORT: u8 = 9;
+    pub const SUGGEST_PIECE: u8 = 13;
+    pub const HAVE_ALL: u8 = 14;
+    pub const HAVE_NONE: u8 = 15;
+    pub const REJECT_REQUEST: u8 = 16;
+    pub const ALLOWED_FAST: u8 = 17;
+    pub const EXTENDED: u8 = 20;
+    pub const HASH_REQUEST: u8 = 21;
+    pub const HASHES: u8 = 22;
+    pub const HASH_REJECT: u8 = 23;
+}
 
-impl Encoder<BtMessage> for BtEncoder {
-    type Error = io::Error;
+impl BtMessage {
+    /// The message id; `None` for a keep-alive, which has none.
+    fn id(&self) -> Option<u8> {
+        Some(match self {
+            BtMessage::KeepAlive(_) => return None,
+            BtMessage::Choke(_) => id::CHOKE,
+            BtMessage::Unchoke(_) => id::UNCHOKE,
+            BtMessage::Interested(_) => id::INTERESTED,
+            BtMessage::NotInterested(_) => id::NOT_INTERESTED,
+            BtMessage::Have(_) => id::HAVE,
+            BtMessage::BitField(_) => id::BITFIELD,
+            BtMessage::Request(_) => id::REQUEST,
+            BtMessage::Piece(_) => id::PIECE,
+            BtMessage::Cancel(_) => id::CANCEL,
+            BtMessage::Port(_) => id::PORT,
+            BtMessage::SuggestPiece(_) => id::SUGGEST_PIECE,
+            BtMessage::HaveAll(_) => id::HAVE_ALL,
+            BtMessage::HaveNone(_) => id::HAVE_NONE,
+            BtMessage::RejectRequest(_) => id::REJECT_REQUEST,
+            BtMessage::AllowedFast(_) => id::ALLOWED_FAST,
+            BtMessage::Extended(_) => id::EXTENDED,
+            BtMessage::HashRequest(_) => id::HASH_REQUEST,
+            BtMessage::Hashes(_) => id::HASHES,
+            BtMessage::HashReject(_) => id::HASH_REJECT,
+            BtMessage::Unknown(id, _) => *id,
+        })
+    }
 
-    fn encode(&mut self, item: BtMessage, dst: &mut tokio_util::bytes::BytesMut) -> Result<(), Self::Error> {
-        // Total on-wire size, including the 4-byte length prefix itself.
-        let total_len = match &item {
-            BtMessage::KeepAlive(_) => 4,
-            BtMessage::Choke(_) => 5,
-            BtMessage::Unchoke(_) => 5,
-            BtMessage::Interested(_) => 5,
-            BtMessage::NotInterested(_) => 5,
-            BtMessage::Have(_) => 9,
-            BtMessage::BitField(bit_field) => 5 + bit_field.has.len(),
-            BtMessage::Request(_) => 17,
-            BtMessage::Piece(piece) => 13 + piece.data.len(),
-            BtMessage::Cancel(_) => 17,
-            BtMessage::SuggestPiece(_) => 9,
-            BtMessage::HaveAll(_) => 5,
-            BtMessage::HaveNone(_) => 5,
-            BtMessage::RejectRequest(_) => 17,
-            BtMessage::AllowedFast(_) => 9,
-            BtMessage::Extended(ext) => 6 + ext.payload.len(),
-            BtMessage::Port(_) => 7,
-            BtMessage::HashRequest(_) | BtMessage::HashReject(_) => 5 + HashRequest::LEN,
-            BtMessage::Hashes(h) => 5 + HashRequest::LEN + h.hashes.len() * 32,
-            BtMessage::Unknown(..) => panic!("cannot encode an Unknown message"),
+    /// Appends everything after the id.
+    fn put_payload(&self, dst: &mut BytesMut) {
+        let block = |dst: &mut BytesMut, index, begin, length| {
+            dst.put_u32(index);
+            dst.put_u32(begin);
+            dst.put_u32(length);
         };
-
-        let start = dst.len();
-        dst.resize(start + total_len, 0);
-        let buf = &mut dst[start..];
-
-        match item {
-            BtMessage::KeepAlive(keep_alive) => keep_alive.encode(buf),
-            BtMessage::Choke(choke) => choke.encode(buf),
-            BtMessage::Unchoke(unchoke) => unchoke.encode(buf),
-            BtMessage::Interested(interested) => interested.encode(buf),
-            BtMessage::NotInterested(not_interested) => not_interested.encode(buf),
-            BtMessage::Have(have) => have.encode(buf),
-            BtMessage::BitField(bit_field) => bit_field.encode(buf),
-            BtMessage::Request(request) => request.encode(buf),
-            BtMessage::Piece(piece) => piece.encode(buf),
-            BtMessage::Cancel(cancel) => cancel.encode(buf),
-            BtMessage::SuggestPiece(suggest) => suggest.encode(buf),
-            BtMessage::HaveAll(have_all) => have_all.encode(buf),
-            BtMessage::HaveNone(have_none) => have_none.encode(buf),
-            BtMessage::RejectRequest(reject) => reject.encode(buf),
-            BtMessage::AllowedFast(allowed_fast) => allowed_fast.encode(buf),
-            BtMessage::Extended(ext) => ext.encode(buf),
-            BtMessage::Port(port) => port.encode(buf),
-            BtMessage::HashRequest(request) => request.encode_as(21, 0, buf),
-            BtMessage::HashReject(request) => request.encode_as(23, 0, buf),
-            BtMessage::Hashes(h) => {
-                h.request.encode_as(22, h.hashes.len() * 32, buf);
-                buf[5 + HashRequest::LEN..].copy_from_slice(h.hashes.as_flattened());
+        match self {
+            BtMessage::KeepAlive(_)
+            | BtMessage::Choke(_)
+            | BtMessage::Unchoke(_)
+            | BtMessage::Interested(_)
+            | BtMessage::NotInterested(_)
+            | BtMessage::HaveAll(_)
+            | BtMessage::HaveNone(_) => {}
+            BtMessage::Have(Have { checked: piece })
+            | BtMessage::SuggestPiece(SuggestPiece { piece })
+            | BtMessage::AllowedFast(AllowedFast { piece }) => dst.put_u32(*piece),
+            BtMessage::BitField(bits) => dst.put_slice(&bits.has),
+            BtMessage::Request(r) => block(dst, r.index, r.begin, r.length),
+            BtMessage::Cancel(c) => block(dst, c.index, c.begin, c.length),
+            BtMessage::RejectRequest(r) => block(dst, r.index, r.begin, r.length),
+            BtMessage::Piece(piece) => {
+                dst.put_u32(piece.index);
+                dst.put_u32(piece.begin);
+                dst.put_slice(&piece.data);
             }
-            BtMessage::Unknown(..) => panic!(),
+            BtMessage::Port(port) => dst.put_u16(port.port),
+            BtMessage::Extended(ext) => {
+                dst.put_u8(ext.ext_id);
+                dst.put_slice(&ext.payload);
+            }
+            BtMessage::HashRequest(request) | BtMessage::HashReject(request) => request.put(dst),
+            BtMessage::Hashes(h) => {
+                h.request.put(dst);
+                dst.put_slice(h.hashes.as_flattened());
+            }
+            BtMessage::Unknown(_, payload) => dst.put_slice(payload),
         }
-
-        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BtDecoder;
-
-/// Both halves in one type, for a `Framed<PeerStream, _>` that reads and writes through the
-/// same object (`FramedRead`/`FramedWrite` over split halves want the two separate types).
+/// The message codec, for a `Framed` (or `FramedRead`/`FramedWrite` over split halves).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BtCodec;
 
 impl Encoder<BtMessage> for BtCodec {
     type Error = io::Error;
 
-    fn encode(&mut self, item: BtMessage, dst: &mut tokio_util::bytes::BytesMut) -> Result<(), Self::Error> {
-        BtEncoder.encode(item, dst)
-    }
-}
-
-impl Decoder for BtCodec {
-    type Item = BtMessage;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut tokio_util::bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        BtDecoder.decode(src)
+    fn encode(&mut self, item: BtMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let start = dst.len();
+        // the length prefix is filled in once the message's length is known
+        dst.put_u32(0);
+        if let Some(id) = item.id() {
+            dst.put_u8(id);
+            item.put_payload(dst);
+        }
+        let length = (dst.len() - start - 4) as u32;
+        dst[start..start + 4].copy_from_slice(&length.to_be_bytes());
+        Ok(())
     }
 }
 
@@ -457,150 +303,113 @@ fn be_u32(buf: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(buf[at..at + 4].try_into().unwrap())
 }
 
-impl Decoder for BtDecoder {
+impl Decoder for BtCodec {
     type Item = BtMessage;
     type Error = io::Error;
 
-    fn decode(&mut self, src: &mut tokio_util::bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(prefix) = src.first_chunk::<4>() else {
             return Ok(None);
-        }
-
-        let mut length_bytes = [0u8; 4];
-        length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_be_bytes(length_bytes) as usize;
+        };
+        let length = u32::from_be_bytes(*prefix) as usize;
         if length > MAX_MESSAGE_LEN {
             return Err(invalid(&format!("message of {length} bytes is over the limit")));
         }
-
         if src.len() < 4 + length {
             // one allocation for the rest of the message instead of growing as it trickles in
             src.reserve(4 + length - src.len());
             return Ok(None);
         }
-
-        if length == 0 {
-            src.advance(4);
-            let keep_alive = BtMessage::KeepAlive(KeepAlive);
-            return Ok(Some(keep_alive));
-        }
-
-        let msg_type = src[4];
-        let msg = {
-            // the byte range [5, 4 + length) is the payload following the 1-byte message id;
-            // `length` counts the id byte itself, so the payload is `length - 1` bytes
-            let buf = &src[5..4 + length];
-            // the payload size each fixed-layout message must have; the peer controls `length`,
-            // so a short one must be refused here rather than indexed past its end below
-            let exact = |n: usize| {
-                if buf.len() == n {
-                    Ok(())
-                } else {
-                    Err(invalid(&format!(
-                        "message {msg_type} has {} payload bytes, expected {n}",
-                        buf.len()
-                    )))
-                }
-            };
-            match msg_type {
-                0 => BtMessage::Choke(Choke),
-                1 => BtMessage::Unchoke(Unchoke),
-                2 => BtMessage::Interested(Interested),
-                3 => BtMessage::NotInterested(NotInterested),
-                4 => {
-                    exact(4)?;
-                    BtMessage::Have(Have {
-                        checked: be_u32(buf, 0),
-                    })
-                }
-                5 => BtMessage::BitField(BitField { has: Box::from(buf) }),
-                6 => {
-                    exact(12)?;
-                    BtMessage::Request(Request {
-                        index: be_u32(buf, 0),
-                        begin: be_u32(buf, 4),
-                        length: be_u32(buf, 8),
-                    })
-                }
-                7 => {
-                    // on the wire a piece message is just <index><begin><block>, with no
-                    // separate length field -- the block extends to the end of the message
-                    if buf.len() < 8 {
-                        return Err(invalid("piece message without index and offset"));
-                    }
-                    let data: Box<[u8]> = Box::from(&buf[8..]);
-                    let length = data.len() as u32;
-                    BtMessage::Piece(Piece {
-                        index: be_u32(buf, 0),
-                        begin: be_u32(buf, 4),
-                        length,
-                        data,
-                    })
-                }
-                8 => {
-                    exact(12)?;
-                    BtMessage::Cancel(Cancel {
-                        index: be_u32(buf, 0),
-                        begin: be_u32(buf, 4),
-                        length: be_u32(buf, 8),
-                    })
-                }
-                9 if buf.len() == 2 => BtMessage::Port(Port {
-                    port: u16::from_be_bytes([buf[0], buf[1]]),
-                }),
-                13 => {
-                    exact(4)?;
-                    BtMessage::SuggestPiece(SuggestPiece { piece: be_u32(buf, 0) })
-                }
-                14 => BtMessage::HaveAll(HaveAll),
-                15 => BtMessage::HaveNone(HaveNone),
-                16 => {
-                    exact(12)?;
-                    BtMessage::RejectRequest(RejectRequest {
-                        index: be_u32(buf, 0),
-                        begin: be_u32(buf, 4),
-                        length: be_u32(buf, 8),
-                    })
-                }
-                17 => {
-                    exact(4)?;
-                    BtMessage::AllowedFast(AllowedFast { piece: be_u32(buf, 0) })
-                }
-                20 => {
-                    // BEP 10: <ext_id><payload>, with no wire-level length field of its own
-                    let Some((&ext_id, payload)) = buf.split_first() else {
-                        return Err(invalid("extended message without an id"));
-                    };
-                    BtMessage::Extended(Extended {
-                        ext_id,
-                        payload: Box::from(payload),
-                    })
-                }
-                21 => {
-                    exact(HashRequest::LEN)?;
-                    BtMessage::HashRequest(HashRequest::decode(buf))
-                }
-                22 => {
-                    let (hashes, rest) = buf.get(HashRequest::LEN..).unwrap_or_default().as_chunks::<32>();
-                    if buf.len() < HashRequest::LEN || !rest.is_empty() {
-                        return Err(invalid("hashes message isn't a request and whole hashes"));
-                    }
-                    BtMessage::Hashes(Hashes {
-                        request: HashRequest::decode(buf),
-                        hashes: hashes.into(),
-                    })
-                }
-                23 => {
-                    exact(HashRequest::LEN)?;
-                    BtMessage::HashReject(HashRequest::decode(buf))
-                }
-                t => BtMessage::Unknown(t, Box::from(buf)),
-            }
+        let msg = match length {
+            0 => BtMessage::KeepAlive(KeepAlive),
+            _ => decode_message(src[4], &src[5..4 + length])?,
         };
-
         src.advance(4 + length);
         Ok(Some(msg))
     }
+}
+
+/// One message from its id and payload. The peer controls the length, so a payload the wrong
+/// size for its id is refused here rather than indexed past its end.
+fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
+    let exact = |n: usize| {
+        if buf.len() == n {
+            Ok(())
+        } else {
+            Err(invalid(&format!(
+                "message {id} has {} payload bytes, expected {n}",
+                buf.len()
+            )))
+        }
+    };
+    let piece = || exact(4).map(|()| be_u32(buf, 0));
+    let block = || exact(12).map(|()| (be_u32(buf, 0), be_u32(buf, 4), be_u32(buf, 8)));
+    Ok(match id {
+        id::CHOKE => BtMessage::Choke(Choke),
+        id::UNCHOKE => BtMessage::Unchoke(Unchoke),
+        id::INTERESTED => BtMessage::Interested(Interested),
+        id::NOT_INTERESTED => BtMessage::NotInterested(NotInterested),
+        id::HAVE => BtMessage::Have(Have { checked: piece()? }),
+        id::BITFIELD => BtMessage::BitField(BitField { has: Box::from(buf) }),
+        id::REQUEST => {
+            let (index, begin, length) = block()?;
+            BtMessage::Request(Request { index, begin, length })
+        }
+        id::PIECE => {
+            let Some((head, data)) = buf.split_first_chunk::<8>() else {
+                return Err(invalid("piece message without index and offset"));
+            };
+            BtMessage::Piece(Piece {
+                index: be_u32(head, 0),
+                begin: be_u32(head, 4),
+                length: data.len() as u32,
+                data: Box::from(data),
+            })
+        }
+        id::CANCEL => {
+            let (index, begin, length) = block()?;
+            BtMessage::Cancel(Cancel { index, begin, length })
+        }
+        id::PORT if buf.len() == 2 => BtMessage::Port(Port {
+            port: u16::from_be_bytes([buf[0], buf[1]]),
+        }),
+        id::SUGGEST_PIECE => BtMessage::SuggestPiece(SuggestPiece { piece: piece()? }),
+        id::HAVE_ALL => BtMessage::HaveAll(HaveAll),
+        id::HAVE_NONE => BtMessage::HaveNone(HaveNone),
+        id::REJECT_REQUEST => {
+            let (index, begin, length) = block()?;
+            BtMessage::RejectRequest(RejectRequest { index, begin, length })
+        }
+        id::ALLOWED_FAST => BtMessage::AllowedFast(AllowedFast { piece: piece()? }),
+        id::EXTENDED => {
+            let Some((&ext_id, payload)) = buf.split_first() else {
+                return Err(invalid("extended message without an id"));
+            };
+            BtMessage::Extended(Extended {
+                ext_id,
+                payload: Box::from(payload),
+            })
+        }
+        id::HASH_REQUEST => {
+            exact(HashRequest::LEN)?;
+            BtMessage::HashRequest(HashRequest::decode(buf))
+        }
+        id::HASHES => {
+            let (hashes, rest) = buf.get(HashRequest::LEN..).unwrap_or_default().as_chunks::<32>();
+            if buf.len() < HashRequest::LEN || !rest.is_empty() {
+                return Err(invalid("hashes message isn't a request and whole hashes"));
+            }
+            BtMessage::Hashes(Hashes {
+                request: HashRequest::decode(buf),
+                hashes: hashes.into(),
+            })
+        }
+        id::HASH_REJECT => {
+            exact(HashRequest::LEN)?;
+            BtMessage::HashReject(HashRequest::decode(buf))
+        }
+        other => BtMessage::Unknown(other, Box::from(buf)),
+    })
 }
 
 #[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default, Immutable, KnownLayout, Unaligned)]
@@ -611,7 +420,7 @@ pub(crate) struct Handshake {
     pub peer_id: [u8; 20],
 }
 
-// pub const HANDSHAKE_STR: &'static [u8] = b"19BitTorrent protocol";
+/// The protocol string a handshake opens with, its length byte included.
 pub const HANDSHAKE_STR: &[u8] = b"\x13BitTorrent protocol";
 
 impl Handshake {
@@ -690,14 +499,14 @@ pub(crate) async fn send_handshake<S: AsyncWrite + Unpin>(
     if local_id.dht {
         extensions[7] |= 0x01; // BEP 5: we'll send our DHT port
     }
-
-    let mut buf = vec![];
-    buf.extend_from_slice(HANDSHAKE_STR);
-    buf.extend_from_slice(&extensions);
-    buf.extend_from_slice(info_hash.as_bytes());
-    buf.extend_from_slice(&local_id.peer_id);
-
-    debug_assert!(buf.len() == 68);
+    let ours = Handshake {
+        extensions,
+        info_hash: *info_hash,
+        peer_id: local_id.peer_id,
+    };
+    let mut buf = [0u8; HANDSHAKE_STR.len() + size_of::<Handshake>()];
+    buf[..HANDSHAKE_STR.len()].copy_from_slice(HANDSHAKE_STR);
+    buf[HANDSHAKE_STR.len()..].copy_from_slice(ours.as_bytes());
     peer.write_all(&buf).await
 }
 
@@ -719,18 +528,11 @@ pub(crate) async fn read_handshake<S: AsyncRead + Unpin>(peer: &mut S) -> io::Re
 pub(crate) async fn read_handshake_body<S: AsyncRead + Unpin>(peer: &mut S) -> io::Result<Handshake> {
     let mut body = [0u8; size_of::<Handshake>()];
     peer.read_exact(&mut body).await?;
-    Ok(Handshake::read_from_bytes(&body).unwrap())
+    Ok(Handshake::read_from_bytes(&body).expect("the buffer is a handshake's size"))
 }
 
-/// Performs the outbound side of a handshake: send ours, then read and validate theirs.
-/// `TcpStream::connect` bounded by `CONNECT_TIMEOUT`, with a timeout reported like any other
-/// connect failure.
-pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    tokio::time::timeout(crate::settings::CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .unwrap_or_else(|_| Err(io::Error::new(ErrorKind::TimedOut, "connect timed out")))
-}
-
+/// The outbound side of a handshake: sends ours, then reads theirs and checks it names
+/// `info_hash` (or, for a hybrid, its v2 hash: the remote upgraded the connection).
 #[tracing::instrument(skip(peer))]
 pub(crate) async fn shake_hands<S: AsyncRead + AsyncWrite + Unpin>(
     peer: &mut S,
@@ -760,7 +562,7 @@ pub(crate) async fn shake_hands<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio_util::bytes::BytesMut;
 
     #[test]
@@ -777,12 +579,12 @@ mod test {
             b"\x00\x00\x00\x06\x04\x00\x00\x00\x01\x00", // Have with a trailing byte
         ] {
             let mut src = BytesMut::from(frame);
-            assert!(BtDecoder.decode(&mut src).is_err(), "{frame:?}");
+            assert!(BtCodec.decode(&mut src).is_err(), "{frame:?}");
         }
 
         let mut huge = BytesMut::from(&b"\xff\xff\xff\xff\x07"[..]);
         assert!(
-            BtDecoder.decode(&mut huge).is_err(),
+            BtCodec.decode(&mut huge).is_err(),
             "a 4 GiB length is refused before buffering"
         );
     }
@@ -791,7 +593,7 @@ mod test {
     fn a_well_formed_have_still_decodes() {
         let mut src = BytesMut::from(&b"\x00\x00\x00\x05\x04\x00\x00\x00\x2a"[..]);
         assert!(matches!(
-            BtDecoder.decode(&mut src).unwrap(),
+            BtCodec.decode(&mut src).unwrap(),
             Some(BtMessage::Have(Have { checked: 42 }))
         ));
         assert!(src.is_empty());
@@ -888,159 +690,59 @@ mod test {
         assert!(ours.is_err());
     }
 
-    fn round_trip(msg: BtMessage) -> BtMessage {
-        let mut buf = BytesMut::new();
-        BtEncoder.encode(msg, &mut buf).unwrap();
-        let decoded = BtDecoder.decode(&mut buf).unwrap().expect("a full message");
-        assert!(buf.is_empty(), "decoder should consume the whole frame");
-        decoded
-    }
-
     #[test]
-    fn keep_alive_round_trips() {
-        assert_eq!(
-            round_trip(BtMessage::KeepAlive(KeepAlive)),
-            BtMessage::KeepAlive(KeepAlive)
-        );
-    }
-
-    #[test]
-    fn choke_round_trips() {
-        assert_eq!(round_trip(BtMessage::Choke(Choke)), BtMessage::Choke(Choke));
-    }
-
-    #[test]
-    fn unchoke_round_trips() {
-        assert_eq!(round_trip(BtMessage::Unchoke(Unchoke)), BtMessage::Unchoke(Unchoke));
-    }
-
-    #[test]
-    fn interested_round_trips() {
-        assert_eq!(
-            round_trip(BtMessage::Interested(Interested)),
-            BtMessage::Interested(Interested)
-        );
-    }
-
-    #[test]
-    fn not_interested_round_trips() {
-        assert_eq!(
-            round_trip(BtMessage::NotInterested(NotInterested)),
-            BtMessage::NotInterested(NotInterested)
-        );
-    }
-
-    #[test]
-    fn have_round_trips() {
-        let have = Have { checked: 0x1234abcd };
-        assert_eq!(round_trip(BtMessage::Have(have)), BtMessage::Have(have));
-    }
-
-    #[test]
-    fn bitfield_round_trips() {
-        let bit_field = BitField {
-            has: Box::from([0xffu8, 0x00, 0xa5]),
-        };
-        assert_eq!(
-            round_trip(BtMessage::BitField(bit_field.clone())),
-            BtMessage::BitField(bit_field)
-        );
-    }
-
-    #[test]
-    fn request_round_trips() {
-        let request = Request {
-            index: 1,
-            begin: 2,
-            length: 3,
-        };
-        assert_eq!(round_trip(BtMessage::Request(request)), BtMessage::Request(request));
-    }
-
-    #[test]
-    fn cancel_round_trips() {
-        let cancel = Cancel {
-            index: 1,
-            begin: 2,
-            length: 3,
-        };
-        assert_eq!(round_trip(BtMessage::Cancel(cancel)), BtMessage::Cancel(cancel));
-    }
-
-    #[test]
-    fn piece_round_trips() {
-        let piece = Piece {
-            index: 7,
-            begin: 16384,
-            length: 4,
-            data: Box::from([1u8, 2, 3, 4]),
-        };
-        assert_eq!(round_trip(BtMessage::Piece(piece.clone())), BtMessage::Piece(piece));
-    }
-
-    #[test]
-    fn extended_round_trips() {
-        let ext = Extended {
-            ext_id: 3,
-            payload: Box::from(*b"d1:mi1ee"),
-        };
-        assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
-    }
-
-    #[test]
-    fn extended_handshake_uses_ext_id_zero() {
-        let ext = Extended {
-            ext_id: 0,
-            payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
-        };
-        assert_eq!(round_trip(BtMessage::Extended(ext.clone())), BtMessage::Extended(ext));
-    }
-
-    #[test]
-    fn port_round_trips() {
-        let port = BtMessage::Port(Port { port: 6881 });
-        assert_eq!(round_trip(port.clone()), port);
-    }
-
-    #[test]
-    fn suggest_piece_round_trips() {
-        let suggest = SuggestPiece { piece: 42 };
-        assert_eq!(
-            round_trip(BtMessage::SuggestPiece(suggest)),
-            BtMessage::SuggestPiece(suggest)
-        );
-    }
-
-    #[test]
-    fn have_all_round_trips() {
-        assert_eq!(round_trip(BtMessage::HaveAll(HaveAll)), BtMessage::HaveAll(HaveAll));
-    }
-
-    #[test]
-    fn have_none_round_trips() {
-        assert_eq!(round_trip(BtMessage::HaveNone(HaveNone)), BtMessage::HaveNone(HaveNone));
-    }
-
-    #[test]
-    fn reject_request_round_trips() {
-        let reject = RejectRequest {
-            index: 1,
-            begin: 2,
-            length: 3,
-        };
-        assert_eq!(
-            round_trip(BtMessage::RejectRequest(reject)),
-            BtMessage::RejectRequest(reject)
-        );
-    }
-
-    #[test]
-    fn allowed_fast_round_trips() {
-        let allowed = AllowedFast { piece: 9 };
-        assert_eq!(
-            round_trip(BtMessage::AllowedFast(allowed)),
-            BtMessage::AllowedFast(allowed)
-        );
+    fn every_message_round_trips() {
+        for msg in [
+            BtMessage::KeepAlive(KeepAlive),
+            BtMessage::Choke(Choke),
+            BtMessage::Unchoke(Unchoke),
+            BtMessage::Interested(Interested),
+            BtMessage::NotInterested(NotInterested),
+            BtMessage::Have(Have { checked: 0x1234abcd }),
+            BtMessage::BitField(BitField {
+                has: Box::from([0xffu8, 0x00, 0xa5]),
+            }),
+            BtMessage::Request(Request {
+                index: 1,
+                begin: 2,
+                length: 3,
+            }),
+            BtMessage::Cancel(Cancel {
+                index: 1,
+                begin: 2,
+                length: 3,
+            }),
+            BtMessage::RejectRequest(RejectRequest {
+                index: 1,
+                begin: 2,
+                length: 3,
+            }),
+            BtMessage::Piece(Piece {
+                index: 7,
+                begin: 16384,
+                length: 4,
+                data: Box::from([1u8, 2, 3, 4]),
+            }),
+            BtMessage::Extended(Extended {
+                ext_id: 3,
+                payload: Box::from(*b"d1:mi1ee"),
+            }),
+            BtMessage::Extended(Extended {
+                ext_id: 0,
+                payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
+            }),
+            BtMessage::Port(Port { port: 6881 }),
+            BtMessage::SuggestPiece(SuggestPiece { piece: 42 }),
+            BtMessage::HaveAll(HaveAll),
+            BtMessage::HaveNone(HaveNone),
+            BtMessage::AllowedFast(AllowedFast { piece: 9 }),
+            BtMessage::Unknown(99, Box::from(*b"whatever")),
+        ] {
+            let mut buf = BytesMut::new();
+            BtCodec.encode(msg.clone(), &mut buf).unwrap();
+            assert_eq!(BtCodec.decode(&mut buf).unwrap(), Some(msg));
+            assert!(buf.is_empty(), "decoder should consume the whole frame");
+        }
     }
 
     /// The two frames back to back exercise that the decoder only consumes exactly one
@@ -1048,14 +750,14 @@ mod test {
     #[test]
     fn decoder_only_consumes_one_frame_at_a_time() {
         let mut buf = BytesMut::new();
-        BtEncoder.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
-        BtEncoder.encode(BtMessage::Interested(Interested), &mut buf).unwrap();
+        BtCodec.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
+        BtCodec.encode(BtMessage::Interested(Interested), &mut buf).unwrap();
 
         assert_eq!(buf.len(), 10);
-        let first = BtDecoder.decode(&mut buf).unwrap().unwrap();
+        let first = BtCodec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(first, BtMessage::Unchoke(Unchoke));
         assert_eq!(buf.len(), 5);
-        let second = BtDecoder.decode(&mut buf).unwrap().unwrap();
+        let second = BtCodec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(second, BtMessage::Interested(Interested));
         assert!(buf.is_empty());
     }
@@ -1065,12 +767,10 @@ mod test {
     #[test]
     fn decoder_waits_for_a_full_frame() {
         let mut full = BytesMut::new();
-        BtEncoder
-            .encode(BtMessage::Have(Have { checked: 5 }), &mut full)
-            .unwrap();
+        BtCodec.encode(BtMessage::Have(Have { checked: 5 }), &mut full).unwrap();
 
         let mut partial = BytesMut::from(&full[..full.len() - 1]);
-        assert_eq!(BtDecoder.decode(&mut partial).unwrap(), None);
+        assert_eq!(BtCodec.decode(&mut partial).unwrap(), None);
         assert_eq!(
             partial.len(),
             full.len() - 1,
@@ -1084,19 +784,17 @@ mod test {
     fn wire_bytes_match_bep3_exactly() {
         // unchoke: <len=0001><id=1>
         let mut buf = BytesMut::new();
-        BtEncoder.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
+        BtCodec.encode(BtMessage::Unchoke(Unchoke), &mut buf).unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 1, 1]);
 
         // have: <len=0005><id=4><piece index>
         let mut buf = BytesMut::new();
-        BtEncoder
-            .encode(BtMessage::Have(Have { checked: 1 }), &mut buf)
-            .unwrap();
+        BtCodec.encode(BtMessage::Have(Have { checked: 1 }), &mut buf).unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 5, 4, 0, 0, 0, 1]);
 
         // piece: <len=0009+X><id=7><index><begin><block>, no separate length field
         let mut buf = BytesMut::new();
-        BtEncoder
+        BtCodec
             .encode(
                 BtMessage::Piece(Piece {
                     index: 1,
@@ -1111,7 +809,7 @@ mod test {
 
         // extended: <len=0002+X><id=20><ext_id><payload>, per BEP 10
         let mut buf = BytesMut::new();
-        BtEncoder
+        BtCodec
             .encode(
                 BtMessage::Extended(Extended {
                     ext_id: 5,
@@ -1124,16 +822,16 @@ mod test {
 
         // have all / have none: <len=0001><id>, no payload, per BEP 6
         let mut buf = BytesMut::new();
-        BtEncoder.encode(BtMessage::HaveAll(HaveAll), &mut buf).unwrap();
+        BtCodec.encode(BtMessage::HaveAll(HaveAll), &mut buf).unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 1, 14]);
 
         let mut buf = BytesMut::new();
-        BtEncoder.encode(BtMessage::HaveNone(HaveNone), &mut buf).unwrap();
+        BtCodec.encode(BtMessage::HaveNone(HaveNone), &mut buf).unwrap();
         assert_eq!(&buf[..], &[0, 0, 0, 1, 15]);
 
         // reject request: <len=0013><id=16><index><begin><length>, per BEP 6
         let mut buf = BytesMut::new();
-        BtEncoder
+        BtCodec
             .encode(
                 BtMessage::RejectRequest(RejectRequest {
                     index: 1,
@@ -1165,15 +863,15 @@ mod test {
             BtMessage::Hashes(hashes),
         ] {
             let mut buf = BytesMut::new();
-            BtEncoder.encode(msg.clone(), &mut buf).unwrap();
-            assert_eq!(BtDecoder.decode(&mut buf).unwrap(), Some(msg));
+            BtCodec.encode(msg.clone(), &mut buf).unwrap();
+            assert_eq!(BtCodec.decode(&mut buf).unwrap(), Some(msg));
             assert!(buf.is_empty());
         }
         // a request short of its proof layers, and hashes that aren't whole
         for frame in [&b"\x00\x00\x00\x30\x15"[..], b"\x00\x00\x00\x32\x16"] {
             let mut src = BytesMut::from(frame);
             src.resize(4 + u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize, 0);
-            assert!(BtDecoder.decode(&mut src).is_err(), "{frame:?}");
+            assert!(BtCodec.decode(&mut src).is_err(), "{frame:?}");
         }
     }
 }

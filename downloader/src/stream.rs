@@ -1,8 +1,8 @@
 //! The byte stream under a peer connection, whichever transport carries it.
 //!
 //! Everything above the handshake (`Peer`, the codec, the metadata fetch) reads and writes a
-//! `PeerStream` and never asks what's inside. Each transport (plain TCP, MSE over another
-//! stream, uTP later) is one variant, so adding one touches only the connect/accept paths.
+//! `PeerStream` and never asks what's inside. Each transport (TCP, uTP, MSE over either) is
+//! one variant, so adding one touches only the connect/accept paths.
 
 use crate::config::Encryption;
 use crate::defs::Identity;
@@ -68,7 +68,12 @@ impl Transport {
 
     async fn dial(&self, addr: SocketAddr) -> io::Result<PeerStream> {
         match self {
-            Transport::Tcp => Ok(PeerStream::Tcp(crate::wire::connect(addr).await?)),
+            Transport::Tcp => {
+                let stream = tokio::time::timeout(crate::settings::CONNECT_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| io::Error::new(ErrorKind::TimedOut, "connect timed out"))??;
+                Ok(PeerStream::Tcp(stream))
+            }
             Transport::Utp(utp) => {
                 // librqbit-utp parents the connection's long-lived span on whatever span is
                 // current when it connects, which would keep our dial's span open for as long as
