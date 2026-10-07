@@ -202,16 +202,19 @@
 
         {#if selectedTorrent}
           <Separator class="my-3" />
-          <Details
-            torrent={selectedTorrent}
-            onselectfiles={(files) => selected !== null && api.selectFiles(selected, files)}
-            onsequential={(on) => selected !== null && api.setSequential(selected, on)}
-            onsuperseed={(on) => selected !== null && api.setSuperSeed(selected, on)}
-            onpeer={(addr) => {
-              traces.focus = addr
-              pane = 'traces'
-            }}
-          />
+          <!-- a fresh panel per torrent: its figures would otherwise glide over from the last one's -->
+          {#key selectedTorrent.id}
+            <Details
+              torrent={selectedTorrent}
+              onselectfiles={(files) => selected !== null && api.selectFiles(selected, files)}
+              onsequential={(on) => selected !== null && api.setSequential(selected, on)}
+              onsuperseed={(on) => selected !== null && api.setSuperSeed(selected, on)}
+              onpeer={(addr) => {
+                traces.focus = addr
+                pane = 'traces'
+              }}
+            />
+          {/key}
         {/if}
 
         {#if resumable.length > 0 || torrents.length === 0}
