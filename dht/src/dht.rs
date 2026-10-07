@@ -9,6 +9,10 @@
 //! - [`DhtClient`] (handle via [`DhtSession::handle`]) runs iterative lookups.
 //! - `DhtServer` answers inbound queries.
 //!
+//! What the node stores (peers announced to it) either expires after BEP 5's 45 minutes or,
+//! with [`Retention::Forever`], is kept so the node doubles as a long-term index; see
+//! [`DhtSession::with_retention`].
+//!
 //! Both halves share one `SharedState`; nothing is owned twice.
 
 pub mod client;
@@ -43,8 +47,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
-use tokio::{net::UdpSocket, task::JoinSet};
+use tokio::{net::UdpSocket, task::JoinSet, time::interval};
 use txn_id_generator::TxnIdGenerator;
+
+pub use state::{PEER_LIFETIME, Retention, StoredPeer};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migrations");
 
@@ -56,6 +62,8 @@ pub struct DhtSession {
     server: DhtServer,
     rpc_manager: RpcManager,
     routing_table: RoutingTable,
+    state: Arc<SharedState>,
+    retention: Retention,
     addr: SocketAddrV4,
 }
 
@@ -258,13 +266,22 @@ impl DhtSession {
 
         let dht = DhtSession {
             client: DhtClient::new(state.clone()),
-            server: DhtServer::new(state),
+            server: DhtServer::new(state.clone()),
             rpc_manager,
             routing_table,
+            state,
+            retention: Retention::default(),
             addr: local_addr,
         };
 
         Ok(dht)
+    }
+
+    /// What happens to announced peers once they go stale; [`Retention::Expire`] unless set.
+    /// Switching an existing database to `Expire` deletes whatever stale peers it holds.
+    pub fn with_retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
     }
 
     pub async fn bootstrap(&self, known_nodes: Vec<SocketAddrV4>) -> Result<(), OurError> {
@@ -297,6 +314,18 @@ impl DhtSession {
         self.client.get_peers(info_hash).await
     }
 
+    /// Info hashes we hold announced peers for: with [`Retention::Forever`], every one anyone
+    /// ever announced to us.
+    pub fn stored_swarms(&self) -> Vec<InfoHash> {
+        self.state.stored_swarms()
+    }
+
+    /// The peers announced to us for `info_hash` that we still hold, stale ones included,
+    /// most recently announced first.
+    pub fn stored_peers(&self, info_hash: &InfoHash) -> Vec<StoredPeer> {
+        self.state.stored_peers(info_hash)
+    }
+
     /// Keep the DHT running so you can use the clients and servers, usually you put spawn this
     /// and abort the task when desired
     pub async fn run(&self) {
@@ -325,6 +354,23 @@ impl DhtSession {
             .name("DHT server")
             .spawn(async move { server.run().await })
             .unwrap();
+
+        if self.retention == Retention::Expire {
+            let state = self.state.clone();
+            join_set
+                .build_task()
+                .name("peer expiry")
+                .spawn(async move {
+                    let mut tick = interval(PEER_LIFETIME / 9);
+                    loop {
+                        tick.tick().await;
+                        let _ = state
+                            .expire_peers()
+                            .inspect_err(|e| warn!("couldn't expire peers: {e}"));
+                    }
+                })
+                .unwrap();
+        }
 
         join_set.join_all().await;
     }

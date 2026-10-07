@@ -27,6 +27,7 @@ diesel::table! {
         port -> Integer,
         last_announced -> BigInt,
         swarm -> Binary,
+        first_announced -> BigInt,
     }
 }
 

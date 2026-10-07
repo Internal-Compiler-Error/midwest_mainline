@@ -1,7 +1,10 @@
 use anyhow::anyhow;
 use axum::{Json, Router, extract::State, routing::post};
 use futures::future::join_all;
-use midwest_mainline::{dht::DhtSession, types::NodeId};
+use midwest_mainline::{
+    dht::{DhtSession, Retention},
+    types::{InfoHash, NodeId},
+};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -49,9 +52,45 @@ fn unsupported(id: serde_json::Value) -> JsonRpcResponse {
     }
 }
 
+fn invalid_params(id: serde_json::Value) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        result: serde_json::json!({ "code": -32602, "message": "Invalid params"}),
+        id,
+    }
+}
+
+/// `{"info_hash": "<40 hex digits>"}`
+fn info_hash_param(params: &Option<serde_json::Value>) -> Option<InfoHash> {
+    let hex = params.as_ref()?.get("info_hash")?.as_str()?;
+    InfoHash::try_from_bytes(&hex::decode(hex).ok()?)
+}
+
 async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) -> Json<JsonRpcResponse> {
     let res = match req.method.as_str() {
         "node_count" => serde_json::json!(s.dht.node_count()),
+        "stored_swarms" => {
+            let swarms: Vec<String> = s.dht.stored_swarms().iter().map(|h| hex::encode(h.0)).collect();
+            serde_json::json!(swarms)
+        }
+        "stored_peers" => {
+            let Some(info_hash) = info_hash_param(&req.params) else {
+                return Json(invalid_params(req.id));
+            };
+            let peers: Vec<_> = s
+                .dht
+                .stored_peers(&info_hash)
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "addr": p.addr.to_string(),
+                        "first_announced": p.first_announced,
+                        "last_announced": p.last_announced,
+                    })
+                })
+                .collect();
+            serde_json::json!(peers)
+        }
         _ => return Json(unsupported(req.id)),
     };
 
@@ -129,7 +168,15 @@ async fn main() -> anyhow::Result<()> {
     set_up_tracing();
 
     let dht_socket = UdpSocket::bind("0.0.0.0:44444".parse::<SocketAddr>()?).await?;
-    let dht = DhtSession::with_stable_id(dht_socket, None, &env::var("DATABASE_URL").unwrap()).unwrap();
+    // DHT_RETENTION=forever keeps every announced peer, making this node a long-term index
+    let retention = match env::var("DHT_RETENTION").as_deref() {
+        Ok("forever") => Retention::Forever,
+        Ok("expire") | Err(_) => Retention::Expire,
+        Ok(other) => return Err(anyhow!("DHT_RETENTION must be `expire` or `forever`, not `{other}`")),
+    };
+    let dht = DhtSession::with_stable_id(dht_socket, None, &env::var("DATABASE_URL").unwrap())
+        .unwrap()
+        .with_retention(retention);
 
     let mut event_loops = JoinSet::new();
 

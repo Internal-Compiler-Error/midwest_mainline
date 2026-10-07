@@ -3,8 +3,8 @@
 //! The table learns passively: `run` consumes the broker's inbound message fan-out and
 //! records every sender we hear from. Liveness is tracked with a `failed_requests`
 //! counter — 3+ failures and a stale `last_sent` lands a node on the replacement queue,
-//! and a failed refresh ping tombstones it (`removed`). Tombstones and expired peers
-//! are purged on the periodic `refresh_table` tick.
+//! and a failed refresh ping tombstones it (`removed`). Tombstones are purged on the
+//! periodic `refresh_table` tick.
 
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
@@ -331,15 +331,10 @@ impl RoutingTable {
     }
 
     pub async fn refresh_table(&self) {
-        // housekeeping: expired peers and tombstoned nodes go for good, so the store
-        // doesn't grow unboundedly
+        // tombstoned nodes go for good, so the table doesn't grow unboundedly
         {
-            use crate::schema::{node, peer};
-            let cutoff = unix_timestmap_ms() - 45 * 60 * 1000;
+            use crate::schema::node;
             let mut conn = self.conn();
-            let _ = diesel::delete(peer::table.filter(peer::last_announced.lt(cutoff)))
-                .execute(&mut conn)
-                .inspect_err(|e| error!("{e}"));
             let _ = diesel::delete(node::table.filter(node::removed.eq(true)))
                 .execute(&mut conn)
                 .inspect_err(|e| error!("{e}"));

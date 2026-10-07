@@ -26,6 +26,7 @@ const SCHEMA_DDL: &str = "
         port INTEGER NOT NULL,
         last_announced BIGINT NOT NULL,
         swarm BLOB NOT NULL REFERENCES swarm(info_hash) ON DELETE CASCADE ON UPDATE CASCADE,
+        first_announced BIGINT NOT NULL DEFAULT 0,
         PRIMARY KEY (ip_addr, port, swarm)
     );
 ";

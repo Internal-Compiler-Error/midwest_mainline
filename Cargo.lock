@@ -2687,6 +2687,7 @@ dependencies = [
  "console-subscriber",
  "enum_extract",
  "futures",
+ "hex",
  "midwest_mainline",
  "rand 0.10.2",
  "serde",

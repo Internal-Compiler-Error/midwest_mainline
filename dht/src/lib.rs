@@ -38,6 +38,9 @@
 //!   `SharedState`. The client runs iterative lookups (closest-known nodes, `CONCURRENT_REQS`
 //!   at a time, following referrals); the server answers inbound queries and stores
 //!   announced peers (token-validated per BEP 5, tokens from `token_generator`).
+//!   Peers are served for 45 minutes after their last announce; past that they're deleted,
+//!   or with [`dht::Retention::Forever`] kept so the node is also a long-term index
+//!   ([`dht::DhtSession::stored_swarms`], [`dht::DhtSession::stored_peers`]).
 //! - [`dht::DhtSession`] wires it all together: resumes or mints a BEP 42 node id from
 //!   the database, then `run()` drives the broker, the routing table, and the server.
 //!
@@ -58,7 +61,7 @@
 //! - [x] respond to get peers
 //! - [x] respond to announce
 //! - [x] respond to find node
-//! - [x] expiration for hash table
+//! - [x] expiration for hash table, or keeping it forever as an index
 //! - [x] ping and prune for routing table
 //! - [x] upload to crate.io
 //!

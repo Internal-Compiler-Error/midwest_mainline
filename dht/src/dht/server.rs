@@ -165,6 +165,7 @@ impl DhtServer {
                         peer::ip_addr.eq(peer_contact.ip().to_string()),
                         peer::port.eq(peer_contact.port() as i32),
                         peer::swarm.eq(info_hash),
+                        peer::first_announced.eq(now),
                         peer::last_announced.eq(now),
                     ),
                 )
@@ -174,5 +175,34 @@ impl DhtServer {
                 .execute(conn)
                 .inspect_err(|e| warn!("{e}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::memory_pool;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn announcing_again_keeps_when_the_peer_was_first_seen() {
+        let pool = memory_pool();
+        let mut conn = pool.get().unwrap();
+        let info_hash = InfoHash([3; 20]);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6881);
+
+        DhtServer::add_peers_to_db(&info_hash, addr, &mut conn).unwrap();
+        diesel::update(peer::table)
+            .set((peer::first_announced.eq(1), peer::last_announced.eq(1)))
+            .execute(&mut conn)
+            .unwrap();
+        DhtServer::add_peers_to_db(&info_hash, addr, &mut conn).unwrap();
+
+        let (first, last): (i64, i64) = peer::table
+            .select((peer::first_announced, peer::last_announced))
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(first, 1);
+        assert!(last > 1);
     }
 }
