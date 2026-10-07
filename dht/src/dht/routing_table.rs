@@ -1,38 +1,38 @@
-//! The k-bucket contact store, persisted in SQLite so contacts survive restarts.
+//! The k-bucket contact store. It lives in memory, where every packet's lookups and updates
+//! go, and is written behind to SQLite (a batch at most every second, from a thread of its
+//! own) so contacts survive restarts.
 //!
 //! The table learns passively: `run` consumes the broker's inbound message fan-out and
 //! records every sender we hear from. Liveness is tracked with a `failed_requests`
 //! counter — 3+ failures and 15 minutes unheard from land a node on the replacement queue,
-//! and a failed refresh ping tombstones it (`removed`). Tombstones are purged on the
-//! periodic `refresh_table` tick.
+//! and a failed refresh ping drops it.
 //!
 //! IPv4 and IPv6 nodes share the `node` table, told apart by its `family` column: each
 //! [`RoutingTable`] sees only the rows of its own family (BEP 32's separate tables).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
-use diesel::sqlite::Sqlite;
+use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::upsert::excluded;
 use futures::future::join_all;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::dht::bep42::compliant;
-use crate::dht::xor;
 use crate::message::ping_query::PingQuery;
 use crate::message::{Krpc, KrpcBody};
-use crate::models::{NodeNoMetaInfo, NodeRow};
+use crate::models::NodeRow;
 use crate::schema::node;
 use crate::types::{self, Family, NodeId, NodeInfo};
 use crate::utils::unix_timestmap_ms;
 
 use super::rpc_manager::RpcManager;
 use super::state::REQ_TIMEOUT;
-
 /// What the one-node-per-address rule (see `RoutingTable::ip_taken`) groups `ip` under: the
 /// address itself for IPv4, its /64 for IPv6, since one IPv6 host typically holds a whole /64
 /// and can pick any address in it. `None` where the rule doesn't apply: a LAN (private,
@@ -116,35 +116,311 @@ const REFRESH_EVERY: Duration = Duration::from_secs(180);
 const QUESTIONABLE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// Failed queries that make a questionable node worth a refresh ping
 const FAILURES_TO_REFRESH: i32 = 3;
+/// How often at most the table's changes are written out, as one transaction
+const PERSIST_EVERY: Duration = Duration::from_secs(1);
+/// Changes that make a batch be written early
+const PERSIST_BATCH: usize = 4096;
+
+type Db = Pool<ConnectionManager<SqliteConnection>>;
+
+/// What the table knows of a node
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Contact {
+    addr: SocketAddr,
+    /// when we last heard from it, unix milliseconds
+    last_contacted: i64,
+    failed: i32,
+    bep42: bool,
+}
+
+impl Contact {
+    fn new(id: &NodeId, addr: SocketAddr, last_contacted: i64) -> Self {
+        Self {
+            addr,
+            last_contacted,
+            failed: 0,
+            bep42: compliant(id, addr.ip()),
+        }
+    }
+}
+
+/// The table itself: every node by id, each bucket's members, and who holds each address group
+#[derive(Debug)]
+struct Nodes {
+    our_id: NodeId,
+    by_id: BTreeMap<NodeId, Contact>,
+    buckets: Vec<HashSet<NodeId>>,
+    groups: HashMap<IpAddr, NodeId>,
+    compliant: usize,
+}
+
+impl Nodes {
+    fn new(our_id: NodeId) -> Self {
+        Self {
+            our_id,
+            by_id: BTreeMap::new(),
+            buckets: vec![HashSet::new(); 160],
+            groups: HashMap::new(),
+            compliant: 0,
+        }
+    }
+
+    fn bucket_of(&self, id: &NodeId) -> usize {
+        bucket_index(&self.our_id, id) as usize
+    }
+
+    fn ip_taken(&self, ip: &IpAddr) -> bool {
+        sybil_group(ip).is_some_and(|group| self.groups.contains_key(&group))
+    }
+
+    /// Puts `id` in; the caller checked it isn't there and its address group is free
+    fn insert(&mut self, id: NodeId, contact: Contact) {
+        let bucket = self.bucket_of(&id);
+        self.buckets[bucket].insert(id);
+        if let Some(group) = sybil_group(&contact.addr.ip()) {
+            self.groups.insert(group, id);
+        }
+        self.compliant += usize::from(contact.bep42);
+        self.by_id.insert(id, contact);
+    }
+
+    fn remove(&mut self, id: &NodeId) -> Option<Contact> {
+        let contact = self.by_id.remove(id)?;
+        let bucket = self.bucket_of(id);
+        self.buckets[bucket].remove(id);
+        if let Some(group) = sybil_group(&contact.addr.ip()) {
+            self.groups.remove(&group);
+        }
+        self.compliant -= usize::from(contact.bep42);
+        Some(contact)
+    }
+
+    /// The `n` nodes closest to `target`, closest first. Ids sharing a longer prefix with the
+    /// target are closer than any sharing a shorter one, and those sharing a prefix are a
+    /// range of the sorted ids: the narrowest range holding `n` holds the closest `n`.
+    fn closest(&self, target: &NodeId, n: usize) -> Vec<NodeInfo> {
+        if n == 0 {
+            return vec![];
+        }
+        let holds_n = |prefix| {
+            let (low, high) = prefix_range(target, prefix);
+            self.by_id.range(low..=high).nth(n - 1).is_some()
+        };
+        // the longest prefix whose range holds n, by bisection: a shorter prefix's range holds
+        // a longer one's
+        let (mut shortest, mut longest) = (0usize, 160);
+        while shortest < longest {
+            let mid = (shortest + longest).div_ceil(2);
+            match holds_n(mid) {
+                true => shortest = mid,
+                false => longest = mid - 1,
+            }
+        }
+        let (low, high) = prefix_range(target, shortest);
+        let mut found: Vec<(NodeId, SocketAddr)> = self.by_id.range(low..=high).map(|(id, c)| (*id, c.addr)).collect();
+        let by_distance = |(id, _): &(NodeId, SocketAddr)| id.dist(target);
+        if found.len() > n {
+            found.select_nth_unstable_by_key(n - 1, by_distance);
+            found.truncate(n);
+        }
+        found.sort_unstable_by_key(by_distance);
+        found.into_iter().map(|(id, addr)| NodeInfo::new(id, addr)).collect()
+    }
+}
+
+/// The lowest and the highest id sharing the first `prefix` bits with `target`
+fn prefix_range(target: &NodeId, prefix: usize) -> (NodeId, NodeId) {
+    let (mut low, mut high) = (target.0, target.0);
+    let (byte, bit) = (prefix / 8, prefix % 8);
+    if byte < low.len() {
+        let mask = 0xFFu8 >> bit;
+        low[byte] &= !mask;
+        high[byte] |= mask;
+        low[byte + 1..].fill(0);
+        high[byte + 1..].fill(0xFF);
+    }
+    (NodeId(low), NodeId(high))
+}
+
+/// A node as it is now, to be written out, or `None` once it's gone
+enum Change {
+    Node(NodeId, Option<Contact>),
+    /// write what's pending now, and say so
+    #[cfg(test)]
+    Flush(std_mpsc::Sender<()>),
+}
+
+/// Writes the table's changes to its rows, a batch at a time, until every sender is gone
+fn persist(db: Db, table: i32, our_id: NodeId, changes: std_mpsc::Receiver<Change>) {
+    let mut batch: HashMap<NodeId, Option<Contact>> = HashMap::new();
+    while let Ok(first) = changes.recv() {
+        let mut next = Some(first);
+        let deadline = Instant::now() + PERSIST_EVERY;
+        let mut open = true;
+        while let Some(change) = next.take() {
+            match change {
+                Change::Node(id, contact) => {
+                    batch.insert(id, contact);
+                }
+                #[cfg(test)]
+                Change::Flush(done) => {
+                    write(&db, table, &our_id, std::mem::take(&mut batch));
+                    let _ = done.send(());
+                }
+            }
+            if batch.len() >= PERSIST_BATCH {
+                break;
+            }
+            match changes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(change) => next = Some(change),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => open = false,
+            }
+        }
+        write(&db, table, &our_id, std::mem::take(&mut batch));
+        if !open {
+            return;
+        }
+    }
+}
+
+fn write(db: &Db, table: i32, our_id: &NodeId, batch: HashMap<NodeId, Option<Contact>>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut conn = match db.get() {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!("couldn't save {} routing table changes: {e}", batch.len());
+            return;
+        }
+    };
+    let written = conn.transaction(|conn| {
+        for (id, contact) in &batch {
+            let this = node::table
+                .filter(node::family.eq(table))
+                .filter(node::id.eq(id.as_bytes()));
+            let Some(contact) = contact else {
+                diesel::delete(this).execute(conn)?;
+                continue;
+            };
+            let ip = contact.addr.ip();
+            diesel::insert_into(node::table)
+                .values(NodeRow {
+                    id: id.0.to_vec(),
+                    family: table,
+                    bucket: bucket_index(our_id, id),
+                    last_contacted: contact.last_contacted,
+                    ip_addr: ip.to_string(),
+                    ip_group: sybil_group(&ip).map(|g| g.to_string()),
+                    port: contact.addr.port().into(),
+                    failed_requests: contact.failed,
+                    removed: false,
+                    bep42: Some(contact.bep42),
+                })
+                .on_conflict((node::family, node::id))
+                .do_update()
+                .set((
+                    node::bucket.eq(excluded(node::bucket)),
+                    node::last_contacted.eq(excluded(node::last_contacted)),
+                    node::ip_addr.eq(excluded(node::ip_addr)),
+                    node::ip_group.eq(excluded(node::ip_group)),
+                    node::port.eq(excluded(node::port)),
+                    node::failed_requests.eq(excluded(node::failed_requests)),
+                    node::removed.eq(false),
+                    node::bep42.eq(excluded(node::bep42)),
+                ))
+                .execute(conn)?;
+        }
+        Ok::<_, diesel::result::Error>(())
+    });
+    if let Err(e) = written {
+        warn!("couldn't save {} routing table changes: {e}", batch.len());
+    }
+}
+
+/// The table's saved rows. Rows marked removed (by versions that tombstoned) go now.
+fn load(db: &Db, table: i32, our_id: NodeId) -> Nodes {
+    let mut nodes = Nodes::new(our_id);
+    let rows = db.get().map_err(|e| e.to_string()).and_then(|mut conn| {
+        diesel::delete(
+            node::table
+                .filter(node::family.eq(table))
+                .filter(node::removed.eq(true)),
+        )
+        .execute(&mut conn)
+        .map_err(|e| e.to_string())?;
+        node::table
+            .filter(node::family.eq(table))
+            .select((
+                node::id,
+                node::ip_addr,
+                node::port,
+                node::last_contacted,
+                node::failed_requests,
+            ))
+            .load::<(Vec<u8>, String, i32, i64, i32)>(&mut conn)
+            .map_err(|e| e.to_string())
+    });
+    let rows = rows
+        .inspect_err(|e| warn!("couldn't read the saved routing table: {e}"))
+        .unwrap_or_default();
+    for (id, ip, port, last_contacted, failed) in rows {
+        let (Some(id), Ok(ip), Ok(port)) = (NodeId::try_from_bytes(&id), ip.parse::<IpAddr>(), u16::try_from(port))
+        else {
+            continue;
+        };
+        let addr = SocketAddr::new(ip, port);
+        if id == our_id || nodes.by_id.contains_key(&id) || nodes.ip_taken(&ip) {
+            continue;
+        }
+        nodes.insert(
+            id,
+            Contact {
+                failed,
+                ..Contact::new(&id, addr, last_contacted)
+            },
+        );
+    }
+    nodes
+}
 
 #[derive(Debug, Clone)]
 /// A RoutingTable will tell you who are the closest nodes that we know
 pub struct RoutingTable {
     id: NodeId,
     family: Family,
-    /// the `node` rows that are this table's: its family's, or with BEP 45, its address's
-    scope_table: i32,
-    table: Pool<ConnectionManager<SqliteConnection>>,
+    nodes: Arc<Mutex<Nodes>>,
+    /// to the thread writing the table out (see `persist`)
+    changes: std_mpsc::Sender<Change>,
     rpc_manager: RpcManager,
     /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
-    /// We keep 160 flat buckets of 1024 and let `find_closest` order the whole table by
-    /// distance; eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps
-    /// the table fresh. Revisit if the table ever outgrows this.
+    /// We keep 160 flat buckets of 1024 and let `find_closest` pick by distance from the
+    /// whole table; eviction of dead nodes (failed_requests >= 3 → refresh) keeps the table
+    /// fresh. Revisit if the table ever outgrows this.
     bucket_capacity: usize,
     /// buckets with a refresh under way, see `add`
     refreshing: Arc<Mutex<HashSet<i32>>>,
 }
 
-type Conn = PooledConnection<ConnectionManager<SqliteConnection>>;
-
 impl RoutingTable {
-    /// The table holds the nodes of the broker's address family, in the broker's scope.
-    pub fn new(id: NodeId, rpc_manager: RpcManager, table: Pool<ConnectionManager<SqliteConnection>>) -> RoutingTable {
+    /// The table holds the nodes of the broker's address family, in the broker's scope, as
+    /// last saved in `db`.
+    pub fn new(id: NodeId, rpc_manager: RpcManager, db: Db) -> RoutingTable {
+        let table = rpc_manager.scope().table;
+        let nodes = load(&db, table, id);
+        let (changes, saved) = std_mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(format!("routing table {table}"))
+            .spawn(move || persist(db, table, id, saved));
+        if let Err(e) = spawned {
+            error!("the routing table won't be saved: {e}");
+        }
         RoutingTable {
             id,
             family: rpc_manager.family(),
-            scope_table: rpc_manager.scope().table,
-            table,
+            nodes: Arc::new(Mutex::new(nodes)),
+            changes,
             rpc_manager,
             bucket_capacity: 1024,
             refreshing: Arc::default(),
@@ -155,20 +431,13 @@ impl RoutingTable {
         self.family
     }
 
-    /// A connection of the pool; `None`, logged, if it has none to give
-    fn conn(&self) -> Option<Conn> {
-        self.table
-            .get()
-            .inspect_err(|e| error!("the routing table has no database connection: {e}"))
-            .ok()
+    fn nodes(&self) -> std::sync::MutexGuard<'_, Nodes> {
+        self.nodes.lock().unwrap()
     }
 
-    /// This table's live rows
-    fn alive(&self) -> node::BoxedQuery<'static, Sqlite> {
-        node::table
-            .filter(node::family.eq(self.scope_table))
-            .filter(node::removed.eq(false))
-            .into_boxed()
+    /// Writes `id` as `contact` (or its removal) out, in the next batch
+    fn save(&self, id: NodeId, contact: Option<Contact>) {
+        let _ = self.changes.send(Change::Node(id, contact));
     }
 
     /// The sender is alive, and so maybe are the nodes it refers us to
@@ -181,15 +450,12 @@ impl RoutingTable {
         if message.is_query() && message.read_only {
             return;
         }
-        let Some(mut conn) = self.conn() else {
-            return;
-        };
-        self.mark_good(&NodeInfo::new(sender, from), &mut conn);
-        self.add_with(sender, from, &mut conn);
+        self.mark_good(&NodeInfo::new(sender, from));
+        self.add(sender, from);
         // the other family's nodes are the session's business (see `DhtSession::pair_with`)
         if let KrpcBody::FindNodeGetPeersResponse(res) = &message.body {
             for node in res.nodes_of(self.family) {
-                self.add_with(node.id(), node.end_point(), &mut conn);
+                self.add(node.id(), node.end_point());
             }
         }
     }
@@ -230,75 +496,52 @@ impl RoutingTable {
 
     /// The `total` nodes we know closest to `target`, closest first.
     pub fn find_closest_n(&self, target: NodeId, total: u16) -> Vec<NodeInfo> {
-        let Some(mut conn) = self.conn() else {
-            return vec![];
-        };
-        self.alive()
-            .order(xor(node::id, target.as_bytes()))
-            .limit(total.into())
-            .select(NodeNoMetaInfo::as_select())
-            .load(&mut conn)
-            .inspect_err(|e| error!("couldn't read the routing table: {e}"))
-            .unwrap_or_default()
-            .into_iter()
-            .map(NodeInfo::from)
-            .collect()
+        self.nodes().closest(&target, total.into())
     }
 
     pub fn find_exact(&self, target: &NodeId) -> Option<NodeInfo> {
-        self.alive()
-            .filter(node::id.eq(target.as_bytes()))
-            .select(NodeNoMetaInfo::as_select())
-            .first(&mut self.conn()?)
-            .ok()
-            .map(NodeInfo::from)
+        let contact = *self.nodes().by_id.get(target)?;
+        Some(NodeInfo::new(*target, contact.addr))
     }
 
     pub fn contains(&self, target: &NodeId) -> bool {
-        self.find_exact(target).is_some()
+        self.nodes().by_id.contains_key(target)
     }
 
-    /// Adds a node we heard of, if its bucket has room or can make some (see `add_with`). A
-    /// node of the other address family is ignored.
+    /// Adds a node we heard of, if its bucket has room or can make some: a full bucket takes a
+    /// BEP 42 compliant node in place of a non-compliant one; otherwise it's refreshed, and
+    /// the node goes in if that made room. A node of the other address family is ignored.
     #[tracing::instrument(skip(self))]
-    pub fn add(&self, id: NodeId, addr: SocketAddr) {
-        if let Some(mut conn) = self.conn() {
-            self.add_with(id, addr, &mut conn);
-        }
-    }
-
-    /// `add`, on `conn`. A full bucket takes a BEP 42 compliant node in place of a
-    /// non-compliant one; otherwise it's refreshed, and the node goes in if that made room.
-    fn add_with(&self, new_node_id: NodeId, addr: SocketAddr, conn: &mut SqliteConnection) {
+    pub fn add(&self, new_node_id: NodeId, addr: SocketAddr) {
         if Family::of(&addr) != self.family || new_node_id == self.id {
             return;
         }
-        let known = self
-            .alive()
-            .filter(node::id.eq(new_node_id.as_bytes()))
-            .count()
-            .get_result::<i64>(conn)
-            .is_ok_and(|n| n > 0);
-        if known || self.ip_taken(&addr.ip(), conn) {
-            return;
-        }
-
         let bucket_idx = self.index(&new_node_id);
-        let new_node = NodeInfo::new(new_node_id, addr);
-        if !self.full_bucket(bucket_idx, conn) {
-            self.put_to_bucket(new_node, conn);
-            return;
-        }
-
-        // BEP 42: a compliant node takes the place of a non-compliant one, the one heard from
-        // least recently
-        if compliant(&new_node_id, addr.ip())
-            && let Some(victim) = self.least_recent_noncompliant(bucket_idx, conn)
+        let contact = Contact::new(&new_node_id, addr, unix_timestmap_ms());
         {
-            debug!("Bucket {bucket_idx} full, {new_node_id:?} replaces a non-BEP 42 node");
-            self.tombstone(&victim, conn);
-            self.put_to_bucket(new_node, conn);
-            return;
+            let mut nodes = self.nodes();
+            if nodes.by_id.contains_key(&new_node_id) || nodes.ip_taken(&addr.ip()) {
+                return;
+            }
+            if nodes.buckets[bucket_idx as usize].len() < self.bucket_capacity {
+                nodes.insert(new_node_id, contact);
+                drop(nodes);
+                self.save(new_node_id, Some(contact));
+                return;
+            }
+            // BEP 42: a compliant node takes the place of a non-compliant one, the one heard
+            // from least recently
+            if contact.bep42
+                && let Some(victim) = least_recent_noncompliant(&nodes, bucket_idx)
+            {
+                debug!("Bucket {bucket_idx} full, {new_node_id:?} replaces a non-BEP 42 node");
+                nodes.remove(&victim);
+                nodes.insert(new_node_id, contact);
+                drop(nodes);
+                self.save(victim, None);
+                self.save(new_node_id, Some(contact));
+                return;
+            }
         }
 
         // one refresh of a bucket at a time; a node turning up meanwhile is let go
@@ -310,97 +553,45 @@ impl RoutingTable {
         tokio::spawn(async move {
             this.refresh_bucket(bucket_idx).await;
             this.refreshing.lock().unwrap().remove(&bucket_idx);
-            let Some(mut conn) = this.conn() else {
-                return;
-            };
-            if this.full_bucket(bucket_idx, &mut conn) {
+            let mut nodes = this.nodes();
+            if nodes.buckets[bucket_idx as usize].len() >= this.bucket_capacity {
                 info!("Bucket {bucket_idx} remains full after refreshing, node not added");
-            } else {
-                this.put_to_bucket(new_node, &mut conn);
+            } else if !nodes.by_id.contains_key(&new_node_id) && !nodes.ip_taken(&addr.ip()) {
+                nodes.insert(new_node_id, contact);
+                drop(nodes);
+                this.save(new_node_id, Some(contact));
             }
         });
-    }
-
-    /// One node per public IPv4 address or IPv6 /64, as libtorrent does: someone running a
-    /// thousand node ids from one machine (a Sybil parked next to popular info hashes,
-    /// typically) gets one slot, not a thousand. LAN addresses are exempt, see `sybil_group`.
-    fn ip_taken(&self, ip: &IpAddr, conn: &mut SqliteConnection) -> bool {
-        let Some(group) = sybil_group(ip) else {
-            return false;
-        };
-        self.alive()
-            .filter(node::ip_group.eq(group.to_string()))
-            .count()
-            .get_result::<i64>(conn)
-            .is_ok_and(|n| n > 0)
-    }
-
-    fn least_recent_noncompliant(&self, i: i32, conn: &mut SqliteConnection) -> Option<NodeId> {
-        self.alive()
-            .filter(node::bucket.eq(i))
-            .filter(node::bep42.eq(false))
-            .order(node::last_contacted.asc())
-            .select(node::id)
-            .first::<Vec<u8>>(conn)
-            .ok()
-            .and_then(|raw| NodeId::try_from_bytes(&raw))
     }
 
     /// How many nodes in the table have BEP 42 compliant ids (LAN ones count as compliant),
     /// and how many nodes there are
     pub fn bep42_compliance(&self) -> (usize, usize) {
-        let Some(mut conn) = self.conn() else {
-            return (0, 0);
-        };
-        let count = |query: node::BoxedQuery<'static, Sqlite>, conn: &mut Conn| {
-            query.count().get_result::<i64>(conn).unwrap_or_default() as usize
-        };
-        let good = count(self.alive().filter(node::bep42.eq(true)), &mut conn);
-        (good, count(self.alive(), &mut conn))
+        let nodes = self.nodes();
+        (nodes.compliant, nodes.by_id.len())
     }
 
     pub fn node_count(&self) -> usize {
-        let Some(mut conn) = self.conn() else {
-            return 0;
-        };
-        self.alive().count().get_result::<i64>(&mut conn).unwrap_or_default() as usize
-    }
-
-    /// Whether the ith bucket is at capacity. Adds race (a refresh's insert against the inbox's),
-    /// so a bucket can end up a node or two over; that's harmless.
-    fn full_bucket(&self, i: i32, conn: &mut SqliteConnection) -> bool {
-        let size = self
-            .alive()
-            .filter(node::bucket.eq(i))
-            .count()
-            .get_result::<i64>(conn)
-            .unwrap_or_default();
-        size as usize >= self.bucket_capacity
+        self.nodes().by_id.len()
     }
 
     /// The questionable nodes of the ith bucket (BEP 5: not heard from in 15 minutes), the ones
     /// that failed a few queries since: a refresh pings them, and drops those that don't answer
-    fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<NodeInfo> {
+    fn replacement_queue(&self, i: i32) -> Vec<NodeInfo> {
         let questionable = unix_timestmap_ms() - QUESTIONABLE_AFTER.as_millis() as i64;
-        self.alive()
-            .filter(node::bucket.eq(i))
-            .filter(node::failed_requests.ge(FAILURES_TO_REFRESH))
-            .filter(node::last_contacted.le(questionable))
-            .order(node::last_contacted.desc())
-            .select(NodeNoMetaInfo::as_select())
-            .load(conn)
-            .inspect_err(|e| error!("{e}"))
-            .unwrap_or_default()
-            .into_iter()
-            .map(NodeInfo::from)
-            .collect()
+        let nodes = self.nodes();
+        let mut queue: Vec<(NodeId, Contact)> = nodes.buckets[i as usize]
+            .iter()
+            .filter_map(|id| Some((*id, *nodes.by_id.get(id)?)))
+            .filter(|(_, c)| c.failed >= FAILURES_TO_REFRESH && c.last_contacted <= questionable)
+            .collect();
+        queue.sort_by_key(|(_, c)| std::cmp::Reverse(c.last_contacted));
+        queue.into_iter().map(|(id, c)| NodeInfo::new(id, c.addr)).collect()
     }
 
     /// Pings each node of the ith bucket's replacement queue, and drops those that don't answer
     async fn refresh_bucket(&self, i: i32) {
-        let Some(queue) = self.conn().map(|mut conn| self.replacement_queue(i, &mut conn)) else {
-            return;
-        };
+        let queue = self.replacement_queue(i);
         join_all(queue.into_iter().map(|target| async move {
             let ping = KrpcBody::PingQuery(PingQuery::new(self.id));
             let answered = self
@@ -408,104 +599,71 @@ impl RoutingTable {
                 .query(ping, target.end_point(), REQ_TIMEOUT)
                 .await
                 .is_ok();
-            if let Some(mut conn) = self.conn() {
-                match answered {
-                    true => self.mark_good(&target, &mut conn),
-                    false => self.tombstone(&target.id(), &mut conn),
-                }
+            match answered {
+                true => self.mark_good(&target),
+                false => self.evict(&target.id()),
             }
         }))
         .await;
     }
 
     pub async fn refresh_table(&self) {
-        // tombstoned nodes go for good, so the table doesn't grow unboundedly
-        if let Some(mut conn) = self.conn() {
-            let _ = diesel::delete(
-                node::table
-                    .filter(node::family.eq(self.scope_table))
-                    .filter(node::removed.eq(true)),
-            )
-            .execute(&mut conn)
-            .inspect_err(|e| error!("{e}"));
-        }
         join_all((0..160).map(|i| self.refresh_bucket(i))).await;
         let (good, all) = self.bep42_compliance();
         info!("{} routing table: {all} nodes, {good} with BEP 42 ids", self.family);
     }
 
     /// We heard from `node`; another address claiming its id doesn't count
-    fn mark_good(&self, node: &NodeInfo, conn: &mut SqliteConnection) {
-        let _ = diesel::update(node::table)
-            .filter(node::family.eq(self.scope_table))
-            .filter(node::id.eq(node.id().as_bytes()))
-            .filter(node::ip_addr.eq(node.end_point().ip().to_string()))
-            .filter(node::port.eq(i32::from(node.end_point().port())))
-            .set((
-                node::last_contacted.eq(unix_timestmap_ms()),
-                node::failed_requests.eq(0),
-            ))
-            .execute(conn)
-            .inspect_err(|e| error!("{e}"));
+    fn mark_good(&self, node: &NodeInfo) {
+        let mut nodes = self.nodes();
+        let Some(contact) = nodes.by_id.get_mut(&node.id()) else {
+            return;
+        };
+        if contact.addr != node.end_point() {
+            return;
+        }
+        contact.last_contacted = unix_timestmap_ms();
+        contact.failed = 0;
+        let contact = *contact;
+        drop(nodes);
+        self.save(node.id(), Some(contact));
     }
 
     /// Record a failed RPC to a known node; enough of these lands it on the replacement
     /// queue (see `replacement_queue`), which is how dead nodes get evicted.
     pub fn mark_failed(&self, id: &NodeId) {
-        let Some(mut conn) = self.conn() else {
+        let mut nodes = self.nodes();
+        let Some(contact) = nodes.by_id.get_mut(id) else {
             return;
         };
-        let _ = diesel::update(node::table)
-            .filter(node::family.eq(self.scope_table))
-            .filter(node::id.eq(id.as_bytes()))
-            .set(node::failed_requests.eq(node::failed_requests + 1))
-            .execute(&mut conn)
-            .inspect_err(|e| error!("{e}"));
+        contact.failed += 1;
+        let contact = *contact;
+        drop(nodes);
+        self.save(*id, Some(contact));
     }
 
-    /// Takes a node out of the table now, for misbehaving rather than for being unreachable.
+    /// Takes a node out of the table now
     pub fn evict(&self, id: &NodeId) {
-        if let Some(mut conn) = self.conn() {
-            self.tombstone(id, &mut conn);
+        if self.nodes().remove(id).is_some() {
+            self.save(*id, None);
         }
-    }
-
-    /// Marks a node removed; the next refresh deletes it
-    fn tombstone(&self, id: &NodeId, conn: &mut SqliteConnection) {
-        let _ = diesel::update(node::table)
-            .filter(node::family.eq(self.scope_table))
-            .filter(node::id.eq(id.as_bytes()))
-            .set(node::removed.eq(true))
-            .execute(conn)
-            .inspect_err(|e| error!("{e}"));
-    }
-
-    fn put_to_bucket(&self, new_node: NodeInfo, conn: &mut SqliteConnection) {
-        let ip = new_node.end_point().ip();
-        let _ = diesel::insert_into(node::table)
-            .values(NodeRow {
-                id: new_node.id().0.to_vec(),
-                family: self.scope_table,
-                bucket: self.index(&new_node.id()),
-                last_contacted: unix_timestmap_ms(),
-                ip_addr: ip.to_string(),
-                ip_group: sybil_group(&ip).map(|g| g.to_string()),
-                port: new_node.end_point().port().into(),
-                failed_requests: 0,
-                removed: false,
-                bep42: Some(compliant(&new_node.id(), ip)),
-            })
-            .on_conflict_do_nothing()
-            .execute(conn)
-            .inspect_err(|e| error!("{e}"));
     }
 }
 
+fn least_recent_noncompliant(nodes: &Nodes, bucket: i32) -> Option<NodeId> {
+    nodes.buckets[bucket as usize]
+        .iter()
+        .filter_map(|id| Some((*id, nodes.by_id.get(id)?)))
+        .filter(|(_, c)| !c.bep42)
+        .min_by_key(|(_, c)| c.last_contacted)
+        .map(|(id, _)| id)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dht::txn_id_generator::TxnIdGenerator;
     use crate::test_support::memory_pool;
+    use rand::RngExt;
     use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
     use std::sync::Arc;
     use tokio::net::UdpSocket;
@@ -576,16 +734,14 @@ mod tests {
         assert_eq!(sybil_group(&"10.1.2.3".parse().unwrap()), None);
     }
 
-    async fn test_routing_table_on(our_id: NodeId, bind: SocketAddr) -> RoutingTable {
-        let pool = memory_pool();
-
+    async fn test_routing_table_in(our_id: NodeId, bind: SocketAddr, pool: Db) -> RoutingTable {
         let socket = UdpSocket::bind(bind).await.unwrap();
         let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
         RoutingTable::new(our_id, broker, pool)
     }
 
     async fn test_routing_table(our_id: NodeId) -> RoutingTable {
-        test_routing_table_on(our_id, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).await
+        test_routing_table_in(our_id, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(), memory_pool()).await
     }
 
     fn id_with_first_byte(b: u8) -> NodeId {
@@ -596,6 +752,23 @@ mod tests {
 
     fn addr(i: u8) -> SocketAddr {
         SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, i), 6881).into()
+    }
+
+    impl RoutingTable {
+        fn contact(&self, id: &NodeId) -> Contact {
+            *self.nodes().by_id.get(id).expect("in the table")
+        }
+
+        fn last_heard(&self, id: &NodeId, at: i64) {
+            self.nodes().by_id.get_mut(id).expect("in the table").last_contacted = at;
+        }
+
+        /// Waits for what the table changed so far to be written out
+        fn flush(&self) {
+            let (done, flushed) = std_mpsc::channel();
+            self.changes.send(Change::Flush(done)).unwrap();
+            flushed.recv().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -617,18 +790,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_closest_is_what_sorting_the_whole_table_gives() {
+        let mut routing_table = test_routing_table(NodeId([0x00; 20])).await;
+        routing_table.bucket_capacity = usize::MAX;
+        let mut all = vec![];
+        for i in 0..3000u32 {
+            let id = NodeId(rand::rng().random());
+            let [_, a, b, c] = i.to_be_bytes();
+            routing_table.add(id, SocketAddr::from(([10, a, b, c], 6881)));
+            all.push(id);
+        }
+        for _ in 0..200 {
+            let target = match rand::rng().random::<bool>() {
+                true => NodeId(rand::rng().random()),
+                // right next to a node, where the narrow ranges are
+                false => all[rand::rng().random_range(0..all.len())],
+            };
+            let n = rand::rng().random_range(0..40u16);
+            let mut sorted = all.clone();
+            sorted.sort_by_cached_key(|id| id.dist(&target));
+            sorted.truncate(n.into());
+            let found: Vec<NodeId> = routing_table.find_closest_n(target, n).iter().map(|n| n.id()).collect();
+            assert_eq!(found, sorted);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_table_is_saved_and_read_back() {
+        let pool = memory_pool();
+        let socket = || async { UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap() };
+        let broker = RpcManager::new(socket().await, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
+        let table = RoutingTable::new(NodeId([0; 20]), broker, pool.clone());
+        let (kept, gone) = (id_with_first_byte(0xF0), id_with_first_byte(0x0F));
+        table.add(kept, addr(1));
+        table.add(gone, addr(2));
+        table.mark_failed(&kept);
+        table.evict(&gone);
+        table.flush();
+
+        let broker = RpcManager::new(socket().await, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
+        let again = RoutingTable::new(NodeId([0; 20]), broker, pool);
+        assert_eq!(again.node_count(), 1);
+        assert_eq!(again.find_exact(&kept).unwrap().end_point(), addr(1));
+        assert_eq!(again.contact(&kept).failed, 1);
+    }
+
+    #[tokio::test]
     async fn the_tables_of_the_two_families_are_separate() {
-        let v4 = test_routing_table(NodeId([0x00; 20])).await;
-        let v6 = RoutingTable::new(
-            NodeId([0x00; 20]),
-            RpcManager::new(
-                UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap(),
-                v4.table.clone(),
-                Arc::new(TxnIdGenerator::new()),
-                None,
-            ),
-            v4.table.clone(),
-        );
+        let pool = memory_pool();
+        let v4 = test_routing_table_in(NodeId([0x00; 20]), (Ipv4Addr::LOCALHOST, 0).into(), pool.clone()).await;
+        let v6 = test_routing_table_in(NodeId([0x00; 20]), (Ipv6Addr::LOCALHOST, 0).into(), pool).await;
         assert_eq!(v6.family(), Family::V6);
 
         let shared = id_with_first_byte(0xF0);
@@ -656,36 +867,28 @@ mod tests {
 
     #[tokio::test]
     async fn failed_queries_increment_and_good_news_resets() {
-        use crate::schema::node::dsl::*;
-
         let routing_table = test_routing_table(NodeId([0x00; 20])).await;
         let a = id_with_first_byte(0xF0);
         routing_table.add(a, addr(1));
 
         routing_table.mark_failed(&a);
         routing_table.mark_failed(&a);
+        assert_eq!(
+            routing_table.contact(&a).failed,
+            2,
+            "each failed RPC must increment the counter"
+        );
 
-        let mut conn = routing_table.table.get().unwrap();
-        let failed: i32 = node
-            .filter(id.eq(a.0.to_vec()))
-            .select(failed_requests)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(failed, 2, "each failed RPC must increment the counter");
-
-        routing_table.mark_good(&NodeInfo::new(a, addr(1)), &mut conn);
-        let failed: i32 = node
-            .filter(id.eq(a.0.to_vec()))
-            .select(failed_requests)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(failed, 0, "hearing from the node resets the counter");
+        routing_table.mark_good(&NodeInfo::new(a, addr(1)));
+        assert_eq!(
+            routing_table.contact(&a).failed,
+            0,
+            "hearing from the node resets the counter"
+        );
     }
 
     #[tokio::test]
     async fn a_compliant_node_takes_a_full_buckets_place_from_a_non_compliant_one() {
-        use crate::schema::node::dsl::*;
-
         let mut table = test_routing_table(NodeId([0x00; 20])).await;
         table.bucket_capacity = 2;
         // all in bucket 159 (top bit set), at public addresses, ids made up so not compliant
@@ -693,12 +896,7 @@ mod tests {
         let newer = NodeId([0xFE; 20]);
         table.add(older, "1.1.1.1:6881".parse().unwrap());
         table.add(newer, "2.2.2.2:6881".parse().unwrap());
-        let mut conn = table.conn().unwrap();
-        diesel::update(node.filter(id.eq(older.0.to_vec())))
-            .set(last_contacted.eq(1))
-            .execute(&mut conn)
-            .unwrap();
-        drop(conn);
+        table.last_heard(&older, 1);
         assert_eq!(table.bep42_compliance(), (0, 2));
 
         let ip: IpAddr = "9.9.9.9".parse().unwrap();
@@ -718,6 +916,10 @@ mod tests {
         // a non-compliant newcomer doesn't get in that way
         table.add(NodeId([0xFD; 20]), "3.3.3.3:6881".parse().unwrap());
         assert!(!table.contains(&NodeId([0xFD; 20])));
+        // and the evicted node's address is free again
+        table.evict(&newer);
+        table.add(NodeId([0xFC; 20]), "1.1.1.1:6881".parse().unwrap());
+        assert!(table.contains(&NodeId([0xFC; 20])));
     }
 
     #[test]
@@ -763,8 +965,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_that_never_answered_is_refreshed_once_it_failed_enough() {
-        use crate::schema::node::dsl::*;
-
         let routing_table = test_routing_table(NodeId([0x00; 20])).await;
         // a node another node referred us to, which never answered a query of ours
         let dead = id_with_first_byte(0xF0);
@@ -772,13 +972,9 @@ mod tests {
         for _ in 0..3 {
             routing_table.mark_failed(&dead);
         }
-        let mut conn = routing_table.table.get().unwrap();
-        diesel::update(node.filter(id.eq(dead.0.to_vec())))
-            .set(last_contacted.eq(1))
-            .execute(&mut conn)
-            .unwrap();
+        routing_table.last_heard(&dead, 1);
         let queued: Vec<NodeId> = routing_table
-            .replacement_queue(routing_table.index(&dead), &mut conn)
+            .replacement_queue(routing_table.index(&dead))
             .into_iter()
             .map(|n| n.id())
             .collect();
@@ -787,20 +983,13 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_node_at_its_own_address_vouches_for_its_id() {
-        use crate::schema::node::dsl::*;
-
         let routing_table = test_routing_table(NodeId([0x00; 20])).await;
         let dead = id_with_first_byte(0xF0);
         routing_table.add(dead, addr(1));
         for _ in 0..3 {
             routing_table.mark_failed(&dead);
         }
-        let mut conn = routing_table.table.get().unwrap();
-        diesel::update(node.filter(id.eq(dead.0.to_vec())))
-            .set(last_contacted.eq(1))
-            .execute(&mut conn)
-            .unwrap();
-        drop(conn);
+        routing_table.last_heard(&dead, 1);
 
         // someone elsewhere claiming the dead node's id doesn't keep it in the table
         let claim = Krpc::new(
@@ -808,23 +997,16 @@ mod tests {
             KrpcBody::PingQuery(PingQuery::new(dead)),
         );
         routing_table.learn_from(addr(2), &claim);
-        let mut conn = routing_table.table.get().unwrap();
         let queued: Vec<NodeId> = routing_table
-            .replacement_queue(routing_table.index(&dead), &mut conn)
+            .replacement_queue(routing_table.index(&dead))
             .into_iter()
             .map(|n| n.id())
             .collect();
         assert_eq!(queued, vec![dead]);
-        drop(conn);
 
         // the node itself does
         routing_table.learn_from(addr(1), &claim);
-        let mut conn = routing_table.table.get().unwrap();
-        assert!(
-            routing_table
-                .replacement_queue(routing_table.index(&dead), &mut conn)
-                .is_empty()
-        );
+        assert!(routing_table.replacement_queue(routing_table.index(&dead)).is_empty());
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@
 //!   queries register their transaction id and await the response on a oneshot; inbound
 //!   queries, and answers matched to a pending query of ours, are fanned out to every
 //!   subscriber (routing table, server); other answers are dropped.
-//! - [`RoutingTable`] is the k-bucket store, persisted in SQLite so contacts survive
-//!   restarts. It also learns passively from every inbound packet.
+//! - [`RoutingTable`] is the k-bucket store, in memory and written behind to SQLite so
+//!   contacts survive restarts. It also learns passively from every inbound packet.
 //! - [`DhtClient`] (handle via [`DhtSession::handle`]) runs iterative lookups.
 //! - `DhtServer` answers inbound queries.
 //!

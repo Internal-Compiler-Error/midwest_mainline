@@ -31,8 +31,8 @@
 //!   (matched on both transaction id *and* sender address); inbound queries and matched
 //!   answers are also fanned out to all subscribers. Send work is spawned so a slow
 //!   write never stalls the receive loop.
-//! - [`dht::routing_table`] — the k-bucket contact store, persisted in SQLite so contacts
-//!   and our node id survive restarts. It subscribes to the broker's inbound fan-out and
+//! - [`dht::routing_table`] — the k-bucket contact store, in memory and written behind
+//!   to SQLite so contacts survive restarts. It subscribes to the broker's inbound fan-out and
 //!   learns from everything we hear; dead nodes are evicted by a failure counter plus
 //!   periodic refresh pings.
 //! - [`dht::client`] / `dht::server` — the two halves of the node, sharing one
@@ -53,8 +53,8 @@
 //!
 //! Two deliberate deviations from BEP 5: the routing table is 160 flat buckets of 1024
 //! nodes instead of k = 8 with bucket splitting (eviction keeps it fresh; see the note on
-//! [`dht::routing_table::RoutingTable`]), and all diesel calls are synchronous — fine for
-//! local SQLite, but don't hold them across network awaits.
+//! [`dht::routing_table::RoutingTable`]), and the store's diesel calls are synchronous — fine
+//! for local SQLite off the async workers, but don't hold them across network awaits.
 //!
 //! ## roadmap
 //! - [x] routing
