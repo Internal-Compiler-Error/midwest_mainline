@@ -63,13 +63,17 @@ impl Rc4 {
 
     /// Encrypts or decrypts `data` in place (the two are the same operation).
     fn apply(&mut self, data: &mut [u8]) {
+        let (s, mut i, mut j) = (&mut self.s, self.i, self.j);
         for byte in data {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[self.i as usize]);
-            self.s.swap(self.i as usize, self.j as usize);
-            let k = self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
-            *byte ^= k;
+            i = i.wrapping_add(1);
+            let si = s[i as usize];
+            j = j.wrapping_add(si);
+            let sj = s[j as usize];
+            s[i as usize] = sj;
+            s[j as usize] = si;
+            *byte ^= s[si.wrapping_add(sj) as usize];
         }
+        (self.i, self.j) = (i, j);
     }
 }
 
