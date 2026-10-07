@@ -179,11 +179,7 @@ impl TorrentSwarm {
         };
         let peer = &mut self.peers[idx];
         let request = match &block {
-            Ok(b) => Request {
-                index: b.index,
-                begin: b.begin,
-                length: b.length,
-            },
+            Ok(b) => Request::from(b),
             Err(request) => *request,
         };
         if !peer.uploads.remove(&request) {
@@ -199,11 +195,7 @@ impl TorrentSwarm {
                 self.stat.uploaded += block.length as u64;
                 peer.send_block(block)
             }
-            Ok(block) => peer.send_reject(Request {
-                index: block.index,
-                begin: block.begin,
-                length: block.length,
-            }),
+            Ok(_) => peer.send_reject(request),
             Err(request) => peer.send_reject(request),
         };
         if sent.is_err() {

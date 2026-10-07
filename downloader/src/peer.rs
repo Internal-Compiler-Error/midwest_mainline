@@ -462,11 +462,7 @@ impl Peer {
         match msg {
             BtMessage::KeepAlive(_) => {}
             BtMessage::Cancel(cancel) => {
-                self.uploads.remove(&Request {
-                    index: cancel.index,
-                    begin: cancel.begin,
-                    length: cancel.length,
-                });
+                self.uploads.remove(&Request::from(cancel));
             }
             BtMessage::Choke(_) => self.choked_us = true,
             BtMessage::Unchoke(_) => self.choked_us = false,
@@ -582,11 +578,7 @@ impl Peer {
     /// Records a block that answers one of our requests. `None` if we never asked for it (or
     /// gave up waiting), in which case the caller should ignore the data.
     pub fn block_received(&mut self, piece: &Piece) -> Option<()> {
-        self.requested.remove(&Request {
-            index: piece.index,
-            begin: piece.begin,
-            length: piece.length,
-        })?;
+        self.requested.remove(&Request::from(piece))?;
         self.stats.block_received(piece.length as usize, Instant::now());
         self.last_progress = Instant::now();
         Some(())
@@ -829,6 +821,37 @@ fn build_extended_handshake(
     out.extend_from_slice(&ip);
     out.push(b'e');
     out
+}
+
+// The block a Piece, Cancel or RejectRequest is about, as the Request that asked for it.
+impl From<&Piece> for Request {
+    fn from(piece: &Piece) -> Self {
+        Request {
+            index: piece.index,
+            begin: piece.begin,
+            length: piece.length,
+        }
+    }
+}
+
+impl From<Cancel> for Request {
+    fn from(cancel: Cancel) -> Self {
+        Request {
+            index: cancel.index,
+            begin: cancel.begin,
+            length: cancel.length,
+        }
+    }
+}
+
+impl From<RejectRequest> for Request {
+    fn from(reject: RejectRequest) -> Self {
+        Request {
+            index: reject.index,
+            begin: reject.begin,
+            length: reject.length,
+        }
+    }
 }
 
 /// BEP 11 "added.f" bits: what a gossiping peer knows about the one it names.

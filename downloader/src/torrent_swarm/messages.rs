@@ -141,11 +141,7 @@ impl TorrentSwarm {
     /// BEP 6: the peer is declining a request we made; the piece it belonged to goes back on
     /// the pile rather than idling out BLOCK_REQUEST_TIMEOUT.
     fn request_rejected(&mut self, idx: usize, reject: RejectRequest) {
-        let req = Request {
-            index: reject.index,
-            begin: reject.begin,
-            length: reject.length,
-        };
+        let req = Request::from(reject);
         let peer = &mut self.peers[idx];
         if peer.requested.remove(&req).is_some() {
             let addr = peer.remote_addr;

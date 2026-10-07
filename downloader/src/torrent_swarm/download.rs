@@ -253,11 +253,7 @@ impl TorrentSwarm {
     /// A block of a raced piece just arrived from `from`: any other racer that asked for the
     /// same block is told not to bother.
     fn cancel_duplicates(&mut self, block: &Piece, from: SocketAddr) {
-        let req = Request {
-            index: block.index,
-            begin: block.begin,
-            length: block.length,
-        };
+        let req = Request::from(block);
         let Some(in_flight) = self.in_flight.get(block.index) else {
             return;
         };
