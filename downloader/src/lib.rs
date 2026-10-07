@@ -50,6 +50,7 @@ pub use torrent::{Torrent, TorrentFile, parse_torrent};
 pub use torrent_swarm::TorrentSwarmStats;
 pub use utp::UtpWatch;
 
+use anyhow::Context;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -75,7 +76,9 @@ pub async fn load_source(
             peers: fetched.peers,
         })
     } else {
-        let bytes = std::fs::read(source)?;
+        let bytes = tokio::fs::read(source)
+            .await
+            .with_context(|| format!("reading {source}"))?;
         Ok(Loaded {
             torrent: parse_torrent(&bytes)?,
             peers: vec![],

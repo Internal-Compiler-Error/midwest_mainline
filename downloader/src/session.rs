@@ -478,7 +478,7 @@ impl TorrentTask {
                     Command::Act(Action::Remove { delete_files }) if self.resume_path.is_some() => {
                         tokio::select! {
                             resolved = &mut resolve => match resolved {
-                                Ok(resolved) => self.remove_files(&resolved.torrent, &resolved.root, delete_files),
+                                Ok(resolved) => self.remove_files(&resolved.torrent, &resolved.root, delete_files).await,
                                 Err(_) => self.remove_unresolved(),
                             },
                             _ = self.controls.cancel.cancelled() => {}
@@ -580,7 +580,13 @@ impl TorrentTask {
         // a newly added torrent whose files are already there (its creator seeding it, a
         // download moved over from another client, an update starting from its
         // predecessor's) starts with a check, not from nothing
-        let mut check = recheck_first || (!resumed && has_data_on_disk(&torrent, &root));
+        let mut check = recheck_first
+            || (!resumed && {
+                let (torrent, root) = (torrent.clone(), root.clone());
+                tokio::task::spawn_blocking(move || has_data_on_disk(&torrent, &root))
+                    .await
+                    .unwrap_or(false)
+            });
         let action = loop {
             let action = if std::mem::take(&mut check) {
                 // back to whichever of running or paused it was in, with what the disk holds
@@ -618,7 +624,7 @@ impl TorrentTask {
         };
 
         if let Action::Remove { delete_files } = action {
-            self.remove_files(&torrent, &root, delete_files);
+            self.remove_files(&torrent, &root, delete_files).await;
             self.bus.emit(Event::TorrentRemoved {
                 info_hash: torrent.info_hash,
                 deleted_files: delete_files,
@@ -731,7 +737,7 @@ impl TorrentTask {
                 Some(Action::Remove { delete_files }) => {
                     match owned {
                         Owned::Nothing => {}
-                        Owned::Torrent { torrent, root } => self.remove_files(torrent, root, delete_files),
+                        Owned::Torrent { torrent, root } => self.remove_files(torrent, root, delete_files).await,
                         Owned::Unresolved => self.remove_unresolved(),
                     }
                     return None;
@@ -762,18 +768,23 @@ impl TorrentTask {
         }
     }
 
-    fn remove_files(&self, torrent: &Torrent, root: &Path, delete_files: bool) {
+    /// The resume file, and with `delete_files` the data, which can be a big tree and is
+    /// deleted on the blocking pool.
+    async fn remove_files(&self, torrent: &Torrent, root: &Path, delete_files: bool) {
         let _ = std::fs::remove_file(self.resume_dir.join(ResumeData::file_name(&torrent.info_hash)));
         if delete_files {
             let data = root.join(torrent.top_level());
-            let deleted = if data.is_dir() {
-                std::fs::remove_dir_all(&data)
-            } else {
-                std::fs::remove_file(&data)
-            };
-            if let Err(e) = deleted {
-                tracing::warn!("couldn't delete {}: {e}", data.display());
-            }
+            let deleted = tokio::task::spawn_blocking(move || {
+                let deleted = if data.is_dir() {
+                    std::fs::remove_dir_all(&data)
+                } else {
+                    std::fs::remove_file(&data)
+                };
+                if let Err(e) = deleted {
+                    tracing::warn!("couldn't delete {}: {e}", data.display());
+                }
+            });
+            let _ = deleted.await;
         }
     }
 
