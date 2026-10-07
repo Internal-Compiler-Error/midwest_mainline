@@ -136,19 +136,26 @@ export class Insights {
         })
         this.lifecycle = keepLast(this.lifecycle, e, LOG_KEPT)
         break
-      case 'torrent_started':
       case 'torrent_queued':
       case 'torrent_paused':
+      case 'torrent_removed':
+        // its swarm stops without a goodbye per peer
+        this.leaveAll(e.info_hash, e.at_ms, e.kind.slice('torrent_'.length))
+        if (e.kind === 'torrent_removed') {
+          this.pieces.delete(e.info_hash)
+          this.lastTraffic.delete(e.info_hash)
+        }
+        this.lifecycle = keepLast(this.lifecycle, e, LOG_KEPT)
+        break
+      case 'torrent_started':
       case 'torrent_checked':
       case 'torrent_completed':
       case 'torrent_failed':
-      case 'torrent_removed':
       case 'metadata_fetched':
       case 'listening':
       case 'port_mapping':
       case 'dht_up':
         this.lifecycle = keepLast(this.lifecycle, e, LOG_KEPT)
-        if (e.kind === 'torrent_removed') this.pieces.delete(e.info_hash)
         break
       case 'pieces_known': {
         const map = this.pieceMap(e.info_hash, e.bitfield.length * 4)
@@ -237,14 +244,7 @@ export class Insights {
       }
       case 'peer_disconnected': {
         const p = this.peers.get(e.addr)
-        if (p) {
-          this.peers.set(e.addr, { ...p, left_at: e.at_ms, reason: e.reason, downloaded: e.downloaded, uploaded: e.uploaded, rx_bps: 0 })
-          this.departed.push(e.addr)
-          while (this.departed.length > DEPARTED_KEPT) {
-            const gone = this.departed.shift()!
-            if (this.peers.get(gone)?.left_at !== null) this.peers.delete(gone)
-          }
-        }
+        if (p) this.leave({ ...p, left_at: e.at_ms, reason: e.reason, downloaded: e.downloaded, uploaded: e.uploaded })
         bump(this.disconnects, e.reason)
         break
       }
@@ -286,6 +286,21 @@ export class Insights {
       case 'dht_lookup':
         this.announce({ at: e.at_ms, url: 'DHT', ok: true, peers: e.peers, detail: `${e.took_ms} ms` })
         break
+    }
+  }
+
+  private leave(gone: PeerRecord) {
+    this.peers.set(gone.addr, { ...gone, rx_bps: 0 })
+    this.departed.push(gone.addr)
+    while (this.departed.length > DEPARTED_KEPT) {
+      const addr = this.departed.shift()!
+      if (this.peers.get(addr)?.left_at !== null) this.peers.delete(addr)
+    }
+  }
+
+  private leaveAll(info_hash: string, at: number, reason: string) {
+    for (const p of [...this.peers.values()]) {
+      if (p.info_hash === info_hash && p.left_at === null) this.leave({ ...p, left_at: at, reason })
     }
   }
 
