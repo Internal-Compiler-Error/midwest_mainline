@@ -1025,17 +1025,30 @@ impl TorrentTask {
                 shown: self.shown(torrent, root),
                 stats: stats.clone(),
             });
-            self.persisted =
-                crate::resume::save_paused(torrent, root, &self.resume_dir, self.resume_inputs(), verified).await;
+            let saved = self.save_paused(torrent, root, verified).await;
             tokio::select! {
                 action = self.controls.next(None) => match action {
                     Some(Action::Pause) | None => {}
+                    Some(Action::Shutdown) if !saved => {
+                        self.save_paused(torrent, root, verified).await;
+                        return Action::Shutdown;
+                    }
                     Some(action) => return action,
                 },
                 // the key moved on while paused
                 Ok(()) = feed.changed() => {}
+                _ = tokio::time::sleep(RESAVE), if !saved => {}
             }
         }
+    }
+
+    /// Writes the resume file marked paused; returns whether that worked.
+    async fn save_paused(&mut self, torrent: &Arc<Torrent>, root: &Path, verified: &BitBox<u8, Msb0>) -> bool {
+        let saved = crate::resume::save_paused(torrent, root, &self.resume_dir, self.resume_inputs(), verified).await;
+        if let Some(persisted) = &saved {
+            self.persisted = persisted.clone();
+        }
+        saved.is_some()
     }
 }
 
@@ -1241,6 +1254,8 @@ fn lock_data_dir(data_dir: &Path) -> anyhow::Result<Option<File>> {
 /// How long shutdown waits for the torrents' last resume writes, and then for the trackers'
 /// `stopped` announces and the like.
 const SAVE_BUDGET: Duration = Duration::from_secs(10);
+/// How soon a paused torrent's resume write that failed is tried again.
+const RESAVE: Duration = Duration::from_secs(30);
 const ANNOUNCE_BUDGET: Duration = Duration::from_secs(2);
 
 /// What a session needs to start.
@@ -2453,6 +2468,35 @@ mod test {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A pause whose resume write fails is written again, at the latest on the way out, so
+    /// the torrent doesn't come back running at the next start.
+    #[test]
+    fn a_pause_that_could_not_be_saved_is_saved_on_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("pause-unsaved");
+        let torrent_file = write_torrent_file(&dir);
+        let root = dir.join("downloads");
+        let resume_dir = dir.join("resume");
+
+        let mut session = Session::new(test_config(&dir)).unwrap();
+        let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_dir(&resume_dir).unwrap().count() == 0 {
+            assert!(Instant::now() < deadline, "resume file was never written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let set_mode = |mode| std::fs::set_permissions(&resume_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(0o500);
+        session.pause(id);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
+        std::thread::sleep(Duration::from_millis(200));
+        set_mode(0o700);
+        session.shutdown();
+        assert!(list_resume_files(&resume_dir)[0].paused, "the pause was lost");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// An unpause that comes while a paused torrent's resume file is being read starts it.
     #[test]
     fn unpause_while_resolving_wins_over_the_resume_file() {
@@ -2462,6 +2506,7 @@ mod test {
 
         let mut session = Session::new(test_config(&dir)).unwrap();
         let id = session.add(torrent_file.display().to_string(), &root);
+        wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Downloading(_))));
         session.pause(id);
         wait_for(&mut session, id, |s| matches!(s, Some(TorrentState::Paused(_))));
         session.shutdown();

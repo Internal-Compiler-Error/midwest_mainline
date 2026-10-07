@@ -483,20 +483,18 @@ pub(crate) async fn keep_saving(
 }
 
 /// Writes `dir/<info hash>.resume` once, marked paused, for a torrent stopped at `verified`.
-/// Returns the bitfield the file holds afterwards.
+/// Returns the bitfield the file holds afterwards, or `None` if the write failed.
 pub(crate) async fn save_paused(
     torrent: &Arc<Torrent>,
     root: &Path,
     dir: &Path,
     inputs: ResumeInputs,
     verified: &BitSlice<u8, Msb0>,
-) -> BitBox<u8, Msb0> {
+) -> Option<BitBox<u8, Msb0>> {
     let mut data = inputs.snapshot(verified, 0).to_data(torrent, root);
     data.paused = true;
     let path = dir.join(ResumeData::file_name(&torrent.info_hash));
-    save_in_background(torrent, &path, data, &inputs.persisted)
-        .await
-        .unwrap_or(inputs.persisted)
+    save_in_background(torrent, &path, data, &inputs.persisted).await
 }
 
 /// What a resume file holds that changes while the torrent runs.
