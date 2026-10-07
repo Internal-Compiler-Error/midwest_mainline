@@ -4,6 +4,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
 use tracing::{trace, warn};
 
 use crate::dht::state::SharedState;
@@ -15,6 +17,13 @@ use crate::message::{
     item_queries::PutQuery,
 };
 use crate::types::{Family, NodeId, NodeInfo};
+
+/// Answers that read or write the store under way at once
+const MAX_STORE_ANSWERS: usize = 8;
+
+fn reads_the_store(query: &KrpcBody) -> bool {
+    !matches!(query, KrpcBody::PingQuery(_) | KrpcBody::FindNodeQuery(_))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DhtServer {
@@ -29,14 +38,28 @@ impl DhtServer {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn run(&self) {
         let mut inbox = self.state.rpc_manager.subscribe_inbound();
+        let store_answers = Arc::new(Semaphore::new(MAX_STORE_ANSWERS));
         while let Some((msg, from)) = inbox.recv().await {
             // BEP 43: a read-only node answers nothing
             if !msg.is_query() || self.state.rpc_manager.is_read_only() {
                 continue;
             }
-            // answering reads and writes the database, so it's off the async workers
+            // ping and find_node are answered from memory, here and now
+            if !reads_the_store(&msg.body) {
+                self.answer(msg, from);
+                continue;
+            }
+            // the rest wait on the database, off the async workers; past what the pool can
+            // serve, a query is dropped, as a node under load does, rather than queued
+            let Ok(permit) = store_answers.clone().try_acquire_owned() else {
+                trace!("too busy to answer {from}");
+                continue;
+            };
             let this = self.clone();
-            tokio::task::spawn_blocking(move || this.answer(msg, from));
+            tokio::task::spawn_blocking(move || {
+                this.answer(msg, from);
+                drop(permit);
+            });
         }
     }
 

@@ -77,6 +77,9 @@ const BOOTSTRAP_STRAGGLERS: Duration = Duration::from_millis(300);
 /// up after; the table goes on growing from every lookup afterwards
 const BOOTSTRAP_ENOUGH: usize = 32;
 const BOOTSTRAP_RETRIES: usize = 3;
+/// SQLite connections a node keeps: more than the server answers from the store at once (see
+/// `server`), so lookups, the crawler and the table's writer get one too
+const DB_CONNECTIONS: u32 = 16;
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -246,7 +249,8 @@ impl DhtSession {
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         let db = Pool::builder()
-            .test_on_check_out(true)
+            .max_size(DB_CONNECTIONS)
+            .connection_timeout(Duration::from_secs(5))
             .connection_customizer(Box::new(SensibleOptions {}))
             .build(manager)
             .map_err(|e| naur!("could not open the database {database_url}: {e}"))?;
@@ -518,12 +522,16 @@ impl DhtSession {
                     let mut tick = interval(PEER_LIFETIME / 9);
                     loop {
                         tick.tick().await;
-                        let _ = state
-                            .expire_peers()
-                            .inspect_err(|e| warn!("couldn't expire peers: {e}"));
-                        let _ = state
-                            .expire_items()
-                            .inspect_err(|e| warn!("couldn't expire BEP 44 items: {e}"));
+                        let state = state.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = state
+                                .expire_peers()
+                                .inspect_err(|e| warn!("couldn't expire peers: {e}"));
+                            let _ = state
+                                .expire_items()
+                                .inspect_err(|e| warn!("couldn't expire BEP 44 items: {e}"));
+                        })
+                        .await;
                     }
                 })
                 .unwrap();
@@ -769,7 +777,53 @@ mod ipv6_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use crate::test_support::scratch_dir;
+    use crate::message::Krpc;
+    use crate::message::get_peers_query::GetPeersQuery;
+    use crate::message::ping_query::PingQuery;
+    use crate::test_support::{node, scratch_dir};
+    use crate::types::TransactionId;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ping_is_answered_while_store_queries_wait_on_the_database() {
+        let dir = scratch_dir("flood");
+        let us = node(&dir, "us", SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await;
+        // every connection of the pool taken: whatever needs the store waits
+        let held: Vec<_> = (0..us.session.state.conn.max_size())
+            .map(|_| us.session.state.conn.get().unwrap())
+            .collect();
+        let them = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let to = us.session.local_addr();
+        for i in 0..600u16 {
+            let query = KrpcBody::GetPeersQuery(GetPeersQuery::new(NodeId([1; 20]), InfoHash([2; 20])));
+            let packet = Krpc::new(TransactionId::from_bytes(&i.to_be_bytes()), query).encode();
+            them.send_to(&packet, to).await.unwrap();
+        }
+        let ping = Krpc::new(
+            TransactionId::from_bytes(b"pi"),
+            KrpcBody::PingQuery(PingQuery::new(NodeId([1; 20]))),
+        );
+        // sent a few times: a flood this size can overrun the socket's buffer
+        let mut buf = [0u8; 1500];
+        let mut answered = false;
+        for _ in 0..10 {
+            them.send_to(&ping.encode(), to).await.unwrap();
+            let heard = tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    let (n, _) = them.recv_from(&mut buf).await.unwrap();
+                    if Krpc::decode(&buf[..n]).is_ok_and(|msg| msg.txn_id == ping.txn_id) {
+                        break;
+                    }
+                }
+            });
+            if heard.await.is_ok() {
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "the ping waited behind the flood");
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stopped_node_lets_go_of_its_port() {
