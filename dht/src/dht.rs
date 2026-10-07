@@ -439,10 +439,11 @@ impl DhtSession {
         self.client.get_peers(info_hash).await
     }
 
-    /// Info hashes we hold announced peers for: with [`Retention::Forever`], every one anyone
-    /// ever announced to us.
-    pub fn stored_swarms(&self) -> Vec<InfoHash> {
-        self.state.stored_swarms()
+    /// Info hashes we hold announced peers for (with [`Retention::Forever`], every one anyone
+    /// ever announced to us): up to `limit` of them, in order, from the first past `after`.
+    /// A long-term index holds millions, so it's read a page at a time.
+    pub fn stored_swarms(&self, after: Option<InfoHash>, limit: usize) -> Vec<InfoHash> {
+        self.state.stored_swarms(after, limit)
     }
 
     /// A BEP 51 crawler on this node, sending `per_second` queries a second once run; see

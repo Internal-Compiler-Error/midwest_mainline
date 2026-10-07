@@ -64,6 +64,10 @@ impl Outcome {
     }
 }
 
+/// Info hashes `stored_swarms` returns unless asked for fewer, and at most
+const SWARMS_PAGE: usize = 1000;
+const MAX_SWARMS_PAGE: usize = 10_000;
+
 /// `{"info_hash": "<40 hex digits>"}`
 fn info_hash_param(params: Option<&serde_json::Value>) -> Option<InfoHash> {
     let hex = params?.get("info_hash")?.as_str()?;
@@ -128,8 +132,12 @@ async fn call(s: &AppState, method: &str, params: Option<&serde_json::Value>) ->
             let count = |field: fn(&CrawlStats) -> &AtomicU64| -> u64 {
                 s.crawlers.iter().map(|c| field(c.stats()).load(Relaxed)).sum()
             };
+            let dht = s.dht.clone();
+            let Ok(info_hashes) = tokio::task::spawn_blocking(move || dht.sampled_count()).await else {
+                return Outcome::error(-32603, "Internal error");
+            };
             serde_json::json!({
-                "info_hashes": s.dht.sampled_count(),
+                "info_hashes": info_hashes,
                 "crawling": !s.crawlers.is_empty(),
                 "queried": count(|s| &s.queried),
                 "answered": count(|s| &s.answered),
@@ -137,17 +145,42 @@ async fn call(s: &AppState, method: &str, params: Option<&serde_json::Value>) ->
                 "new_info_hashes": count(|s| &s.new_info_hashes),
             })
         }
+        // a page of the store's info hashes, in order: `{"after": "<40 hex digits>", "limit": n}`,
+        // both optional; the next page starts after the last one returned
         "stored_swarms" => {
-            let swarms: Vec<String> = s.dht.stored_swarms().iter().map(|h| hex::encode(h.0)).collect();
-            serde_json::json!(swarms)
+            let param = |key| params.and_then(|p| p.get(key));
+            let after = match param("after") {
+                None => None,
+                Some(after) => match after
+                    .as_str()
+                    .and_then(|h| InfoHash::try_from_bytes(&hex::decode(h).ok()?))
+                {
+                    Some(after) => Some(after),
+                    None => return Outcome::invalid_params(),
+                },
+            };
+            let limit = match param("limit") {
+                None => SWARMS_PAGE,
+                Some(limit) => match limit.as_u64() {
+                    Some(limit) => (limit as usize).min(MAX_SWARMS_PAGE),
+                    None => return Outcome::invalid_params(),
+                },
+            };
+            let dht = s.dht.clone();
+            let Ok(swarms) = tokio::task::spawn_blocking(move || dht.stored_swarms(after, limit)).await else {
+                return Outcome::error(-32603, "Internal error");
+            };
+            serde_json::json!(swarms.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>())
         }
         "stored_peers" => {
             let Some(info_hash) = info_hash_param(params) else {
                 return Outcome::invalid_params();
             };
-            let peers: Vec<_> = s
-                .dht
-                .stored_peers(&info_hash)
+            let dht = s.dht.clone();
+            let Ok(peers) = tokio::task::spawn_blocking(move || dht.stored_peers(&info_hash)).await else {
+                return Outcome::error(-32603, "Internal error");
+            };
+            let peers: Vec<_> = peers
                 .into_iter()
                 .map(|p| {
                     serde_json::json!({

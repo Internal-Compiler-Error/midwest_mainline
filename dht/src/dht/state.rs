@@ -215,8 +215,16 @@ impl SharedState {
     }
 
     /// Info hashes the store holds at least one peer for.
-    pub(crate) fn stored_swarms(&self) -> Vec<InfoHash> {
-        or_nothing(self.with_conn(|conn| peer::table.select(peer::swarm).distinct().load::<Vec<u8>>(conn)))
+    pub(crate) fn stored_swarms(&self, after: Option<InfoHash>, limit: usize) -> Vec<InfoHash> {
+        let mut query = swarm::table
+            .select(swarm::info_hash)
+            .order(swarm::info_hash)
+            .limit(limit.try_into().unwrap_or(i64::MAX))
+            .into_boxed();
+        if let Some(after) = after {
+            query = query.filter(swarm::info_hash.gt(after.0.to_vec()));
+        }
+        or_nothing(self.with_conn(|conn| query.load::<Vec<u8>>(conn)))
             .iter()
             .filter_map(|bytes| InfoHash::try_from_bytes(bytes))
             .collect()
@@ -385,11 +393,17 @@ mod tests {
         let fresh: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         assert_eq!(state.swarm_peers(&fresh_hash, Family::V4), vec![fresh]);
         assert!(state.swarm_peers(&stale_hash, Family::V4).is_empty());
-        assert_eq!(state.stored_swarms().len(), 2, "kept until something expires them");
+        assert_eq!(
+            state.stored_swarms(None, 10).len(),
+            2,
+            "kept until something expires them"
+        );
+        assert_eq!(state.stored_swarms(None, 1), vec![fresh_hash], "a page at a time");
+        assert_eq!(state.stored_swarms(Some(fresh_hash), 10), vec![stale_hash]);
         assert_eq!(state.stored_peers(&fresh_hash).len(), 2);
 
         state.expire_peers().unwrap();
-        assert_eq!(state.stored_swarms(), vec![fresh_hash]);
+        assert_eq!(state.stored_swarms(None, 10), vec![fresh_hash]);
         assert_eq!(
             state.stored_peers(&fresh_hash),
             vec![StoredPeer {
