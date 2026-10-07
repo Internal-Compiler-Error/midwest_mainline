@@ -474,12 +474,22 @@ fn main() {
     let logs = LogBuffer::new(5_000);
     let telemetry = Telemetry::install(Box::new(logs.layer())).expect("failed to install tracing");
     let data_dir = data_dir();
-    let mut session = Session::new(SessionConfig {
+    let mut session = match Session::new(SessionConfig {
         peer_id: random_peer_id(),
         settings: Settings::load(&data_dir),
         data_dir,
-    })
-    .expect("failed to start a session");
+    }) {
+        Ok(session) => session,
+        // a second copy of the app, most likely: say so in a window rather than vanish
+        Err(e) => {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("downloader")
+                .set_description(format!("{e:#}"))
+                .show();
+            std::process::exit(1);
+        }
+    };
     let events = session.subscribe();
     // everything from last time comes back, paused ones paused
     session.resume_all();
