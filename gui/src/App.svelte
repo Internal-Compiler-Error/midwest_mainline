@@ -206,7 +206,7 @@
           {#key selectedTorrent.id}
             <Details
               torrent={selectedTorrent}
-              onselectfiles={(files) => selected !== null && api.selectFiles(selected, files)}
+              onselectfiles={(files) => api.selectFiles(selectedTorrent.id, files)}
               onsequential={(on) => selected !== null && api.setSequential(selected, on)}
               onsuperseed={(on) => selected !== null && api.setSuperSeed(selected, on)}
               onpeer={(addr) => {

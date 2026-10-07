@@ -20,7 +20,7 @@
     onpeer,
   }: {
     torrent: TorrentRow
-    onselectfiles: (selected: boolean[]) => void
+    onselectfiles: (selected: boolean[]) => Promise<void>
     onsequential: (on: boolean) => void
     onsuperseed: (on: boolean) => void
     onpeer?: (addr: string) => void
@@ -42,11 +42,23 @@
     'files' in torrent ? torrent.files.map((f, i) => [f, i] as const).filter(([f]) => !f.pad) : [],
   )
 
+  /** The selection last asked for, until a poll shows it: the torrent applies it a moment
+   * later, and a second click meanwhile must build on the first rather than undo it. */
+  let asked = $state.raw<boolean[] | null>(null)
+  let polled = $derived(isKnown(torrent) ? torrent.files.map((f) => f.selected) : [])
+  let wanted = $derived(asked ?? polled)
+  $effect(() => {
+    if (asked && asked.every((on, i) => on === polled[i])) asked = null
+  })
+
   function toggleFile(index: number, checked: boolean) {
     if (!isKnown(torrent)) return
-    const selected = torrent.files.map((f) => f.selected)
+    const selected = [...wanted]
     selected[index] = checked
-    onselectfiles(selected)
+    asked = selected
+    onselectfiles(selected).catch(() => {
+      if (asked === selected) asked = null
+    })
   }
 </script>
 
@@ -125,9 +137,9 @@
         {#each shownFiles as [file, i] (file.path)}
           <li class="flex items-center gap-2">
             <Checkbox
-              checked={file.selected}
+              checked={wanted[i]}
               onCheckedChange={(checked) => toggleFile(i, checked === true)}
-              title={file.selected ? 'skip this file' : 'download this file'}
+              title={wanted[i] ? 'skip this file' : 'download this file'}
             />
             <span class="truncate select-text" title={file.path}>{file.path}</span>
             <span class="ml-auto text-muted-foreground tabular-nums">{humanBytes(file.size)}</span>
