@@ -5,8 +5,8 @@
 //! The table learns passively: `run` consumes the broker's inbound message fan-out and
 //! records every node that answers a query of ours; a node that queries us is pinged before
 //! it may join, and nodes named in answers are lookup candidates, not members.
-//! Liveness is tracked with a `failed_requests` counter — 3+ failures and 15 minutes unheard
-//! from land a node on the replacement queue, and a failed refresh ping drops it.
+//! Every few minutes a refresh pings the nodes not heard from in 15 minutes (BEP 5's
+//! questionable), those that failed queries of ours first; a node that misses twice goes.
 //!
 //! IPv4 and IPv6 nodes share the `node` table, told apart by its `family` column: each
 //! [`RoutingTable`] sees only the rows of its own family (BEP 32's separate tables).
@@ -115,8 +115,9 @@ pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
 const REFRESH_EVERY: Duration = Duration::from_secs(180);
 /// BEP 5's questionable node: not heard from in this long
 const QUESTIONABLE_AFTER: Duration = Duration::from_secs(15 * 60);
-/// Failed queries that make a questionable node worth a refresh ping
-const FAILURES_TO_REFRESH: i32 = 3;
+/// Questionable nodes a bucket's refresh pings at most, so a long-quiet table is checked a
+/// slice at a time
+const REFRESH_PER_BUCKET: usize = 32;
 /// How often at most the table's changes are written out, as one transaction
 const PERSIST_EVERY: Duration = Duration::from_secs(1);
 /// Changes that make a batch be written early
@@ -399,7 +400,7 @@ pub struct RoutingTable {
     rpc_manager: RpcManager,
     /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
     /// We keep 160 flat buckets of 1024 and let `find_closest` pick by distance from the
-    /// whole table; eviction of dead nodes (failed_requests >= 3 → refresh) keeps the table
+    /// whole table; eviction of dead nodes (questionable → refresh ping) keeps the table
     /// fresh. Revisit if the table ever outgrows this.
     bucket_capacity: usize,
     /// buckets with a refresh under way, see `add`
@@ -627,20 +628,21 @@ impl RoutingTable {
     }
 
     /// The questionable nodes of the ith bucket (BEP 5: not heard from in 15 minutes), the ones
-    /// that failed a few queries since: a refresh pings them, and drops those that don't answer
+    /// that failed queries of ours first, then the longest quiet: a refresh pings them
     fn replacement_queue(&self, i: i32) -> Vec<NodeInfo> {
         let questionable = unix_timestmap_ms() - QUESTIONABLE_AFTER.as_millis() as i64;
         let nodes = self.nodes();
         let mut queue: Vec<(NodeId, Contact)> = nodes.buckets[i as usize]
             .iter()
             .filter_map(|id| Some((*id, *nodes.by_id.get(id)?)))
-            .filter(|(_, c)| c.failed >= FAILURES_TO_REFRESH && c.last_contacted <= questionable)
+            .filter(|(_, c)| c.last_contacted <= questionable)
             .collect();
-        queue.sort_by_key(|(_, c)| std::cmp::Reverse(c.last_contacted));
+        queue.sort_by_key(|(_, c)| (std::cmp::Reverse(c.failed), c.last_contacted));
+        queue.truncate(REFRESH_PER_BUCKET);
         queue.into_iter().map(|(id, c)| NodeInfo::new(id, c.addr)).collect()
     }
 
-    /// Pings each node of the ith bucket's replacement queue, and drops those that don't answer
+    /// Pings each node of the ith bucket's replacement queue; see `refreshed`
     async fn refresh_bucket(&self, i: i32) {
         let queue = self.replacement_queue(i);
         join_all(queue.into_iter().map(|target| async move {
@@ -650,12 +652,24 @@ impl RoutingTable {
                 .query(ping, target.end_point(), REQ_TIMEOUT)
                 .await
                 .is_ok();
-            match answered {
-                true => _ = self.mark_good(&target),
-                false => self.evict(&target.id()),
-            }
+            self.refreshed(&target, answered);
         }))
         .await;
+    }
+
+    /// A refresh ping to `node` was answered or not. Unanswered, it counts as a failure, and a
+    /// node with another failure on record goes: one lost packet is forgiven.
+    fn refreshed(&self, node: &NodeInfo, answered: bool) {
+        if answered {
+            self.mark_good(node);
+            return;
+        }
+        let failed = self.nodes().by_id.get(&node.id()).map(|c| c.failed);
+        match failed {
+            Some(failed) if failed >= 1 => self.evict(&node.id()),
+            Some(_) => self.mark_failed(&node.id()),
+            None => {}
+        }
     }
 
     pub async fn refresh_table(&self) {
@@ -1032,6 +1046,31 @@ mod tests {
             .map(|n| n.id())
             .collect();
         assert_eq!(queued, vec![dead]);
+    }
+
+    #[tokio::test]
+    async fn a_node_gone_quiet_is_pinged_and_dropped_after_two_misses() {
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
+        // a node that answered once, and that we never asked anything since
+        let quiet = id_with_first_byte(0xF0);
+        routing_table.add(quiet, addr(1));
+        let bucket = routing_table.index(&quiet);
+        assert!(
+            routing_table.replacement_queue(bucket).is_empty(),
+            "not questionable yet"
+        );
+        routing_table.last_heard(&quiet, 1);
+        assert_eq!(
+            routing_table.replacement_queue(bucket),
+            vec![NodeInfo::new(quiet, addr(1))]
+        );
+
+        // one lost ping is forgiven, a second isn't
+        let node = NodeInfo::new(quiet, addr(1));
+        routing_table.refreshed(&node, false);
+        assert!(routing_table.contains(&quiet));
+        routing_table.refreshed(&node, false);
+        assert!(!routing_table.contains(&quiet));
     }
 
     #[tokio::test]
