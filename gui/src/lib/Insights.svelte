@@ -2,6 +2,7 @@
   // Live charts over the event bus (see bus.svelte.ts for what is accumulated). Every
   // chart is an ECharts option derived from the store; ECharts animates the changes.
   import { Button } from '$lib/components/ui/button'
+  import * as Select from '$lib/components/ui/select'
   import { humanBytes, rate, timeOfDay } from './format'
   import { base, type Chart, type Option } from './echart'
   import type { Insights, PeerRecord } from './bus.svelte'
@@ -289,9 +290,14 @@
         <div class="flex items-center gap-2">
           <h3 class="font-medium">Piece map</h3>
           {#if pieceMaps.length > 1}
-            <select class="rounded border bg-background px-1 text-xs" aria-label="torrent" bind:value={pieceTorrent}>
-              {#each pieceMaps as m (m.info_hash)}<option value={m.info_hash}>{m.name}</option>{/each}
-            </select>
+            <Select.Root type="single" value={shownPieces?.info_hash} onValueChange={(v) => (pieceTorrent = v)}>
+              <Select.Trigger size="sm" class="max-w-64 px-1.5 text-xs data-[size=sm]:h-6" aria-label="torrent">
+                <span class="truncate">{shownPieces?.name}</span>
+              </Select.Trigger>
+              <Select.Content>
+                {#each pieceMaps as m (m.info_hash)}<Select.Item class="text-xs" value={m.info_hash} label={m.name} />{/each}
+              </Select.Content>
+            </Select.Root>
           {:else if shownPieces}
             <span class="text-muted-foreground">{shownPieces.name}</span>
           {/if}

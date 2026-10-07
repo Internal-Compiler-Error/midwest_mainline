@@ -7,9 +7,12 @@
   import * as Dialog from '$lib/components/ui/dialog'
   import { Input } from '$lib/components/ui/input'
   import { Label } from '$lib/components/ui/label'
+  import * as Select from '$lib/components/ui/select'
   import { Switch } from '$lib/components/ui/switch'
   import * as api from './api'
   import type { Settings } from './api'
+
+  const ENCRYPTION: Record<Settings['encryption'], string> = { disabled: 'Disabled', prefer: 'Prefer', require: 'Require' }
 
   let { open: isOpen = $bindable(), onsaved }: { open: boolean; onsaved: (settings: Settings) => void } = $props()
   let draft = $state<Settings | null>(null)
@@ -104,15 +107,14 @@
         <Input id="ratio" type="number" min="0" step="0.1" bind:value={draft.seed_ratio_limit} class="h-8 w-28" />
 
         <Label for="encryption">Encryption</Label>
-        <select
-          id="encryption"
-          bind:value={draft.encryption}
-          class="border-input bg-background h-8 w-40 rounded-md border px-2 text-sm"
-        >
-          <option value="disabled">Disabled</option>
-          <option value="prefer">Prefer</option>
-          <option value="require">Require</option>
-        </select>
+        <Select.Root type="single" bind:value={draft.encryption}>
+          <Select.Trigger id="encryption" size="sm" class="w-40">{ENCRYPTION[draft.encryption]}</Select.Trigger>
+          <Select.Content>
+            {#each Object.entries(ENCRYPTION) as [value, label] (value)}
+              <Select.Item {value} {label} />
+            {/each}
+          </Select.Content>
+        </Select.Root>
       </div>
       {#if error}<p class="text-destructive">{error}</p>{/if}
       {#if notice}<p class="text-muted-foreground">{notice}</p>{/if}
