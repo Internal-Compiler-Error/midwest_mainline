@@ -164,6 +164,10 @@ impl DhtServer {
             true => from,
             false => SocketAddr::new(from.ip(), announce.port()),
         };
+        // nobody can connect there, and every other node drops such a value unread
+        if peer.port() == 0 {
+            return KrpcBody::ErrorResponse(KrpcError::new_protocol());
+        }
         match self.state.store_peer(&announce.info_hash(), peer, announce.seed()) {
             Ok(()) => self.ack(),
             Err(e) => {

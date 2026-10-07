@@ -857,6 +857,31 @@ mod lifecycle_tests {
 }
 
 #[cfg(test)]
+mod announce_tests {
+    use super::*;
+    use crate::test_support::{node, scratch_dir};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_announce_of_port_0_is_refused() {
+        let dir = scratch_dir("port0");
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let store = node(&dir, "store", loopback).await;
+        let us = node(&dir, "us", loopback).await;
+        us.session.bootstrap(vec![store.session.local_addr()]).await.unwrap();
+        let hash = InfoHash([7; 20]);
+        let (_, token) = us.session.get_peers(hash).await.announce_candidates[0].clone();
+        let announced = us
+            .session
+            .handle()
+            .announce_peers(store.session.local_addr(), hash, Some(0), token, false)
+            .await;
+        assert!(matches!(announced, Err(OurError::Remote(e)) if e.code() == 203));
+        assert!(store.session.stored_peers(&hash).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod spoofing_tests {
     use super::*;
     use crate::message::Krpc;
