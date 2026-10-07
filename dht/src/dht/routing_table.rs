@@ -128,9 +128,9 @@ pub struct RoutingTable {
     table: Pool<ConnectionManager<SqliteConnection>>,
     rpc_manager: RpcManager,
     /// NOTE(deviation): BEP 5 specifies k = 8 per bucket with split-when-covers-self.
-    /// We keep 160 flat buckets of 1024 and let `find_closest` gather across buckets;
-    /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
-    /// table fresh. Revisit if the table ever outgrows this.
+    /// We keep 160 flat buckets of 1024 and let `find_closest` order the whole table by
+    /// distance; eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps
+    /// the table fresh. Revisit if the table ever outgrows this.
     bucket_capacity: usize,
     /// buckets with a refresh under way, see `add`
     refreshing: Arc<Mutex<HashSet<i32>>>,
@@ -212,68 +212,25 @@ impl RoutingTable {
         bucket_index(&self.id, target)
     }
 
-    fn closest_in_bucket(&self, target: &NodeId, i: i32, limit: i64, conn: &mut SqliteConnection) -> Vec<NodeInfo> {
-        use crate::schema::node::dsl::*;
-
-        let nodes = node
-            .select(NodeNoMetaInfo::as_select())
-            .filter(family.eq(self.scope_table))
-            .filter(removed.eq(false))
-            .filter(bucket.eq(i))
-            // order by Kadamlia XOR distance
-            .order(xor(id, target.as_bytes()))
-            .limit(limit)
-            .load(conn)
-            .expect("Writers don't block readers");
-
-        nodes.into_iter().map(|nodee| nodee.into()).collect::<Vec<_>>()
-    }
-
+    /// The k (8) nodes we know closest to `target`, closest first
     pub fn find_closest(&self, target: NodeId) -> Vec<NodeInfo> {
         self.find_closest_n(target, 8)
     }
 
     /// The `total` nodes we know closest to `target`, closest first.
     pub fn find_closest_n(&self, target: NodeId, total: u16) -> Vec<NodeInfo> {
-        // NOTE: Start with the center and alternating left and right expansion, none of this is
-        // done in a transaction so we don't block other writers due to sqlite only allowing one
-        // writers at anytime. It's possible that other writers may modify the table while we
-        // fetch, that's ok, the DHT is allowed to be somewhat sloppy.
-
-        let mut conn = self.conn();
-
-        let target_idx = self.index(&target);
-        let mut closest = self.closest_in_bucket(&target, target_idx, total.into(), &mut conn);
-
-        let mut offset = 1;
-        let mut remaining: u16 = total.saturating_sub(closest.len().try_into().expect("we spcified the limit"));
-        loop {
-            // if got we wanted, or both sides are out of bounds, then there's no more we can do
-            if remaining == 0 || (target_idx - offset < 0 && target_idx + offset >= 160) {
-                break;
-            }
-
-            // favours the nodes closer to the target, i.e buckets with larger index
-            let right_bucket = target_idx + offset;
-            if remaining != 0 && right_bucket < 160 {
-                let mut additional = self.closest_in_bucket(&target, right_bucket, remaining.into(), &mut conn);
-                remaining = remaining.saturating_sub(additional.len().try_into().expect("we spcified the limit"));
-                closest.append(&mut additional);
-            }
-
-            let left_bucket = target_idx - offset;
-            if remaining != 0 && left_bucket >= 0 {
-                let mut additional = self.closest_in_bucket(&target, left_bucket, remaining.into(), &mut conn);
-                remaining = remaining.saturating_sub(additional.len().try_into().expect("we spcified the limit"));
-                closest.append(&mut additional);
-            }
-
-            offset += 1;
-        }
-
-        closest.sort_unstable_by(|a, b| types::cmp_resp(&a.id(), &b.id(), &target));
-
-        closest
+        use crate::schema::node::dsl::*;
+        node.select(NodeNoMetaInfo::as_select())
+            .filter(family.eq(self.scope_table))
+            .filter(removed.eq(false))
+            .order(xor(id, target.as_bytes()))
+            .limit(total.into())
+            .load(&mut self.conn())
+            .inspect_err(|e| error!("couldn't read the routing table: {e}"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(NodeInfo::from)
+            .collect()
     }
 
     pub fn find_exact(&self, target: &NodeId) -> Option<NodeInfo> {
@@ -856,6 +813,22 @@ mod tests {
         let mut expected = vec![(good.0[0], Some(true)), (1, Some(false)), (2, Some(true))];
         expected.sort();
         assert_eq!(flags, expected, "the LAN node is exempt");
+    }
+
+    #[tokio::test]
+    async fn the_closest_come_from_the_buckets_below_the_targets_before_those_above() {
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
+        // the target is in bucket 158; 0x80.. sits in 159, 0x20.. in 157, and to the target
+        // they're 0xC0.. and 0x60.. away
+        let above = id_with_first_byte(0x80);
+        let below = id_with_first_byte(0x20);
+        routing_table.add(above, addr(1));
+        routing_table.add(below, addr(2));
+
+        let target = id_with_first_byte(0x40);
+        let ids = |n| -> Vec<NodeId> { routing_table.find_closest_n(target, n).iter().map(|n| n.id()).collect() };
+        assert_eq!(ids(1), vec![below]);
+        assert_eq!(ids(2), vec![below, above]);
     }
 
     #[tokio::test]
