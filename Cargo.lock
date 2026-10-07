@@ -1395,7 +1395,6 @@ name = "downloader-gui"
 version = "0.1.0"
 dependencies = [
  "downloader",
- "rand 0.10.2",
  "rfd 0.17.2",
  "serde",
  "tauri",

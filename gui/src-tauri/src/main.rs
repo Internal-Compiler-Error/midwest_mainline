@@ -8,11 +8,11 @@
 
 use downloader::feed::Feed;
 use downloader::{
-    Encryption, Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings,
-    Telemetry, TorrentId, TorrentState, TraceSnapshot, TrackerInfo, TrackerState, data_dir, random_peer_id,
+    Events, FileInfo, LogBuffer, MappingState, PeerInfo, Progress, Session, SessionConfig, Settings, Telemetry,
+    TorrentId, TorrentState, TraceSnapshot, TrackerInfo, TrackerState, data_dir, random_peer_id,
 };
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{Emitter, Manager, RunEvent, State};
 use tokio::sync::Notify;
@@ -27,6 +27,12 @@ struct App {
     events: Mutex<Option<Events>>,
     /// the page has its listener up (see `events_ready`); until then the forwarder holds back
     page_ready: Arc<Notify>,
+}
+
+impl App {
+    fn session(&self) -> MutexGuard<'_, Session> {
+        self.session.lock().unwrap()
+    }
 }
 
 #[derive(Serialize)]
@@ -197,7 +203,7 @@ impl From<PeerInfo> for PeerDto {
 impl From<Progress> for ProgressDto {
     fn from(p: Progress) -> Self {
         Self {
-            info_hash: p.info_hash.clone(),
+            info_hash: p.info_hash,
             name: p.name,
             root: p.root,
             files: p.files.into_iter().map(FileDto::from).collect(),
@@ -268,7 +274,7 @@ struct StatusDto {
 
 #[tauri::command]
 fn status(app: State<App>) -> StatusDto {
-    let status = app.session.lock().unwrap().status();
+    let status = app.session().status();
     let (port_mapping, external_ip) = match status.port_mapping {
         MappingState::Off => ("off", None),
         MappingState::Searching => ("searching", None),
@@ -294,8 +300,7 @@ struct LogChunk {
 
 #[tauri::command]
 fn torrents(app: State<App>) -> Vec<TorrentRow> {
-    let mut session = app.session.lock().unwrap();
-    session
+    app.session()
         .torrents()
         .into_iter()
         .map(|(id, state)| TorrentRow {
@@ -307,54 +312,52 @@ fn torrents(app: State<App>) -> Vec<TorrentRow> {
 
 #[tauri::command]
 fn add_torrent(app: State<App>, source: String, root: String) -> TorrentId {
-    app.session.lock().unwrap().add(source, root)
+    app.session().add(source, root)
 }
 
 #[tauri::command]
 fn resume_torrent(app: State<App>, path: String) -> TorrentId {
-    app.session.lock().unwrap().resume(path)
+    app.session().resume(path)
 }
 
 #[tauri::command]
 fn remove_torrent(app: State<App>, id: TorrentId, delete_files: bool) {
-    app.session.lock().unwrap().remove(id, delete_files);
+    app.session().remove(id, delete_files);
 }
 
 #[tauri::command]
 fn select_files(app: State<App>, id: TorrentId, selected: Vec<bool>) {
-    app.session.lock().unwrap().select_files(id, selected);
+    app.session().select_files(id, selected);
 }
 
 #[tauri::command]
 fn pause_torrent(app: State<App>, id: TorrentId) {
-    app.session.lock().unwrap().pause(id);
+    app.session().pause(id);
 }
 
 #[tauri::command]
 fn unpause_torrent(app: State<App>, id: TorrentId) {
-    app.session.lock().unwrap().unpause(id);
+    app.session().unpause(id);
 }
 
 #[tauri::command]
 fn recheck_torrent(app: State<App>, id: TorrentId) {
-    app.session.lock().unwrap().recheck(id);
+    app.session().recheck(id);
 }
 
 #[tauri::command]
 fn set_sequential(app: State<App>, id: TorrentId, on: bool) {
-    app.session.lock().unwrap().set_sequential(id, on);
+    app.session().set_sequential(id, on);
 }
 
 #[tauri::command]
 fn set_super_seed(app: State<App>, id: TorrentId, on: bool) {
-    app.session.lock().unwrap().set_super_seed(id, on);
+    app.session().set_super_seed(id, on);
 }
 
 #[tauri::command]
 fn resumable(app: State<App>) -> Vec<ResumableDto> {
-    app.session
-        .lock()
-        .unwrap()
+    app.session()
         .resumable()
         .into_iter()
         .map(|r| ResumableDto {
@@ -399,82 +402,15 @@ fn events_ready(app: State<App>) {
 }
 
 #[tauri::command]
-fn default_download_dir(app: State<App>) -> String {
-    app.session
-        .lock()
-        .unwrap()
-        .settings()
-        .download_dir
-        .display()
-        .to_string()
-}
-
-/// `Settings` field for field, in the units the dialog edits.
-#[derive(Serialize, serde::Deserialize)]
-struct SettingsDto {
-    listen_port: u16,
-    download_dir: String,
-    dht: bool,
-    dht_read_only: bool,
-    max_peers_per_torrent: usize,
-    download_limit: u64,
-    upload_limit: u64,
-    seed_ratio_limit: f64,
-    encryption: Encryption,
-    utp: bool,
-    port_mapping: bool,
-    max_active_downloads: usize,
-}
-
-impl From<Settings> for SettingsDto {
-    fn from(s: Settings) -> Self {
-        Self {
-            listen_port: s.listen_port,
-            download_dir: s.download_dir.display().to_string(),
-            dht: s.dht,
-            dht_read_only: s.dht_read_only,
-            max_peers_per_torrent: s.max_peers_per_torrent,
-            download_limit: s.download_limit,
-            upload_limit: s.upload_limit,
-            seed_ratio_limit: s.seed_ratio_limit,
-            encryption: s.encryption,
-            utp: s.utp,
-            port_mapping: s.port_mapping,
-            max_active_downloads: s.max_active_downloads,
-        }
-    }
-}
-
-impl From<SettingsDto> for Settings {
-    fn from(s: SettingsDto) -> Self {
-        Self {
-            listen_port: s.listen_port,
-            download_dir: s.download_dir.into(),
-            dht: s.dht,
-            dht_read_only: s.dht_read_only,
-            max_peers_per_torrent: s.max_peers_per_torrent,
-            download_limit: s.download_limit,
-            upload_limit: s.upload_limit,
-            seed_ratio_limit: s.seed_ratio_limit,
-            encryption: s.encryption,
-            utp: s.utp,
-            port_mapping: s.port_mapping,
-            max_active_downloads: s.max_active_downloads,
-        }
-    }
-}
-
-#[tauri::command]
-fn settings(app: State<App>) -> SettingsDto {
-    app.session.lock().unwrap().settings().into()
+fn settings(app: State<App>) -> Settings {
+    app.session().settings()
 }
 
 /// Returns whether a restart is needed for everything to take effect.
 #[tauri::command]
-fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, String> {
-    let mut session = app.session.lock().unwrap();
+fn update_settings(app: State<App>, settings: Settings) -> Result<bool, String> {
+    let mut session = app.session();
     let before = session.settings();
-    let settings: Settings = settings.into();
     let restart = settings.listen_port != before.listen_port
         || settings.dht != before.dht
         || settings.dht_read_only != before.dht_read_only
@@ -485,7 +421,6 @@ fn update_settings(app: State<App>, settings: SettingsDto) -> Result<bool, Strin
     Ok(restart)
 }
 
-/// A fully random peer id, Azureus-style ("-DL0100-" + 12 random bytes).
 /// How long to gather library events before handing them to the webview as one batch: a
 /// busy swarm emits hundreds a second, and one IPC message per event would swamp it.
 const EVENT_BATCH_EVERY: Duration = Duration::from_millis(100);
@@ -571,7 +506,6 @@ fn main() {
             clear_logs,
             report_error,
             events_ready,
-            default_download_dir,
             settings,
             update_settings,
         ])
@@ -604,7 +538,7 @@ fn main() {
             // the session owns a tokio runtime, which must be stopped from a plain thread:
             // here, on the main thread, once the last window has closed
             if let RunEvent::ExitRequested { .. } = event {
-                app.state::<App>().session.lock().unwrap().shutdown();
+                app.state::<App>().session().shutdown();
             }
         });
 }

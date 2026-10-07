@@ -143,7 +143,6 @@ export const setSuperSeed = (id: TorrentId, on: boolean) => invoke<void>('set_su
 export const resumable = () => invoke<Resumable[]>('resumable')
 export const logsSince = (seen: number) => invoke<LogChunk>('logs_since', { seen })
 export const clearLogs = () => invoke<void>('clear_logs')
-export const defaultDownloadDir = () => invoke<string>('default_download_dir')
 
 export interface Settings {
   listen_port: number

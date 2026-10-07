@@ -145,7 +145,7 @@
   }
 
   $effect(() => {
-    api.defaultDownloadDir().then((dir) => (downloadDir = dir))
+    api.settings().then((s) => (downloadDir = s.download_dir))
     rescan()
     // torrents complete at startup were complete before; only later ones get a notification
     api.torrents().then((initial) => {

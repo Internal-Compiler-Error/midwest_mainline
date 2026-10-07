@@ -11,7 +11,6 @@ downloader = { path = "../../downloader" }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.3"
 serde = { version = "1.0.229", features = ["derive"] }
-rand = "0.10.2"
 tauri-plugin-opener = "2.5.5"
 tauri-plugin-notification = "2.4.0"
 tokio = { version = "1.53", features = ["sync", "time"] }
