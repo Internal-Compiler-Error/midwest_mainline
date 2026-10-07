@@ -317,27 +317,25 @@ impl BtClient {
         shutdown: CancellationToken,
         events: EventBus,
     ) {
-        // Listen on both families independently rather than relying on a single dual-stack
-        // socket (whether an unspecified IPv6 bind also accepts v4-mapped connections is a
-        // platform/sysctl-dependent default, not something we can portably assume). Bind IPv6
-        // first: if the platform's default *does* make it dual-stack, the IPv4 bind below then
-        // fails with AddrInUse, which we treat as "already covered", not an error.
-        let port = id.serving.port();
+        // one listener per family, the IPv6 one v6-only (see `bind_listener`); with port 0 the
+        // IPv4 one takes whatever the IPv6 one got, so there's one port to announce
+        let mut port = id.serving.port();
         let mut listeners = Vec::new();
-        let families: [(SocketAddr, &str); 2] = [
-            (
-                SocketAddrV6::new(crate::defs::BIND_V6, port, 0, 0).into(),
-                "ipv6 peers can't dial us",
-            ),
-            (
-                SocketAddrV4::new(crate::defs::BIND_V4, port).into(),
-                "relying on the ipv6 listener if it's dual-stack",
-            ),
-        ];
-        for (addr, without) in families {
-            match TcpListener::bind(addr).await {
+        for v6 in [true, false] {
+            let (addr, without): (SocketAddr, _) = match v6 {
+                true => (
+                    SocketAddrV6::new(crate::defs::BIND_V6, port, 0, 0).into(),
+                    "ipv6 peers can't dial us",
+                ),
+                false => (
+                    SocketAddrV4::new(crate::defs::BIND_V4, port).into(),
+                    "ipv4 peers can't dial us",
+                ),
+            };
+            match bind_listener(addr) {
                 Ok(listener) => {
                     let bound = listener.local_addr().unwrap_or(addr);
+                    port = bound.port();
                     tracing::info!("listening for inbound peer connections on {bound}");
                     events.emit(Event::Listening {
                         transport: "tcp",
@@ -424,6 +422,22 @@ impl BtClient {
             ));
         }
     }
+}
+
+/// A TCP listener on `addr`. An IPv6 one is v6-only: whether `[::]` also takes IPv4 is up to
+/// the platform (macOS says yes), and one that does holds the port the IPv4 listener needs.
+fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    // what tokio's own `bind` does on Unix: a restart can rebind while old connections linger
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// BEP 47: links `relative` (under `root`) to `target`, a path from the torrent's top level,
@@ -612,6 +626,7 @@ pub(crate) fn default_settings() -> SettingsWatch {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::net::Ipv6Addr;
 
     /// BEP 47 symlink targets are paths from the torrent's top level, but a link whose own
     /// directory runs through another of the torrent's links sits shallower than its path
@@ -666,5 +681,50 @@ mod test {
             );
         }
         fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// One listener per address family on the one port, both up and accepting: the IPv6 one
+    /// is v6-only, since one that's dual-stack (macOS's default for `[::]`) takes the IPv4
+    /// port from the other.
+    #[tokio::test]
+    async fn listens_on_both_families_at_one_port() {
+        let v6 = bind_listener(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
+        assert!(socket2::SockRef::from(&v6).only_v6().unwrap());
+        drop(v6);
+
+        // any port: the IPv4 listener takes the one the IPv6 one got
+        let port = 0;
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let _client = BtClient::with_events(
+            Identity {
+                peer_id: *b"-DL0100-listen-test.",
+                serving: SocketAddr::from(([0, 0, 0, 0], port)),
+                dht: false,
+                encryption: crate::config::Encryption::Disabled,
+            },
+            crate::dht::Dht::none(),
+            bus,
+        );
+        let mut tcp = vec![];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(stamped) = events.next().await {
+                if let Event::Listening { transport: "tcp", port } = stamped.event {
+                    tcp.push(port);
+                }
+            }
+        })
+        .await;
+        let [v6_port, v4_port] = tcp[..] else {
+            panic!("{tcp:?}");
+        };
+        assert_eq!(v6_port, v4_port);
+        let port = v4_port;
+        for addr in [
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ] {
+            tokio::net::TcpStream::connect(addr).await.unwrap();
+        }
     }
 }
