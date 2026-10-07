@@ -1,6 +1,7 @@
 use std::io;
 use thiserror::Error;
 
+use crate::message::error::KrpcError;
 use crate::types::TransactionId;
 
 #[derive(Debug, Error)]
@@ -15,6 +16,10 @@ pub enum OurError {
     // stupid ass bendy library's error type only implements Debug + Display and not actually Error
     #[error("Bendy complained {0}")]
     BendyDecodeError(bendy::decoding::Error),
+
+    /// The queried node answered with a KRPC error
+    #[error("the node answered with error {0:?}")]
+    Remote(KrpcError),
 
     #[error("Something went wrong in the DHT: {0}")]
     DhtFailure(String),

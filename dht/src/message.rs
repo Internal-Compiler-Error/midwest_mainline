@@ -24,7 +24,8 @@ use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
 use crate::message::sample_infohashes_query::SampleInfohashesQuery;
 use crate::types::{InfoHash, NodeId};
-use find_node_get_peers_response::{MAX_SAMPLE_INTERVAL, Samples, ScrapeFilters};
+use find_node_get_peers_response::{Item, ItemSignature, MAX_SAMPLE_INTERVAL, Samples, ScrapeFilters};
+use item_queries::{GetQuery, PutQuery, Signed};
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 
 pub mod announce_peer_query;
@@ -32,6 +33,7 @@ pub mod error;
 pub mod find_node_get_peers_response;
 pub mod find_node_query;
 pub mod get_peers_query;
+pub mod item_queries;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
 pub mod sample_infohashes_query;
@@ -240,6 +242,138 @@ fn extract_samples(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Op
         interval: interval.clamp(0, MAX_SAMPLE_INTERVAL.into()) as u32,
         num: num.max(0) as u64,
         samples: samples.as_chunks::<20>().0.iter().map(|h| InfoHash(*h)).collect(),
+    }))
+}
+
+/// `view` bencoded again. For canonical bencode (sorted keys, which BEP 44 values must be) it's
+/// the bytes it was parsed from, which is what signatures and targets are computed over.
+pub(crate) fn encode_view(view: &BencodeItemView) -> Vec<u8> {
+    fn write(view: &BencodeItemView, out: &mut Vec<u8>) {
+        match view {
+            BencodeItemView::Integer(i) => out.extend_from_slice(format!("i{i}e").as_bytes()),
+            BencodeItemView::ByteString(s) => {
+                out.extend_from_slice(format!("{}:", s.len()).as_bytes());
+                out.extend_from_slice(s);
+            }
+            BencodeItemView::List(items) => {
+                out.push(b'l');
+                items.iter().for_each(|item| write(item, out));
+                out.push(b'e');
+            }
+            BencodeItemView::Dictionary(dict) => {
+                out.push(b'd');
+                for (k, v) in dict {
+                    write(&BencodeItemView::ByteString(k), out);
+                    write(v, out);
+                }
+                out.push(b'e');
+            }
+        }
+    }
+    let mut out = vec![];
+    write(view, &mut out);
+    out
+}
+
+/// `raw` as one bencoded value (nested at most 64 deep); `None` if it's anything else
+pub(crate) fn parse_value(raw: &[u8]) -> Option<value::Value<'static>> {
+    use bendy::decoding::{Decoder, FromBencode};
+    let mut decoder = Decoder::new(raw).with_max_depth(64);
+    let value = {
+        let object = decoder.next_object().ok()??;
+        value::Value::decode_bencode_object(object).ok()?.into_owned()
+    };
+    matches!(decoder.next_object(), Ok(None)).then_some(value)
+}
+
+/// Emits `raw`, a bencoded value, as itself rather than as a string of its bytes
+pub(crate) fn emit_raw(enc: SingleItemEncoder, raw: &[u8]) -> Result<(), bendy::encoding::Error> {
+    match parse_value(raw) {
+        Some(value) => enc.emit(&value),
+        // values are checked on the way in, so this is a bug; a string is still valid KRPC
+        None => enc.emit_bytes(raw),
+    }
+}
+
+fn extract_int(dict: &mut BTreeMap<&[u8], BencodeItemView>, key: &[u8]) -> Result<Option<i64>, OurError> {
+    match dict.remove(key) {
+        None => Ok(None),
+        Some(BencodeItemView::Integer(i)) => Ok(Some(i)),
+        Some(_) => Err(OurError::DecodeError(eyre!(
+            "'{}' key is not an integer",
+            String::from_utf8_lossy(key)
+        ))),
+    }
+}
+
+fn extract_bytes<'a>(
+    dict: &mut BTreeMap<&[u8], BencodeItemView<'a>>,
+    key: &[u8],
+) -> Result<Option<&'a [u8]>, OurError> {
+    match dict.remove(key) {
+        None => Ok(None),
+        Some(BencodeItemView::ByteString(s)) => Ok(Some(s)),
+        Some(_) => Err(OurError::DecodeError(eyre!(
+            "'{}' key is not a binary string",
+            String::from_utf8_lossy(key)
+        ))),
+    }
+}
+
+fn extract_get(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
+    let target = extract_bytes(arguments, b"target")?
+        .and_then(NodeId::try_from_bytes)
+        .ok_or(OurError::DecodeError(eyre!("get has no 20-byte 'target'")))?;
+    let query = GetQuery::new(querier, target)
+        .with_seq(extract_int(arguments, b"seq")?)
+        .with_want(extract_want(arguments)?);
+    report_unused_keys(arguments, "get query body has unused keys");
+    Ok(query)
+}
+
+fn extract_put(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<PutQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
+    let token = extract_bytes(arguments, b"token")?.ok_or(OurError::DecodeError(eyre!("put has no 'token'")))?;
+    let value = arguments
+        .remove(b"v".as_slice())
+        .ok_or(OurError::DecodeError(eyre!("put has no 'v'")))?;
+    let signed = match extract_bytes(arguments, b"k")? {
+        None => None,
+        Some(key) => {
+            let malformed = || OurError::DecodeError(eyre!("a mutable put needs a 32-byte k, a seq, a 64-byte sig"));
+            Some(Signed {
+                key: key.try_into().map_err(|_| malformed())?,
+                salt: extract_bytes(arguments, b"salt")?.unwrap_or_default().to_vec(),
+                seq: extract_int(arguments, b"seq")?.ok_or_else(malformed)?,
+                sig: extract_bytes(arguments, b"sig")?
+                    .and_then(|sig| sig.try_into().ok())
+                    .ok_or_else(malformed)?,
+            })
+        }
+    };
+    let query = PutQuery::new(querier, Token::from_bytes(token), encode_view(&value), signed)
+        .with_cas(extract_int(arguments, b"cas")?);
+    report_unused_keys(arguments, "put query body has unused keys");
+    Ok(query)
+}
+
+/// BEP 44's item in an answer to `get`: `v`, and `k`, `seq` and `sig` if it's mutable. Those
+/// three are taken only whole; a mutable item without them doesn't verify anyway.
+fn extract_item(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Item>, OurError> {
+    let key = extract_bytes(response, b"k")?.and_then(|k| <[u8; 32]>::try_from(k).ok());
+    let seq = extract_int(response, b"seq")?;
+    let sig = extract_bytes(response, b"sig")?.and_then(|s| <[u8; 64]>::try_from(s).ok());
+    let Some(value) = response.remove(b"v".as_slice()) else {
+        return Ok(None);
+    };
+    let signature = match (key, seq, sig) {
+        (Some(key), Some(seq), Some(sig)) => Some(ItemSignature { key, seq, sig }),
+        _ => None,
+    };
+    Ok(Some(Item {
+        value: encode_view(&value),
+        signature,
     }))
 }
 
@@ -484,6 +618,10 @@ impl ParseKrpc for &[u8] {
                 KrpcBody::AnnouncePeerQuery(extract_announce_peer(&mut arguments)?)
             } else if &*query_type == b"sample_infohashes" {
                 KrpcBody::SampleInfohashesQuery(extract_sample_infohashes(&mut arguments)?)
+            } else if &*query_type == b"get" {
+                KrpcBody::GetQuery(extract_get(&mut arguments)?)
+            } else if &*query_type == b"put" {
+                KrpcBody::PutQuery(extract_put(&mut arguments)?)
             } else {
                 let query_type = String::from_utf8_lossy(&query_type);
                 info!("Unsupported query type: {query_type}");
@@ -513,6 +651,7 @@ impl ParseKrpc for &[u8] {
             let token = extract_token(&mut response)?;
             let samples = extract_samples(&mut response)?;
             let scrape = extract_scrape(&mut response)?;
+            let item = extract_item(&mut response)?;
 
             if nodes.is_none()
                 && nodes6.is_none()
@@ -520,6 +659,7 @@ impl ParseKrpc for &[u8] {
                 && token.is_none()
                 && samples.is_none()
                 && scrape.is_none()
+                && item.is_none()
             {
                 // when they have none of these, then it's just a response to ping to announce query
                 KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id))
@@ -554,6 +694,11 @@ impl ParseKrpc for &[u8] {
 
                 let builder = match scrape {
                     Some(scrape) => builder.with_scrape(scrape),
+                    None => builder,
+                };
+
+                let builder = match item {
+                    Some(item) => builder.with_item(item),
                     None => builder,
                 };
 
@@ -607,6 +752,8 @@ pub enum KrpcBody {
     GetPeersQuery(GetPeersQuery),
     PingQuery(PingQuery),
     SampleInfohashesQuery(SampleInfohashesQuery),
+    GetQuery(GetQuery),
+    PutQuery(PutQuery),
 
     PingAnnouncePeerResponse(PingAnnouncePeerResponse),
     FindNodeGetPeersResponse(FindNodeGetPeersResponse),
@@ -634,6 +781,8 @@ impl KrpcBody {
                 | KrpcBody::GetPeersQuery(_)
                 | KrpcBody::AnnouncePeerQuery(_)
                 | KrpcBody::SampleInfohashesQuery(_)
+                | KrpcBody::GetQuery(_)
+                | KrpcBody::PutQuery(_)
         )
     }
 }
@@ -687,6 +836,22 @@ impl Krpc {
                 KrpcBody::SampleInfohashesQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "sample_infohashes")?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
+                }
+                KrpcBody::GetQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "get")?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
+                }
+                KrpcBody::PutQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "put")?;
                     enc.emit_pair_with(b"a", |e| {
                         let _: () = q.encode_body(e);
                         Ok(())
@@ -747,6 +912,8 @@ impl Krpc {
             KrpcBody::GetPeersQuery(get_peers_query) => Some(*get_peers_query.requestor()),
             KrpcBody::PingQuery(ping_query) => Some(*ping_query.requestor()),
             KrpcBody::SampleInfohashesQuery(query) => Some(query.requestor()),
+            KrpcBody::GetQuery(query) => Some(query.requestor()),
+            KrpcBody::PutQuery(query) => Some(query.requestor()),
 
             KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => {
                 Some(*ping_announce_peer_response.target_id())
@@ -1442,6 +1609,82 @@ mod test {
         assert!(!msg.parse().unwrap().read_only);
         let msg = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping2:ro1:11:t2:aa1:y1:qe" as &[u8];
         assert!(!msg.parse().unwrap().read_only);
+    }
+
+    #[test]
+    fn bep_44_get_and_put_round_trip() {
+        let id = NodeId::from_bytes(b"abcdefghij0123456789");
+        let get = GetQuery::new(id, NodeId::from_bytes(b"mnopqrstuvwxyz123456")).with_seq(Some(4));
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::GetQuery(get));
+        let encoded = msg.encode();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            "d1:ad2:id20:abcdefghij01234567893:seqi4e6:target20:mnopqrstuvwxyz123456e1:q3:get1:t2:aa1:y1:qe"
+        );
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        // the value goes out as itself, not as a string of its bytes
+        let put = PutQuery::new(id, Token::from_bytes(b"tok"), b"d1:ai1ee".to_vec(), None);
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::PutQuery(put));
+        let encoded = msg.encode();
+        assert!(String::from_utf8_lossy(&encoded).contains("1:vd1:ai1ee"));
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let signed = Signed {
+            key: [1; 32],
+            salt: b"foobar".to_vec(),
+            seq: 9,
+            sig: [2; 64],
+        };
+        let put =
+            PutQuery::new(id, Token::from_bytes(b"tok"), b"12:Hello World!".to_vec(), Some(signed)).with_cas(Some(8));
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::PutQuery(put));
+        assert_eq!(msg.encode().as_ref().parse().unwrap(), msg);
+
+        let res = Builder::new(id)
+            .with_token(Token::from_bytes(b"tok"))
+            .with_nodes(&[])
+            .with_item(Item {
+                value: b"li1ei2ee".to_vec(),
+                signature: Some(ItemSignature {
+                    key: [3; 32],
+                    seq: 1,
+                    sig: [4; 64],
+                }),
+            })
+            .build();
+        let msg = Krpc::new_with_body(
+            TransactionId::from_bytes(b"aa"),
+            KrpcBody::FindNodeGetPeersResponse(res),
+        );
+        assert_eq!(msg.encode().as_ref().parse().unwrap(), msg);
+    }
+
+    #[test]
+    fn malformed_bep_44_wire_data_is_a_decode_error_or_dropped_not_a_panic() {
+        // a put without v, with a short k, with k but no sig
+        let msgs: [&[u8]; 3] = [
+            b"d1:ad2:id20:abcdefghij01234567895:token3:toke1:q3:put1:t2:aa1:y1:qe",
+            b"d1:ad2:id20:abcdefghij01234567891:k3:abc3:seqi1e3:sig3:abc5:token3:tok1:vi1ee1:q3:put1:t2:aa1:y1:qe",
+            b"d1:ad2:id20:abcdefghij01234567891:k32:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3:seqi1e5:token3:tok1:vi1ee1:q3:put1:t2:aa1:y1:qe",
+        ];
+        for msg in msgs {
+            assert!(msg.parse().is_err(), "{}", String::from_utf8_lossy(msg));
+        }
+        // a get with a short target, or a seq that isn't a number
+        let msg = b"d1:ad2:id20:abcdefghij01234567896:target3:abce1:q3:get1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+        let msg = b"d1:ad2:id20:abcdefghij01234567893:seq1:16:target20:mnopqrstuvwxyz123456e1:q3:get1:t2:aa1:y1:qe"
+            as &[u8];
+        assert!(msg.parse().is_err());
+        // an answer whose k is short: the value, unsigned
+        let msg =
+            b"d1:rd2:id20:0123456789abcdefghij1:k3:abc3:seqi1e3:sig3:abc5:token3:tok1:vi7ee1:t2:aa1:y1:re" as &[u8];
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        let item = res.item().unwrap();
+        assert_eq!((item.value.as_slice(), &item.signature), (b"i7e".as_slice(), &None));
     }
 
     #[test]

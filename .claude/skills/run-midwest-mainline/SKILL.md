@@ -149,7 +149,7 @@ terminal.
 | `cli <source> [secs]` | run the CLI on a .torrent or magnet, summarize |
 | `gui [source] [secs]` | launch the GUI, screenshot it, quit |
 | `dht-up [expire\|forever]` | start the DHT node in the background, wait for RPC |
-| `rpc <method> [params]` | JSON-RPC: `node_count`, `node_counts`, `stored_swarms`, `stored_peers`, `sampled` |
+| `rpc <method> [params]` | JSON-RPC: `node_count`, `node_counts`, `stored_swarms`, `stored_peers`, `sampled`, `scrape`, `put`, `get` |
 | `krpc <cmd> [args]` | KRPC over UDP: `ping`, `get_peers <hash>`, `announce <hash> <port>` |
 | `dht-down` | stop the DHT node |
 | `logs` | tail a running GUI's console over TCP |

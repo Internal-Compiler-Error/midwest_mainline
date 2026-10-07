@@ -300,9 +300,13 @@ impl RpcManager {
             .await
             .map_err(|_| naur!("pending request superseded or dropped before a response arrived"))?;
 
-        // no node_id means the reponse is a krpc error message, only error message omit the node
-        // id
-        let response_node_id = response.node_id().ok_or(naur!("node responded with error"))?;
+        // only error messages omit the node id
+        let Some(response_node_id) = response.node_id() else {
+            return Err(match response.body {
+                KrpcBody::ErrorResponse(e) => OurError::Remote(e),
+                _ => naur!("node responded without an id"),
+            });
+        };
         let mut conn = self
             .db
             .get()

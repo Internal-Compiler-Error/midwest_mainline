@@ -78,6 +78,23 @@ impl DhtServer {
                 let res = ResBuilder::new(self.state.our_id).with_samples(self.state.sample());
                 KrpcBody::FindNodeGetPeersResponse(self.with_closest(res, query.target(), query.want()).build())
             }
+            KrpcBody::GetQuery(query) => {
+                let token = self.state.token_generator.token_for_ip(&from.ip());
+                let mut res = ResBuilder::new(self.state.our_id).with_token(token);
+                if let Some(item) = self.state.stored_item(&query.target(), query.seq()) {
+                    res = res.with_item(item);
+                }
+                KrpcBody::FindNodeGetPeersResponse(self.with_closest(res, query.target(), query.want()).build())
+            }
+            KrpcBody::PutQuery(put) => {
+                if !self.state.token_generator.is_valid_token(&from.ip(), put.token()) {
+                    return KrpcBody::ErrorResponse(KrpcError::new_protocol());
+                }
+                match self.state.store_item(put) {
+                    Ok(()) => KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id)),
+                    Err(e) => KrpcBody::ErrorResponse(e),
+                }
+            }
             _ => unreachable!("caught by assert"),
         }
     }

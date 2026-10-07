@@ -13,6 +13,10 @@ impl KrpcError {
         Self { code, message }
     }
 
+    pub fn code(&self) -> u32 {
+        self.code
+    }
+
     pub fn new_generic() -> Self {
         Self {
             code: 201,
@@ -39,6 +43,13 @@ impl KrpcError {
             code: 204,
             message: "Method Unknown".to_string(),
         }
+    }
+}
+
+/// The database failing us is a server error to the querier
+impl From<diesel::result::Error> for KrpcError {
+    fn from(_: diesel::result::Error) -> Self {
+        Self::new_server()
     }
 }
 

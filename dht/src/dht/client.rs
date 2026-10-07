@@ -12,8 +12,11 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::dht::bep42;
+use crate::dht::item::{self, MutableItem};
 use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
+use crate::message::find_node_get_peers_response::{FindNodeGetPeersResponse, Item};
+use crate::message::item_queries::{GetQuery, PutQuery, Signed};
 use crate::message::{
     KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_get_peers_response::ScrapeFilters,
     find_node_query::FindNodeQuery, get_peers_query::GetPeersQuery, ping_query::PingQuery,
@@ -21,6 +24,7 @@ use crate::message::{
 };
 use crate::our_error::{OurError, naur};
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
+use ed25519_dalek::SigningKey;
 
 /// What one node answers a `get_peers` with
 struct GetPeersReply {
@@ -31,6 +35,25 @@ struct GetPeersReply {
     values: Vec<SocketAddr>,
     /// BEP 33, when asked for
     scrape: Option<ScrapeFilters>,
+}
+
+/// What a BEP 44 put came to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutOutcome {
+    /// where the item is stored
+    pub target: NodeId,
+    /// how many nodes took it
+    pub stored: usize,
+}
+
+fn check_value(value: &[u8]) -> Result<(), OurError> {
+    if value.len() > item::MAX_VALUE {
+        return Err(naur!("BEP 44 values are at most {} bytes bencoded", item::MAX_VALUE));
+    }
+    if !item::is_canonical_bencode(value) {
+        return Err(naur!("a BEP 44 value is one value in canonical bencode"));
+    }
+    Ok(())
 }
 
 /// BEP 33's estimate of a swarm's size
@@ -352,7 +375,6 @@ impl DhtClient {
                     nodes: res.nodes_of(self.state.family).to_vec(),
                 })
             }
-            KrpcBody::ErrorResponse(err) => Err(naur!("{dest} answered sample_infohashes with {err:?}")),
             other => Err(naur!("unexpected answer to sample_infohashes: {other:?}")),
         }
     }
@@ -470,6 +492,154 @@ impl DhtClient {
             announce_candidates,
         };
         (result, filters)
+    }
+
+    /// BEP 44: the immutable item stored at `target`, bencoded, if any node near it has one
+    #[tracing::instrument(skip(self))]
+    pub async fn get_immutable(&self, target: NodeId) -> Option<Vec<u8>> {
+        let genuine = |item: &Item| item::immutable_target(&item.value) == target;
+        if let Some(item) = self.state.stored_item(&target, None).filter(genuine) {
+            return Some(item.value);
+        }
+        let (_, items) = self.lookup_items(target, None, genuine).await;
+        items.into_iter().find(genuine).map(|item| item.value)
+    }
+
+    /// BEP 44: the newest mutable item of `key` and `salt` the nodes near its target hold, if
+    /// any newer than `newer_than`; only ones the key really signed count
+    #[tracing::instrument(skip(self))]
+    pub async fn get_mutable(&self, key: [u8; 32], salt: &[u8], newer_than: Option<i64>) -> Option<MutableItem> {
+        let target = item::mutable_target(&key, salt);
+        let (_, items) = self.lookup_items(target, newer_than, |_| false).await;
+        items
+            .iter()
+            .chain(self.state.stored_item(&target, newer_than).as_ref())
+            .filter_map(|item| MutableItem::verified(item, &key, salt))
+            .max_by_key(|item| item.seq)
+    }
+
+    /// BEP 44: stores `value` (one bencoded value) at the nodes closest to its hash
+    #[tracing::instrument(skip(self, value))]
+    pub async fn put_immutable(&self, value: Vec<u8>) -> Result<PutOutcome, OurError> {
+        check_value(&value)?;
+        let target = item::immutable_target(&value);
+        self.put(target, None, |token| {
+            PutQuery::new(self.state.our_id, token, value.clone(), None)
+        })
+        .await
+    }
+
+    /// BEP 44: signs `value` (one bencoded value) with `key` under `salt` at `seq`, and stores
+    /// it at the nodes closest to the key's target. With `cas`, a node keeps it only if what
+    /// it holds has that sequence number.
+    #[tracing::instrument(skip(self, key, value))]
+    pub async fn put_mutable(
+        &self,
+        key: &SigningKey,
+        salt: &[u8],
+        seq: i64,
+        value: Vec<u8>,
+        cas: Option<i64>,
+    ) -> Result<PutOutcome, OurError> {
+        check_value(&value)?;
+        if salt.len() > item::MAX_SALT {
+            return Err(naur!("BEP 44 salts are at most {} bytes", item::MAX_SALT));
+        }
+        let public = key.verifying_key().to_bytes();
+        let signed = Signed {
+            key: public,
+            salt: salt.to_vec(),
+            seq,
+            sig: item::sign(key, salt, seq, &value),
+        };
+        let target = item::mutable_target(&public, salt);
+        self.put(target, Some(seq), |token| {
+            PutQuery::new(self.state.our_id, token, value.clone(), Some(signed.clone())).with_cas(cas)
+        })
+        .await
+    }
+
+    /// Gets write tokens from the nodes closest to `target` and puts `query(token)` to each
+    async fn put(
+        &self,
+        target: NodeId,
+        seq: Option<i64>,
+        query: impl Fn(Token) -> PutQuery,
+    ) -> Result<PutOutcome, OurError> {
+        let (holders, _) = self.lookup_items(target, seq, |_| false).await;
+        if holders.is_empty() {
+            return Err(naur!("no node near {target:?} gave us a write token"));
+        }
+        let puts = holders.into_iter().map(|(node, token)| {
+            let body = KrpcBody::PutQuery(query(token));
+            async move {
+                match self.state.rpc_manager.query(body, &node, REQ_TIMEOUT).await?.body {
+                    KrpcBody::PingAnnouncePeerResponse(_) => Ok(()),
+                    other => Err(naur!("unexpected answer to put: {other:?}")),
+                }
+            }
+        });
+        let results = futures::future::join_all(puts).await;
+        let stored = results.iter().filter(|r| r.is_ok()).count();
+        for e in results.into_iter().filter_map(Result::err) {
+            debug!("put of {target:?}: {e}");
+        }
+        Ok(PutOutcome { target, stored })
+    }
+
+    /// A lookup with BEP 44's `get`: the k closest nodes that gave us a write token, BEP 42
+    /// compliant ones first, and every item found; done early once `wanted` finds one
+    async fn lookup_items(
+        &self,
+        target: NodeId,
+        newer_than: Option<i64>,
+        wanted: impl Fn(&Item) -> bool,
+    ) -> (Vec<(NodeInfo, Token)>, Vec<Item>) {
+        let want = self.want();
+        let mut holders: Vec<(NodeInfo, Token)> = vec![];
+        let mut items = vec![];
+        self.lookup(
+            target,
+            |node| self.send_get_rpc(node.end_point(), target, newer_than, want),
+            |node, res: FindNodeGetPeersResponse| {
+                let nodes = res.nodes_of(self.state.family).to_vec();
+                if let Some(token) = res.token() {
+                    holders.push((node, token.clone()));
+                }
+                let item = res.item().cloned();
+                let done = item.as_ref().is_some_and(&wanted);
+                let useful = item.is_some() || !nodes.is_empty();
+                items.extend(item);
+                Heard { nodes, useful, done }
+            },
+        )
+        .await;
+        holders.sort_by_cached_key(|(node, _)| {
+            (
+                !bep42::compliant(&node.id(), node.end_point().ip()),
+                node.id().dist(&target),
+            )
+        });
+        holders.truncate(LOOKUP_K);
+        (holders, items)
+    }
+
+    async fn send_get_rpc(
+        &self,
+        dest: SocketAddr,
+        target: NodeId,
+        newer_than: Option<i64>,
+        want: Option<Want>,
+    ) -> Result<FindNodeGetPeersResponse, OurError> {
+        let query = KrpcBody::GetQuery(
+            GetQuery::new(self.state.our_id, target)
+                .with_seq(newer_than)
+                .with_want(want),
+        );
+        match self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?.body {
+            KrpcBody::FindNodeGetPeersResponse(res) => Ok(res),
+            other => Err(naur!("unexpected answer to get: {other:?}")),
+        }
     }
 
     /// Announces us as a peer for `info_hash` to `recipient`, on `port` or, `None`, the port

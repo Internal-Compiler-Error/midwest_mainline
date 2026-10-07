@@ -95,6 +95,26 @@ async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) 
                 Err(e) => serde_json::json!({ "code": -32000, "message": e.to_string() }),
             }
         }
+        // BEP 44, immutable items: `{"text": "..."}` is stored as a bencoded string
+        "put" => {
+            let Some(text) = req.params.as_ref().and_then(|p| p.get("text")?.as_str()) else {
+                return Json(invalid_params(req.id));
+            };
+            let value = [format!("{}:", text.len()).as_bytes(), text.as_bytes()].concat();
+            match s.dht.handle().put_immutable(value).await {
+                Ok(put) => serde_json::json!({ "target": hex::encode(put.target.0), "stored": put.stored }),
+                Err(e) => serde_json::json!({ "code": -32000, "message": e.to_string() }),
+            }
+        }
+        // `{"target": "<40 hex digits>"}`: the bencoded value, as text
+        "get" => {
+            let target = req.params.as_ref().and_then(|p| p.get("target")?.as_str());
+            let Some(target) = target.and_then(|t| NodeId::try_from_bytes(&hex::decode(t).ok()?)) else {
+                return Json(invalid_params(req.id));
+            };
+            let value = s.dht.handle().get_immutable(target).await;
+            serde_json::json!(value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+        }
         "sampled" => {
             let count = |field: fn(&CrawlStats) -> &AtomicU64| -> u64 {
                 s.crawlers.iter().map(|c| field(c.stats()).load(Relaxed)).sum()

@@ -1,6 +1,18 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    item (target) {
+        target -> Binary,
+        value -> Binary,
+        key -> Nullable<Binary>,
+        salt -> Nullable<Binary>,
+        seq -> Nullable<BigInt>,
+        sig -> Nullable<Binary>,
+        last_put -> BigInt,
+    }
+}
+
+diesel::table! {
     misc (key) {
         key -> Text,
         value -> Text,
@@ -52,4 +64,4 @@ diesel::table! {
 
 diesel::joinable!(peer -> swarm (swarm));
 
-diesel::allow_tables_to_appear_in_same_query!(misc, node, peer, sampled_infohash, swarm,);
+diesel::allow_tables_to_appear_in_same_query!(item, misc, node, peer, sampled_infohash, swarm,);

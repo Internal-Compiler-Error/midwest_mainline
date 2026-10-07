@@ -5,7 +5,7 @@ use bendy::encoding::SingleItemEncoder;
 use crate::bloom::BloomFilter;
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token};
 
-use super::{ToKrpcBody, compact_addr};
+use super::{ToKrpcBody, compact_addr, emit_raw};
 
 /// KRPC responses are not tagged with the query they answer, so find_node and get_peers
 /// responses share one struct: `nodes`/`nodes6` cover find_node (and the get_peers fallback),
@@ -14,7 +14,8 @@ use super::{ToKrpcBody, compact_addr};
 /// `nodes` and `nodes6` are `None` when the key is absent, which is not the same as present
 /// and empty: an answer without peers must carry at least one of them.
 ///
-/// The extensions that answer with nodes too ride along: BEP 51's samples, BEP 33's filters.
+/// The extensions that answer with nodes too ride along: BEP 51's samples, BEP 33's filters,
+/// BEP 44's items.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     queried: NodeId,
@@ -25,6 +26,23 @@ pub struct FindNodeGetPeersResponse {
     samples: Option<Samples>,
     /// boxed: 512 bytes most answers don't carry
     scrape: Option<Box<ScrapeFilters>>,
+    item: Option<Item>,
+}
+
+/// BEP 44's answer to `get`: the value stored at the target, bencoded, and for a mutable item
+/// what it was signed with
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct Item {
+    pub value: Vec<u8>,
+    pub signature: Option<ItemSignature>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct ItemSignature {
+    /// `k`, the ed25519 public key
+    pub key: [u8; 32],
+    pub seq: i64,
+    pub sig: [u8; 64],
 }
 
 /// BEP 33's answer to a get_peers with `scrape`: the node's seeds and other peers
@@ -58,6 +76,7 @@ pub struct Builder {
     nodes6: Option<Vec<NodeInfo>>,
     samples: Option<Samples>,
     scrape: Option<Box<ScrapeFilters>>,
+    item: Option<Item>,
 }
 
 impl Builder {
@@ -70,7 +89,13 @@ impl Builder {
             nodes6: None,
             samples: None,
             scrape: None,
+            item: None,
         }
+    }
+
+    pub fn with_item(mut self, item: Item) -> Self {
+        self.item = Some(item);
+        self
     }
 
     pub fn with_scrape(mut self, scrape: ScrapeFilters) -> Self {
@@ -142,6 +167,7 @@ impl Builder {
             nodes6: self.nodes6,
             samples: self.samples,
             scrape: self.scrape,
+            item: self.item,
         }
     }
 }
@@ -188,6 +214,11 @@ impl FindNodeGetPeersResponse {
     /// BEP 33, in an answer to a get_peers with `scrape`
     pub fn scrape(&self) -> Option<&ScrapeFilters> {
         self.scrape.as_deref()
+    }
+
+    /// BEP 44, in an answer to `get`
+    pub fn item(&self) -> Option<&Item> {
+        self.item.as_ref()
     }
 }
 
@@ -243,6 +274,14 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
             if let Some(scrape) = &self.scrape {
                 enc.emit_pair_with(b"BFsd", |e| e.emit_bytes(&scrape.seeds.0));
                 enc.emit_pair_with(b"BFpe", |e| e.emit_bytes(&scrape.peers.0));
+            }
+            if let Some(item) = &self.item {
+                enc.emit_pair_with(b"v", |e| emit_raw(e, &item.value));
+                if let Some(signature) = &item.signature {
+                    enc.emit_pair_with(b"k", |e| e.emit_bytes(&signature.key));
+                    enc.emit_pair(b"seq", signature.seq);
+                    enc.emit_pair_with(b"sig", |e| e.emit_bytes(&signature.sig));
+                }
             }
             Ok(())
         })

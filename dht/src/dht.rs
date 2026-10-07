@@ -26,6 +26,7 @@ pub mod bep42;
 pub mod client;
 pub mod crawler;
 mod external_ip;
+pub mod item;
 pub mod routing_table;
 pub mod rpc_manager;
 mod scope;
@@ -506,6 +507,9 @@ impl DhtSession {
                         let _ = state
                             .expire_peers()
                             .inspect_err(|e| warn!("couldn't expire peers: {e}"));
+                        let _ = state
+                            .expire_items()
+                            .inspect_err(|e| warn!("couldn't expire BEP 44 items: {e}"));
                     }
                 })
                 .unwrap();
@@ -1072,6 +1076,161 @@ mod bep43_tests {
             .query(ping, &ro.session.local_addr(), Duration::from_millis(300))
             .await;
         assert!(answer.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bep44_tests {
+    use super::*;
+    use crate::message::item_queries::{PutQuery, Signed};
+    use crate::test_support::{Node, node, scratch_dir};
+    use item::SigningKey;
+
+    const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    /// Three storing nodes that know each other, and two clients that know only the first
+    async fn network(dir: &std::path::Path) -> (Vec<Node>, Node, Node) {
+        let mut stores = vec![];
+        for name in ["a", "b", "c"] {
+            stores.push(node(dir, name, LOOPBACK).await);
+        }
+        let first = stores[0].session.local_addr();
+        for store in &stores[1..] {
+            store.session.bootstrap(vec![first]).await.unwrap();
+        }
+        let writer = node(dir, "writer", LOOPBACK).await;
+        let reader = node(dir, "reader", LOOPBACK).await;
+        writer.session.bootstrap(vec![first]).await.unwrap();
+        reader.session.bootstrap(vec![first]).await.unwrap();
+        (stores, writer, reader)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_immutable_item_put_by_one_is_got_by_another() {
+        let dir = scratch_dir("bep44-immutable");
+        let (_stores, writer, reader) = network(&dir).await;
+        let value = b"d4:name5:hello4:sizei42ee".to_vec();
+        let put = writer.session.handle().put_immutable(value.clone()).await.unwrap();
+        assert_eq!(put.target, item::immutable_target(&value));
+        assert!(put.stored >= 3, "{put:?}");
+
+        assert_eq!(reader.session.handle().get_immutable(put.target).await, Some(value));
+        assert_eq!(reader.session.handle().get_immutable(NodeId([9; 20])).await, None);
+
+        // not one canonical value, or too big: refused before anything is sent
+        let handle = writer.session.handle();
+        assert!(handle.put_immutable(b"d1:bi1e1:ai2ee".to_vec()).await.is_err());
+        let big = format!("1000:{}", "x".repeat(1000)).into_bytes();
+        assert!(handle.put_immutable(big).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mutable_item_is_got_at_its_newest() {
+        let dir = scratch_dir("bep44-mutable");
+        let (_stores, writer, reader) = network(&dir).await;
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let public = key.verifying_key().to_bytes();
+        let handle = writer.session.handle();
+        handle
+            .put_mutable(&key, b"salt", 1, b"5:first".to_vec(), None)
+            .await
+            .unwrap();
+        let put = handle
+            .put_mutable(&key, b"salt", 2, b"6:second".to_vec(), Some(1))
+            .await
+            .unwrap();
+        assert!(put.stored >= 3, "{put:?}");
+
+        let got = reader
+            .session
+            .handle()
+            .get_mutable(public, b"salt", None)
+            .await
+            .unwrap();
+        assert_eq!((got.seq, got.value.as_slice()), (2, b"6:second".as_slice()));
+        assert_eq!(
+            reader.session.handle().get_mutable(public, b"salt", Some(2)).await,
+            None
+        );
+        assert_eq!(reader.session.handle().get_mutable(public, b"other", None).await, None);
+
+        // an old seq, or a cas that no longer holds, is refused everywhere
+        let stale = handle
+            .put_mutable(&key, b"salt", 1, b"5:first".to_vec(), None)
+            .await
+            .unwrap();
+        assert_eq!(stale.stored, 0);
+        let lost_race = handle
+            .put_mutable(&key, b"salt", 3, b"5:third".to_vec(), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(lost_race.stored, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_put_that_breaks_the_rules_gets_bep_44s_error() {
+        let dir = scratch_dir("bep44-errors");
+        let store = node(&dir, "store", LOOPBACK).await;
+        let us = node(&dir, "us", LOOPBACK).await;
+        us.session.bootstrap(vec![store.session.local_addr()]).await.unwrap();
+        let found = us.session.get_peers(InfoHash([1; 20])).await.unwrap();
+        let (_, token) = found.announce_candidates[0].clone();
+        let key = SigningKey::from_bytes(&[6; 32]);
+        let signed = |salt: &[u8], seq, value: &[u8]| Signed {
+            key: key.verifying_key().to_bytes(),
+            salt: salt.to_vec(),
+            seq,
+            sig: item::sign(&key, salt, seq, value),
+        };
+        let put = |value: &[u8], signed: Option<Signed>| {
+            KrpcBody::PutQuery(PutQuery::new(
+                us.session.handle().our_id(),
+                token.clone(),
+                value.to_vec(),
+                signed,
+            ))
+        };
+        let code = async |body: KrpcBody| match us
+            .session
+            .rpc_manager
+            .query(body, &store.session.local_addr(), Duration::from_secs(1))
+            .await
+        {
+            Err(OurError::Remote(e)) => Some(e),
+            Ok(_) => None,
+            Err(e) => panic!("{e}"),
+        };
+
+        let big = format!("1001:{}", "x".repeat(1001)).into_bytes();
+        assert_eq!(code(put(&big, None)).await.map(|e| e.code()), Some(205));
+        let mut forged = signed(b"", 1, b"i1e");
+        forged.seq = 2;
+        assert_eq!(code(put(b"i1e", Some(forged))).await.map(|e| e.code()), Some(206));
+        let salt = [0u8; 65];
+        assert_eq!(
+            code(put(b"i1e", Some(signed(&salt, 1, b"i1e"))))
+                .await
+                .map(|e| e.code()),
+            Some(207)
+        );
+        assert_eq!(code(put(b"i1e", Some(signed(b"", 5, b"i1e")))).await, None);
+        assert_eq!(
+            code(put(b"i2e", Some(signed(b"", 4, b"i2e")))).await.map(|e| e.code()),
+            Some(302)
+        );
+        let cas = KrpcBody::PutQuery(
+            PutQuery::new(
+                us.session.handle().our_id(),
+                token.clone(),
+                b"i3e".to_vec(),
+                Some(signed(b"", 6, b"i3e")),
+            )
+            .with_cas(Some(4)),
+        );
+        assert_eq!(code(cas).await.map(|e| e.code()), Some(301));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

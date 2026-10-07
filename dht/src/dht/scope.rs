@@ -8,7 +8,6 @@
 use std::net::IpAddr;
 
 use diesel::SqliteConnection;
-use diesel::prelude::*;
 
 use crate::types::Family;
 use crate::utils::{db_get, db_put};
@@ -40,7 +39,7 @@ impl Scope {
     /// The scope of a node bound to `ip`, numbered the first time it's asked for
     pub(crate) fn of_address(ip: IpAddr, conn: &mut SqliteConnection) -> Result<Scope, diesel::result::Error> {
         let suffix = format!("@{ip}");
-        conn.transaction(|conn| {
+        conn.immediate_transaction(|conn| {
             let key = format!("table{suffix}");
             let table = match db_get(&key, conn)?.and_then(|t| t.parse().ok()) {
                 Some(table) => table,
