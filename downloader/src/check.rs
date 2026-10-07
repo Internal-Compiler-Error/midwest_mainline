@@ -3,9 +3,12 @@
 
 use crate::torrent::Torrent;
 use bitvec::prelude::*;
+use rayon::prelude::*;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// Which pieces under `root` hash correctly. A file that's missing or too short fails every
 /// piece touching it. `progress` gets the count of pieces checked so far, now and then.
@@ -23,20 +26,35 @@ pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usiz
         total += size;
     }
 
-    let mut verified = bitvec![u8, Msb0; 0; torrent.pieces.len()].into_boxed_bitslice();
-    let mut buf = vec![0u8; torrent.piece_size as usize];
-    for piece in 0..torrent.pieces.len() {
-        let len = torrent.nth_piece_size(piece as u32).unwrap();
-        let start = piece as u64 * torrent.piece_size as u64;
-        if read_at(&files, &offsets, start, &mut buf[..len]) {
-            verified.set(piece, torrent.valid_piece(piece as u32, &buf[..len]));
+    // every core hashes, each with its own buffer; the caller's thread only reports progress,
+    // so `progress` needn't be thread-safe
+    let n = torrent.pieces.len();
+    let checked = AtomicUsize::new(0);
+    let good: Vec<bool> = std::thread::scope(|scope| {
+        let work = scope.spawn(|| {
+            (0..n)
+                .into_par_iter()
+                .map_init(
+                    || vec![0u8; torrent.piece_size as usize],
+                    |buf, piece| {
+                        let len = torrent.nth_piece_size(piece as u32).unwrap();
+                        let start = piece as u64 * torrent.piece_size as u64;
+                        let ok = read_at(&files, &offsets, start, &mut buf[..len])
+                            && torrent.valid_piece(piece as u32, &buf[..len]);
+                        checked.fetch_add(1, Ordering::Relaxed);
+                        ok
+                    },
+                )
+                .collect()
+        });
+        while !work.is_finished() {
+            progress(checked.load(Ordering::Relaxed));
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if piece % 64 == 63 {
-            progress(piece + 1);
-        }
-    }
-    progress(torrent.pieces.len());
-    verified
+        work.join().expect("hashing panicked")
+    });
+    progress(n);
+    good.into_iter().collect::<BitVec<u8, Msb0>>().into_boxed_bitslice()
 }
 
 /// Fills `buf` from the torrent's files as one long stream starting at `start`; false if any
