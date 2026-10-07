@@ -87,22 +87,22 @@ export interface RatePoint {
 
 export class Insights {
   /** the raw stream, newest last */
-  feed = $state<Stamped[]>([])
+  feed = $state.raw<Stamped[]>([])
   counts = new SvelteMap<Kind, number>()
   received = $state(0)
   lagged = $state(0)
 
-  rates = $state<RatePoint[]>([])
+  rates = $state.raw<RatePoint[]>([])
   peers = new SvelteMap<string, PeerRecord>()
-  picks = $state<Pick[]>([])
+  picks = $state.raw<Pick[]>([])
   pieces = new SvelteMap<string, PieceMap>()
   /** torrent names by info hash, from `torrent_resolved` */
   names = new SvelteMap<string, string>()
   discovery = new SvelteMap<string, number>()
   clients = new SvelteMap<string, number>()
   disconnects = new SvelteMap<string, number>()
-  announces = $state<Announce[]>([])
-  lifecycle = $state<Stamped[]>([])
+  announces = $state.raw<Announce[]>([])
+  lifecycle = $state.raw<Stamped[]>([])
   dialsFailed = $state(0)
   wasted = $state(0)
   wastedBlocks = $state(0)
@@ -112,11 +112,26 @@ export class Insights {
   /** rates land in one-second buckets across torrents */
   private buckets = new Map<number, RatePoint>()
   private departed: string[] = []
+  /** what this batch adds to `picks`, and whether `buckets` changed; both are published once
+   * per batch, since a busy swarm sends hundreds of either a second */
+  private newPicks: Pick[] = []
+  private ratesChanged = false
 
   ingest(batch: Stamped[]) {
     for (const e of batch) this.one(e)
-    this.feed = [...this.feed, ...batch].slice(-FEED_LINES)
+    this.feed = this.feed.concat(batch).slice(-FEED_LINES)
     this.received += batch.length
+    if (this.newPicks.length) {
+      this.picks = this.picks.concat(this.newPicks).slice(-PICKS_KEPT)
+      this.newPicks = []
+    }
+    if (this.ratesChanged) {
+      // a bucket is final once a later second has data; publish everything but the newest
+      const keys = [...this.buckets.keys()].sort((a, b) => a - b)
+      while (keys.length > SERIES_POINTS + 1) this.buckets.delete(keys.shift()!)
+      this.rates = keys.slice(0, -1).map((k) => this.buckets.get(k)!)
+      this.ratesChanged = false
+    }
   }
 
   private one(e: Stamped) {
@@ -204,10 +219,7 @@ export class Insights {
         point.down += Math.max(0, e.downloaded - prev.down)
         point.up += Math.max(0, e.uploaded - prev.up)
         this.buckets.set(t, point)
-        // a bucket is final once a later second has data; publish everything but the newest
-        const keys = [...this.buckets.keys()].sort((a, b) => a - b)
-        while (keys.length > SERIES_POINTS + 1) this.buckets.delete(keys.shift()!)
-        this.rates = keys.slice(0, -1).map((k) => this.buckets.get(k)!)
+        this.ratesChanged = true
         break
       }
       case 'peers_discovered': {
@@ -261,7 +273,7 @@ export class Insights {
         const explore = e.explore ?? 1.5
         const p = this.peers.get(e.addr)
         if (p) this.peers.set(e.addr, { ...p, picks: e.picked_count, exploit: e.exploit, explore })
-        this.picks = keepLast(this.picks, { at: e.at_ms, addr: e.addr, exploit: e.exploit, explore }, PICKS_KEPT)
+        this.newPicks.push({ at: e.at_ms, addr: e.addr, exploit: e.exploit, explore })
         break
       }
       case 'peer_sample': {
