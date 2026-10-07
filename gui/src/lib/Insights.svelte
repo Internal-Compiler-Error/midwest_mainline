@@ -2,7 +2,7 @@
   // Live charts over the event bus (see bus.svelte.ts for what is accumulated). Every
   // chart is an ECharts option derived from the store; ECharts animates the changes.
   import { Button } from '$lib/components/ui/button'
-  import { humanBytes, timeOfDay } from './format'
+  import { humanBytes, rate, timeOfDay } from './format'
   import { base, type Chart, type Option } from './echart'
   import type { Insights, PeerRecord } from './bus.svelte'
   import type { Kind, Stamped } from './events'
@@ -12,7 +12,8 @@
   let filter = $state<Kind | null>(null)
   let pieceTorrent = $state<string | null>(null)
 
-  const perSecond = (bytes: number) => `${humanBytes(bytes)}/s`
+  /** an axis tick: a round number, so the zeros rate() pads to three figures are dropped */
+  const rateTick = (bps: number) => rate(bps).replace(/\.0+ |(\.\d*?[1-9])0+ /, '$1 ')
   const short = (addr: string) => addr.replace(/^\[?([^\]]+)\]?:(\d+)$/, '$1:$2')
 
   /** A count per label as horizontal bars, the biggest at the top. */
@@ -44,10 +45,10 @@
   let throughput = $derived.by((): Option => {
     const t = insights.rates.map((p) => p.t * 1000)
     return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
+      tooltip: { trigger: 'axis', valueFormatter: (v) => rate(Number(v)) },
       legend: { top: 0, right: 0, icon: 'circle' },
       xAxis: { type: 'time', axisLabel: { formatter: '{HH}:{mm}:{ss}' }, splitLine: { show: false } },
-      yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
+      yAxis: { type: 'value', axisLabel: { formatter: rateTick }, splitNumber: 3 },
       series: [area('down', insights.rates.map((p, i) => [t[i], p.down])), area('up', insights.rates.map((p, i) => [t[i], p.up]))],
     })
   })
@@ -99,8 +100,8 @@
   let race = $derived.by((): Option => {
     const top = byRate.slice(0, 8).reverse()
     return base({
-      tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
-      xAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
+      tooltip: { trigger: 'axis', valueFormatter: (v) => rate(Number(v)) },
+      xAxis: { type: 'value', axisLabel: { formatter: rateTick }, splitNumber: 3 },
       yAxis: { type: 'category', data: top.map((p) => `${short(p.addr)} · ${p.client}`), axisLabel: { fontSize: 10, interval: 0 }, animationDuration: 300, animationDurationUpdate: 300 },
       series: [
         {
@@ -121,10 +122,10 @@
     return {
       replace: true,
       option: base({
-        tooltip: { trigger: 'axis', valueFormatter: (v) => perSecond(Number(v)) },
+        tooltip: { trigger: 'axis', valueFormatter: (v) => rate(Number(v)) },
         legend: { top: 0, right: 0, icon: 'circle', textStyle: { fontSize: 9 } },
         xAxis: { type: 'category', data: [...Array(60).keys()].map((i) => `${i - 59}s`), axisLabel: { interval: 19 } },
-        yAxis: { type: 'value', axisLabel: { formatter: perSecond }, splitNumber: 3 },
+        yAxis: { type: 'value', axisLabel: { formatter: rateTick }, splitNumber: 3 },
         series: top.map((p) => ({
           id: p.addr,
           name: short(p.addr),
