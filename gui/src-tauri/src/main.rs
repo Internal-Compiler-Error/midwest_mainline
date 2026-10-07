@@ -520,6 +520,17 @@ fn main() {
             settings,
             update_settings,
         ])
+        // the run driver opens a given bottom pane (console, insights, traces) for its
+        // screenshots; it's the same remembered choice the footer buttons make
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && let Ok(pane) = std::env::var("DOWNLOADER_PANE")
+            {
+                let _ = webview.eval(format!(
+                    "if (localStorage.getItem('pane') !== {pane:?}) {{ localStorage.setItem('pane', {pane:?}); location.reload() }}"
+                ));
+            }
+        })
         .setup(|app| {
             forward_events(app.handle().clone());
             // a window launched from a script opens behind whatever is in front, and WebKit

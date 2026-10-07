@@ -1763,18 +1763,19 @@ impl TorrentSwarm {
             let our_id = self.id.clone();
             let utp = self.utp.borrow().clone();
             let hints = self.known.get(&addr).map(KnownPeer::dial_hints).unwrap_or_default();
-            let span = tracing::info_span!(
-                "dial",
-                info_hash = %torrent.info_hash,
-                peer = %addr,
-                transport = tracing::field::Empty,
-                encrypted = tracing::field::Empty,
-                error = tracing::field::Empty,
-            );
             tokio::spawn(async move {
                 let Ok(_permit) = HALF_OPEN.acquire().await else {
                     return;
                 };
+                // from here, not from the queueing above: a dial waiting for a slot isn't dialling
+                let span = tracing::info_span!(
+                    "dial",
+                    info_hash = %torrent.info_hash,
+                    peer = %addr,
+                    transport = tracing::field::Empty,
+                    encrypted = tracing::field::Empty,
+                    error = tracing::field::Empty,
+                );
                 let dialed = dial(addr, &torrent, &our_id, utp, hints).instrument(span.clone()).await;
                 let result = match dialed {
                     Ok(connected) => {

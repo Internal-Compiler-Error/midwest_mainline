@@ -6,6 +6,16 @@ import type { Action } from 'svelte/action'
 
 export type Option = echarts.EChartsOption
 
+/** An option plus a click handler, for a chart whose items do something when clicked. */
+export interface Interactive {
+  option: Option
+  onclick: (params: echarts.ECElementEvent) => void
+}
+
+function split(arg: Option | Interactive): [Option, Interactive['onclick'] | undefined] {
+  return 'onclick' in arg && 'option' in arg ? [arg.option as Option, arg.onclick as Interactive['onclick']] : [arg as Option, undefined]
+}
+
 function isDark(): boolean {
   return document.documentElement.classList.contains('dark')
 }
@@ -22,10 +32,12 @@ export function base(option: Option): Option {
   }
 }
 
-export const echart: Action<HTMLElement, Option> = (node, option) => {
+export const echart: Action<HTMLElement, Option | Interactive> = (node, arg) => {
+  let [current, onclick] = split(arg)
   let chart = echarts.init(node, isDark() ? 'dark' : undefined, { renderer: 'canvas' })
-  let current = option
+  const listen = () => chart.on('click', (params) => onclick?.(params))
   const apply = () => chart.setOption({ backgroundColor: 'transparent', ...current })
+  listen()
   apply()
 
   const resize = new ResizeObserver(() => chart.resize())
@@ -35,13 +47,14 @@ export const echart: Action<HTMLElement, Option> = (node, option) => {
   const theme = new MutationObserver(() => {
     chart.dispose()
     chart = echarts.init(node, isDark() ? 'dark' : undefined, { renderer: 'canvas' })
+    listen()
     apply()
   })
   theme.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 
   return {
-    update(next: Option) {
-      current = next
+    update(next: Option | Interactive) {
+      ;[current, onclick] = split(next)
       apply()
     },
     destroy() {

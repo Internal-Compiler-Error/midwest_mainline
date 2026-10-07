@@ -14,6 +14,8 @@
   import type { Resumable, TorrentId, TorrentRow, Status } from './lib/api'
   import Console from './lib/Console.svelte'
   import Insights from './lib/Insights.svelte'
+  import TracesPane from './lib/Traces.svelte'
+  import { Traces } from './lib/spans.svelte'
   import { Insights as InsightsStore } from './lib/bus.svelte'
   import { subscribe as subscribeEvents } from './lib/events'
   import Details from './lib/Details.svelte'
@@ -30,13 +32,14 @@
   /// where the next torrent goes; the folder picker starts here and updates it
   let downloadDir = $state('')
   let resumable = $state<Resumable[]>([])
-  type Pane = 'console' | 'insights' | null
+  type Pane = 'console' | 'insights' | 'traces' | null
   /// what the bottom pane shows; the choice survives a restart
   let pane = $state<Pane>(rememberedPane())
   function rememberedPane(): Pane {
     try {
       const saved = localStorage.getItem('pane')
-      if (saved === 'console' || saved === 'insights' || saved === 'none') return saved === 'none' ? null : saved
+      if (saved === 'console' || saved === 'insights' || saved === 'traces' || saved === 'none')
+        return saved === 'none' ? null : saved
     } catch {}
     return 'insights'
   }
@@ -53,6 +56,11 @@
     else if (bottom.isCollapsed()) bottom.expand()
   })
   const insights = new InsightsStore()
+  const traces = new Traces()
+  // only polled while the pane is open, and only for the selected torrent
+  $effect(() => {
+    traces.follow(pane === 'traces' && selectedTorrent ? api.infoHashOf(selectedTorrent) : null)
+  })
   let showSettings = $state(false)
   let logLines = $state<string[]>([])
   let logSeen = 0
@@ -235,6 +243,12 @@
         <Console lines={logLines} />
       {:else if pane === 'insights'}
         <Insights {insights} />
+      {:else if pane === 'traces'}
+        {#if selectedTorrent}
+          <TracesPane {traces} />
+        {:else}
+          <p class="p-3 text-sm text-muted-foreground">Select a torrent to see its traces.</p>
+        {/if}
       {/if}
     </Resizable.Pane>
   </Resizable.PaneGroup>
@@ -245,6 +259,9 @@
     </Button>
     <Button variant={pane === 'insights' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'insights' ? null : 'insights')}>
       Insights
+    </Button>
+    <Button variant={pane === 'traces' ? 'secondary' : 'ghost'} size="xs" onclick={() => (pane = pane === 'traces' ? null : 'traces')}>
+      Traces
     </Button>
     {#if pane === 'console'}
       <span class="text-xs text-muted-foreground">{logLines.length} lines</span>

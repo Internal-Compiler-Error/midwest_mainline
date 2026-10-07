@@ -174,3 +174,37 @@ export function humanBytesLike(bytes: number, like: number): string {
 
 /** Rates are always in KiB/s, so a moving figure never changes unit. */
 export const kibPerSecond = (bytes: number) => `${(bytes / 1024).toFixed(1)} KiB/s`
+
+/** One span of a torrent's work (see downloader::telemetry), open or finished. */
+export interface TraceSpan {
+  id: number
+  parent: number | null
+  /** dial, peer, piece, piece.check, tracker.announce, dht.lookup, metadata, metadata.peer, ... */
+  name: string
+  /** unix milliseconds */
+  start_ms: number
+  /** null while still open */
+  end_ms: number | null
+  fields: [string, string][]
+  events: { at_ms: number; level: string; message: string }[]
+}
+
+export interface TraceSnapshot {
+  /** pass back as `since` next time */
+  seq: number
+  finished: TraceSpan[]
+  open: TraceSpan[]
+}
+
+export const traces = (infoHash: string, since: number) => invoke<TraceSnapshot>('traces', { infoHash, since })
+
+/** The info hash a row's spans are tagged with: known once it's running, and for a magnet
+ * that's still resolving, read off its `xt=urn:btih:` (hex form only). */
+export function infoHashOf(row: TorrentRow): string | null {
+  if ('info_hash' in row) return row.info_hash
+  if (row.kind === 'resolving' || row.kind === 'failed') {
+    const m = /urn:btih:([0-9a-f]{40})/i.exec(row.source)
+    return m ? m[1].toLowerCase() : null
+  }
+  return null
+}
