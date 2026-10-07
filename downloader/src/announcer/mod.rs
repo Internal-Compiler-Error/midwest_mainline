@@ -11,6 +11,8 @@ mod http;
 mod tracker;
 mod udp;
 
+pub(crate) use http::percent_encode;
+
 use crate::defs::Identity;
 use crate::dht::DhtWatch;
 use crate::events::EventBus;

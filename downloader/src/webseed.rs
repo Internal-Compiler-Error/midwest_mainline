@@ -6,6 +6,7 @@
 //! request per file it touches, cutting the body into blocks that go through the same
 //! assembly and hash check as blocks from peers.
 
+use crate::announcer::percent_encode;
 use crate::peer::PeerStatistics;
 use crate::settings::{
     BLOCK_SIZE, WEB_SEED_BACKOFF, WEB_SEED_BACKOFF_MAX, WEB_SEED_CONNECT_TIMEOUT, WEB_SEED_JOBS, WEB_SEED_MAX_RUN,
@@ -84,25 +85,9 @@ pub(crate) fn file_url(base: &str, torrent: &Torrent, file: usize) -> String {
     if !url.ends_with('/') {
         url.push('/');
     }
-    for (i, segment) in path.iter().enumerate() {
-        if i > 0 {
-            url.push('/');
-        }
-        percent_encode(segment, &mut url);
-    }
+    let segments: Vec<String> = path.iter().map(|segment| percent_encode(segment.as_bytes())).collect();
+    url.push_str(&segments.join("/"));
     url
-}
-
-/// RFC 3986: everything but the unreserved characters is escaped, so a name with spaces, '#',
-/// '?' or non-ASCII letters still names the file and nothing else.
-fn percent_encode(segment: &str, out: &mut String) {
-    for &b in segment.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
 }
 
 /// Why a job stopped short.
@@ -211,16 +196,16 @@ impl Job {
             {
                 // BEP 47: padding is zeros, and not on the server
                 pipeline.push_back(if self.torrent.attrs[range.file].pad {
-                    Err(range.len)
+                    Part::Zeros(range.len)
                 } else {
-                    Ok(self.fetch(range)?)
+                    Part::Fetch(self.fetch(range)?)
                 });
             }
             let mut fetch = match pipeline.pop_front() {
                 None => return Ok(()),
-                Some(Ok(fetch)) => fetch,
-                Some(Err(zeros)) => {
-                    for block in blocks.feed(&vec![0; zeros as usize]) {
+                Some(Part::Fetch(fetch)) => fetch,
+                Some(Part::Zeros(len)) => {
+                    for block in blocks.feed(&vec![0; len as usize]) {
                         if !deliver(block).await {
                             return Ok(());
                         }
@@ -328,6 +313,13 @@ impl Job {
     }
 }
 
+/// One file's share of a job, in the order they're delivered.
+enum Part {
+    /// padding, which no server has: this many zeros
+    Zeros(u64),
+    Fetch(Fetch),
+}
+
 /// A request a job has started: the body arrives through `body`, then the channel closes (or
 /// a failure comes instead).
 struct Fetch {
@@ -431,13 +423,14 @@ impl<'t> Blocks<'t> {
             if self.buf.len() == self.block_len() {
                 let piece_size = self.torrent.piece_size as u64;
                 let data: Box<[u8]> = std::mem::replace(&mut self.buf, Vec::with_capacity(BLOCK_SIZE)).into();
+                let length = data.len() as u32;
                 out.push(Piece {
                     index: (self.at / piece_size) as u32,
                     begin: (self.at % piece_size) as u32,
-                    length: data.len() as u32,
+                    length,
                     data,
                 });
-                self.at += out.last().map_or(0, |b| b.length as u64);
+                self.at += length as u64;
             }
         }
         out
