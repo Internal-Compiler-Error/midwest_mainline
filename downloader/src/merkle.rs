@@ -23,18 +23,24 @@ pub fn zero_subtree(levels: u32) -> Hash {
     (0..levels).fold([0; 32], |h, _| pair(&h, &h))
 }
 
-/// The root over `nodes`, filled out to `width` (a power of two, at least `nodes.len()`) with
-/// `pad`, the value of a node of `nodes`' layer that covers nothing but padding.
-pub fn root(nodes: &[Hash], width: usize, pad: Hash) -> Hash {
-    debug_assert!(width.is_power_of_two() && width >= nodes.len());
-    let mut layer = nodes.to_vec();
-    let mut pad = pad;
-    let mut width = width;
+/// The hashes of `data`'s 16 KiB blocks, the last one possibly short: a tree's leaves.
+pub fn leaves(data: &[u8]) -> Vec<Hash> {
+    data.chunks(BLOCK).map(|block| Sha256::digest(block).into()).collect()
+}
+
+/// The root over `layer`, filled out to `width` (a power of two, at least `layer.len()`) with
+/// `pad`, the value of a node of that layer that covers nothing but padding. Works in place.
+fn root(mut layer: Vec<Hash>, mut width: usize, mut pad: Hash) -> Hash {
+    debug_assert!(width.is_power_of_two() && width >= layer.len());
     while width > 1 {
         if layer.len() % 2 == 1 {
             layer.push(pad);
         }
-        layer = layer.as_chunks::<2>().0.iter().map(|[l, r]| pair(l, r)).collect();
+        let half = layer.len() / 2;
+        for i in 0..half {
+            layer[i] = pair(&layer[2 * i], &layer[2 * i + 1]);
+        }
+        layer.truncate(half);
         pad = pair(&pad, &pad);
         width /= 2;
     }
@@ -44,8 +50,7 @@ pub fn root(nodes: &[Hash], width: usize, pad: Hash) -> Hash {
 /// The root of the tree over `data`'s 16 KiB blocks, `leaves` wide (a power of two covering
 /// them all); leaves past the data are zero hashes, not hashes of zeros.
 pub fn data_root(data: &[u8], leaves: usize) -> Hash {
-    let hashes: Vec<Hash> = data.chunks(BLOCK).map(|block| Sha256::digest(block).into()).collect();
-    root(&hashes, leaves, [0; 32])
+    root(self::leaves(data), leaves, [0; 32])
 }
 
 /// The leaves a file of `len` bytes needs under its root: a power of two, at least one.
@@ -56,7 +61,7 @@ pub fn file_leaves(len: u64) -> usize {
 /// A file's `pieces root` from its piece layer (one hash per piece, `piece_size` bytes each).
 pub fn root_from_layer(layer: &[Hash], piece_size: u32) -> Hash {
     let levels = (piece_size as usize / BLOCK).trailing_zeros();
-    root(layer, layer.len().next_power_of_two(), zero_subtree(levels))
+    root(layer.to_vec(), layer.len().next_power_of_two(), zero_subtree(levels))
 }
 
 /// Every layer of the tree over `layer`, bottom up and padded out to a power of two: what

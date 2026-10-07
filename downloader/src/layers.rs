@@ -9,7 +9,6 @@
 use crate::merkle::{self, Hash};
 use crate::torrent::Torrent;
 use crate::wire::{HashRequest, Hashes};
-use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -308,11 +307,7 @@ pub fn answer_from_data(
         let data = read(piece)?;
         let start = k as u64 * torrent.piece_size as u64;
         let used = (len - start).min(torrent.piece_size as u64) as usize;
-        let mut leaves: Vec<Hash> = data
-            .get(..used)?
-            .chunks(merkle::BLOCK)
-            .map(|block| sha2::Sha256::digest(block).into())
-            .collect();
+        let mut leaves = merkle::leaves(data.get(..used)?);
         leaves.resize(1 << level, [0; 32]);
         let tree = merkle::layers_above(&leaves, [0; 32]);
         let expected = match layer {
@@ -347,7 +342,6 @@ mod test {
     use super::*;
     use crate::torrent::fixtures::{self, sorted};
     use crate::torrent::parse_torrent;
-    use sha2::Sha256;
 
     const P: usize = 32768;
 
@@ -383,7 +377,7 @@ mod test {
 
     /// Every layer of `data`'s tree from the leaves up, straight from BEP 52's definition.
     fn full_tree(data: &[u8]) -> Vec<Vec<Hash>> {
-        let mut leaves: Vec<Hash> = data.chunks(merkle::BLOCK).map(|b| Sha256::digest(b).into()).collect();
+        let mut leaves = merkle::leaves(data);
         leaves.resize(merkle::file_leaves(data.len() as u64), [0; 32]);
         merkle::layers_above(&leaves, [0; 32])
     }
