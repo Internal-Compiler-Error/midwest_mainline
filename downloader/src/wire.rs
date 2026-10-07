@@ -599,6 +599,21 @@ mod test {
         assert!(src.is_empty());
     }
 
+    /// Every id with every payload length up to past the longest fixed one: a message, an
+    /// error or a wait, never a panic.
+    #[test]
+    fn any_id_and_length_decodes_or_fails() {
+        for id in 0..=u8::MAX {
+            for len in 0..HashRequest::LEN + 40 {
+                let mut src = BytesMut::new();
+                src.put_u32(1 + len as u32);
+                src.put_u8(id);
+                src.put_bytes(0xa5, len);
+                let _ = BtCodec.decode(&mut src);
+            }
+        }
+    }
+
     /// Exercises the outbound (`shake_hands`) and inbound (`read_handshake` then
     /// `send_handshake`) halves against each other over a real loopback socket, since
     /// splitting them apart is the change most likely to silently break framing.
