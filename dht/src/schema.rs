@@ -30,7 +30,6 @@ diesel::table! {
         port -> Integer,
         failed_requests -> Integer,
         removed -> Bool,
-        last_sent -> Nullable<BigInt>,
         added -> BigInt,
         bep42 -> Nullable<Bool>,
     }

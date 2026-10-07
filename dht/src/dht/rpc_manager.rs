@@ -25,10 +25,10 @@ use crate::{
     message::{Krpc, KrpcBody, error::KrpcError},
     our_error::{OurError, naur},
     types::{Family, NodeInfo, TransactionId},
-    utils::{db_put, unix_timestmap_ms},
+    utils::db_put,
 };
 
-use super::{TxnIdGenerator, external_ip::ExternalIp, routing_table::update_last_sent, scope::Scope};
+use super::{TxnIdGenerator, external_ip::ExternalIp, scope::Scope};
 
 /// BEP 5's `v`, which every message we send carries
 const CLIENT_VERSION: &[u8] = b"MW01";
@@ -285,7 +285,6 @@ impl RpcManager {
     /// to the address, typically IPv6 on a host without it) is an [`OurError::IoError`] at
     /// once, rather than a timeout later.
     async fn send_and_wait(&self, message: Krpc, endpoint: SocketAddr) -> Result<Krpc, OurError> {
-        let sent_time = unix_timestmap_ms();
         let rx = self.subscribe_one(message.transaction_id().clone(), endpoint);
         self.socket
             .send_to(&self.encode_for(message, endpoint), endpoint)
@@ -294,20 +293,10 @@ impl RpcManager {
             .await
             .map_err(|_| naur!("pending request superseded or dropped before a response arrived"))?;
 
-        // only error messages omit the node id
-        let Some(response_node_id) = response.node_id() else {
-            return Err(match response.body {
-                KrpcBody::ErrorResponse(e) => OurError::Remote(e),
-                _ => naur!("node responded without an id"),
-            });
-        };
-        let mut conn = self
-            .db
-            .get()
-            .map_err(|e| naur!("could not check out a db connection: {e}"))?;
-        // it's a double update but that's issue for another day
-        update_last_sent(&response_node_id, self.scope.table, sent_time, &mut conn);
-        Ok(response)
+        match response.body {
+            KrpcBody::ErrorResponse(e) => Err(OurError::Remote(e)),
+            _ => Ok(response),
+        }
     }
 
     async fn send_and_wait_timeout(

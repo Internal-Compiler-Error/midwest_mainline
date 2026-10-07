@@ -2,7 +2,7 @@
 //!
 //! The table learns passively: `run` consumes the broker's inbound message fan-out and
 //! records every sender we hear from. Liveness is tracked with a `failed_requests`
-//! counter — 3+ failures and a stale `last_sent` lands a node on the replacement queue,
+//! counter — 3+ failures and 15 minutes unheard from land a node on the replacement queue,
 //! and a failed refresh ping tombstones it (`removed`). Tombstones are purged on the
 //! periodic `refresh_table` tick.
 //!
@@ -117,6 +117,10 @@ pub(crate) fn bucket_index(our_id: &NodeId, target: &NodeId) -> i32 {
 }
 
 const REFRESH_EVERY: Duration = Duration::from_secs(180);
+/// BEP 5's questionable node: not heard from in this long
+const QUESTIONABLE_AFTER: Duration = Duration::from_secs(15 * 60);
+/// Failed queries that make a questionable node worth a refresh ping
+const FAILURES_TO_REFRESH: i32 = 3;
 
 #[derive(Debug, Clone)]
 /// A RoutingTable will tell you who are the closest nodes that we know
@@ -402,35 +406,26 @@ impl RoutingTable {
         count as usize
     }
 
-    /// Find the list of "problematic" nodes that if not responded, should be removed
+    /// The questionable nodes of the ith bucket (BEP 5: not heard from in 15 minutes), the ones
+    /// that failed a few queries since: a refresh pings them, and drops those that don't answer
     fn replacement_queue(&self, i: i32, conn: &mut SqliteConnection) -> Vec<crate::models::NodeRow> {
         use crate::schema::node::dsl::*;
-
-        fn cutoff() -> i64 {
-            let fifteenth_mins_ms = 15 * 60 * 1000;
-            unix_timestmap_ms() - fifteenth_mins_ms
-        }
-
+        let questionable = unix_timestmap_ms() - QUESTIONABLE_AFTER.as_millis() as i64;
         node.filter(family.eq(self.scope_table))
             .filter(removed.eq(false))
             .filter(bucket.eq(i))
-            .filter(failed_requests.ge(3)) // TODO: make this configurable
-            .filter(last_sent.le(cutoff()))
+            .filter(failed_requests.ge(FAILURES_TO_REFRESH))
+            .filter(last_contacted.le(questionable))
             .order(last_contacted.desc())
             .select(crate::models::NodeRow::as_select())
             .get_results(conn)
-            .unwrap()
+            .inspect_err(|e| error!("{e}"))
+            .unwrap_or_default()
     }
 
     // Send a ping to fresh the node
     async fn refresh_node(&self, target: &NodeInfo) {
         let ping_msg = KrpcBody::PingQuery(PingQuery::new(self.id));
-
-        {
-            let mut conn = self.conn();
-            update_last_sent(&target.id(), self.scope_table, unix_timestmap_ms(), &mut conn);
-        }
-
         let response = self.rpc_manager.query(ping_msg, target, REQ_TIMEOUT).await;
         let mut conn = self.conn();
         match response {
@@ -541,18 +536,6 @@ impl RoutingTable {
             .execute(conn)
             .inspect_err(|e| error!("{e}"));
     }
-}
-
-pub fn update_last_sent(nodee: &NodeId, table: i32, sent_timestamp: i64, conn: &mut SqliteConnection) {
-    use crate::schema::node::dsl::*;
-
-    let idd = nodee.0.to_vec();
-    let _ = diesel::update(node)
-        .set(last_sent.eq(sent_timestamp))
-        .filter(family.eq(table))
-        .filter(id.eq(idd))
-        .execute(conn)
-        .inspect_err(|e| error!("{e}"));
 }
 
 #[cfg(test)]
@@ -813,6 +796,30 @@ mod tests {
         let mut expected = vec![(good.0[0], Some(true)), (1, Some(false)), (2, Some(true))];
         expected.sort();
         assert_eq!(flags, expected, "the LAN node is exempt");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_answered_is_refreshed_once_it_failed_enough() {
+        use crate::schema::node::dsl::*;
+
+        let routing_table = test_routing_table(NodeId([0x00; 20])).await;
+        // a node another node referred us to, which never answered a query of ours
+        let dead = id_with_first_byte(0xF0);
+        routing_table.add(dead, addr(1));
+        for _ in 0..3 {
+            routing_table.mark_failed(&dead);
+        }
+        let mut conn = routing_table.table.get().unwrap();
+        diesel::update(node.filter(id.eq(dead.0.to_vec())))
+            .set(last_contacted.eq(1))
+            .execute(&mut conn)
+            .unwrap();
+        let queued: Vec<Vec<u8>> = routing_table
+            .replacement_queue(routing_table.index(&dead), &mut conn)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(queued, vec![dead.0.to_vec()]);
     }
 
     #[tokio::test]
