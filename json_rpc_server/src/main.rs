@@ -97,14 +97,12 @@ async fn call(s: &AppState, method: &str, params: Option<&serde_json::Value>) ->
             let Some(info_hash) = info_hash_param(params) else {
                 return Outcome::invalid_params();
             };
-            match s.dht.handle().scrape(info_hash).await {
-                Ok(estimate) => serde_json::json!({
-                    "seeds": estimate.seeds,
-                    "peers": estimate.peers,
-                    "nodes": estimate.nodes,
-                }),
-                Err(e) => return Outcome::error(-32000, e),
-            }
+            let estimate = s.dht.handle().scrape(info_hash).await;
+            serde_json::json!({
+                "seeds": estimate.seeds,
+                "peers": estimate.peers,
+                "nodes": estimate.nodes,
+            })
         }
         // BEP 44, immutable items: `{"text": "..."}` is stored as a bencoded string
         "put" => {

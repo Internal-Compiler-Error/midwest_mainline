@@ -348,10 +348,10 @@ impl DhtClient {
         })
     }
 
-    /// The peers for `info_hash` the nodes nearest it hold, and the nodes to announce to. Never
-    /// fails as such: nobody answering is no peers and no one to announce to.
+    /// The peers for `info_hash` the nodes nearest it hold, and the nodes to announce to; nobody
+    /// answering is no peers and no one to announce to.
     #[tracing::instrument(skip(self))]
-    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<GetPeersResult, OurError> {
+    pub async fn get_peers(&self, info_hash: InfoHash) -> GetPeersResult {
         self.get_peers_with(info_hash, |_| {}).await
     }
 
@@ -363,7 +363,7 @@ impl DhtClient {
         &self,
         info_hash: InfoHash,
         mut found: impl FnMut(&[SocketAddr]) + Send,
-    ) -> Result<GetPeersResult, OurError> {
+    ) -> GetPeersResult {
         let ours = self.state.swarm_peers(&info_hash, self.family());
         if !ours.is_empty() {
             found(&ours);
@@ -374,14 +374,14 @@ impl DhtClient {
                 result.peers.push(peer);
             }
         }
-        Ok(result)
+        result
     }
 
     /// BEP 33: how big the swarm is, from the bloom filters of seeds and peers the nodes
     /// nearest the hash keep, ORed together (with our own, if we hold any), so a peer
     /// announced to several of them counts once
     #[tracing::instrument(skip(self))]
-    pub async fn scrape(&self, info_hash: InfoHash) -> Result<SwarmEstimate, OurError> {
+    pub async fn scrape(&self, info_hash: InfoHash) -> SwarmEstimate {
         let (_, filters) = self.lookup_peers(info_hash, true, |_| {}).await;
         let answered = filters.len();
         let both = filters.into_iter().chain(self.state.scrape_filters(&info_hash)).fold(
@@ -391,11 +391,11 @@ impl DhtClient {
                 peers: acc.peers.union(&f.peers),
             },
         );
-        Ok(SwarmEstimate {
+        SwarmEstimate {
             seeds: both.seeds.estimate().round() as u64,
             peers: both.peers.estimate().round() as u64,
             nodes: answered,
-        })
+        }
     }
 
     /// The lookup behind `get_peers` and `scrape`: harvests peers, tokens and, with `scrape`,
@@ -670,7 +670,7 @@ mod tests {
         let state = Arc::new(SharedState::new(our_id, routing_table, broker, swarm_pool));
         let client = DhtClient::new(state);
 
-        let result = client.get_peers(InfoHash([0xFF; 20])).await.unwrap();
+        let result = client.get_peers(InfoHash([0xFF; 20])).await;
 
         assert_eq!(result.peers, vec![peer_x], "the referral must be followed to B");
         assert!(

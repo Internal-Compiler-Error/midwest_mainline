@@ -430,7 +430,7 @@ impl DhtSession {
         self.client.find_node(target).await
     }
 
-    pub async fn get_peers(&self, info_hash: InfoHash) -> Result<client::GetPeersResult, OurError> {
+    pub async fn get_peers(&self, info_hash: InfoHash) -> client::GetPeersResult {
         self.client.get_peers(info_hash).await
     }
 
@@ -712,7 +712,7 @@ mod ipv6_tests {
 
         // A looks the hash up at B, gets a token, and announces itself there
         let info_hash = InfoHash([0x42; 20]);
-        let found = a.session.get_peers(info_hash).await.unwrap();
+        let found = a.session.get_peers(info_hash).await;
         assert!(found.peers.is_empty());
         let (_, token) = found
             .announce_candidates
@@ -727,7 +727,7 @@ mod ipv6_tests {
 
         // C, knowing only B, finds A's announce: an 18-byte IPv6 value
         c.session.bootstrap(vec![b_addr]).await.unwrap();
-        let found = c.session.get_peers(info_hash).await.unwrap();
+        let found = c.session.get_peers(info_hash).await;
         assert_eq!(found.peers, vec![SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 1234)]);
         // B learned of both, in its IPv6 table
         assert_eq!(b.session.node_count(), 2);
@@ -873,13 +873,13 @@ mod bep33_tests {
             .await
             .unwrap();
 
-        let estimate = us.session.handle().scrape(hash).await.unwrap();
+        let estimate = us.session.handle().scrape(hash).await;
         assert_eq!(estimate.nodes, 2);
         assert!(estimate.seeds.abs_diff(40) <= 2, "{estimate:?}");
         assert!(estimate.peers.abs_diff(20) <= 1, "{estimate:?}");
 
         // a hash nobody holds: nothing, and no filters
-        let none = us.session.handle().scrape(InfoHash([0x44; 20])).await.unwrap();
+        let none = us.session.handle().scrape(InfoHash([0x44; 20])).await;
         assert_eq!((none.seeds, none.peers, none.nodes), (0, 0, 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -942,7 +942,7 @@ mod bep45_tests {
         // a token is the socket's that issued it
         let hash = InfoHash([0x45; 20]);
         let x_client = x.session.handle();
-        let found = x_client.get_peers(hash).await.unwrap();
+        let found = x_client.get_peers(hash).await;
         let (_, primarys_token) = found
             .announce_candidates
             .iter()
@@ -995,7 +995,7 @@ mod bep43_tests {
         // its lookups work, and A serves them, but leaves it out of its table
         ro.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
         assert_eq!(ro.session.node_count(), 1);
-        let found = ro.session.get_peers(InfoHash([1; 20])).await.unwrap();
+        let found = ro.session.get_peers(InfoHash([1; 20])).await;
         assert_eq!(found.announce_candidates.len(), 1, "A answered with a token");
         assert_eq!(a.session.node_count(), 0);
 
@@ -1143,7 +1143,7 @@ mod bep44_tests {
         let store = node(&dir, "store", LOOPBACK).await;
         let us = node(&dir, "us", LOOPBACK).await;
         us.session.bootstrap(vec![store.session.local_addr()]).await.unwrap();
-        let found = us.session.get_peers(InfoHash([1; 20])).await.unwrap();
+        let found = us.session.get_peers(InfoHash([1; 20])).await;
         let (_, token) = found.announce_candidates[0].clone();
         let key = SigningKey::from_bytes(&[6; 32]);
         let signed = |salt: &[u8], seq, value: &[u8]| Signed {
