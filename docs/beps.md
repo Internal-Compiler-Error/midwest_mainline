@@ -25,6 +25,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 23 | Compact peer lists | `announcer.rs` |
 | 27 | Private torrents (no DHT/PEX/LSD for them) | `torrent.rs`, `torrent_swarm.rs`, `announcer.rs` |
 | 29 | uTP (via `librqbit-utp`; happy-eyeballs with TCP) | `utp.rs`, `stream.rs` |
+| 32 | IPv6 DHT: a second `DhtSession` on an IPv6 socket, `nodes6`/`want`, 18-byte values, per-/64 Sybil rule, v6 table seeded from v4 `nodes6` answers (untested on a live v6 route: the dev Mac has none) | `dht/` (`DhtSession::pair_with`, migration `2026-10-07-000000_ipv6_nodes`), `downloader/src/dht.rs` |
 | 41 | UDP tracker extensions: we send an empty option list only | `announcer.rs` |
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
@@ -35,7 +36,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | BEP | What | Notes |
 |---|---|---|
 | 19 | Web seeds (`url-list`, magnet `ws=`) | HTTP range requests as a peer-like source in the swarm, with a `webseed` span |
-| 32 | IPv6 DHT (`nodes6`, `want`) | separate v4/v6 routing tables, lookups on both families |
 
 ## Next, in order
 
