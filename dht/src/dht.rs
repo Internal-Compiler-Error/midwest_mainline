@@ -22,6 +22,7 @@
 
 pub mod bep42;
 pub mod client;
+pub mod crawler;
 mod external_ip;
 pub mod routing_table;
 pub mod rpc_manager;
@@ -382,6 +383,17 @@ impl DhtSession {
         self.state.stored_swarms()
     }
 
+    /// A BEP 51 crawler on this node, sending `per_second` queries a second once run; see
+    /// [`crawler`]. What it finds is counted by [`DhtSession::sampled_count`].
+    pub fn crawler(&self, per_second: u32) -> crawler::Crawler {
+        crawler::Crawler::new(self.handle(), self.state.clone(), per_second)
+    }
+
+    /// Distinct info hashes a crawler on this database has sampled from other nodes (BEP 51)
+    pub fn sampled_count(&self) -> usize {
+        self.state.sampled_count()
+    }
+
     /// The peers announced to us for `info_hash` that we still hold, stale ones included,
     /// most recently announced first.
     pub fn stored_peers(&self, info_hash: &InfoHash) -> Vec<StoredPeer> {
@@ -701,30 +713,7 @@ mod migration_tests {
 #[cfg(test)]
 mod ipv6_tests {
     use super::*;
-    use std::time::Duration;
-
-    struct Node {
-        session: Arc<DhtSession>,
-        _run: tokio::task::JoinHandle<()>,
-    }
-
-    async fn node(dir: &std::path::Path, name: &str, bind: SocketAddr) -> Node {
-        let socket = UdpSocket::bind(bind).await.unwrap();
-        let db = dir.join(format!("{name}.db"));
-        let session = Arc::new(DhtSession::with_stable_id(socket, None, db.to_str().unwrap()).unwrap());
-        let run = tokio::spawn({
-            let session = session.clone();
-            async move { session.run().await }
-        });
-        Node { session, _run: run }
-    }
-
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("midwest-mainline-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_support::{node, scratch_dir};
 
     const V6_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
     const V4_LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -795,6 +784,80 @@ mod ipv6_tests {
             .expect("X came in as nodes6");
         assert_eq!(seeded.end_point(), x.session.local_addr());
         assert_eq!(us4.session.routing_table.find_exact(&x_id), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bep51_tests {
+    use super::*;
+    use crate::test_support::{node, scratch_dir};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const LOOPBACK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    fn store(session: &DhtSession, info_hash: InfoHash) {
+        let mut conn = session.state.conn.get().unwrap();
+        server::DhtServer::add_peers_to_db(&info_hash, "10.0.0.1:6881".parse().unwrap(), &mut conn).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_answers_with_a_sample_of_what_it_stores() {
+        let dir = scratch_dir("bep51-answer");
+        let a = node(&dir, "a", LOOPBACK).await;
+        let b = node(&dir, "b", LOOPBACK).await;
+        let stored = [InfoHash([1; 20]), InfoHash([2; 20])];
+        for hash in stored {
+            store(&a.session, hash);
+        }
+        b.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
+
+        let sampled = b
+            .session
+            .handle()
+            .sample_infohashes(a.session.local_addr(), NodeId([0x55; 20]))
+            .await
+            .unwrap();
+        assert_eq!(sampled.num, 2);
+        let mut samples = sampled.samples.clone();
+        samples.sort_by_key(|h| h.0);
+        assert_eq!(samples, stored);
+        assert!(sampled.interval <= state::SAMPLE_INTERVAL && sampled.interval > Duration::ZERO);
+        assert_eq!(sampled.node.id(), a.session.handle().our_id());
+        assert_eq!(sampled.nodes.len(), 1, "A knows B, and says so");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_crawler_walks_from_node_to_node_and_keeps_what_they_sample() {
+        let dir = scratch_dir("bep51-crawl");
+        // A knows C, B knows only A: the crawler on B must reach C through A's `nodes`
+        let a = node(&dir, "a", LOOPBACK).await;
+        let c = node(&dir, "c", LOOPBACK).await;
+        store(&a.session, InfoHash([1; 20]));
+        store(&c.session, InfoHash([1; 20]));
+        store(&c.session, InfoHash([3; 20]));
+        c.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
+        let b = node(&dir, "b", LOOPBACK).await;
+        b.session.bootstrap(vec![a.session.local_addr()]).await.unwrap();
+        b.session.routing_table.evict(&c.session.handle().our_id());
+
+        let crawler = b.session.crawler(50);
+        let crawl = {
+            let crawler = crawler.clone();
+            tokio::spawn(async move { crawler.run().await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while b.session.sampled_count() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(b.session.sampled_count(), 2);
+        // and politely: each node once, however fast the crawler may go
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        crawl.abort();
+        assert_eq!(crawler.stats().answered.load(Relaxed), 2);
+        assert_eq!(crawler.stats().new_info_hashes.load(Relaxed), 2);
+        assert_eq!(crawler.stats().samples.load(Relaxed), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

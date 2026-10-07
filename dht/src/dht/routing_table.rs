@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diesel::r2d2::PooledConnection;
@@ -127,6 +128,8 @@ pub struct RoutingTable {
     /// eviction of dead nodes (failed_requests >= 3 → refresh → mark_as_dead) keeps the
     /// table fresh. Revisit if the table ever outgrows this.
     bucket_capacity: usize,
+    /// buckets with a refresh under way, see `add`
+    refreshing: Arc<Mutex<HashSet<i32>>>,
 }
 
 impl RoutingTable {
@@ -138,6 +141,7 @@ impl RoutingTable {
             table,
             rpc_manager,
             bucket_capacity: 1024, // TODO: make this configurable in the future
+            refreshing: Arc::default(),
         }
     }
 
@@ -146,18 +150,9 @@ impl RoutingTable {
     }
 
     fn add_new_nodes(&self, from: SocketAddr, message: &Krpc) {
-        if let KrpcBody::ErrorResponse(_) = message.body {
+        // errors carry no id
+        let Some(node_id) = message.node_id() else {
             return;
-        }
-
-        let node_id = match &message.body {
-            KrpcBody::AnnouncePeerQuery(announce_peer_query) => *announce_peer_query.requestor(),
-            KrpcBody::FindNodeQuery(find_node_query) => find_node_query.requestor(),
-            KrpcBody::GetPeersQuery(get_peers_query) => *get_peers_query.requestor(),
-            KrpcBody::PingQuery(ping_query) => *ping_query.requestor(),
-            KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => *ping_announce_peer_response.target_id(),
-            KrpcBody::FindNodeGetPeersResponse(find_node_get_peers_response) => *find_node_get_peers_response.queried(),
-            KrpcBody::ErrorResponse(_) => unreachable!("errors should get early returned"),
         };
 
         {
@@ -282,13 +277,10 @@ impl RoutingTable {
         self.find_exact(target).is_some()
     }
 
+    /// Whether the ith bucket is at capacity. Adds race (a refresh's insert against the inbox's),
+    /// so a bucket can end up a node or two over; that's harmless.
     pub fn full_bucket(&self, i: i32) -> bool {
-        let size = self.bucket_size(i);
-        assert!(
-            size <= self.bucket_capacity,
-            "bucket managed to grow beyond the size limit"
-        );
-        size == self.bucket_capacity
+        self.bucket_size(i) >= self.bucket_capacity
     }
 
     /// Add a new node to the routing table, if the buckets are full, the node will be ignored.
@@ -334,15 +326,20 @@ impl RoutingTable {
             return;
         }
 
-        info!("Bucket {bucket_idx} full, refreshing all buckets to evict");
+        // one refresh of a bucket at a time; a node turning up meanwhile is let go
+        if !self.refreshing.lock().unwrap().insert(bucket_idx) {
+            debug!("Bucket {bucket_idx} full and being refreshed, skipping {new_node_id:?}");
+            return;
+        }
+        info!("Bucket {bucket_idx} full, refreshing it to evict");
         let this = self.clone();
         let work = async move {
             let node = NodeInfo::new(new_node_id, addr);
 
             // instead of going from least recently seen and probe one by one, just refresh the
             // entire bucket
-            let bucket_idx = this.index(&new_node_id);
             this.refresh_bucket(bucket_idx).await;
+            this.refreshing.lock().unwrap().remove(&bucket_idx);
 
             if this.full_bucket(bucket_idx) {
                 info!("Bucket {bucket_idx} remains full after refreshing, node not added");

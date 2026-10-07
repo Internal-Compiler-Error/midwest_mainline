@@ -70,6 +70,10 @@ impl DhtServer {
             KrpcBody::FindNodeQuery(find_node) => self.generate_find_node_response(find_node, from),
             KrpcBody::AnnouncePeerQuery(announce_peer) => self.generate_announce_peer_response(announce_peer, from),
             KrpcBody::GetPeersQuery(get_peers) => self.generate_get_peers_response(get_peers, from),
+            KrpcBody::SampleInfohashesQuery(query) => {
+                let res = ResBuilder::new(self.state.our_id).with_samples(self.state.sample());
+                KrpcBody::FindNodeGetPeersResponse(self.with_closest(res, query.target(), query.want()).build())
+            }
             _ => unreachable!("caught by assert"),
         }
     }
@@ -151,7 +155,7 @@ impl DhtServer {
         KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(self.state.our_id))
     }
 
-    fn add_peers_to_db(
+    pub(crate) fn add_peers_to_db(
         info_hash: &InfoHash,
         peer_contact: SocketAddr,
         conn: &mut PooledConnection<ConnectionManager<SqliteConnection>>,

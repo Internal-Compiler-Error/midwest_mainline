@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use bendy::encoding::SingleItemEncoder;
 
-use crate::types::{Family, NodeId, NodeInfo, Token};
+use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token};
 
 use super::{ToKrpcBody, compact_addr};
 
@@ -12,6 +12,8 @@ use super::{ToKrpcBody, compact_addr};
 ///
 /// `nodes` and `nodes6` are `None` when the key is absent, which is not the same as present
 /// and empty: an answer without peers must carry at least one of them.
+///
+/// The extensions that answer with nodes too ride along: BEP 51's samples.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct FindNodeGetPeersResponse {
     queried: NodeId,
@@ -19,7 +21,21 @@ pub struct FindNodeGetPeersResponse {
     values: Vec<SocketAddr>,
     nodes: Option<Vec<NodeInfo>>,
     nodes6: Option<Vec<NodeInfo>>,
+    samples: Option<Samples>,
 }
+
+/// BEP 51's answer to sample_infohashes
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct Samples {
+    /// seconds until the node has a fresh sample; BEP 51 allows 0 to 6 hours
+    pub interval: u32,
+    /// how many info hashes the node stores in all
+    pub num: u64,
+    pub samples: Vec<InfoHash>,
+}
+
+/// BEP 51's limit on `interval`
+pub const MAX_SAMPLE_INTERVAL: u32 = 6 * 60 * 60;
 
 #[derive(Debug, Hash, Clone)]
 pub struct Builder {
@@ -28,6 +44,7 @@ pub struct Builder {
     values: Vec<SocketAddr>,
     nodes: Option<Vec<NodeInfo>>,
     nodes6: Option<Vec<NodeInfo>>,
+    samples: Option<Samples>,
 }
 
 impl Builder {
@@ -38,7 +55,13 @@ impl Builder {
             values: vec![],
             nodes: None,
             nodes6: None,
+            samples: None,
         }
+    }
+
+    pub fn with_samples(mut self, samples: Samples) -> Self {
+        self.samples = Some(samples);
+        self
     }
 
     pub fn with_token(mut self, token: Token) -> Self {
@@ -98,6 +121,7 @@ impl Builder {
             values: self.values,
             nodes,
             nodes6: self.nodes6,
+            samples: self.samples,
         }
     }
 }
@@ -134,6 +158,11 @@ impl FindNodeGetPeersResponse {
             Family::V4 => self.nodes(),
             Family::V6 => self.nodes6(),
         }
+    }
+
+    /// BEP 51, in an answer to sample_infohashes
+    pub fn samples(&self) -> Option<&Samples> {
+        self.samples.as_ref()
     }
 }
 
@@ -179,6 +208,12 @@ impl ToKrpcBody for FindNodeGetPeersResponse {
             }
             if let Some(nodes6) = &self.nodes6 {
                 enc.emit_pair_with(b"nodes6", |e| e.emit_bytes(&compact_nodes(nodes6)));
+            }
+            if let Some(samples) = &self.samples {
+                enc.emit_pair(b"interval", samples.interval);
+                enc.emit_pair(b"num", samples.num);
+                let raw: Vec<u8> = samples.samples.iter().flat_map(|h| h.0).collect();
+                enc.emit_pair_with(b"samples", |e| e.emit_bytes(&raw));
             }
             Ok(())
         })

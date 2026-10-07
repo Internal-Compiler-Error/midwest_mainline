@@ -21,7 +21,9 @@ use crate::message::error::KrpcError;
 use crate::message::find_node_query::FindNodeQuery;
 use crate::message::get_peers_query::GetPeersQuery;
 use crate::message::ping_query::PingQuery;
+use crate::message::sample_infohashes_query::SampleInfohashesQuery;
 use crate::types::{InfoHash, NodeId};
+use find_node_get_peers_response::{MAX_SAMPLE_INTERVAL, Samples};
 use juicy_bencode::{BencodeItemView, parse_bencode_dict};
 
 pub mod announce_peer_query;
@@ -31,6 +33,7 @@ pub mod find_node_query;
 pub mod get_peers_query;
 pub mod ping_announce_peer_response;
 pub mod ping_query;
+pub mod sample_infohashes_query;
 
 /// Compact peer info: 4 (IPv4) or 16 (IPv6) address bytes, then the port, all big endian.
 pub fn compact_addr(addr: &SocketAddr) -> Vec<u8> {
@@ -201,6 +204,42 @@ fn extract_find_node(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result
 
     report_unused_keys(arguments, "Find_node query body has unused keys");
     Ok(find_node_request)
+}
+
+fn extract_sample_infohashes(
+    arguments: &mut BTreeMap<&[u8], BencodeItemView>,
+) -> Result<SampleInfohashesQuery, OurError> {
+    let querier = extract_node_id(arguments)?;
+    let Some(BencodeItemView::ByteString(target)) = arguments.remove(&b"target".as_slice()) else {
+        return Err(OurError::DecodeError(eyre!("sample_infohashes has no 'target' string")));
+    };
+    let target = NodeId::try_from_bytes(target).ok_or(OurError::DecodeError(eyre!("'target' key is not 20 bytes")))?;
+    let query = SampleInfohashesQuery::new(querier, target).with_want(extract_want(arguments)?);
+
+    report_unused_keys(arguments, "sample_infohashes query body has unused keys");
+    Ok(query)
+}
+
+/// BEP 51's `samples`, `interval` and `num`: present when `samples` is. Whole info hashes
+/// only, the interval clamped to BEP 51's range.
+fn extract_samples(response: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<Option<Samples>, OurError> {
+    let Some(samples) = response.remove(b"samples".as_slice()) else {
+        return Ok(None);
+    };
+    let BencodeItemView::ByteString(samples) = samples else {
+        return Err(OurError::DecodeError(eyre!("'samples' key is not a binary string")));
+    };
+    let int = |v: Option<BencodeItemView>| match v {
+        Some(BencodeItemView::Integer(i)) => Some(i),
+        _ => None,
+    };
+    let interval = int(response.remove(b"interval".as_slice())).unwrap_or(0);
+    let num = int(response.remove(b"num".as_slice())).unwrap_or(0);
+    Ok(Some(Samples {
+        interval: interval.clamp(0, MAX_SAMPLE_INTERVAL.into()) as u32,
+        num: num.max(0) as u64,
+        samples: samples.as_chunks::<20>().0.iter().map(|h| InfoHash(*h)).collect(),
+    }))
 }
 
 fn extract_get_peers(arguments: &mut BTreeMap<&[u8], BencodeItemView>) -> Result<GetPeersQuery, OurError> {
@@ -417,6 +456,8 @@ impl ParseKrpc for &[u8] {
                 KrpcBody::GetPeersQuery(extract_get_peers(&mut arguments)?)
             } else if &*query_type == b"announce_peer" {
                 KrpcBody::AnnouncePeerQuery(extract_announce_peer(&mut arguments)?)
+            } else if &*query_type == b"sample_infohashes" {
+                KrpcBody::SampleInfohashesQuery(extract_sample_infohashes(&mut arguments)?)
             } else {
                 let query_type = String::from_utf8_lossy(&query_type);
                 info!("Unsupported query type: {query_type}");
@@ -444,8 +485,9 @@ impl ParseKrpc for &[u8] {
             let nodes6 = extract_nodes(&mut response, Family::V6)?;
             let values = extract_peers(&mut response)?;
             let token = extract_token(&mut response)?;
+            let samples = extract_samples(&mut response)?;
 
-            if nodes.is_none() && nodes6.is_none() && values.is_none() && token.is_none() {
+            if nodes.is_none() && nodes6.is_none() && values.is_none() && token.is_none() && samples.is_none() {
                 // when they have none of these, then it's just a response to ping to announce query
                 KrpcBody::PingAnnouncePeerResponse(PingAnnouncePeerResponse::new(target_id))
             } else {
@@ -469,6 +511,11 @@ impl ParseKrpc for &[u8] {
 
                 let builder = match values {
                     Some(values) => builder.with_values(&values),
+                    None => builder,
+                };
+
+                let builder = match samples {
+                    Some(samples) => builder.with_samples(samples),
                     None => builder,
                 };
 
@@ -513,6 +560,7 @@ pub enum KrpcBody {
     FindNodeQuery(FindNodeQuery),
     GetPeersQuery(GetPeersQuery),
     PingQuery(PingQuery),
+    SampleInfohashesQuery(SampleInfohashesQuery),
 
     PingAnnouncePeerResponse(PingAnnouncePeerResponse),
     FindNodeGetPeersResponse(FindNodeGetPeersResponse),
@@ -539,6 +587,7 @@ impl KrpcBody {
                 | KrpcBody::FindNodeQuery(_)
                 | KrpcBody::GetPeersQuery(_)
                 | KrpcBody::AnnouncePeerQuery(_)
+                | KrpcBody::SampleInfohashesQuery(_)
         )
     }
 }
@@ -584,6 +633,14 @@ impl Krpc {
                 KrpcBody::PingQuery(q) => {
                     enc.emit_pair(b"y", "q")?;
                     enc.emit_pair(b"q", "ping")?;
+                    enc.emit_pair_with(b"a", |e| {
+                        let _: () = q.encode_body(e);
+                        Ok(())
+                    })?;
+                }
+                KrpcBody::SampleInfohashesQuery(q) => {
+                    enc.emit_pair(b"y", "q")?;
+                    enc.emit_pair(b"q", "sample_infohashes")?;
                     enc.emit_pair_with(b"a", |e| {
                         let _: () = q.encode_body(e);
                         Ok(())
@@ -640,6 +697,7 @@ impl Krpc {
             KrpcBody::FindNodeQuery(find_node_query) => Some(find_node_query.requestor()),
             KrpcBody::GetPeersQuery(get_peers_query) => Some(*get_peers_query.requestor()),
             KrpcBody::PingQuery(ping_query) => Some(*ping_query.requestor()),
+            KrpcBody::SampleInfohashesQuery(query) => Some(query.requestor()),
 
             KrpcBody::PingAnnouncePeerResponse(ping_announce_peer_response) => {
                 Some(*ping_announce_peer_response.target_id())
@@ -1155,6 +1213,74 @@ mod test {
             panic!("expected an announce_peer query");
         };
         assert!(query.implied_port());
+    }
+
+    #[test]
+    fn sample_infohashes_round_trips() {
+        let query = SampleInfohashesQuery::new(
+            NodeId::from_bytes(b"abcdefghij0123456789"),
+            NodeId::from_bytes(b"mnopqrstuvwxyz123456"),
+        );
+        let msg = Krpc::new_with_body(TransactionId::from_bytes(b"aa"), KrpcBody::SampleInfohashesQuery(query));
+        let encoded = msg.encode();
+        assert_eq!(
+            std::str::from_utf8(&encoded).unwrap(),
+            "d1:ad2:id20:abcdefghij01234567896:target20:mnopqrstuvwxyz123456e1:q17:sample_infohashes1:t2:aa1:y1:qe"
+        );
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        let res = Builder::new(NodeId::from_bytes(b"0123456789abcdefghij"))
+            .with_samples(Samples {
+                interval: 900,
+                num: 7,
+                samples: vec![InfoHash([1; 20]), InfoHash([2; 20])],
+            })
+            .with_nodes(&[])
+            .build();
+        let msg = Krpc::new_with_body(
+            TransactionId::from_bytes(b"aa"),
+            KrpcBody::FindNodeGetPeersResponse(res),
+        );
+        let encoded = msg.encode();
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(text.contains("8:intervali900e5:nodes0:3:numi7e7:samples40:"), "{text}");
+        assert_eq!(encoded.as_ref().parse().unwrap(), msg);
+
+        // no samples at all is still an answer to sample_infohashes
+        let msg = b"d1:rd2:id20:0123456789abcdefghij8:intervali0e3:numi0e7:samples0:e1:t2:aa1:y1:re" as &[u8];
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.samples().unwrap().samples, vec![]);
+    }
+
+    #[test]
+    fn malformed_bep_51_wire_data_is_trimmed_or_a_decode_error_not_a_panic() {
+        // no target
+        let msg = b"d1:ad2:id20:abcdefghij0123456789e1:q17:sample_infohashes1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+        // a short target
+        let msg = b"d1:ad2:id20:abcdefghij01234567896:target3:abce1:q17:sample_infohashes1:t2:aa1:y1:qe" as &[u8];
+        assert!(msg.parse().is_err());
+        // samples that aren't a string
+        let msg = b"d1:rd2:id20:0123456789abcdefghij7:samplesi5ee1:t2:aa1:y1:re" as &[u8];
+        assert!(msg.parse().is_err());
+        // 30 bytes of samples, a negative num, an interval past 6 hours, and no interval at all
+        let mut msg = b"d1:rd2:id20:0123456789abcdefghij8:intervali99999999e3:numi-4e7:samples30:".to_vec();
+        msg.extend_from_slice(&[7; 30]);
+        msg.extend_from_slice(b"e1:t2:aa1:y1:re");
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.as_slice().parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        let samples = res.samples().unwrap();
+        assert_eq!(samples.samples, vec![InfoHash([7; 20])]);
+        assert_eq!(samples.num, 0);
+        assert_eq!(samples.interval, MAX_SAMPLE_INTERVAL);
+        let msg = b"d1:rd2:id20:0123456789abcdefghij7:samples0:e1:t2:aa1:y1:re" as &[u8];
+        let KrpcBody::FindNodeGetPeersResponse(res) = msg.parse().unwrap().body else {
+            panic!("expected a find_node/get_peers response")
+        };
+        assert_eq!(res.samples().unwrap().interval, 0);
     }
 
     #[test]

@@ -2,12 +2,16 @@ use anyhow::anyhow;
 use axum::{Json, Router, extract::State, routing::post};
 use futures::future::join_all;
 use midwest_mainline::{
-    dht::{DhtSession, Retention},
+    dht::{
+        DhtSession, Retention,
+        crawler::{CrawlStats, Crawler},
+    },
     types::{InfoHash, NodeId},
 };
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::{
     env,
     net::{Ipv6Addr, SocketAddr},
@@ -77,6 +81,19 @@ async fn handle_rpc(State(s): State<AppState>, Json(req): Json<JsonRpcRequest>) 
             "bep42_v4": s.dht.bep42_compliance().0,
             "bep42_v6": s.dht6.as_ref().map(|d| d.bep42_compliance().0),
         }),
+        "sampled" => {
+            let count = |field: fn(&CrawlStats) -> &AtomicU64| -> u64 {
+                s.crawlers.iter().map(|c| field(c.stats()).load(Relaxed)).sum()
+            };
+            serde_json::json!({
+                "info_hashes": s.dht.sampled_count(),
+                "crawling": !s.crawlers.is_empty(),
+                "queried": count(|s| &s.queried),
+                "answered": count(|s| &s.answered),
+                "samples": count(|s| &s.samples),
+                "new_info_hashes": count(|s| &s.new_info_hashes),
+            })
+        }
         "stored_swarms" => {
             let swarms: Vec<String> = s.dht.stored_swarms().iter().map(|h| hex::encode(h.0)).collect();
             serde_json::json!(swarms)
@@ -176,6 +193,8 @@ struct AppState {
     pub dht: Arc<DhtSession>,
     /// the IPv6 node (BEP 32), if an IPv6 socket could be bound
     pub dht6: Option<Arc<DhtSession>>,
+    /// BEP 51 crawlers, one per node, if crawling
+    pub crawlers: Vec<Crawler>,
 }
 
 #[tokio::main]
@@ -211,6 +230,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let nodes: Vec<Arc<DhtSession>> = std::iter::once(dht.clone()).chain(dht6.clone()).collect();
+    // DHT_CRAWL=<queries a second> grows the index with BEP 51 samples from other nodes
+    let crawl_rate: Option<u32> = env::var("DHT_CRAWL").ok().map(|r| r.parse()).transpose()?;
+    let crawlers: Vec<Crawler> = match crawl_rate {
+        Some(rate) if retention == Retention::Forever => nodes.iter().map(|node| node.crawler(rate)).collect(),
+        Some(_) => {
+            warn!("DHT_CRAWL is for the long-term index, DHT_RETENTION=forever; not crawling");
+            vec![]
+        }
+        None => vec![],
+    };
 
     let mut event_loops = JoinSet::new();
 
@@ -218,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         dht: dht.clone(),
         dht6: dht6.clone(),
+        crawlers: crawlers.clone(),
     };
     for node in &nodes {
         let node = node.clone();
@@ -240,6 +270,10 @@ async fn main() -> anyhow::Result<()> {
     event_loops.spawn(async {
         let _ = axum::serve(listener, json_rpc_server).await;
     });
+
+    for crawler in crawlers {
+        event_loops.spawn(async move { crawler.run().await });
+    }
 
     // populate the DHT routing tables
     for node in nodes {

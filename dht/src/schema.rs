@@ -35,6 +35,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    sampled_infohash (info_hash) {
+        info_hash -> Binary,
+        first_sampled -> BigInt,
+        last_sampled -> BigInt,
+        times_sampled -> Integer,
+    }
+}
+
+diesel::table! {
     swarm (info_hash) {
         info_hash -> Binary,
     }
@@ -42,4 +51,4 @@ diesel::table! {
 
 diesel::joinable!(peer -> swarm (swarm));
 
-diesel::allow_tables_to_appear_in_same_query!(misc, node, peer, swarm,);
+diesel::allow_tables_to_appear_in_same_query!(misc, node, peer, sampled_infohash, swarm,);

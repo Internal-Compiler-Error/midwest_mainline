@@ -6,11 +6,12 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{SqliteConnection, prelude::*};
 use rand::RngExt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{OnceLock, Weak};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use crate::dht::routing_table::RoutingTable;
 use crate::dht::rpc_manager::RpcManager;
+use crate::message::find_node_get_peers_response::Samples;
 use crate::schema::{peer, swarm};
 use crate::token_generator::TokenGenerator;
 use crate::types::{Family, InfoHash, NodeId};
@@ -24,6 +25,12 @@ pub const REQ_TIMEOUT: Duration = Duration::from_secs(3);
 /// BEP 5's suggested lifetime of an announcement. Only peers announced within it are handed
 /// out in get_peers responses, whatever the [`Retention`].
 pub const PEER_LIFETIME: Duration = Duration::from_secs(45 * 60);
+
+/// How long the BEP 51 sample we hand out stands. BEP 51 allows up to 6 hours; a quarter of
+/// an hour lets crawlers see more of a big store, and costs a query of the store that often.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Info hashes in a BEP 51 sample; 20 of them and 8 nodes fit a UDP packet comfortably
+pub const MAX_SAMPLES: i64 = 20;
 
 /// What happens to an announced peer once it's older than [`PEER_LIFETIME`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,6 +76,8 @@ pub(crate) struct SharedState {
     /// [`DhtSession::pair_with`](crate::dht::DhtSession::pair_with)); weak, as each points at
     /// the other
     pub(crate) sibling: OnceLock<Weak<SharedState>>,
+    /// the BEP 51 sample we hand out, and when it was taken
+    samples: Mutex<Option<(Instant, Samples)>>,
 }
 
 impl SharedState {
@@ -86,6 +95,7 @@ impl SharedState {
             token_generator: TokenGenerator::new(rand::rng().random()),
             rpc_manager,
             sibling: OnceLock::new(),
+            samples: Mutex::new(None),
         }
     }
 
@@ -159,6 +169,39 @@ impl SharedState {
             .iter()
             .filter_map(|bytes| InfoHash::try_from_bytes(bytes))
             .collect()
+    }
+
+    /// BEP 51: up to [`MAX_SAMPLES`] info hashes from the store at random, refreshed every
+    /// [`SAMPLE_INTERVAL`], and how many the store holds
+    pub(crate) fn sample(&self) -> Samples {
+        let mut cached = self.samples.lock().unwrap();
+        if let Some((taken, samples)) = &*cached
+            && taken.elapsed() < SAMPLE_INTERVAL
+        {
+            let left = SAMPLE_INTERVAL.saturating_sub(taken.elapsed());
+            return Samples {
+                interval: left.as_secs() as u32,
+                ..samples.clone()
+            };
+        }
+        let mut conn = self.conn.get().expect("failed to get one connection from pool");
+        let num: i64 = swarm::table.count().get_result(&mut conn).unwrap_or_default();
+        let samples = swarm::table
+            .select(swarm::info_hash)
+            .order(diesel::dsl::sql::<diesel::sql_types::Integer>("random()"))
+            .limit(MAX_SAMPLES)
+            .load::<Vec<u8>>(&mut conn)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|bytes| InfoHash::try_from_bytes(bytes))
+            .collect();
+        let samples = Samples {
+            interval: SAMPLE_INTERVAL.as_secs() as u32,
+            num: num as u64,
+            samples,
+        };
+        *cached = Some((Instant::now(), samples.clone()));
+        samples
     }
 
     /// Deletes peers announced longer than [`PEER_LIFETIME`] ago, and swarms left with none.

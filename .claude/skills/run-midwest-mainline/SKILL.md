@@ -105,6 +105,11 @@ $D dht-down
 the same way, and deletes stale peers on a timer. The node's log (DEBUG, fixed in
 `json_rpc_server`) is `$RUN_DIR/dht.log`.
 
+`DHT_CRAWL=20 $D dht-up` also runs a BEP 51 crawler (20 `sample_infohashes` queries a second,
+index mode only); `$D rpc sampled` counts what it found (`info_hashes`, about 10k after the
+first minute) and how many nodes it asked and heard back from (about half answer).
+`$D rpc node_counts` splits the routing tables by family and BEP 42 compliance.
+
 **Traces in Jaeger** (optional, for developers; users get the Traces pane). The image is
 pulled already (`docker.io/jaegertracing/jaeger:latest` in Podman). Any run with
 `OTEL_EXPORTER_OTLP_ENDPOINT` set exports its spans over OTLP/HTTP:
@@ -144,7 +149,7 @@ terminal.
 | `cli <source> [secs]` | run the CLI on a .torrent or magnet, summarize |
 | `gui [source] [secs]` | launch the GUI, screenshot it, quit |
 | `dht-up [expire\|forever]` | start the DHT node in the background, wait for RPC |
-| `rpc <method> [params]` | JSON-RPC: `node_count`, `stored_swarms`, `stored_peers` |
+| `rpc <method> [params]` | JSON-RPC: `node_count`, `node_counts`, `stored_swarms`, `stored_peers`, `sampled` |
 | `krpc <cmd> [args]` | KRPC over UDP: `ping`, `get_peers <hash>`, `announce <hash> <port>` |
 | `dht-down` | stop the DHT node |
 | `logs` | tail a running GUI's console over TCP |

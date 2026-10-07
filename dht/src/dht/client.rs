@@ -16,7 +16,7 @@ use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
 use crate::message::{
     KrpcBody, Want, announce_peer_query::AnnouncePeerQuery, find_node_query::FindNodeQuery,
-    get_peers_query::GetPeersQuery, ping_query::PingQuery,
+    get_peers_query::GetPeersQuery, ping_query::PingQuery, sample_infohashes_query::SampleInfohashesQuery,
 };
 use crate::our_error::{OurError, naur};
 use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
@@ -68,6 +68,20 @@ struct Heard {
     useful: bool,
     /// the lookup has what it came for
     done: bool,
+}
+
+/// One node's answer to BEP 51's sample_infohashes
+#[derive(Debug, Clone)]
+pub struct Sampled {
+    /// who answered
+    pub node: NodeInfo,
+    /// not to be asked again before this is up
+    pub interval: Duration,
+    /// info hashes the node stores in all
+    pub num: u64,
+    pub samples: Vec<InfoHash>,
+    /// nodes close to the target, for walking the keyspace
+    pub nodes: Vec<NodeInfo>,
 }
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
@@ -297,6 +311,30 @@ impl DhtClient {
         } else {
             debug!("Did not get a find node response, got {:?}", body);
             Err(naur!("Did not get a find node response"))
+        }
+    }
+
+    /// BEP 51: a sample of the info hashes the node at `dest` stores, and the nodes it knows
+    /// closest to `target`
+    #[tracing::instrument(skip(self))]
+    pub async fn sample_infohashes(&self, dest: SocketAddr, target: NodeId) -> Result<Sampled, OurError> {
+        let query = KrpcBody::SampleInfohashesQuery(SampleInfohashesQuery::new(self.state.our_id, target));
+        let response = self.state.rpc_manager.query(query, &dest, REQ_TIMEOUT).await?;
+        match response.body {
+            KrpcBody::FindNodeGetPeersResponse(res) => {
+                let Some(samples) = res.samples() else {
+                    return Err(naur!("{dest} answered sample_infohashes without samples"));
+                };
+                Ok(Sampled {
+                    node: NodeInfo::new(*res.queried(), dest),
+                    interval: Duration::from_secs(samples.interval.into()),
+                    num: samples.num,
+                    samples: samples.samples.clone(),
+                    nodes: res.nodes_of(self.state.family).to_vec(),
+                })
+            }
+            KrpcBody::ErrorResponse(err) => Err(naur!("{dest} answered sample_infohashes with {err:?}")),
+            other => Err(naur!("unexpected answer to sample_infohashes: {other:?}")),
         }
     }
 
