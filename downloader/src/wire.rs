@@ -5,7 +5,7 @@ use crate::defs::Identity;
 use midwest_mainline::types::InfoHash;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::bytes::{Buf, BufMut, BytesMut};
+use tokio_util::bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -45,12 +45,13 @@ pub struct BlockRef {
     pub length: u32,
 }
 
-/// A block. On the wire it's `<index><begin><data>`.
+/// A block. On the wire it's `<index><begin><data>`; a decoded one's `data` is a slice of the
+/// buffer it was read into, not a copy.
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
 pub struct Piece {
     pub index: u32,
     pub begin: u32,
-    pub data: Box<[u8]>,
+    pub data: Bytes,
 }
 
 impl Piece {
@@ -104,7 +105,7 @@ pub struct AllowedFast {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extended {
     pub ext_id: u8,
-    pub payload: Box<[u8]>,
+    pub payload: Bytes,
 }
 
 /// BEP 52 `hash request` (id 21) and `hash reject` (id 23): which hashes of the tree under
@@ -174,7 +175,7 @@ pub(crate) enum BtMessage {
     HashRequest(HashRequest),
     Hashes(Hashes),
     HashReject(HashRequest),
-    Unknown(u8, Box<[u8]>),
+    Unknown(u8, Bytes),
 }
 
 /// The message ids, for encoding and decoding alike.
@@ -319,18 +320,23 @@ impl Decoder for BtCodec {
             src.reserve(4 + length - src.len());
             return Ok(None);
         }
-        let msg = match length {
-            0 => BtMessage::KeepAlive(KeepAlive),
-            _ => decode_message(src[4], &src[5..4 + length])?,
+        let mut frame = src.split_to(4 + length);
+        frame.advance(4);
+        let msg = match frame.first() {
+            None => BtMessage::KeepAlive(KeepAlive),
+            Some(&id) => {
+                frame.advance(1);
+                decode_message(id, frame.freeze())?
+            }
         };
-        src.advance(4 + length);
         Ok(Some(msg))
     }
 }
 
 /// One message from its id and payload. The peer controls the length, so a payload the wrong
 /// size for its id is refused here rather than indexed past its end.
-fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
+fn decode_message(id: u8, payload: Bytes) -> io::Result<BtMessage> {
+    let buf = &payload[..];
     let exact = |n: usize| {
         if buf.len() == n {
             Ok(())
@@ -358,13 +364,13 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
         id::BITFIELD => BtMessage::BitField(BitField { has: Box::from(buf) }),
         id::REQUEST => BtMessage::Request(block()?),
         id::PIECE => {
-            let Some((head, data)) = buf.split_first_chunk::<8>() else {
+            if buf.len() < 8 {
                 return Err(invalid("piece message without index and offset"));
-            };
+            }
             BtMessage::Piece(Piece {
-                index: be_u32(head, 0),
-                begin: be_u32(head, 4),
-                data: Box::from(data),
+                index: be_u32(buf, 0),
+                begin: be_u32(buf, 4),
+                data: payload.slice(8..),
             })
         }
         id::CANCEL => BtMessage::Cancel(block()?),
@@ -377,12 +383,12 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
         id::REJECT_REQUEST => BtMessage::RejectRequest(block()?),
         id::ALLOWED_FAST => BtMessage::AllowedFast(AllowedFast { piece: piece()? }),
         id::EXTENDED => {
-            let Some((&ext_id, payload)) = buf.split_first() else {
+            let Some(&ext_id) = buf.first() else {
                 return Err(invalid("extended message without an id"));
             };
             BtMessage::Extended(Extended {
                 ext_id,
-                payload: Box::from(payload),
+                payload: payload.slice(1..),
             })
         }
         id::HASH_REQUEST => {
@@ -403,7 +409,7 @@ fn decode_message(id: u8, buf: &[u8]) -> io::Result<BtMessage> {
             exact(HashRequest::LEN)?;
             BtMessage::HashReject(HashRequest::decode(buf))
         }
-        other => BtMessage::Unknown(other, Box::from(buf)),
+        other => BtMessage::Unknown(other, payload),
     })
 }
 
@@ -730,22 +736,22 @@ mod test {
             BtMessage::Piece(Piece {
                 index: 7,
                 begin: 16384,
-                data: Box::from([1u8, 2, 3, 4]),
+                data: Bytes::from_static(&[1, 2, 3, 4]),
             }),
             BtMessage::Extended(Extended {
                 ext_id: 3,
-                payload: Box::from(*b"d1:mi1ee"),
+                payload: Bytes::from_static(b"d1:mi1ee"),
             }),
             BtMessage::Extended(Extended {
                 ext_id: 0,
-                payload: Box::from(*b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
+                payload: Bytes::from_static(b"d1:md11:ut_metadatai1ee13:metadata_sizei100ee"),
             }),
             BtMessage::Port(Port { port: 6881 }),
             BtMessage::SuggestPiece(SuggestPiece { piece: 42 }),
             BtMessage::HaveAll(HaveAll),
             BtMessage::HaveNone(HaveNone),
             BtMessage::AllowedFast(AllowedFast { piece: 9 }),
-            BtMessage::Unknown(99, Box::from(*b"whatever")),
+            BtMessage::Unknown(99, Bytes::from_static(b"whatever")),
         ] {
             let mut buf = BytesMut::new();
             BtCodec.encode(msg.clone(), &mut buf).unwrap();
@@ -808,7 +814,7 @@ mod test {
                 BtMessage::Piece(Piece {
                     index: 1,
                     begin: 2,
-                    data: Box::from([9u8, 8, 7]),
+                    data: Bytes::from_static(&[9, 8, 7]),
                 }),
                 &mut buf,
             )
@@ -821,7 +827,7 @@ mod test {
             .encode(
                 BtMessage::Extended(Extended {
                     ext_id: 5,
-                    payload: Box::from([1u8, 2]),
+                    payload: Bytes::from_static(&[1, 2]),
                 }),
                 &mut buf,
             )

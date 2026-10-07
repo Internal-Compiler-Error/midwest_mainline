@@ -411,7 +411,7 @@ impl<'t> Blocks<'t> {
             bytes = &bytes[take..];
             if self.buf.len() == self.block_len() {
                 let piece_size = self.torrent.piece_size as u64;
-                let data: Box<[u8]> = std::mem::replace(&mut self.buf, Vec::with_capacity(BLOCK_SIZE)).into();
+                let data: Bytes = std::mem::replace(&mut self.buf, Vec::with_capacity(BLOCK_SIZE)).into();
                 let length = data.len() as u32;
                 out.push(Piece {
                     index: (self.at / piece_size) as u32,

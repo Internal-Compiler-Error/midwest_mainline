@@ -291,9 +291,7 @@ async fn fetch_from_peer(
     writer
         .send(BtMessage::Extended(Extended {
             ext_id: 0,
-            payload: format!("d1:md11:ut_metadatai{UT_METADATA_ID}eee")
-                .into_bytes()
-                .into_boxed_slice(),
+            payload: format!("d1:md11:ut_metadatai{UT_METADATA_ID}eee").into_bytes().into(),
         }))
         .await?;
 
@@ -323,9 +321,7 @@ async fn fetch_from_peer(
         writer
             .send(BtMessage::Extended(Extended {
                 ext_id: their_id,
-                payload: format!("d8:msg_typei0e5:piecei{piece}ee")
-                    .into_bytes()
-                    .into_boxed_slice(),
+                payload: format!("d8:msg_typei0e5:piecei{piece}ee").into_bytes().into(),
             }))
             .await?;
     }
@@ -644,7 +640,7 @@ mod test {
                     if writer
                         .send(BtMessage::Extended(Extended {
                             ext_id: 0,
-                            payload: handshake.into_bytes().into_boxed_slice(),
+                            payload: handshake.into_bytes().into(),
                         }))
                         .await
                         .is_err()
@@ -676,7 +672,7 @@ mod test {
                             .send(BtMessage::Extended(Extended {
                                 // the id the fetcher declared for its ut_metadata messages
                                 ext_id: UT_METADATA_ID,
-                                payload: payload.into_boxed_slice(),
+                                payload: payload.into(),
                             }))
                             .await;
                     }

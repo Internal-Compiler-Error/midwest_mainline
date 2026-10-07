@@ -154,7 +154,7 @@ impl TorrentSwarm {
                 .map(|data| Piece {
                     index: request.index,
                     begin: request.begin,
-                    data,
+                    data: data.into(),
                 })
                 .map_err(|e| {
                     warn!("couldn't read {request:?} for {to}: {e:#}");

@@ -594,7 +594,7 @@ impl Peer {
         };
         self.send(BtMessage::Extended(Extended {
             ext_id,
-            payload: payload.into_boxed_slice(),
+            payload: payload.into(),
         }))
     }
 
@@ -688,7 +688,7 @@ impl Peer {
         );
         self.send(BtMessage::Extended(Extended {
             ext_id: 0,
-            payload: payload.into_boxed_slice(),
+            payload: payload.into(),
         }))
     }
 
@@ -1503,7 +1503,7 @@ mod test {
         peer.block_received(&Piece {
             index: 0,
             begin: 0,
-            data: Box::new([0; 4]),
+            data: tokio_util::bytes::Bytes::from_static(&[0; 4]),
         })
         .unwrap();
         assert!(!peer.stalled(limit));

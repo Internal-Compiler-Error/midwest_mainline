@@ -221,7 +221,7 @@ pub(super) fn block(req: BlockRef) -> BtMessage {
     BtMessage::Piece(Piece {
         index: req.index,
         begin: req.begin,
-        data: Box::from(&content()[start..start + req.length as usize]),
+        data: content()[start..start + req.length as usize].to_vec().into(),
     })
 }
 

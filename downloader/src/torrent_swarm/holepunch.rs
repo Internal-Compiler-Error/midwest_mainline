@@ -114,7 +114,7 @@ mod test {
         let mut b = fake_peer(&handle, &b_addr.to_string()).await;
         let speaks_holepunch = BtMessage::Extended(crate::wire::Extended {
             ext_id: 0,
-            payload: Box::from(&b"d1:md12:ut_holepunchi9eee"[..]),
+            payload: tokio_util::bytes::Bytes::from_static(b"d1:md12:ut_holepunchi9eee"),
         });
         for peer in [&mut a, &mut b] {
             peer.send(speaks_holepunch.clone()).await.unwrap();
@@ -123,7 +123,7 @@ mod test {
         let ask = |msg: Holepunch| {
             BtMessage::Extended(crate::wire::Extended {
                 ext_id: Extension::UtHolepunch.id(),
-                payload: msg.encode().into_boxed_slice(),
+                payload: msg.encode().into(),
             })
         };
         a.send(ask(Holepunch::Rendezvous(b_addr))).await.unwrap();
