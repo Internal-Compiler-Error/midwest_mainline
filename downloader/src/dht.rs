@@ -1,6 +1,6 @@
 //! The client's DHT nodes (BEP 5), from the sibling `midwest_mainline` crate. One per address
 //! family, shared by every torrent: swarms and the metadata fetcher ask them for peers and
-//! announce themselves through `announcer::dht_announcer`. IPv6 is a separate DHT (BEP 32)
+//! announce themselves through `announcer::dht`. IPv6 is a separate DHT (BEP 32)
 //! with its own socket, routing table and node id; the two nodes are paired so each seeds the
 //! other's table while it's young.
 //!
