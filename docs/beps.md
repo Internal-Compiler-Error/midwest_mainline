@@ -21,6 +21,7 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 12 | Multitracker (`announce-list`) | `torrent.rs`, `announcer.rs` |
 | 14 | Local service discovery | `lsd.rs` |
 | 15 | UDP trackers (connect, announce, scrape; retransmits, connection-id expiry) | `announcer.rs` |
+| 19 | Web seeds (`url-list`, magnet `ws=`): HTTP(S) range requests over a shared HTTP/2 client, runs of consecutive pieces scheduled by UCB next to peers, endgame racing, backoff/give-up; `webseed` spans | `webseed.rs`, `torrent_swarm.rs`, `torrent.rs`, `magnet.rs` |
 | 20 | Peer id convention (`-DL0100-` + random) | `defs.rs` (`random_peer_id`) |
 | 23 | Compact peer lists | `announcer.rs` |
 | 27 | Private torrents (no DHT/PEX/LSD for them) | `torrent.rs`, `torrent_swarm.rs`, `announcer.rs` |
@@ -30,12 +31,6 @@ unless the user says otherwise; the order is by value to a fast, modern client.
 | 48 | Tracker scrape: swarm counts from announce replies, a scrape only when they leave something unsaid (at most every 30 min); shown per tracker and as the torrent's swarm size | `announcer.rs` (`SwarmCounts`, `http_scrape_url`), `Details.svelte` |
 | 42 | DHT security extension: our node id is derived from our external IP (we don't yet *verify* others') | `dht/src/dht.rs` |
 | MSE | Message stream encryption (not a BEP; the Vuze/libtorrent spec) | `mse.rs` |
-
-## In progress
-
-| BEP | What | Notes |
-|---|---|---|
-| 19 | Web seeds (`url-list`, magnet `ws=`) | HTTP range requests as a peer-like source in the swarm, with a `webseed` span |
 
 ## Next, in order
 

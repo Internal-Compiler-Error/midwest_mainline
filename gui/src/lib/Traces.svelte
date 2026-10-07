@@ -20,6 +20,7 @@
     { title: 'Metadata', names: ['metadata', 'metadata.peer'], rows: 8, weight: 1.1 },
     { title: 'Trackers', names: ['tracker.announce', 'tracker.scrape'], rows: 6, weight: 1.1 },
     { title: 'DHT', names: ['dht.lookup'], rows: 3, weight: 1.1 },
+    { title: 'Web seeds', names: ['webseed'], rows: 8, weight: 1.1 },
     { title: 'Dials', names: ['dial'], rows: 48, weight: 2.4 },
     { title: 'Peers', names: ['peer'], rows: 64, weight: 3.2 },
     { title: 'Pieces', names: ['piece'], rows: 96, weight: 4 },
@@ -87,6 +88,9 @@
         return field(span, 'error') ? '#f87171' : '#5eead4'
       case 'tracker.announce':
         return field(span, 'error') ? '#ef4444' : '#14b8a6'
+      case 'webseed':
+        if (open) return '#fbbf24'
+        return field(span, 'error') ? '#ef4444' : '#f59e0b'
       case 'dht.lookup':
         return Number(field(span, 'peers') ?? 0) > 0 ? '#10b981' : '#94a3b8'
       case 'metadata':
@@ -164,9 +168,10 @@
       // at least a few rows' worth of height per row, so one span isn't a slab
       const rowHeight = (y1 - y0) / Math.max(rowEnds.length, Math.min(lane.rows, 4))
       for (const [span, row] of placed) {
+        const opacity = span.id === pinned ? 1 : span.end_ms === null ? 0.45 : 0.85
         out.push({
-          value: [span.id, span.start_ms, span.end_ms ?? now, y0 + row * rowHeight, rowHeight],
-          itemStyle: { color: colour(span), opacity: span.id === pinned ? 1 : span.end_ms === null ? 0.45 : 0.85 },
+          value: [span.id, span.start_ms, span.end_ms ?? now, y0 + row * rowHeight, rowHeight, opacity],
+          itemStyle: { color: colour(span), opacity },
           span,
         })
       }
@@ -213,7 +218,13 @@
               { x: start[0], y: start[1] + height * 0.1, width: Math.max(end[0] - start[0] - 1, 1.5), height: Math.max(height * 0.8, 1) },
               { x: sys.x, y: sys.y, width: sys.width, height: sys.height },
             )
-            return shape && { type: 'rect', shape: { ...shape, r: Math.min(2, shape.height / 2) }, style: api.style() }
+            return (
+              shape && {
+                type: 'rect',
+                shape: { ...shape, r: Math.min(2, shape.height / 2) },
+                style: { fill: api.visual('color') as string, opacity: api.value(5) as number },
+              }
+            )
           },
           encode: { x: [1, 2], y: 3 },
           data: bars,

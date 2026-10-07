@@ -67,5 +67,10 @@ export function field(span: TraceSpan, name: string): string | undefined {
 /** Whether `span` is about `peer`: its own `peer` field, or an event inside it naming the peer
  * (a racer joining a piece, a claim released). */
 export function involves(span: TraceSpan, peer: string): boolean {
+  // a web seed is listed by its URL, and its spans name it by host
+  if (/^https?:\/\//.test(peer)) {
+    const host = new URL(peer).host
+    return field(span, 'host') === host || field(span, 'peer') === host
+  }
   return field(span, 'peer') === peer || span.events.some((e) => e.message.includes(`peer=${peer}`))
 }

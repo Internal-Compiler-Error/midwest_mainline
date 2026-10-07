@@ -36,7 +36,7 @@ summarize() {
   local log=$1
   sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '
     /got metadata/ {meta++}
-    /DHT node up/ {dht++}
+    /DHT nodes? up/ {dht++}
     /DHT lookup found/ {lookups++}
     /connected, [0-9]+ peers now/ {conn++}
     /is completed/ {pieces++}
@@ -61,6 +61,9 @@ case ${1:-} in
     source=${2:?usage: driver.sh cli <torrent-or-magnet> [seconds]}
     secs=${3:-60}
     rm -rf "$RUN_DIR/cli-download"
+    # always the current code: a stale binary against a database the newer GUI has migrated
+    # fails in confusing ways
+    (cd "$ROOT" && cargo build -q -p downloader)
     echo "running the CLI for ${secs}s, log at $RUN_DIR/cli.log"
     DOWNLOADER_DATA_DIR=$DATA_DIR RUST_LOG=${RUST_LOG:-info} RUST_BACKTRACE=0 \
       timeout -s INT "$secs" "$ROOT/target/debug/downloader" "$source" "$RUN_DIR/cli-download" \
@@ -85,6 +88,7 @@ case ${1:-} in
       started_vite=1
       timeout 30 zsh -c 'until nc -z localhost 5173 2>/dev/null; do sleep 0.2; done' || { echo "Vite never came up, see $RUN_DIR/vite.log" >&2; exit 1; }
     fi
+    (cd "$ROOT" && cargo build -q -p downloader-gui)
     echo "launching the GUI for ${secs}s, console at $RUN_DIR/gui.log"
     # the GUI downloads into its settings' download_dir, which defaults to ~/Downloads: point
     # it at the scratch dir so a test run never writes into the user's own folders
