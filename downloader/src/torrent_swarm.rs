@@ -233,7 +233,6 @@ pub(crate) enum SwarmEvent {
     /// `dialing`, it could never be retried -- an address a peer keeps re-gossiping over PEX
     /// needs to actually leave the set on failure.
     DialFailed(SocketAddr),
-    /// a hybrid's pieces that failed `recheck_by_layer`
     /// the answer to a hash request below the piece layer, see `answer_from_data`
     HashesRead {
         to: SocketAddr,
@@ -1341,8 +1340,6 @@ impl TorrentSwarm {
         });
     }
 
-    /// Second half of `serve_request`: the bytes are in hand (or the read failed, in which
-    /// case the request is declined). The peer may have been choked or dropped meanwhile.
     /// Answers a hash request below the piece layer from `pieces`' data, read and hashed on the
     /// blocking pool; the answer (or a reject, if the data didn't hash right) comes back as
     /// `HashesRead`.
@@ -1376,6 +1373,8 @@ impl TorrentSwarm {
         }
     }
 
+    /// Second half of `serve_request`: the bytes are in hand (or the read failed, in which
+    /// case the request is declined). The peer may have been choked or dropped meanwhile.
     fn send_block(&mut self, to: SocketAddr, block: Result<Piece, Request>) {
         let Some(idx) = self.peer_index(to) else {
             return;
@@ -2652,11 +2651,6 @@ impl TorrentSwarm {
         }
     }
 
-    /// Tit-for-tat unchoking, run periodically. Ranks interested peers (those who want to
-    /// download from us) by the download rate they've been giving us -- reciprocation is the
-    /// point -- and unchokes the top MAX_UNCHOKED_PEERS. Every OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS
-    /// rounds, one additional peer is unchoked at random so a new or under-rated peer gets a
-    /// chance to prove itself instead of the same top N being unchoked forever.
     /// A peer that just declared interest gets a free upload slot now rather than at the next
     /// choking round, up to 10 s away; the round still decides who keeps one.
     fn unchoke_if_slot_free(&mut self, idx: usize) {
@@ -2677,6 +2671,11 @@ impl TorrentSwarm {
         }
     }
 
+    /// Tit-for-tat unchoking, run periodically. Ranks interested peers (those who want to
+    /// download from us) by the download rate they've been giving us -- reciprocation is the
+    /// point -- and unchokes the top `upload_slots`. Every OPTIMISTIC_UNCHOKE_EVERY_N_ROUNDS
+    /// rounds, one additional peer is unchoked at random so a new or under-rated peer gets a
+    /// chance to prove itself instead of the same top N being unchoked forever.
     fn run_choking_algorithm(&mut self, round: u64) {
         let mut interested: Vec<(SocketAddr, f64)> = self
             .peers
@@ -2747,7 +2746,6 @@ impl TorrentSwarm {
     }
 }
 
-/// The next message from any peer, polled starting at `offset` so no peer is always first.
 /// Regular (non-optimistic) upload slots for `interested` peers. A handful of slots reciprocates
 /// with only a handful of a big swarm's leechers, and the rest have no reason to send us
 /// anything, so the count grows with the square root of the demand.
@@ -2975,8 +2973,6 @@ mod test {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
-    /// (as if it had just completed a handshake), the test keeps the other.
     /// BEP 55, as the relay: two peers that speak holepunch are introduced to each other on
     /// one's request, and a request for a peer we don't have gets the matching error.
     #[tokio::test]
@@ -3032,6 +3028,8 @@ mod test {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// Connects a fake remote peer to the swarm: the swarm gets one end of a localhost socket
+    /// (as if it had just completed a handshake), the test keeps the other.
     async fn fake_peer(handle: &TorrentSwarmHandle, pretend_addr: &str) -> Framed<tokio::net::TcpStream, BtCodec> {
         fake_peer_with(handle, pretend_addr, false).await
     }
