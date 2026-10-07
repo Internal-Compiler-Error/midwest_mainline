@@ -11,12 +11,12 @@
 use midwest_mainline::types::InfoHash;
 use num_bigint::BigUint;
 use sha1::{Digest, Sha1};
-use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio_util::bytes::{Buf, Bytes};
 
 const PRIME_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563";
 static PRIME: LazyLock<BigUint> = LazyLock::new(|| BigUint::parse_bytes(PRIME_HEX.as_bytes(), 16).unwrap());
@@ -121,11 +121,25 @@ fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
 
+/// Appends whatever `stream` has next to `buf`; the peer hanging up is an error, since the
+/// handshake isn't done.
+async fn read_more<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) -> io::Result<()> {
+    let mut chunk = [0u8; 1024];
+    let n = stream.read(&mut chunk).await?;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer hung up mid-handshake",
+        ));
+    }
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(())
+}
+
 /// Reads from `stream` until `needle` shows up, tolerating up to `max_before` bytes of
 /// padding in front of it. Returns whatever was read past the needle.
 async fn skip_to<S: AsyncRead + Unpin>(stream: &mut S, needle: &[u8], max_before: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
     loop {
         if let Some(at) = buf.windows(needle.len()).position(|w| w == needle) {
             return Ok(buf.split_off(at + needle.len()));
@@ -133,14 +147,7 @@ async fn skip_to<S: AsyncRead + Unpin>(stream: &mut S, needle: &[u8], max_before
         if buf.len() >= max_before + needle.len() {
             return Err(err("no sync marker within the allowed padding"));
         }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer hung up mid-handshake",
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
+        read_more(stream, &mut buf).await?;
     }
 }
 
@@ -153,15 +160,7 @@ async fn take<S: AsyncRead + Unpin>(
     n: usize,
 ) -> io::Result<Vec<u8>> {
     while ahead.len() < n {
-        let mut chunk = [0u8; 1024];
-        let got = stream.read(&mut chunk).await?;
-        if got == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer hung up mid-handshake",
-            ));
-        }
-        ahead.extend_from_slice(&chunk[..got]);
+        read_more(stream, ahead).await?;
     }
     let rest = ahead.split_off(n);
     let mut field = std::mem::replace(ahead, rest);
@@ -182,7 +181,7 @@ pub(crate) struct Encrypted<S> {
     tx: Rc4,
     /// plaintext that arrived in the same read as the handshake's last field, handed out
     /// before anything more is read from `inner`
-    leftover: VecDeque<u8>,
+    leftover: Bytes,
     /// ciphertext accepted by `poll_write` and not yet written out. Bytes are encrypted
     /// exactly once, when accepted; a short write must not run them through the cipher
     /// again or the keystreams desynchronise
@@ -191,7 +190,7 @@ pub(crate) struct Encrypted<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Encrypted<S> {
-    fn new(inner: S, rx: Rc4, tx: Rc4, leftover: VecDeque<u8>) -> Self {
+    fn new(inner: S, rx: Rc4, tx: Rc4, leftover: Bytes) -> Self {
         Self {
             inner,
             rx,
@@ -225,13 +224,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Encrypted<S> {
         let this = self.get_mut();
         if !this.leftover.is_empty() {
             let n = this.leftover.len().min(buf.remaining());
-            let (first, _second) = this.leftover.as_slices();
-            assert!(
-                _second.is_empty(),
-                "leftover is not written after the handshake, so it should never wrap"
-            );
-            buf.put_slice(&first[..n]);
-            this.leftover.drain(..n);
+            buf.put_slice(&this.leftover[..n]);
+            this.leftover.advance(n);
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
