@@ -152,39 +152,33 @@ impl BtClient {
         self.shutdown.clone()
     }
 
+    /// Cloned out, so the lock isn't held across what's done with it.
+    fn swarm(&self, info_hash: &InfoHash) -> Option<TorrentSwarmHandle> {
+        self.swarms.lock().unwrap().get(info_hash).cloned()
+    }
+
     /// The connected peers of a torrent, refreshed once a second.
     pub fn peers(&self, torrent: &Torrent) -> Option<watch::Receiver<Vec<PeerSnapshot>>> {
-        self.swarms
-            .lock()
-            .unwrap()
-            .get(&torrent.info_hash)
-            .map(TorrentSwarmHandle::peers)
+        self.swarm(&torrent.info_hash).as_ref().map(TorrentSwarmHandle::peers)
     }
 
     /// What each tracker of a torrent has done lately, refreshed as they announce.
     pub fn trackers(&self, torrent: &Torrent) -> Option<watch::Receiver<Vec<TrackerStatus>>> {
-        self.swarms
-            .lock()
-            .unwrap()
-            .get(&torrent.info_hash)
+        self.swarm(&torrent.info_hash)
+            .as_ref()
             .map(TorrentSwarmHandle::trackers)
     }
 
     /// A live view of `torrent`'s aggregate progress, if it's been added. Keeps updating for as
     /// long as the torrent's swarm runs -- the receiver only depends on the underlying channel.
     pub fn stats(&self, torrent: &Torrent) -> Option<watch::Receiver<TorrentSwarmStats>> {
-        self.swarms
-            .lock()
-            .unwrap()
-            .get(&torrent.info_hash)
-            .map(TorrentSwarmHandle::stats)
+        self.swarm(&torrent.info_hash).as_ref().map(TorrentSwarmHandle::stats)
     }
 
     /// Downloads only the selected files of a torrent from now on (one flag per file, in
     /// `Torrent::files` order). Unknown torrents are ignored.
     pub fn select_files(&self, info_hash: &InfoHash, selected: Vec<bool>) {
-        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.swarm(info_hash) {
             tokio::spawn(async move { handle.select_files(selected).await });
         }
     }
@@ -192,8 +186,7 @@ impl BtClient {
     /// Fetches a torrent's pieces in order rather than rarest first. Unknown torrents are
     /// ignored.
     pub fn set_sequential(&self, info_hash: &InfoHash, on: bool) {
-        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.swarm(info_hash) {
             tokio::spawn(async move { handle.set_sequential(on).await });
         }
     }
@@ -201,8 +194,7 @@ impl BtClient {
     /// BEP 16 super-seeding: while the torrent is complete, each newly connected peer is
     /// shown one piece at a time. Unknown torrents are ignored.
     pub fn set_super_seed(&self, info_hash: &InfoHash, on: bool) {
-        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.swarm(info_hash) {
             tokio::spawn(async move { handle.set_super_seed(on).await });
         }
     }
@@ -210,8 +202,7 @@ impl BtClient {
     /// Tells a torrent's swarm about peers found some other way than its own announces, such
     /// as the ones a magnet's metadata fetch met. Unknown torrents are ignored.
     pub fn add_peers(&self, info_hash: &InfoHash, peers: Vec<SocketAddr>) {
-        let handle = self.swarms.lock().unwrap().get(info_hash).cloned();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.swarm(info_hash) {
             tokio::spawn(async move { handle.peers_discovered(peers, PeerSource::Metadata).await });
         }
     }
@@ -345,36 +336,29 @@ impl BtClient {
         // fails with AddrInUse, which we treat as "already covered", not an error.
         let port = id.serving.port();
         let mut listeners = Vec::new();
-
-        match TcpListener::bind(SocketAddrV6::new(crate::defs::BIND_V6, port, 0, 0)).await {
-            Ok(listener) => {
-                tracing::info!(
-                    "listening for inbound peer connections on {}",
-                    listener.local_addr().unwrap()
-                );
-                events.emit(Event::Listening {
-                    transport: "tcp",
-                    port: listener.local_addr().map(|a| a.port()).unwrap_or(port),
-                });
-                listeners.push(listener);
-            }
-            Err(e) => tracing::warn!("no ipv6 inbound listener on port {port} ({e}); ipv6 peers can't dial us"),
-        }
-        match TcpListener::bind(SocketAddrV4::new(crate::defs::BIND_V4, port)).await {
-            Ok(listener) => {
-                tracing::info!(
-                    "listening for inbound peer connections on {}",
-                    listener.local_addr().unwrap()
-                );
-                events.emit(Event::Listening {
-                    transport: "tcp",
-                    port: listener.local_addr().map(|a| a.port()).unwrap_or(port),
-                });
-                listeners.push(listener);
-            }
-            Err(e) => tracing::warn!(
-                "no ipv4 inbound listener on port {port} ({e}); relying on the ipv6 listener above if it's dual-stack"
+        let families: [(SocketAddr, &str); 2] = [
+            (
+                SocketAddrV6::new(crate::defs::BIND_V6, port, 0, 0).into(),
+                "ipv6 peers can't dial us",
             ),
+            (
+                SocketAddrV4::new(crate::defs::BIND_V4, port).into(),
+                "relying on the ipv6 listener if it's dual-stack",
+            ),
+        ];
+        for (addr, without) in families {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    let bound = listener.local_addr().unwrap_or(addr);
+                    tracing::info!("listening for inbound peer connections on {bound}");
+                    events.emit(Event::Listening {
+                        transport: "tcp",
+                        port: bound.port(),
+                    });
+                    listeners.push(listener);
+                }
+                Err(e) => tracing::warn!("no inbound listener on {addr} ({e}); {without}"),
+            }
         }
 
         if listeners.is_empty() {
@@ -454,7 +438,6 @@ impl BtClient {
     }
 }
 
-/// See `MAX_INBOUND_HANDSHAKES`.
 /// BEP 47: links `relative` (under `root`) to `target`, a path from the torrent's top level,
 /// with a relative link so the download can be moved. Best effort: an existing entry is left
 /// alone, and a failure only costs the link.
@@ -486,6 +469,7 @@ fn make_symlink(torrent: &Torrent, root: &Path, relative: &Path, target: &Path) 
     }
 }
 
+/// See `MAX_INBOUND_HANDSHAKES`.
 static INBOUND_HANDSHAKES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_INBOUND_HANDSHAKES);
 
 /// Takes an inbound connection through its opening (see `stream::accept`), replies to the
