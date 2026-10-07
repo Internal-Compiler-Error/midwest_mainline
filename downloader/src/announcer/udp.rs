@@ -1,5 +1,6 @@
 //! UDP trackers (BEP 15): a connect exchange buys a connection ID, good for a minute, which
 //! every announce and scrape carries; requests are retransmitted on a doubling timeout.
+//! Announces carry the URL's path (BEP 41).
 
 use super::tracker::{AnnounceEvent, Announced, NUMWANT, Tracker, announce_interval, preview};
 use super::{SwarmCounts, compact_peers};
@@ -92,8 +93,6 @@ impl UdpClient {
             key: U32,
             num_want: I32,
             port: U16,
-            /// BEP 41's option list, empty
-            extensions: U16,
         }
 
         let transaction_id = rand::rng().random::<i32>();
@@ -113,9 +112,10 @@ impl UdpClient {
             key: self.key.into(),
             num_want: (NUMWANT as i32).into(),
             port: tracker.announcer.identity.serving.port().into(),
-            extensions: 0.into(),
         };
-        let reply = self.request(request.as_bytes(), transaction_id, "announce").await?;
+        let mut request = request.as_bytes().to_vec();
+        request.extend(options(&tracker.url));
+        let reply = self.request(&request, transaction_id, "announce").await?;
         let is_v6 = matches!(
             self.socket.as_ref().map(UdpSocket::peer_addr),
             Some(Ok(SocketAddr::V6(_)))
@@ -221,6 +221,25 @@ async fn open_at(address: SocketAddr, attempts: u32) -> anyhow::Result<(UdpSocke
     socket.connect(address).await.context("connecting the UDP socket")?;
     let connection = connect(&socket, attempts).await?;
     Ok((socket, connection))
+}
+
+/// BEP 41's option list for an announce: the URL's path and query as URL data (a private
+/// tracker's passkey may be there), in pieces of at most 255 bytes, then the end of options.
+fn options(url: &Url) -> Vec<u8> {
+    const URL_DATA: u8 = 2;
+    const END_OF_OPTIONS: u8 = 0;
+    let mut data = url.path().to_string();
+    if let Some(query) = url.query() {
+        data.push('?');
+        data.push_str(query);
+    }
+    let mut options = vec![];
+    for piece in data.as_bytes().chunks(u8::MAX as usize) {
+        options.extend([URL_DATA, piece.len() as u8]);
+        options.extend_from_slice(piece);
+    }
+    options.push(END_OF_OPTIONS);
+    options
 }
 
 /// How long to wait for an answer to the `n`th try (from 0) of a request.
@@ -402,6 +421,22 @@ mod test {
         assert!(parse_scrape(&ints(&[2, 7, 5])).is_err(), "short");
     }
 
+    /// BEP 41: the URL's path and query go to the tracker, which the URL data option is the
+    /// only place for
+    #[test]
+    fn announces_carry_the_url_path() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        assert_eq!(options(&url("udp://t.test:1")), [0]);
+        let mut expected = vec![2, 19];
+        expected.extend_from_slice(b"/announce?passkey=k");
+        expected.push(0);
+        assert_eq!(options(&url("udp://t.test:1/announce?passkey=k")), expected);
+        let long = format!("/{}", "x".repeat(299));
+        let options = options(&url(&format!("udp://t.test:1{long}")));
+        assert_eq!((options[0], options[1], options[257], options[258]), (2, 255, 2, 45));
+        assert_eq!(options.len(), 2 + 255 + 2 + 45 + 1);
+    }
+
     /// An unanswered request comes back as time to retransmit; answers to other transactions
     /// are skipped; the tracker's error action carries its message.
     #[tokio::test]
@@ -445,7 +480,7 @@ mod test {
             tracker.send_to(&reply, from).await.unwrap();
 
             let (n, from) = tracker.recv_from(&mut buf).await.unwrap();
-            assert_eq!(n, 100, "98 bytes and an empty BEP 41 option list");
+            assert_eq!(n, 99, "98 bytes and an empty BEP 41 option list");
             assert_eq!(buf[..8], 77i64.to_be_bytes(), "connection ID");
             assert_eq!(buf[80..84], 2i32.to_be_bytes(), "event=started");
             let mut reply = ints(&[1]);
