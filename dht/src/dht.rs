@@ -44,6 +44,9 @@ use diesel::{
     sql_types,
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use rand::{Rng, RngExt};
@@ -59,6 +62,10 @@ use txn_id_generator::TxnIdGenerator;
 pub use state::{PEER_LIFETIME, Retention, StoredPeer};
 
 pub(crate) const MIGRATIONS: EmbeddedMigrations = embed_migrations!("../migrations");
+
+/// How much longer bootstrap waits for the other routers once one answered: they answer within
+/// a round trip or not at all
+const BOOTSTRAP_STRAGGLERS: Duration = Duration::from_millis(300);
 
 /// The DHT service, it contains pointers to a server and client, it's main role is to run the
 /// tasks required to make DHT alive
@@ -348,23 +355,41 @@ impl DhtSession {
     }
 
     /// Bootstraps from those of `known_nodes` in this node's address family; the rest are
-    /// skipped.
+    /// skipped. Every one is pinged; once the first answers (and the others had a moment to),
+    /// one lookup of our own id fills the table. Slow or dead ones don't hold that up.
     pub async fn bootstrap(&self, known_nodes: Vec<SocketAddr>) -> Result<(), OurError> {
-        let mut bootstrap_join_set = JoinSet::new();
-
-        for contact in known_nodes.into_iter().filter(|c| Family::of(c) == self.family()) {
-            bootstrap_join_set
-                .build_task()
-                .name(&format!("bootstrap with {contact}"))
-                .spawn(Self::bootstrap_from(self.handle(), contact))
-                .unwrap();
+        let client = self.handle();
+        let mut pings: FuturesUnordered<_> = known_nodes
+            .into_iter()
+            .filter(|c| Family::of(c) == self.family())
+            .map(|contact| {
+                let client = client.clone();
+                // spawned, so a ping still in flight when the lookup starts adds its node later
+                tokio::spawn(async move {
+                    info!("bootstrapping with {contact}");
+                    let pinged = client.ping(contact).await;
+                    if let Err(e) = &pinged {
+                        info!("bootstrap node {contact} didn't answer: {e}");
+                    }
+                    pinged
+                })
+            })
+            .collect();
+        let started = tokio::time::Instant::now();
+        while let Some(pinged) = pings.next().await {
+            if matches!(pinged, Ok(Ok(_))) {
+                let _ =
+                    tokio::time::timeout(BOOTSTRAP_STRAGGLERS, async { while pings.next().await.is_some() {} }).await;
+                break;
+            }
         }
-
-        bootstrap_join_set.join_all().await;
+        info!("bootstrap routers answered in {:?}", started.elapsed());
+        client.find_node(client.our_id()).await;
 
         info!(
-            "{} DHT bootstrapped, routing table has {} nodes",
+            "{} DHT bootstrapped in {:?}, routing table has {} nodes",
             self.family(),
+            started.elapsed(),
             self.node_count()
         );
 
@@ -468,26 +493,6 @@ impl DhtSession {
         }
 
         join_set.join_all().await;
-    }
-
-    /// Given a known node, perform one find node to ourself add the response to the routing table
-    /// *and* do one additional round of find node to all the returned nodes from the bootstrapping
-    /// node.
-    ///
-    /// This is subject to change in the future.
-    #[tracing::instrument(skip_all)]
-    async fn bootstrap_from(dht: DhtClient, endpoint: SocketAddr) -> Result<(), OurError> {
-        let our_id = dht.our_id();
-
-        info!("bootstrapping with {endpoint}");
-
-        let node_id = dht.ping(endpoint).await?;
-        info!("obtained bootstrap node id {node_id:?}");
-
-        dht.find_node(our_id).await;
-
-        info!("{endpoint} bootstrap success");
-        Ok(())
     }
 
     /// Returns a cheap handle to the lookup client; cloning is a single refcount bump

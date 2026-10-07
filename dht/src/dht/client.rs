@@ -3,12 +3,13 @@
 //! shared.
 
 use futures::StreamExt;
-use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::{debug, warn};
 
 use crate::dht::routing_table::sybil_group;
 use crate::dht::state::{REQ_TIMEOUT, SharedState};
@@ -22,22 +23,51 @@ use crate::types::{Family, InfoHash, NodeId, NodeInfo, Token, cmp_resp};
 /// What one node answers a `get_peers` with: a write token, closer nodes, and peers
 type GetPeersReply = (Option<Token>, Vec<NodeInfo>, Vec<SocketAddr>);
 
-const ROUNDS_LIMIT: i32 = 8;
 /// Queries in flight at once in a lookup. BEP 5 suggests 3; more costs little on UDP and finishes
 /// a lookup in seconds rather than a minute when many nodes are dead.
 const CONCURRENT_REQS: usize = 8;
-/// A get_peers lookup ends once the closest nodes that answered number this many and nothing
-/// closer is left to ask: Kademlia's k, where announced peers are stored.
+/// A lookup ends once the closest nodes that answered number this many and nothing closer is
+/// left to ask: Kademlia's k, where announced peers are stored.
 const LOOKUP_K: usize = 8;
-/// Nodes from our routing table a get_peers lookup starts from. More than k, so a cluster of
-/// unhelpful nodes nearest the target can't dead-end every path.
+/// Nodes from our routing table a lookup starts from. More than k, so a cluster of unhelpful
+/// nodes nearest the target can't dead-end every path.
 const LOOKUP_SEEDS: u16 = 32;
-/// Bounds on one get_peers lookup, for a routing table so sparse or stale it never converges.
+/// Bounds on one lookup, for a routing table so sparse or stale it never converges.
 const LOOKUP_MAX_QUERIES: usize = 200;
-const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Below this many nodes, the paired node of the other family is still bootstrapping, and
 /// our lookups ask for its family's nodes too.
 const SEED_SIBLING_BELOW: usize = 500;
+
+/// A node that hasn't answered a lookup's query in this long probably won't: another query
+/// takes its slot, though its answer is still taken until REQ_TIMEOUT
+const SLOW_REPLY: Duration = Duration::from_millis(1000);
+
+/// `query` to `node`, given up on after `patience` (handing the query back to be waited for
+/// elsewhere), or awaited to the end without one
+async fn patiently<T, Fut: Future<Output = Result<T, OurError>>>(
+    node: NodeInfo,
+    mut query: Pin<Box<Fut>>,
+    patience: Option<Duration>,
+) -> (NodeInfo, Result<Result<T, OurError>, Pin<Box<Fut>>>) {
+    match patience {
+        Some(patience) => match tokio::time::timeout(patience, &mut query).await {
+            Ok(result) => (node, Ok(result)),
+            Err(_) => (node, Err(query)),
+        },
+        None => (node, Ok(query.await)),
+    }
+}
+
+/// What a lookup makes of one node's answer
+struct Heard {
+    /// nodes it refers us to
+    nodes: Vec<NodeInfo>,
+    /// whether the answer counts towards the lookup's end
+    useful: bool,
+    /// the lookup has what it came for
+    done: bool,
+}
 
 /// Outcome of an iterative get_peers lookup (BEP 5).
 #[derive(Debug)]
@@ -92,100 +122,142 @@ impl DhtClient {
         };
     }
 
-    /// starting point of trying to find any nodes on the network
+    /// The nodes closest to `target` that answered us, closest first; just the one if a node
+    /// with exactly that id turned up.
     #[tracing::instrument(skip(self))]
     pub async fn find_node(&self, target: NodeId) -> Vec<NodeInfo> {
-        // TODO: While timing out out on an individual request in the process of searching is not an
-        // error per se, it's still desirable to deliver these information to the caller somehow
-
         // if we already know the node, then no need for any network requests
         if let Some(node) = self.state.routing_table.find_exact(&target) {
             return vec![node];
         }
 
-        // find the closest nodes that we know
-        let mut closest = self.state.routing_table.find_closest(target);
         let want = self.want();
-        // ids we've already sent a query to; consulted and updated every round
+        let mut exact = None;
+        let mut closest = self
+            .lookup(
+                target,
+                |node| self.send_find_nodes_rpc(node.end_point(), target, want),
+                |node, nodes: Vec<NodeInfo>| {
+                    exact = std::iter::once(node)
+                        .chain(nodes.iter().copied())
+                        .find(|n| n.id() == target);
+                    Heard {
+                        useful: !nodes.is_empty(),
+                        done: exact.is_some(),
+                        nodes,
+                    }
+                },
+            )
+            .await;
+        if let Some(exact) = exact {
+            return vec![exact];
+        }
+        closest.truncate(LOOKUP_K);
+        closest
+    }
+
+    /// An iterative Kademlia lookup towards `target`, streaming rather than in rounds:
+    /// CONCURRENT_REQS queries are always in flight, and each answer starts the next query at
+    /// once instead of waiting for a round's slowest node. `query` asks one node; `heard` makes
+    /// of its answer the nodes it refers us to, and whether the lookup is done early. The
+    /// lookup ends when the LOOKUP_K closest nodes that answered usefully leave nothing closer
+    /// to ask. Returns those that answered usefully, closest first.
+    async fn lookup<T, Fut>(
+        &self,
+        target: NodeId,
+        query: impl Fn(NodeInfo) -> Fut,
+        mut heard: impl FnMut(NodeInfo, T) -> Heard,
+    ) -> Vec<NodeInfo>
+    where
+        Fut: Future<Output = Result<T, OurError>>,
+    {
+        let by_distance = |l: &NodeInfo, r: &NodeInfo| cmp_resp(&l.id(), &r.id(), &target);
+        // one node per public IP (see `RoutingTable::ip_taken`), here too: a Sybil's many ids
+        // around the target would otherwise fill every slot of the lookup
+        let mut seen: HashSet<NodeId> = HashSet::from([self.state.our_id]);
+        let mut seen_ips: HashSet<IpAddr> = HashSet::new();
+        let mut fresh_node = move |n: &NodeInfo| {
+            seen.insert(n.id()) && sybil_group(&n.end_point().ip()).is_none_or(|group| seen_ips.insert(group))
+        };
+        let mut known = self.state.routing_table.find_closest_n(target, LOOKUP_SEEDS);
+        known.sort_unstable_by(by_distance);
+        known.retain(|n| fresh_node(n));
         let mut queried: HashSet<NodeId> = HashSet::new();
-        let mut querying: Vec<NodeInfo> = vec![];
+        // nodes that answered usefully, closest first; the lookup is done when nothing
+        // unqueried is closer than the LOOKUP_K-th of these
+        let mut answered: Vec<NodeInfo> = vec![];
+        let mut in_flight = FuturesUnordered::new();
+        // queries still within SLOW_REPLY; the slower ones stay in flight but free their slot
+        let mut prompt: Vec<NodeInfo> = vec![];
+        let query = &query;
+        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
 
-        let mut round = 0;
         loop {
-            info!("round {round} of finding {target:?}");
-            if round == ROUNDS_LIMIT {
-                info!(
-                    "Too many rounds of find node, returning with {} closest nodes",
-                    closest.len()
-                );
-                return closest;
-            }
-            round += 1;
-
-            // this round: the unqueried known nodes closest to the target
-            querying.clear();
-            querying.extend(
-                closest
-                    .iter()
-                    .filter(|n| !queried.contains(&n.id()))
-                    .take(CONCURRENT_REQS),
-            );
-            if querying.is_empty() {
-                info!("asked every known node, returning with {} closest nodes", closest.len());
-                return closest;
-            }
-            for node in &querying {
+            while prompt.len() < CONCURRENT_REQS && queried.len() < LOOKUP_MAX_QUERIES {
+                let Some(node) = known.iter().find(|n| !queried.contains(&n.id())).copied() else {
+                    break;
+                };
+                if let Some(kth) = answered.get(LOOKUP_K - 1)
+                    && by_distance(&node, kth).is_gt()
+                {
+                    break;
+                }
                 queried.insert(node.id());
+                prompt.push(node);
+                in_flight.push(patiently(node, Box::pin(query(node)), Some(SLOW_REPLY)));
             }
-
-            let round_results = querying
-                .iter()
-                .map(|node| async move {
-                    (
-                        node.id(),
-                        self.send_find_nodes_rpc(node.end_point(), target, want).await,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let round_results = join_all(round_results).await;
-
-            let mut returned_nodes = vec![];
-            for (node_id, result) in round_results {
-                match result {
-                    Ok(nodes) => returned_nodes.extend(nodes),
-                    Err(OurError::IoError(_)) => {}
-                    // timeouts and the like: record the failure so repeated ones get the
-                    // node evicted
-                    Err(_) => self.state.routing_table.mark_failed(&node_id),
+            // the k closest have answered and nothing closer is left to ask: what's still in
+            // flight past SLOW_REPLY, typically dead nodes running out their timeouts, is
+            // unlikely to change the outcome
+            if let Some(kth) = answered.get(LOOKUP_K - 1) {
+                let closer = |n: &NodeInfo| by_distance(n, kth).is_lt();
+                if !prompt.iter().any(closer) && !known.iter().any(|n| !queried.contains(&n.id()) && closer(n)) {
+                    break;
                 }
             }
-
-            // a node that just heard from us lists us; looking ourselves up (bootstrapping)
-            // must not stop there
-            returned_nodes.retain(|n| n.id() != self.state.our_id);
-
-            // the node we reached to might be dead already, which will return as a timeout
-            if returned_nodes.is_empty() {
-                info!(
-                    "Last round of branching returned nothing, returning with {} closest nodes",
-                    closest.len()
-                );
-                return closest;
+            let Ok(Some((node, outcome))) = tokio::time::timeout_at(deadline, in_flight.next()).await else {
+                break;
+            };
+            prompt.retain(|n| n.id() != node.id());
+            let result = match outcome {
+                Ok(result) => result,
+                Err(slow) => {
+                    in_flight.push(patiently(node, slow, None));
+                    continue;
+                }
+            };
+            match result {
+                Ok(reply) => {
+                    let Heard { nodes, useful, done } = heard(node, reply);
+                    if done {
+                        break;
+                    }
+                    if useful {
+                        let at = answered.partition_point(|a| by_distance(a, &node).is_lt());
+                        answered.insert(at, node);
+                    }
+                    let nodes_len = nodes.len();
+                    let fresh: Vec<NodeInfo> = nodes.into_iter().filter(|n| fresh_node(n)).collect();
+                    debug!(
+                        "lookup: {} answered with {} nodes ({} new); {} known, {} queried",
+                        node.end_point(),
+                        nodes_len,
+                        fresh.len(),
+                        known.len(),
+                        queried.len()
+                    );
+                    if !fresh.is_empty() {
+                        known.extend(fresh);
+                        known.sort_unstable_by(by_distance);
+                    }
+                }
+                // our own network can't reach the node (no IPv6 route, say): not its fault
+                Err(OurError::IoError(_)) => {}
+                // timeouts and the like: record the failure so repeated ones get the node evicted
+                Err(_) => self.state.routing_table.mark_failed(&node.id()),
             }
-
-            // it's possible that some of the nodes returned are actually the node we're looking for
-            // so we check for that and return it if it's the case
-            if let Some(target_node) = returned_nodes.iter().find(|node| node.id() == target) {
-                return vec![*target_node];
-            }
-
-            closest.append(&mut returned_nodes);
-            closest.sort_unstable_by_key(|n| n.id().0);
-            closest.dedup_by(|l, r| l.id() == r.id());
-            closest.sort_unstable_by(|lhs, rhs| cmp_resp(&lhs.id(), &rhs.id(), &target));
-
-            // another round we go!
         }
+        answered
     }
 
     // attempt to find the target node via a peer on this address
@@ -240,87 +312,37 @@ impl DhtClient {
         }
 
         // iterative lookup: query the closest-known nodes, follow their `nodes` referrals
-        // towards the info hash, and harvest peers and tokens along the way. Queries stream
-        // rather than going in rounds: CONCURRENT_REQS are always in flight, and each answer
-        // starts the next query at once instead of waiting for the round's slowest node.
-        let target = NodeId(info_hash.0);
-        let by_distance = |l: &NodeInfo, r: &NodeInfo| cmp_resp(&l.id(), &r.id(), &target);
-        // one node per public IP (see `RoutingTable::ip_taken`), here too: a Sybil's many ids
-        // around the target would otherwise fill every slot of the lookup
-        let mut seen: HashSet<NodeId> = HashSet::from([self.state.our_id]);
-        let mut seen_ips: HashSet<IpAddr> = HashSet::new();
-        let mut fresh_node = move |n: &NodeInfo| {
-            seen.insert(n.id()) && sybil_group(&n.end_point().ip()).is_none_or(|group| seen_ips.insert(group))
-        };
+        // towards the info hash, and harvest peers and tokens along the way
         let want = self.want();
-        let mut known = self.state.routing_table.find_closest_n(target, LOOKUP_SEEDS);
-        known.sort_unstable_by(by_distance);
-        known.retain(|n| fresh_node(n));
-        let mut queried: HashSet<NodeId> = HashSet::new();
-        // nodes that answered usefully, closest first; the lookup is done when nothing
-        // unqueried is closer than the LOOKUP_K-th of these
-        let mut answered: Vec<NodeInfo> = vec![];
         let mut peers: Vec<SocketAddr> = vec![];
         let mut announce_candidates: Vec<(NodeInfo, Token)> = vec![];
-        let mut in_flight = FuturesUnordered::new();
-        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
-
-        loop {
-            while in_flight.len() < CONCURRENT_REQS && queried.len() < LOOKUP_MAX_QUERIES {
-                let Some(node) = known.iter().find(|n| !queried.contains(&n.id())).copied() else {
-                    break;
-                };
-                if let Some(kth) = answered.get(LOOKUP_K - 1)
-                    && by_distance(&node, kth).is_gt()
-                {
-                    break;
+        self.lookup(
+            NodeId(info_hash.0),
+            |node| self.send_get_peers_rpc(node.end_point(), info_hash, want),
+            |node, (token, nodes, values): GetPeersReply| {
+                debug!("get_peers: {} answered with {} peers", node.end_point(), values.len());
+                if !values.is_empty() {
+                    found(&values);
                 }
-                queried.insert(node.id());
-                in_flight.push(async move { (node, self.send_get_peers_rpc(node.end_point(), info_hash, want).await) });
-            }
-            let Ok(Some((node, result))) = tokio::time::timeout_at(deadline, in_flight.next()).await else {
-                break;
-            };
-            match result {
-                Ok((token, nodes, values)) => {
-                    let nodes_len = nodes.len();
-                    if !values.is_empty() {
-                        found(&values);
-                    }
-                    let values_len = values.len();
-                    peers.extend(values);
-                    if let Some(token) = token {
-                        announce_candidates.push((node, token));
-                    }
-                    // BEP 5 has a node without peers return closer nodes; one that sends
-                    // neither (typically a crawler parked next to popular hashes to collect
-                    // announces) gets no say in when the lookup is done, and leaves the table
-                    if values_len == 0 && nodes_len == 0 {
-                        self.state.routing_table.evict(&node.id());
-                    } else {
-                        let at = answered.partition_point(|a| by_distance(a, &node).is_lt());
-                        answered.insert(at, node);
-                    }
-                    let fresh: Vec<NodeInfo> = nodes.into_iter().filter(|n| fresh_node(n)).collect();
-                    debug!(
-                        "get_peers: {} answered with {} peers, {} nodes ({} new); {} known, {} queried",
-                        node.end_point(),
-                        values_len,
-                        nodes_len,
-                        fresh.len(),
-                        known.len(),
-                        queried.len()
-                    );
-                    if !fresh.is_empty() {
-                        known.extend(fresh);
-                        known.sort_unstable_by(by_distance);
-                    }
+                // BEP 5 has a node without peers return closer nodes; one that sends neither
+                // (typically a crawler parked next to popular hashes to collect announces) gets
+                // no say in when the lookup is done, and leaves the table
+                let useful = !(values.is_empty() && nodes.is_empty());
+                if !useful {
+                    self.state.routing_table.evict(&node.id());
                 }
-                // our own network can't reach the node (no IPv6 route, say): not its fault
-                Err(OurError::IoError(_)) => {}
-                Err(_) => self.state.routing_table.mark_failed(&node.id()),
-            }
-        }
+                peers.extend(values);
+                if let Some(token) = token {
+                    announce_candidates.push((node, token));
+                }
+                Heard {
+                    nodes,
+                    useful,
+                    done: false,
+                }
+            },
+        )
+        .await;
 
         peers.sort_unstable();
         peers.dedup();
@@ -410,15 +432,15 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::UdpSocket;
 
-    /// A fake DHT node that answers every get_peers query with the given response body
+    /// A fake DHT node that answers every get_peers and find_node query with the given body
     async fn fake_dht_node(socket: UdpSocket, body: KrpcBody) {
         let mut buf = [0u8; 1500];
         loop {
             let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
             let Ok(msg) = (&buf[..n]).parse() else { continue };
-            let KrpcBody::GetPeersQuery(_) = &msg.body else {
+            if !matches!(msg.body, KrpcBody::GetPeersQuery(_) | KrpcBody::FindNodeQuery(_)) {
                 continue;
-            };
+            }
             let resp = Krpc::new_with_body(msg.transaction_id().clone(), body.clone());
             let _ = socket.send_to(&resp.encode(), peer).await;
         }
@@ -487,5 +509,65 @@ mod tests {
                 .any(|(n, t)| n.id() == NodeId([0xAA; 20]) && *t == token_a),
             "A's token must be captured too"
         );
+    }
+
+    /// A client whose routing table holds just `known`
+    async fn client_knowing(known: &[NodeInfo]) -> DhtClient {
+        let pool = memory_pool();
+        let our_id = NodeId([0x01; 20]);
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let broker = RpcManager::new(socket, pool.clone(), Arc::new(TxnIdGenerator::new()), None);
+        broker.run().await.unwrap();
+        let routing_table = RoutingTable::new(our_id, broker.clone(), pool.clone());
+        for node in known {
+            routing_table.add(node.id(), node.end_point());
+        }
+        DhtClient::new(Arc::new(SharedState::new(our_id, routing_table, broker, pool)))
+    }
+
+    /// A fake node with id `id` answering with `nodes`
+    async fn fake_referrer(id: NodeId, nodes: &[NodeInfo]) -> NodeInfo {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let body = KrpcBody::FindNodeGetPeersResponse(ResBuilder::new(id).with_nodes(nodes).build());
+        tokio::spawn(fake_dht_node(socket, body));
+        NodeInfo::new(id, addr)
+    }
+
+    #[tokio::test]
+    async fn find_node_streams_past_a_dead_node_to_the_exact_match() {
+        // A refers us to B and to D, which is closer to the target but never answers; B
+        // knows the target itself
+        let target = NodeId([0xC0; 20]);
+        let target_node = NodeInfo::new(target, SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+        let b = fake_referrer(NodeId([0xB0; 20]), &[target_node]).await;
+        let dead = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let d = NodeInfo::new(NodeId([0xC1; 20]), dead.local_addr().unwrap());
+        let a = fake_referrer(NodeId([0xA0; 20]), &[b, d]).await;
+
+        let client = client_knowing(&[a]).await;
+        let started = tokio::time::Instant::now();
+        let found = client.find_node(target).await;
+        assert_eq!(found, vec![target_node]);
+        assert!(
+            started.elapsed() < SLOW_REPLY,
+            "B's answer ends the lookup without waiting for D: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_node_returns_the_closest_that_answered() {
+        // a chain of referrals, each node knowing the next one closer to the target
+        let target = NodeId([0xFF; 20]);
+        let mut next: Vec<NodeInfo> = vec![];
+        for byte in [0xF0u8, 0xE0, 0xC0, 0x80] {
+            next = vec![fake_referrer(NodeId([byte; 20]), &next).await];
+        }
+        let client = client_knowing(&next).await;
+        let found = client.find_node(target).await;
+        let ids: Vec<u8> = found.iter().map(|n| n.id().0[0]).collect();
+        // the 0xF0 node answers without nodes, which doesn't count as a useful answer
+        assert_eq!(ids, vec![0xE0, 0xC0, 0x80]);
     }
 }

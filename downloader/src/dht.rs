@@ -231,8 +231,10 @@ fn bind6(port: u16) -> std::io::Result<UdpSocket> {
 
 async fn bootstrap(session: &DhtSession, session6: Option<&DhtSession>) {
     let mut routers = Vec::new();
-    for host in BOOTSTRAP_NODES {
-        match lookup_host(host).await {
+    let resolved =
+        futures::future::join_all(BOOTSTRAP_NODES.map(|host| async move { (host, lookup_host(host).await) }));
+    for (host, addrs) in resolved.await {
+        match addrs {
             Ok(addrs) => routers.extend(addrs),
             Err(e) => tracing::debug!("couldn't resolve DHT router {host}: {e}"),
         }
