@@ -12,6 +12,7 @@ use rand::RngExt;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -75,8 +76,14 @@ async fn run(swarms: Swarms, tcp_port: u16, announce_now: Arc<Notify>, shutdown:
     let listen = async {
         let mut buf = [0u8; 1500];
         loop {
-            let Ok((n, from)) = socket.recv_from(&mut buf).await else {
-                continue;
+            let (n, from) = match socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                Err(e) => {
+                    debug!("LSD receive failed: {e}");
+                    // an error that persists would otherwise spin this loop
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
             };
             let Some(search) = parse_bt_search(&buf[..n]) else {
                 continue;
@@ -161,6 +168,7 @@ pub(crate) fn parse_bt_search(bytes: &[u8]) -> Option<BtSearch> {
             "port" => port = value.parse().ok(),
             "infohash" => {
                 if value.len() == 40
+                    && value.bytes().all(|b| b.is_ascii_hexdigit())
                     && let Ok(bytes) = (0..40)
                         .step_by(2)
                         .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
@@ -212,6 +220,15 @@ mod test {
             "no port"
         );
         assert!(parse_bt_search(&[0xff, 0xfe]).is_none());
+
+        // 40 bytes, but 'é' is two of them: must be rejected, not sliced mid-character
+        let multibyte = "BT-SEARCH * HTTP/1.1\r\nPort: 1\r\nInfohash: 0é102030405060708090A0B0C0D0E0F10111213\r\n\r\n";
+        assert!(parse_bt_search(multibyte.as_bytes()).is_none());
+        let signed = b"BT-SEARCH * HTTP/1.1\r\nPort: 1\r\nInfohash: +1+2030405060708090A0B0C0D0E0F1011121314\r\n\r\n";
+        assert!(
+            parse_bt_search(signed).is_none(),
+            "from_str_radix alone would take a '+'"
+        );
     }
 
     #[test]

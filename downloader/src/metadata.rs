@@ -44,6 +44,9 @@ use tracing::{debug, info};
 /// The ut_metadata message id we advertise for peers to send *us* ut_metadata messages on.
 /// Our own choice, same as `peer::UT_METADATA_ID`; only the remote's id is negotiated.
 const UT_METADATA_ID: u8 = 1;
+/// Largest metadata we'll fetch. An info dict is mostly piece hashes, and 8 MiB is ~400k
+/// pieces, more than torrent makers produce; a peer claiming more is lying or broken.
+const MAX_METADATA_SIZE: usize = 8 * 1024 * 1024;
 
 /// How long a single peer gets to complete the whole exchange (handshake and every metadata
 /// piece) once connected, before we give up on it and let another peer try. Connecting itself
@@ -257,12 +260,13 @@ async fn fetch_from_peer(
 
     ensure!(metadata_size > 0, "{addr} advertised a zero-length metadata size");
     ensure!(
-        metadata_size <= 32 * 1024 * 1024,
+        metadata_size <= MAX_METADATA_SIZE,
         "{addr} advertised an implausible metadata size of {metadata_size} bytes"
     );
 
     let total_pieces = metadata_size.div_ceil(METADATA_PIECE_SIZE);
-    let mut buffer = vec![0u8; metadata_size];
+    // sized on the first piece that arrives, so a peer that only claims a size costs nothing
+    let mut buffer = Vec::new();
     let mut have: Vec<bool> = vec![false; total_pieces];
 
     // Ask for everything up front rather than one at a time: metadata is at most a few
@@ -291,9 +295,10 @@ async fn fetch_from_peer(
         }
 
         let (piece, data) = match parse_data_message(&ext.payload) {
-            Ok(Some(parsed)) => parsed,
-            // a `reject` (msg_type 2), or a message we don't care about
-            Ok(None) => bail!("{addr} rejected a metadata request"),
+            Ok(UtMetadata::Data(piece, data)) => (piece, data),
+            Ok(UtMetadata::Reject) => bail!("{addr} rejected a metadata request"),
+            // a request for our metadata (we have none to serve), or an unknown msg_type
+            Ok(UtMetadata::Other) => continue,
             Err(e) => bail!("{addr} sent a malformed ut_metadata message: {e:#}"),
         };
 
@@ -307,6 +312,7 @@ async fn fetch_from_peer(
             end - start
         );
 
+        buffer.resize(metadata_size, 0);
         buffer[start..end].copy_from_slice(data);
         have[piece] = true;
     }
@@ -346,20 +352,27 @@ fn parse_their_handshake(payload: &[u8]) -> anyhow::Result<(u8, usize)> {
     Ok((*id as u8, *size as usize))
 }
 
+enum UtMetadata<'a> {
+    /// msg_type 1: a piece index and its raw bytes
+    Data(usize, &'a [u8]),
+    /// msg_type 2: a normal "I don't have it" answer rather than a protocol error
+    Reject,
+    /// a request (msg_type 0) or a msg_type BEP 9 doesn't define
+    Other,
+}
+
 /// Splits a ut_metadata `data` message into its piece index and raw bytes.
-///
-/// Returns `Ok(None)` for a `reject` (msg_type 2), which is a normal "I don't have it" answer
-/// rather than a protocol error.
-fn parse_data_message(payload: &[u8]) -> anyhow::Result<Option<(usize, &[u8])>> {
+fn parse_data_message(payload: &[u8]) -> anyhow::Result<UtMetadata<'_>> {
     let Ok((rest, dict)) = juicy_bencode::parse_bencode_dict(payload) else {
         bail!("not a bencoded dict");
     };
     let Some(BencodeItemView::Integer(msg_type)) = dict.get(b"msg_type".as_slice()) else {
         bail!("no msg_type");
     };
-    // 0 = request (we're not serving here), 1 = data, 2 = reject
-    if *msg_type != 1 {
-        return Ok(None);
+    match *msg_type {
+        1 => {}
+        2 => return Ok(UtMetadata::Reject),
+        _ => return Ok(UtMetadata::Other),
     }
     let Some(BencodeItemView::Integer(piece)) = dict.get(b"piece".as_slice()) else {
         bail!("data message with no piece index");
@@ -368,7 +381,7 @@ fn parse_data_message(payload: &[u8]) -> anyhow::Result<Option<(usize, &[u8])>> 
 
     // BEP 9: the raw metadata bytes follow the bencoded dict directly, with no framing of
     // their own -- whatever the dict didn't consume is the payload.
-    Ok(Some((*piece as usize, rest)))
+    Ok(UtMetadata::Data(*piece as usize, rest))
 }
 
 /// Wraps a raw info dict back up into a complete `.torrent` file so the existing
@@ -483,7 +496,9 @@ mod test {
         let mut msg = b"d8:msg_typei1e5:piecei2e10:total_sizei99ee".to_vec();
         msg.extend_from_slice(b"RAWBYTES");
 
-        let (piece, data) = parse_data_message(&msg).unwrap().unwrap();
+        let UtMetadata::Data(piece, data) = parse_data_message(&msg).unwrap() else {
+            panic!("not parsed as data");
+        };
         assert_eq!(piece, 2);
         assert_eq!(data, b"RAWBYTES");
     }
@@ -492,7 +507,10 @@ mod test {
     #[test]
     fn reject_message_is_not_an_error() {
         let msg = b"d8:msg_typei2e5:piecei0ee";
-        assert!(parse_data_message(msg).unwrap().is_none());
+        assert!(matches!(parse_data_message(msg).unwrap(), UtMetadata::Reject));
+        // and a peer asking us for metadata while we fetch it isn't a reason to give up on it
+        let msg = b"d8:msg_typei0e5:piecei0ee";
+        assert!(matches!(parse_data_message(msg).unwrap(), UtMetadata::Other));
     }
 
     /// End-to-end over a real loopback socket: a peer serving metadata (using this crate's own

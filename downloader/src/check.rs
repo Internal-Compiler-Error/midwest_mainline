@@ -14,7 +14,7 @@ pub fn check_files(torrent: &Torrent, root: &Path, mut progress: impl FnMut(usiz
     let files: Vec<(u64, Option<File>)> = torrent
         .files
         .iter()
-        .map(|(size, path)| (*size as u64, File::open(root.join(path)).ok()))
+        .map(|(size, path)| (*size, File::open(root.join(path)).ok()))
         .collect();
     let mut offsets = Vec::with_capacity(files.len());
     let mut total = 0u64;

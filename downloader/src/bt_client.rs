@@ -253,10 +253,10 @@ impl BtClient {
                 .with_context(|| format!("opening {}", file.display()))?;
             if fresh {
                 // `TorrentStorage::new` derives per-file offsets from on-disk lengths
-                f.set_len(*size as u64)?;
+                f.set_len(*size)?;
             } else {
                 let on_disk = f.metadata()?.len();
-                if on_disk != *size as u64 {
+                if on_disk != *size {
                     bail!(
                         "{} is {on_disk} bytes on disk but the torrent says {size}; can't resume",
                         file.display()

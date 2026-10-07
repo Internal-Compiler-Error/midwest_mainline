@@ -13,7 +13,7 @@ pub struct TorrentStorage {
 
     /// for each file at `i`, offset[i] contains the offset of the file into the conceptual one
     /// giant file
-    offsets: Vec<usize>,
+    offsets: Vec<u64>,
 }
 
 impl TorrentStorage {
@@ -21,11 +21,11 @@ impl TorrentStorage {
         // prefix sum
         let offsets = files
             .iter()
-            .scan(0, |acc, file| {
+            .scan(0u64, |acc, file| {
                 let start = *acc;
                 // relies on each file already being sized to its expected length (see
                 // `BtClient::add_torrent`, which `set_len`s every file right after creating it)
-                *acc += file.metadata().unwrap().len() as usize;
+                *acc += file.metadata().unwrap().len();
                 Some(start)
             })
             .collect::<Vec<_>>();
@@ -38,23 +38,20 @@ impl TorrentStorage {
     }
 
     /// The byte range of `piece` in the conceptual single file all the torrent's files form.
-    fn piece_range(&self, piece: u32) -> anyhow::Result<Range<usize>> {
+    fn piece_range(&self, piece: u32) -> anyhow::Result<Range<u64>> {
         let piece_size = self
             .torrent
             .nth_piece_size(piece)
             .ok_or_else(|| anyhow!("piece index out of range"))?;
-        let start = piece as usize * self.torrent.piece_size as usize;
-        Ok(start..start + piece_size)
+        let start = piece as u64 * self.torrent.piece_size as u64;
+        Ok(start..start + piece_size as u64)
     }
 
     pub fn write_piece(&self, piece: u32, complete_piece: &[u8]) -> anyhow::Result<()> {
         let mut written = 0;
         for (file, range) in self.file_segments(self.piece_range(piece)?) {
-            let size = range.end - range.start;
-            file.write_all_at(
-                &complete_piece[written..written + size],
-                range.start.try_into().unwrap(),
-            )?;
+            let size = (range.end - range.start) as usize;
+            file.write_all_at(&complete_piece[written..written + size], range.start)?;
             written += size;
         }
 
@@ -70,20 +67,20 @@ impl TorrentStorage {
     /// error rather than being clamped -- BEP 3 has no notion of a short block on the wire.
     pub fn read_block(&self, piece: u32, begin: u32, length: u32) -> anyhow::Result<Box<[u8]>> {
         let piece_range = self.piece_range(piece)?;
-        let start = piece_range.start + begin as usize;
-        let end = start + length as usize;
+        let start = piece_range.start + begin as u64;
+        let end = start + length as u64;
         if end > piece_range.end {
             anyhow::bail!("block {begin}+{length} runs past the end of piece {piece}");
         }
         self.read_range(start..end)
     }
 
-    fn read_range(&self, range: Range<usize>) -> anyhow::Result<Box<[u8]>> {
-        let mut buf = vec![0u8; range.len()];
+    fn read_range(&self, range: Range<u64>) -> anyhow::Result<Box<[u8]>> {
+        let mut buf = vec![0u8; (range.end - range.start) as usize];
         let mut read = 0;
         for (file, interval) in self.file_segments(range) {
-            let len = interval.len();
-            file.read_exact_at(&mut buf[read..read + len], interval.start as u64)?;
+            let len = (interval.end - interval.start) as usize;
+            file.read_exact_at(&mut buf[read..read + len], interval.start)?;
             read += len;
         }
         Ok(buf.into_boxed_slice())
@@ -91,7 +88,7 @@ impl TorrentStorage {
 
     /// Maps a byte range of the conceptual single file onto the actual files it spans, with
     /// each file's part expressed as a range within that file.
-    fn file_segments(&self, range: Range<usize>) -> Vec<(&File, Range<usize>)> {
+    fn file_segments(&self, range: Range<u64>) -> Vec<(&File, Range<u64>)> {
         let first = self
             .offsets
             .partition_point(|&off| off <= range.start)
@@ -104,7 +101,7 @@ impl TorrentStorage {
             let f_end = if f + 1 < self.offsets.len() {
                 self.offsets[f + 1]
             } else {
-                self.torrent.total_size.try_into().unwrap()
+                self.torrent.total_size
             };
 
             let overlap_start = range.start.max(f_start);
@@ -185,5 +182,46 @@ mod test {
             storage.read_block(0, 16, 0).is_ok(),
             "an empty block at the very end is in range"
         );
+    }
+
+    #[test]
+    fn writes_pieces_past_4_gib() {
+        const MIB: u64 = 1 << 20;
+        let sizes = [MIB, 5 << 30, MIB];
+        let mut info = b"d5:filesl".to_vec();
+        for (i, size) in sizes.iter().enumerate() {
+            info.extend_from_slice(format!("d6:lengthi{size}e4:pathl6:f{i}.binee").as_bytes());
+        }
+        info.extend_from_slice(format!("e4:name3:big12:piece lengthi{}e6:pieces{}:", 4 * MIB, 1281 * 20).as_bytes());
+        info.extend_from_slice(&[0; 1281 * 20]);
+        info.push(b'e');
+        let mut torrent = parse_torrent(&build_torrent_file(&info, &[])).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("downloader-storage-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = vec![];
+        for (i, (size, path)) in torrent.files.iter_mut().enumerate() {
+            *path = dir.join(format!("f{i}.bin"));
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&*path)
+                .unwrap();
+            // sparse, so this costs no disk space
+            file.set_len(*size).unwrap();
+            files.push(file);
+        }
+        let last = dir.join("f2.bin");
+        let storage = TorrentStorage::new(Arc::new(torrent), files);
+
+        // the last piece starts at 5 GiB: the final MiB of f1, then all of f2
+        let piece: Vec<u8> = (0..2 * MIB).map(|i| (i / MIB) as u8 + 1).collect();
+        storage.write_piece(1280, &piece).unwrap();
+        assert_eq!(std::fs::read(&last).unwrap(), vec![2; MIB as usize]);
+        assert_eq!(&*storage.read_block(1280, MIB as u32 - 1, 2).unwrap(), &[1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

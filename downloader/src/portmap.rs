@@ -21,6 +21,9 @@ use tracing::{debug, info, warn};
 
 /// asked of the gateway; it may grant less, and renewals follow what it granted
 const LEASE: Duration = Duration::from_secs(2 * 3600);
+/// floor on a granted lease when scheduling renewals: a gateway granting 0 or 1 seconds
+/// would otherwise have us renewing in a busy loop
+const MIN_LEASE: Duration = Duration::from_secs(120);
 /// how often to look again when there was no gateway to map on
 const RETRY: Duration = Duration::from_secs(10 * 60);
 const UPNP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -107,9 +110,11 @@ pub(crate) fn start(ports: Ports, shutdown: CancellationToken, bus: EventBus) ->
                     state(MappingState::Mapped {
                         external_ip: mapper.external_ip().await,
                     });
-                    mapper.keep_alive(&shutdown).await;
+                    let stopped = mapper.keep_alive(&shutdown).await;
                     mapper.close().await;
-                    return;
+                    if stopped {
+                        return;
+                    }
                 }
                 None => {
                     info!("no port mapping: the gateway at {gateway} answers neither NAT-PMP nor UPnP");
@@ -291,8 +296,8 @@ impl Mapper {
         any
     }
 
-    /// Renews at half the lease until shutdown.
-    async fn keep_alive(&mut self, shutdown: &CancellationToken) {
+    /// Renews at half the lease until shutdown (true) or until no renewal takes (false).
+    async fn keep_alive(&mut self, shutdown: &CancellationToken) -> bool {
         loop {
             let lease = match self {
                 Mapper::Pmp(mappings) => mappings
@@ -302,21 +307,26 @@ impl Mapper {
                     .unwrap_or(LEASE),
                 Mapper::Upnp { lease, .. } => *lease,
             };
-            wait_or_stop(lease / 2, shutdown).await;
+            wait_or_stop(lease.max(MIN_LEASE) / 2, shutdown).await;
             if shutdown.is_cancelled() {
-                return;
+                return true;
             }
-            match self {
+            let renewed = match self {
                 Mapper::Pmp(mappings) => {
+                    let mut any = false;
                     for mapping in mappings.iter_mut() {
-                        if let Err(e) = mapping.renew().await {
-                            warn!("renewing a port mapping failed: {e}");
+                        match mapping.renew().await {
+                            Ok(()) => any = true,
+                            Err(e) => warn!("renewing a port mapping failed: {e}"),
                         }
                     }
+                    any
                 }
-                Mapper::Upnp { .. } => {
-                    self.add_upnp().await;
-                }
+                Mapper::Upnp { .. } => self.add_upnp().await,
+            };
+            if !renewed {
+                info!("the gateway stopped renewing our port mappings; looking for one again");
+                return false;
             }
         }
     }

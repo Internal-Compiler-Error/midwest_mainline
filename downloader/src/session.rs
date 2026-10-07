@@ -1211,7 +1211,7 @@ fn progress(
             .enumerate()
             .map(|(i, (size, p))| FileInfo {
                 path: p.display().to_string(),
-                size: *size as u64,
+                size: *size,
                 selected: selected.get(i).copied().unwrap_or(true),
             })
             .collect(),

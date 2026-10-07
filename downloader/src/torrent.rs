@@ -33,6 +33,10 @@ fn safe_path_component(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Largest piece length we accept. BEP 3 sets no limit, but real torrents stay at or under
+/// 16 MiB, and a whole piece is buffered in memory while it downloads.
+const MAX_PIECE_SIZE: u32 = 64 << 20;
+
 /// Represents a parsed torrent metadata file
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Torrent {
@@ -48,7 +52,7 @@ pub struct Torrent {
 
     /// Files in the torrent: (size in bytes, path relative to the download root), always
     /// starting with `name` -- the single file's name, or the directory holding them all
-    pub files: Vec<(u32, PathBuf)>,
+    pub files: Vec<(u64, PathBuf)>,
 
     /// Total size of all files combined in bytes
     pub total_size: u64,
@@ -95,8 +99,8 @@ impl Torrent {
 
     /// The pieces holding any byte of file `index`; empty for an empty file.
     pub fn pieces_of_file(&self, index: usize) -> std::ops::Range<u32> {
-        let start: u64 = self.files[..index].iter().map(|(len, _)| *len as u64).sum();
-        let end = start + self.files[index].0 as u64;
+        let start: u64 = self.files[..index].iter().map(|(len, _)| len).sum();
+        let end = start + self.files[index].0;
         if end == start {
             return 0..0;
         }
@@ -155,14 +159,14 @@ impl Torrent {
 
 /// Parses a torrent metadata file and returns a Torrent struct
 pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
-    let (hash, raw_info) = compute_info_hash(metadata_file);
+    let (hash, raw_info) = compute_info_hash(metadata_file)?;
 
     let (_, mut torrent) = juicy_bencode::parse_bencode_dict(metadata_file).map_err(|_| {
         // the error type has a reference on the input, we don't want that
         anyhow!("not a valid dict")
     })?;
 
-    let BencodeItemView::Dictionary(mut info) = torrent.remove(b"info".as_slice()).unwrap() else {
+    let Some(BencodeItemView::Dictionary(mut info)) = torrent.remove(b"info".as_slice()) else {
         bail!("info needs to be a dict");
     };
 
@@ -194,7 +198,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         announce_tiers.push(vec![String::from_utf8(announce.to_vec())?]);
     }
 
-    let BencodeItemView::ByteString(name) = info.remove(b"name".as_slice()).unwrap() else {
+    let Some(BencodeItemView::ByteString(name)) = info.remove(b"name".as_slice()) else {
         bail!("name needs to be a string");
     };
     let name = str::from_utf8(name)?.to_string();
@@ -202,45 +206,77 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
     // `BtClient::add_torrent`); this only decides the layout under it
     let root = safe_path_component(&name)?;
 
-    let BencodeItemView::Integer(piece_len) = info.remove(b"piece length".as_slice()).unwrap() else {
+    let Some(BencodeItemView::Integer(piece_len)) = info.remove(b"piece length".as_slice()) else {
         bail!("piece length needs to be an integer");
     };
-    let piece_len: u32 = piece_len.try_into()?;
+    if !(1..=MAX_PIECE_SIZE as i64).contains(&piece_len) {
+        bail!("piece length {piece_len} is out of range");
+    }
+    let piece_len = piece_len as u64;
 
-    let BencodeItemView::ByteString(pieces) = info.remove(b"pieces".as_slice()).unwrap() else {
+    let Some(BencodeItemView::ByteString(pieces)) = info.remove(b"pieces".as_slice()) else {
         bail!("pieces needs to be a byte string");
     };
+    if pieces.len() % 20 != 0 {
+        bail!("pieces is {} bytes, not a multiple of 20", pieces.len());
+    }
 
     // BEP 27: absent means not private; some encoders write `0` explicitly rather than
     // omitting the key, so treat any non-1 value the same as absent instead of erroring.
     let private = matches!(info.remove(b"private".as_slice()), Some(BencodeItemView::Integer(1)));
 
+    let file_len = |length: i64| -> anyhow::Result<u64> {
+        u64::try_from(length).map_err(|_| anyhow!("file length {length} is negative"))
+    };
     let mut files = vec![];
-
     if let Some(BencodeItemView::Integer(length)) = info.remove(b"length".as_slice()) {
-        files.push((length as u32, root));
+        files.push((file_len(length)?, root));
     } else if let Some(BencodeItemView::List(file_lists)) = info.remove(b"files".as_slice()) {
-        let mut file_lists = file_lists.iter();
-        while let Some(BencodeItemView::Dictionary(entries)) = file_lists.next() {
-            let BencodeItemView::Integer(length) = entries.get(b"length".as_slice()).unwrap() else {
+        for entry in file_lists.iter() {
+            let BencodeItemView::Dictionary(entries) = entry else {
+                bail!("file entry needs to be a dict");
+            };
+            let Some(BencodeItemView::Integer(length)) = entries.get(b"length".as_slice()) else {
                 bail!("file length needs to be an integer");
             };
-            let BencodeItemView::List(paths) = entries.get(b"path".as_slice()).unwrap() else {
+            let Some(BencodeItemView::List(paths)) = entries.get(b"path".as_slice()) else {
                 bail!("file path needs to be a list");
             };
+            if paths.is_empty() {
+                bail!("file path is empty");
+            }
             let mut f = root.clone();
-            let mut paths = paths.iter();
-            while let Some(BencodeItemView::ByteString(p)) = paths.next() {
+            for p in paths.iter() {
+                let BencodeItemView::ByteString(p) = p else {
+                    bail!("file path segment needs to be a string");
+                };
                 f.push(safe_path_component(str::from_utf8(p)?)?);
             }
 
-            files.push((*length as u32, f));
+            files.push((file_len(*length)?, f));
         }
     }
+    if files.is_empty() {
+        bail!("torrent has no files");
+    }
 
-    let pieces = pieces.chunks(20).map(|e| e.try_into().unwrap()).collect();
-    let total_size = files.iter().map(|(len, _f)| *len as u64).sum();
-    let piece_len = u64::from(piece_len);
+    let total_size = files
+        .iter()
+        .try_fold(0u64, |acc, (len, _)| acc.checked_add(*len))
+        .ok_or_else(|| anyhow!("total size overflows"))?;
+    if total_size == 0 {
+        bail!("torrent is empty");
+    }
+    let pieces = pieces.as_chunks::<20>().0.to_vec();
+    if pieces.len() as u64 != total_size.div_ceil(piece_len) {
+        bail!(
+            "{} piece hashes for {total_size} bytes in pieces of {piece_len}",
+            pieces.len()
+        );
+    }
+    if u32::try_from(pieces.len()).is_err() {
+        bail!("too many pieces");
+    }
     // an evenly-divisible torrent has a "remainder" of 0, but the last piece is still
     // full-sized in that case
     let last_piece_len = match total_size % piece_len {
@@ -254,7 +290,7 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
         pieces,
         total_size,
         files,
-        last_piece_size: last_piece_len.try_into()?,
+        last_piece_size: last_piece_len as u32,
         name,
         info_hash: hash,
         raw_info,
@@ -264,26 +300,25 @@ pub fn parse_torrent(metadata_file: &[u8]) -> anyhow::Result<Torrent> {
 
 /// Computes the info hash of a torrent metadata file, and also returns the raw bencoded bytes
 /// of the "info" dict (needed to serve BEP 9 ut_metadata requests).
-fn compute_info_hash(input: &[u8]) -> (InfoHash, Vec<u8>) {
+fn compute_info_hash(input: &[u8]) -> anyhow::Result<(InfoHash, Vec<u8>)> {
+    let bencode = |e: bendy::decoding::Error| anyhow!("invalid bencode: {e}");
     let mut decoder = bendy::decoding::Decoder::new(input);
-    let Some(Object::Dict(mut dict)) = decoder.next_object().unwrap() else {
-        panic!("torrent metadata must be a dictionary")
+    let Some(Object::Dict(mut dict)) = decoder.next_object().map_err(bencode)? else {
+        bail!("torrent metadata must be a dictionary")
     };
 
-    while let Some((key, val)) = dict.next_pair().unwrap() {
+    while let Some((key, val)) = dict.next_pair().map_err(bencode)? {
         if key == b"info" {
-            let buf = match val {
-                Object::List(list_decoder) => list_decoder.into_raw().unwrap(),
-                Object::Dict(dict_decoder) => dict_decoder.into_raw().unwrap(),
-                Object::Integer(i) => i.as_bytes(),
-                Object::Bytes(items) => items,
+            let Object::Dict(dict_decoder) = val else {
+                bail!("info needs to be a dict");
             };
+            let buf = dict_decoder.into_raw().map_err(bencode)?;
             let hash = InfoHash::from_bytes(Sha1::digest(buf).as_slice());
-            return (hash, buf.to_vec());
+            return Ok((hash, buf.to_vec()));
         }
     }
 
-    panic!("torrent metadata must contain 'info' key")
+    bail!("torrent metadata must contain 'info' key")
 }
 
 #[cfg(test)]
@@ -391,6 +426,95 @@ mod test {
         torrent.extend_from_slice(&info);
         torrent.extend_from_slice(b"e");
         torrent
+    }
+
+    /// A multi-file torrent with `files` as (length, name) and `piece_hashes` zeroed hashes.
+    fn multi_file_torrent(files: &[(i64, &str)], piece_length: i64, piece_hashes: usize) -> Vec<u8> {
+        let mut info = b"d5:filesl".to_vec();
+        for (length, name) in files {
+            info.extend_from_slice(format!("d6:lengthi{length}e4:pathl").as_bytes());
+            info.extend_from_slice(&bencode_string(name.as_bytes()));
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(format!("e4:name5:multi12:piece lengthi{piece_length}e6:pieces").as_bytes());
+        info.extend_from_slice(&bencode_string(&vec![0u8; piece_hashes * 20]));
+        info.push(b'e');
+        crate::metadata::build_torrent_file(&info, &[])
+    }
+
+    #[test]
+    fn lays_out_files_past_4_gib() {
+        const MIB: u64 = 1 << 20;
+        let big = 5 << 30;
+        let bytes = multi_file_torrent(
+            &[(MIB as i64, "a"), (big as i64, "big"), (MIB as i64, "c")],
+            4 << 20,
+            1281,
+        );
+        let torrent = parse_torrent(&bytes).unwrap();
+
+        assert_eq!(torrent.files[1].0, big);
+        assert_eq!(torrent.total_size, big + 2 * MIB);
+        assert_eq!(torrent.pieces_of_file(0), 0..1);
+        assert_eq!(torrent.pieces_of_file(1), 0..1281);
+        // "c" starts at 5 GiB + 1 MiB: the second half of piece 1280, the last one
+        assert_eq!(torrent.pieces_of_file(2), 1280..1281);
+        assert_eq!(torrent.last_piece_size as u64, 2 * MIB);
+        let wanted = torrent.wanted_pieces(&[false, false, true]);
+        assert_eq!(wanted.count_ones(), 1);
+        assert!(wanted[1280]);
+    }
+
+    #[test]
+    fn rejects_malformed_info() {
+        let ok = multi_file_torrent(&[(5, "a"), (5, "b")], 4, 3);
+        assert!(parse_torrent(&ok).is_ok());
+
+        let mut bad_pieces = single_file_torrent(15, 5);
+        // "pieces" is the last info key; cut a byte off its hashes and its length prefix
+        let at = bad_pieces.windows(4).position(|w| w == b"60:\0").unwrap();
+        bad_pieces.splice(at..at + 3, *b"59:");
+        bad_pieces.remove(at + 3);
+        assert!(parse_torrent(&bad_pieces).is_err(), "pieces not a multiple of 20");
+
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(5, "a")], 0, 0)).is_err(),
+            "zero piece length"
+        );
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(5, "a")], -4, 2)).is_err(),
+            "negative piece length"
+        );
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(5, "a")], 1 << 40, 1)).is_err(),
+            "huge piece length"
+        );
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(-5, "a"), (10, "b")], 4, 2)).is_err(),
+            "negative length"
+        );
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(5, "a"), (5, "b")], 4, 2)).is_err(),
+            "too few hashes"
+        );
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(5, "a"), (5, "b")], 4, 4)).is_err(),
+            "too many hashes"
+        );
+        assert!(parse_torrent(&multi_file_torrent(&[], 4, 0)).is_err(), "no files");
+        assert!(
+            parse_torrent(&multi_file_torrent(&[(0, "a")], 4, 0)).is_err(),
+            "empty torrent"
+        );
+        let overflow = multi_file_torrent(&[(i64::MAX, "a"), (i64::MAX, "b"), (2, "c")], 1 << 20, 0);
+        assert!(parse_torrent(&overflow).is_err(), "total size overflows");
+
+        assert!(parse_torrent(b"d8:announce3:urle").is_err(), "missing info");
+        assert!(parse_torrent(b"d4:infoi1ee").is_err(), "info not a dict");
+        assert!(parse_torrent(b"d4:infod4:name1:aee").is_err(), "info missing keys");
+        assert!(parse_torrent(b"li1ee").is_err(), "not a dict");
+        assert!(parse_torrent(b"").is_err(), "empty input");
+        assert!(parse_torrent(b"d4:info").is_err(), "truncated");
     }
 
     #[test]
