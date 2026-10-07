@@ -30,7 +30,7 @@ pub struct Settings {
     pub download_dir: PathBuf,
     /// run a DHT node; off means peers come from trackers and PEX only. Next start.
     pub dht: bool,
-    /// connections per torrent, inbound and outbound together; applies live
+    /// connections per torrent, inbound and outbound together, 0 for no limit; applies live
     pub max_peers_per_torrent: usize,
     /// bytes per second across all torrents, 0 for no limit; applies live
     pub download_limit: u64,
@@ -56,7 +56,7 @@ impl Default for Settings {
             listen_port: 6881,
             download_dir: default_download_dir(),
             dht: true,
-            max_peers_per_torrent: 200,
+            max_peers_per_torrent: 0,
             download_limit: 0,
             upload_limit: 0,
             seed_ratio_limit: 0.0,
@@ -77,6 +77,14 @@ impl Settings {
             self.listen_port - 1
         } else {
             self.listen_port + 1
+        }
+    }
+
+    /// `max_peers_per_torrent` with 0 read as no limit
+    pub fn peer_cap(&self) -> usize {
+        match self.max_peers_per_torrent {
+            0 => usize::MAX,
+            n => n,
         }
     }
 

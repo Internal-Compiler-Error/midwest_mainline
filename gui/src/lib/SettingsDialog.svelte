@@ -86,8 +86,8 @@
         <Label for="max-active">Active downloads (0 = no limit)</Label>
         <Input id="max-active" type="number" min="0" bind:value={draft.max_active_downloads} class="h-8 w-28" />
 
-        <Label for="max-peers">Peers per torrent</Label>
-        <Input id="max-peers" type="number" min="1" bind:value={draft.max_peers_per_torrent} class="h-8 w-28" />
+        <Label for="max-peers">Peers per torrent (0 = no limit)</Label>
+        <Input id="max-peers" type="number" min="0" bind:value={draft.max_peers_per_torrent} class="h-8 w-28" />
 
         <Label for="down-limit">Download limit (KiB/s)</Label>
         <Input id="down-limit" type="number" min="0" bind:value={downloadKib} class="h-8 w-28" />

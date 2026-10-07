@@ -1346,7 +1346,7 @@ impl TorrentSwarm {
         if connected.dialed && self.id.encryption == crate::config::Encryption::Prefer {
             known.plaintext_only = !connected.stream.is_encrypted();
         }
-        if self.peers.len() >= self.settings.borrow().max_peers_per_torrent {
+        if self.peers.len() >= self.settings.borrow().peer_cap() {
             tracing::debug!("{remote_addr} refused, at the connection cap");
             return;
         }
@@ -1417,7 +1417,7 @@ impl TorrentSwarm {
     /// that get dialled, so gossip about peers we never call doesn't pile up in `known`.
     fn connect_to_peers(&mut self, peers: Vec<(SocketAddr, bool)>) {
         let now = Instant::now();
-        let cap = self.settings.borrow().max_peers_per_torrent;
+        let cap = self.settings.borrow().peer_cap();
         for (addr, utp_capable) in peers {
             let addr = canonical(addr);
             if self.peers.len() + self.dialing.len() >= cap {
